@@ -1,5 +1,5 @@
 // ============================================================
-// Erbium Android Hook — DIAGNOSTIC
+// Erbium Android Hook — LOG-ONLY version
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -15,12 +15,14 @@
 #include <mutex>
 #include <android/log.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
-#define LOG_TAG "ErbiumDiag"
+#define LOG_TAG "ErbiumHook"
 #define UNREAL_LIB_NAME  "libUnreal.so"
 #define VFT_PTR_OFFSET   0xBDB8BC0
 #define VFT_INDEX        0xDD
 
+// ---------- Logger ----------
 static FILE* g_logfile = nullptr;
 
 static std::mutex& GetMutex() {
@@ -30,9 +32,9 @@ static std::mutex& GetMutex() {
 
 static void InitLogFile() {
     const char* paths[] = {
-        "/storage/emulated/0/Android/data/com.epicgames.fortnite/files/diag.log",
-        "/sdcard/Android/data/com.epicgames.fortnite/files/diag.log",
-        "/data/local/tmp/diag.log",
+        "/storage/emulated/0/Android/data/com.epicgames.fortnite/files/hook.log",
+        "/sdcard/Android/data/com.epicgames.fortnite/files/hook.log",
+        "/data/local/tmp/hook.log",
     };
     for (auto p : paths) {
         FILE* f = fopen(p, "w");
@@ -60,6 +62,7 @@ static void LOGF(const char* fmt, ...) {
     }
 }
 
+// ---------- Lib info ----------
 struct LibInfo { uintptr_t base, text_start, text_end; };
 
 static LibInfo GetLibInfo(const char* name) {
@@ -81,11 +84,59 @@ static LibInfo GetLibInfo(const char* name) {
     return info;
 }
 
-static bool IsInRange(uintptr_t a, uintptr_t s, uintptr_t e) {
-    return a >= s && a < e;
+// ---------- دالة الاستبدال (Log Only) ----------
+typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
+static SpawnDefaultPawnFor_t g_orig_SpawnDefaultPawnFor = nullptr;
+static uint64_t g_call_count = 0;
+
+static void* Hook_SpawnDefaultPawnFor(void* this_, void* new_player, void* start_spot) {
+    g_call_count++;
+    LOGF("");
+    LOGF("========================================");
+    LOGF("[Hook #%llu] SpawnDefaultPawnFor", (unsigned long long)g_call_count);
+    LOGF("  this_      = %p", this_);
+    LOGF("  NewPlayer  = %p", new_player);
+    LOGF("  StartSpot  = %p %s", start_spot, start_spot == nullptr ? "← NULL!" : "");
+
+    // استدعاء الدالة الأصلية — بدون أي تعديل
+    void* pawn = nullptr;
+    if (g_orig_SpawnDefaultPawnFor)
+        pawn = g_orig_SpawnDefaultPawnFor(this_, new_player, start_spot);
+
+    LOGF("  Return     = %p %s", pawn, pawn == nullptr ? "← NULL!" : "✓");
+    LOGF("========================================");
+    return pawn;
 }
 
-static void RunDiagnostic() {
+// ---------- تركيب الـ Hook ----------
+static bool VFTHook(void** vtable, size_t idx, void* hook_fn, void** orig_out) {
+    void** slot = &vtable[idx];
+    if (orig_out) *orig_out = *slot;
+
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t addr       = (uintptr_t)slot;
+    uintptr_t page_start = addr & ~(page_size - 1);
+
+    size_t span = page_size;
+    if ((addr + sizeof(void*)) > (page_start + page_size))
+        span += page_size;
+
+    if (mprotect((void*)page_start, span, PROT_READ | PROT_WRITE) != 0) {
+        LOGF("[VFTHook] mprotect RW failed: %s", strerror(errno));
+        return false;
+    }
+
+    *slot = hook_fn;
+
+    mprotect((void*)page_start, span, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)page_start, (char*)page_start + span);
+
+    LOGF("[VFTHook] ✓ slot=%p orig=%p hook=%p", slot, *orig_out, hook_fn);
+    return true;
+}
+
+// ---------- العمل الفعلي ----------
+static void RunHook() {
     LibInfo info{0,0,0};
     LOGF("[Wait] Searching for %s...", UNREAL_LIB_NAME);
 
@@ -97,48 +148,26 @@ static void RunDiagnostic() {
 
     if (!info.base) { LOGF("[ERROR] libUnreal never loaded"); return; }
 
-    LOGF("");
-    LOGF("base       = 0x%lx", info.base);
-    LOGF("text_start = 0x%lx", info.text_start);
-    LOGF("text_end   = 0x%lx", info.text_end);
+    LOGF("base = 0x%lx", info.base);
 
-    uintptr_t loc = info.base + VFT_PTR_OFFSET;
-    LOGF("");
-    LOGF("VFT_PTR address  = 0x%lx", loc);
-    LOGF("Value at address = 0x%lx", *(uintptr_t*)loc);
+    // Interpretation B: العنوان نفسه هو VFT
+    void** vtable = (void**)(info.base + VFT_PTR_OFFSET);
+    LOGF("VFT (Interp B) = %p", vtable);
+    LOGF("VFT[0xDD] = %p", vtable[VFT_INDEX]);
 
-    void** vt_a = *(void***)loc;
-    LOGF("");
-    LOGF("--- Interp A (deref) ---");
-    LOGF("VFT ptr (A) = %p", vt_a);
-    if (vt_a) {
-        uintptr_t ea = (uintptr_t)vt_a[VFT_INDEX];
-        LOGF("A[0x%X] = 0x%lx (%s)", VFT_INDEX, ea,
-             IsInRange(ea, info.text_start, info.text_end) ? "TEXT" : "----");
+    // ثبّت الـ Hook
+    bool ok = VFTHook(vtable, VFT_INDEX,
+                      (void*)Hook_SpawnDefaultPawnFor,
+                      (void**)&g_orig_SpawnDefaultPawnFor);
+
+    LOGF(ok ? "[✓] Hook installed successfully" : "[✗] Hook FAILED");
+
+    if (ok) {
+        LOGF("");
+        LOGF("==========================================");
+        LOGF(" Waiting for SpawnDefaultPawnFor to be called...");
+        LOGF("==========================================");
     }
-
-    void** vt_b = (void**)loc;
-    uintptr_t eb = (uintptr_t)vt_b[VFT_INDEX];
-    LOGF("");
-    LOGF("--- Interp B (direct) ---");
-    LOGF("VFT ptr (B) = %p", vt_b);
-    LOGF("B[0x%X] = 0x%lx (%s)", VFT_INDEX, eb,
-         IsInRange(eb, info.text_start, info.text_end) ? "TEXT" : "----");
-
-    LOGF("");
-    LOGF("--- Context around 0x%X ---", VFT_INDEX);
-    for (int i = -3; i <= 3; i++) {
-        int idx = VFT_INDEX + i;
-        uintptr_t va = vt_a ? (uintptr_t)vt_a[idx] : 0;
-        uintptr_t vb = (uintptr_t)vt_b[idx];
-        LOGF("idx 0x%X | A=0x%lx (%s) | B=0x%lx (%s)",
-             idx,
-             va, IsInRange(va, info.text_start, info.text_end) ? "TEXT" : "----",
-             vb, IsInRange(vb, info.text_start, info.text_end) ? "TEXT" : "----");
-    }
-
-    LOGF("");
-    LOGF("DIAGNOSTIC COMPLETE");
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -146,7 +175,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "=== JNI_OnLoad ===");
     InitLogFile();
     std::thread([]{
-        try { RunDiagnostic(); } catch (...) {
+        try { RunHook(); } catch (...) {
             LOGF("[ERROR] exception in thread");
         }
     }).detach();
