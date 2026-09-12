@@ -1,5 +1,5 @@
 // ============================================================
-// Erbium Android Hook — LOG-ONLY version
+// Erbium Android Hook — MULTI VFT PROBE
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -20,7 +20,6 @@
 #define LOG_TAG "ErbiumHook"
 #define UNREAL_LIB_NAME  "libUnreal.so"
 #define VFT_PTR_OFFSET   0xBDB8BC0
-#define VFT_INDEX        0xDD
 
 // ---------- Logger ----------
 static FILE* g_logfile = nullptr;
@@ -38,11 +37,7 @@ static void InitLogFile() {
     };
     for (auto p : paths) {
         FILE* f = fopen(p, "w");
-        if (f) {
-            g_logfile = f;
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Logging to: %s", p);
-            return;
-        }
+        if (f) { g_logfile = f; return; }
     }
 }
 
@@ -84,34 +79,85 @@ static LibInfo GetLibInfo(const char* name) {
     return info;
 }
 
-// ---------- دالة الاستبدال (Log Only) ----------
-typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
-static SpawnDefaultPawnFor_t g_orig_SpawnDefaultPawnFor = nullptr;
-static uint64_t g_call_count = 0;
+// ---------- Generic probe hook ----------
+// كل hook يسجل فقط: هذا مؤشر دوال عام
+struct ProbeEntry {
+    int          vft_index;
+    const char*  name;
+    void*        original;
+    uint32_t     call_count;
+};
 
-static void* Hook_SpawnDefaultPawnFor(void* this_, void* new_player, void* start_spot) {
-    g_call_count++;
-    LOGF("");
-    LOGF("========================================");
-    LOGF("[Hook #%llu] SpawnDefaultPawnFor", (unsigned long long)g_call_count);
-    LOGF("  this_      = %p", this_);
-    LOGF("  NewPlayer  = %p", new_player);
-    LOGF("  StartSpot  = %p %s", start_spot, start_spot == nullptr ? "← NULL!" : "");
+static ProbeEntry g_probes[] = {
+    { 0xD4, "VFT[0xD4]", nullptr, 0 },
+    { 0xD5, "VFT[0xD5]", nullptr, 0 },
+    { 0xD6, "VFT[0xD6]", nullptr, 0 },
+    { 0xD7, "VFT[0xD7]", nullptr, 0 },
+    { 0xD8, "VFT[0xD8]", nullptr, 0 },
+    { 0xD9, "VFT[0xD9]", nullptr, 0 },
+    { 0xDA, "VFT[0xDA]", nullptr, 0 },
+    { 0xDB, "VFT[0xDB]", nullptr, 0 },
+    { 0xDC, "VFT[0xDC]", nullptr, 0 },
+    { 0xDD, "VFT[0xDD]", nullptr, 0 },   // SpawnDefaultPawnFor
+    { 0xDE, "VFT[0xDE]", nullptr, 0 },
+    { 0xDF, "VFT[0xDF]", nullptr, 0 },
+    { 0xE0, "VFT[0xE0]", nullptr, 0 },
+};
+static constexpr size_t g_probes_count = sizeof(g_probes) / sizeof(g_probes[0]);
 
-    // استدعاء الدالة الأصلية — بدون أي تعديل
-    void* pawn = nullptr;
-    if (g_orig_SpawnDefaultPawnFor)
-        pawn = g_orig_SpawnDefaultPawnFor(this_, new_player, start_spot);
+// hook generic: ياخد 3 args (this, arg1, arg2) ويعيد void*
+// هذا لا يعمل لكل الدوال لكن يكفي للكشف
+typedef void* (*GenericFunc_t)(void*, void*, void*);
 
-    LOGF("  Return     = %p %s", pawn, pawn == nullptr ? "← NULL!" : "✓");
-    LOGF("========================================");
-    return pawn;
-}
+// دالة hook عامة — نحتاج 13 نسخة مختلفة (واحدة لكل مدخل)
+// لذا سنستخدم macro
+#define DEFINE_PROBE_HOOK(N) \
+    static void* Hook_Probe_##N(void* a, void* b, void* c) { \
+        auto& p = g_probes[N]; \
+        p.call_count++; \
+        if (p.call_count <= 3) { \
+            LOGF("[PROBE] %s (#%u) called | this=%p arg1=%p arg2=%p", \
+                 p.name, p.call_count, a, b, c); \
+        } \
+        auto orig = (GenericFunc_t)p.original; \
+        if (!orig) return nullptr; \
+        return orig(a, b, c); \
+    }
 
-// ---------- تركيب الـ Hook ----------
-static bool VFTHook(void** vtable, size_t idx, void* hook_fn, void** orig_out) {
+DEFINE_PROBE_HOOK(0)
+DEFINE_PROBE_HOOK(1)
+DEFINE_PROBE_HOOK(2)
+DEFINE_PROBE_HOOK(3)
+DEFINE_PROBE_HOOK(4)
+DEFINE_PROBE_HOOK(5)
+DEFINE_PROBE_HOOK(6)
+DEFINE_PROBE_HOOK(7)
+DEFINE_PROBE_HOOK(8)
+DEFINE_PROBE_HOOK(9)
+DEFINE_PROBE_HOOK(10)
+DEFINE_PROBE_HOOK(11)
+DEFINE_PROBE_HOOK(12)
+
+static void* g_hook_fns[] = {
+    (void*)Hook_Probe_0,
+    (void*)Hook_Probe_1,
+    (void*)Hook_Probe_2,
+    (void*)Hook_Probe_3,
+    (void*)Hook_Probe_4,
+    (void*)Hook_Probe_5,
+    (void*)Hook_Probe_6,
+    (void*)Hook_Probe_7,
+    (void*)Hook_Probe_8,
+    (void*)Hook_Probe_9,
+    (void*)Hook_Probe_10,
+    (void*)Hook_Probe_11,
+    (void*)Hook_Probe_12,
+};
+
+// ---------- VFT patch ----------
+static bool VFTPatch(void** vtable, size_t idx, void* hook_fn, void** orig_out) {
     void** slot = &vtable[idx];
-    if (orig_out) *orig_out = *slot;
+    *orig_out = *slot;
 
     const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     uintptr_t addr       = (uintptr_t)slot;
@@ -122,7 +168,6 @@ static bool VFTHook(void** vtable, size_t idx, void* hook_fn, void** orig_out) {
         span += page_size;
 
     if (mprotect((void*)page_start, span, PROT_READ | PROT_WRITE) != 0) {
-        LOGF("[VFTHook] mprotect RW failed: %s", strerror(errno));
         return false;
     }
 
@@ -131,7 +176,6 @@ static bool VFTHook(void** vtable, size_t idx, void* hook_fn, void** orig_out) {
     mprotect((void*)page_start, span, PROT_READ | PROT_EXEC);
     __builtin___clear_cache((char*)page_start, (char*)page_start + span);
 
-    LOGF("[VFTHook] ✓ slot=%p orig=%p hook=%p", slot, *orig_out, hook_fn);
     return true;
 }
 
@@ -149,35 +193,55 @@ static void RunHook() {
     if (!info.base) { LOGF("[ERROR] libUnreal never loaded"); return; }
 
     LOGF("base = 0x%lx", info.base);
+    LOGF("text = 0x%lx .. 0x%lx", info.text_start, info.text_end);
 
-    // Interpretation B: العنوان نفسه هو VFT
     void** vtable = (void**)(info.base + VFT_PTR_OFFSET);
-    LOGF("VFT (Interp B) = %p", vtable);
-    LOGF("VFT[0xDD] = %p", vtable[VFT_INDEX]);
+    LOGF("VFT = %p", vtable);
 
-    // ثبّت الـ Hook
-    bool ok = VFTHook(vtable, VFT_INDEX,
-                      (void*)Hook_SpawnDefaultPawnFor,
-                      (void**)&g_orig_SpawnDefaultPawnFor);
-
-    LOGF(ok ? "[✓] Hook installed successfully" : "[✗] Hook FAILED");
-
-    if (ok) {
-        LOGF("");
-        LOGF("==========================================");
-        LOGF(" Waiting for SpawnDefaultPawnFor to be called...");
-        LOGF("==========================================");
+    // اطبع كل VFT entries أولاً
+    LOGF("");
+    LOGF("--- VFT entries we will hook ---");
+    for (size_t i = 0; i < g_probes_count; i++) {
+        uintptr_t fn = (uintptr_t)vtable[g_probes[i].vft_index];
+        bool in_text = (fn >= info.text_start && fn < info.text_end);
+        LOGF("  [0x%X] = 0x%lx %s",
+             g_probes[i].vft_index, fn, in_text ? "(TEXT ✓)" : "(NOT TEXT ✗)");
     }
+
+    // ثبّت الـ hooks على المدخلات الصالحة فقط
+    LOGF("");
+    LOGF("--- Installing probes ---");
+    int installed = 0;
+    for (size_t i = 0; i < g_probes_count; i++) {
+        uintptr_t fn = (uintptr_t)vtable[g_probes[i].vft_index];
+        // ثبّت فقط إذا كانت القيمة في .text (أي دالة حقيقية)
+        if (fn < info.text_start || fn >= info.text_end) {
+            LOGF("  Skip 0x%X (not in text)", g_probes[i].vft_index);
+            continue;
+        }
+
+        bool ok = VFTPatch(vtable, g_probes[i].vft_index,
+                           g_hook_fns[i], &g_probes[i].original);
+        if (ok) {
+            LOGF("  ✓ 0x%X hooked (orig=%p)", g_probes[i].vft_index, g_probes[i].original);
+            installed++;
+        } else {
+            LOGF("  ✗ 0x%X failed", g_probes[i].vft_index);
+        }
+    }
+
+    LOGF("");
+    LOGF("==========================================");
+    LOGF(" %d probes installed", installed);
+    LOGF(" Waiting for any of them to be called...");
+    LOGF("==========================================");
 }
 
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "=== JNI_OnLoad ===");
     InitLogFile();
     std::thread([]{
-        try { RunHook(); } catch (...) {
-            LOGF("[ERROR] exception in thread");
-        }
+        try { RunHook(); } catch (...) {}
     }).detach();
     return JNI_VERSION_1_6;
 }
