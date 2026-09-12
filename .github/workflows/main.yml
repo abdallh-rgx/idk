@@ -1,0 +1,54 @@
+name: Build Hook
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Print NDK info
+        run: |
+          echo "NDK path: ${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      - name: Build with ndk-build
+        run: |
+          ${{ steps.setup-ndk.outputs.ndk-path }}/ndk-build \
+            NDK_PROJECT_PATH=. \
+            NDK_APPLICATION_MK=jni/Application.mk \
+            APP_BUILD_SCRIPT=jni/Android.mk
+
+      - name: Verify .so
+        run: |
+          file libs/arm64-v8a/liberbium_hook.so
+          echo "--- NEEDED libraries ---"
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf \
+            -d libs/arm64-v8a/liberbium_hook.so | grep NEEDED || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liberbium_hook-arm64
+          path: libs/arm64-v8a/liberbium_hook.so
