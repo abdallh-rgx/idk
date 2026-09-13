@@ -46,6 +46,8 @@
 #define VFT_NAME_ISVALID_OFF            0x30
 #define VFT_NAME_GETNAME_OFF            0x38
 
+#define VFT_INDEX_HandleMatchHasStarted 0x11C
+
 #define SCAN_START  0x100
 #define SCAN_END    0x2000
 #define SCAN_STEP   8
@@ -449,7 +451,6 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("========================================");
     LOGF("[Aircraft] StartAircraftPhase this=%p a2=%d", this_, (int)a2);
 
-    // Dump the actual GameMode vtable before anything
     DumpGameModeVtable(this_, "aircraft");
 
     InstallVFTOnReal(this_);
