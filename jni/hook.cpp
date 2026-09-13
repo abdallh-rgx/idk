@@ -1,5 +1,5 @@
 // ============================================================
-// Erbium Android Hook — Final v21 (Safe Scan + PostLogin Name)
+// Erbium Android Hook — Final v22 (Deep GameSession Fix)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -55,9 +55,9 @@
 #define VFT_INDEX_HandleMatchHasStarted  0x11C
 #define VFT_INDEX_SpawnDefaultPawnFor    0x0DD
 
-// Scan range (ضيّقناها لأمان أكبر)
+// Scan range (وسّعناها قليلاً + فحص أدق)
 #define SCAN_START  0x380
-#define SCAN_END    0x600
+#define SCAN_END    0x800
 #define SCAN_STEP   8
 
 // ============================================================
@@ -122,7 +122,7 @@ static const char16_t* GetShortName(const char16_t* full_path) {
 }
 
 // ============================================================
-// 🔒 Safe Memory Read via process_vm_readv (لا يكرش)
+// 🔒 Safe Memory
 // ============================================================
 static bool SafeReadPtr(void* addr, void** out) {
     *out = nullptr;
@@ -137,16 +137,14 @@ static bool SafeReadI16(void* addr, int16_t* out) {
     if (!addr) return false;
     struct iovec local  = { out, sizeof(int16_t) };
     struct iovec remote = { addr, sizeof(int16_t) };
-    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    return n == (ssize_t)sizeof(int16_t);
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(int16_t);
 }
 static bool SafeReadU8(void* addr, uint8_t* out) {
     *out = 0;
     if (!addr) return false;
     struct iovec local  = { out, sizeof(uint8_t) };
     struct iovec remote = { addr, sizeof(uint8_t) };
-    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    return n == (ssize_t)sizeof(uint8_t);
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(uint8_t);
 }
 
 // ============================================================
@@ -208,58 +206,84 @@ static void* (*g_orig_SDPF)(void*, void*, void*) = nullptr;
 static void Hook_HandleMatchHasStarted(void*);
 static void* Hook_SpawnDefaultPawnFor(void*, void*, void*);
 
-// ============================================================
-// StaticFindObject
-// ============================================================
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t g_StaticFindObject = nullptr;
 
 // ============================================================
-// فحص صحة المؤشر
+// 🎯 فحص صحة المؤشر (مع استثناء libUnreal)
 // ============================================================
 static bool IsValidPtr(void* ptr) {
     uintptr_t p = (uintptr_t)ptr;
     return (p >= 0x1000000000ULL && p <= 0x8000000000ULL);
 }
 
+// فحص أشد: heap فقط (يستثني rodata/code الخاصة بـ libUnreal)
+static bool IsValidHeapPtr(void* ptr) {
+    uintptr_t p = (uintptr_t)ptr;
+    if (p < 0x1000000000ULL || p > 0x8000000000ULL) return false;
+    // استثني منطقة libUnreal (عادة < 0x10000000 عن base)
+    if (g_base && p >= g_base && p < (g_base + 0x10000000ULL)) return false;
+    return true;
+}
+
+// فحص vtable: يجب أن يكون مؤشر صالح (في libUnreal أو heap)
+static bool HasValidVtable(void* obj) {
+    if (!IsValidHeapPtr(obj)) return false;
+    void* vft = nullptr;
+    if (!SafeReadPtr(obj, &vft)) return false;
+    if (!IsValidPtr(vft)) return false;
+    // vtable عادة في rodata من libUnreal (قريب من base)
+    uintptr_t v = (uintptr_t)vft;
+    if (g_base && v >= g_base && v < (g_base + 0x10000000ULL)) return true;
+    // أو في heap (نادر لكن ممكن)
+    return IsValidHeapPtr(vft);
+}
+
 // ============================================================
-// 🔒 Scan آمن عن GameSession (لا يكرش)
+// 🔒 Scan آمن + ذكي
 // ============================================================
 static void* ScanGameModeForGameSession(void* gameMode) {
     if (!gameMode) return nullptr;
 
-    LOGF("[Scan] Safe-scanning GameMode=%p range=0x%X..0x%X",
+    LOGF("[Scan] Smart-scan GameMode=%p range=0x%X..0x%X",
          gameMode, SCAN_START, SCAN_END);
 
-    int hits = 0;
+    void* best = nullptr;
+
     for (int offset = SCAN_START; offset < SCAN_END; offset += SCAN_STEP) {
         void* ptr = nullptr;
         if (!SafeReadPtr((char*)gameMode + offset, &ptr)) continue;
-        if (!IsValidPtr(ptr)) continue;
+        if (!IsValidHeapPtr(ptr)) continue;
+        if (!HasValidVtable(ptr)) continue;
 
         void* ptr2 = nullptr;
-        if (!SafeReadPtr((char*)ptr + OFFSET_478_2D8, &ptr2)) {
-            LOGF("[Scan] +0x%X -> %p (2D8 unreadable)", offset, ptr);
-            continue;
-        }
-        if (!IsValidPtr(ptr2)) continue;
+        if (!SafeReadPtr((char*)ptr + OFFSET_478_2D8, &ptr2)) continue;
+        if (!IsValidHeapPtr(ptr2)) continue;
+        if (!HasValidVtable(ptr2)) continue;
 
         void* ptr3 = nullptr;
         SafeReadPtr((char*)ptr2 + OFFSET_2D8_298, &ptr3);
 
-        LOGF("[Scan] +0x%X -> %p -> %p -> %p %s",
-             offset, ptr, ptr2, ptr3, IsValidPtr(ptr3) ? "✅" : "");
-        hits++;
+        LOGF("[Scan] +0x%X -> %p -> %p -> %p  (ptr3 %s)",
+             offset, ptr, ptr2, ptr3,
+             !ptr3 ? "NULL ✅ candidate" :
+             (IsValidHeapPtr(ptr3) ? "set-heap" : "set-libunreal"));
 
-        if (IsValidPtr(ptr3)) {
-            LOGF("[Scan] ✅ GameSession candidate found at +0x%X", offset);
+        // الأفضل: ptr3 == NULL (جاهز للحقن)
+        if (ptr3 == nullptr) {
+            LOGF("[Scan] ✅ Found GameSession candidate @ +0x%X (ptr3 is NULL)", offset);
             return ptr;
         }
-        if (hits > 40) { LOGF("[Scan] too many hits, stopping"); break; }
+        // بديل: نحفظ أول واحد ثم نكمل البحث
+        if (!best) best = ptr;
     }
 
-    LOGF("[Scan] Done. GameSession not found.");
-    return nullptr;
+    if (best) {
+        LOGF("[Scan] ⚠️ No NULL-slot candidate; using first valid @ %p", best);
+    } else {
+        LOGF("[Scan] ❌ No GameSession candidate found.");
+    }
+    return best;
 }
 
 // ============================================================
@@ -283,7 +307,7 @@ static void* FindPlaylistByName(const char16_t* fullPath) {
 }
 
 // ============================================================
-// حقن Playlist
+// حقن Playlist (Path1 + Path1b + Path2)
 // ============================================================
 static bool InjectPlaylist(void* gameMode) {
     if (!gameMode) return false;
@@ -297,50 +321,72 @@ static bool InjectPlaylist(void* gameMode) {
 
     bool injected = false;
 
-    // Path1: GameState + 0x2298
+    // ---- Path1: GameState + 0x2298 AND 0x2290 ----
     void* gameState = nullptr;
     if (SafeReadPtr((char*)gameMode + OFFSET_GameMode_GameState, &gameState) && gameState) {
         void* p2298 = nullptr;
-        if (SafeReadPtr((char*)gameState + OFFSET_GameState_Playlist2298, &p2298)) {
-            if (!p2298) {
-                *(void**)((char*)gameState + OFFSET_GameState_Playlist2298) = g_cached_playlist;
-                LOGF("[Inject] ✅ [Path1] SET gameState+0x2298 = %p", g_cached_playlist);
-                injected = true;
-            }
+        SafeReadPtr((char*)gameState + OFFSET_GameState_Playlist2298, &p2298);
+        if (!p2298) {
+            *(void**)((char*)gameState + OFFSET_GameState_Playlist2298) = g_cached_playlist;
+            LOGF("[Inject] ✅ [Path1a] SET gameState+0x2298 = %p", g_cached_playlist);
+            injected = true;
+        } else {
+            LOGF("[Inject] [Path1a] gameState+0x2298 already = %p", p2298);
         }
+
+        void* p2290 = nullptr;
+        SafeReadPtr((char*)gameState + OFFSET_GameState_Playlist2290, &p2290);
+        if (!p2290) {
+            *(void**)((char*)gameState + OFFSET_GameState_Playlist2290) = g_cached_playlist;
+            LOGF("[Inject] ✅ [Path1b] SET gameState+0x2290 = %p", g_cached_playlist);
+            injected = true;
+        } else {
+            LOGF("[Inject] [Path1b] gameState+0x2290 already = %p", p2290);
+        }
+    } else {
+        LOGF("[Inject] ❌ gameState not valid!");
     }
 
-    // Path2 (اختياري + آمن)
-    if (!g_cached_game_session) {
+    // ---- Path2: GameSession -> 0x2D8 -> 0x298 ----
+    if (!g_cached_game_session || !IsValidHeapPtr(g_cached_game_session)) {
+        g_cached_game_session = nullptr;
+
+        // محاولة الإزاحة القياسية 0x478
         void* ptr478 = nullptr;
-        if (SafeReadPtr((char*)gameMode + 0x478, &ptr478) && IsValidPtr(ptr478)) {
+        if (SafeReadPtr((char*)gameMode + 0x478, &ptr478) && IsValidHeapPtr(ptr478) && HasValidVtable(ptr478)) {
             void* ptr2D8 = nullptr;
-            if (SafeReadPtr((char*)ptr478 + OFFSET_478_2D8, &ptr2D8) && IsValidPtr(ptr2D8)) {
+            if (SafeReadPtr((char*)ptr478 + OFFSET_478_2D8, &ptr2D8) && IsValidHeapPtr(ptr2D8)) {
                 g_cached_game_session = ptr478;
                 LOGF("[Inject] [Path2] GameSession @+0x478 = %p", ptr478);
             }
         }
         if (!g_cached_game_session) {
+            LOGF("[Inject] [Path2] Standard 0x478 failed. Smart-scanning...");
             g_cached_game_session = ScanGameModeForGameSession(gameMode);
         }
     }
 
     if (g_cached_game_session) {
         void* ptr2D8 = nullptr;
-        if (SafeReadPtr((char*)g_cached_game_session + OFFSET_478_2D8, &ptr2D8) && IsValidPtr(ptr2D8)) {
+        if (SafeReadPtr((char*)g_cached_game_session + OFFSET_478_2D8, &ptr2D8) && IsValidHeapPtr(ptr2D8)) {
             void* ptr298 = nullptr;
-            if (SafeReadPtr((char*)ptr2D8 + OFFSET_2D8_298, &ptr298)) {
-                if (!IsValidPtr(ptr298)) {
-                    *(void**)((char*)ptr2D8 + OFFSET_2D8_298) = g_cached_playlist;
-                    LOGF("[Inject] ✅ [Path2] SET ptr2D8+0x298 = %p", g_cached_playlist);
-                    injected = true;
-                } else {
-                    LOGF("[Inject] [Path2] already set");
-                }
+            SafeReadPtr((char*)ptr2D8 + OFFSET_2D8_298, &ptr298);
+
+            LOGF("[Inject] [Path2] current ptr2D8+0x298 = %p", ptr298);
+
+            // ⚠️ حقن قسري حتى لو كان "already set" لكنه ليس البلايليست
+            if (ptr298 != g_cached_playlist) {
+                *(void**)((char*)ptr2D8 + OFFSET_2D8_298) = g_cached_playlist;
+                LOGF("[Inject] ✅ [Path2] SET ptr2D8+0x298 = %p (was %p)", g_cached_playlist, ptr298);
+                injected = true;
+            } else {
+                LOGF("[Inject] [Path2] already correct ✓");
             }
+        } else {
+            LOGF("[Inject] ❌ [Path2] ptr2D8 invalid");
         }
     } else {
-        LOGF("[Inject] ⚠️ [Path2] skipped (Path1 already OK)");
+        LOGF("[Inject] ⚠️ [Path2] GameSession not found — flight path may be broken");
     }
     return injected;
 }
@@ -375,7 +421,10 @@ static void Hook_HandleMatchHasStarted(void* this_) {
 
 static void* Hook_SpawnDefaultPawnFor(void* this_, void* newPlayer, void* startSpot) {
     LOGF("[0xDD] SpawnDefaultPawnFor this=%p newPlayer=%p startSpot=%p", this_, newPlayer, startSpot);
-    if (startSpot == nullptr) LOGF("  [!] startSpot NULL — flight broken");
+    if (startSpot == nullptr) {
+        LOGF("  ⚠️ startSpot NULL — attempting to inject Playlist then retry");
+        InjectPlaylist(this_);
+    }
     void* r = g_orig_SDPF ? g_orig_SDPF(this_, newPlayer, startSpot) : nullptr;
     LOGF("  Return = %p", r);
     return r;
@@ -402,7 +451,7 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("========================================");
     LOGF("[Aircraft] StartAircraftPhase this=%p a2=%d", this_, (int)a2);
     InstallVFTOnReal(this_);
-    LOGF("[Aircraft] InjectPlaylist...");
+    LOGF("[Aircraft] InjectPlaylist (pre-call)...");
     InjectPlaylist(this_);
     bool result = g_orig_SAP ? g_orig_SAP(this_, a2) : false;
     LOGF("[Aircraft] returned: %d %s", (int)result, result ? "SUCCESS ✅" : "FAIL ❌");
@@ -422,20 +471,14 @@ static void* Hook_GetGameState(void* gm) {
 }
 
 // ============================================================
-// PostLogin — قراءة فقط + قراءة الاسم
+// PostLogin (read-only + name)
 // ============================================================
-struct FString16 {
-    char16_t* Data;
-    int32_t   Num;
-    int32_t   Max;
-    ~FString16() {}
-};
+struct FString16 { char16_t* Data; int32_t Num; int32_t Max; ~FString16() {} };
 typedef bool       (*IsValidFn_t)(void*);
 typedef FString16  (*GetNameFn_t)(void*);
 
 static std::string TryReadPlayerName(void* playerState) {
     if (!IsValidPtr(playerState)) return "<no-PS>";
-
     void* subObj = nullptr;
     if (!SafeReadPtr((char*)playerState + OFFSET_PS_2A8, &subObj)) return "<2A8-unread>";
     if (!IsValidPtr(subObj)) return "<no-subObj>";
@@ -444,23 +487,16 @@ static std::string TryReadPlayerName(void* playerState) {
     if (!SafeReadPtr(subObj, (void**)&vft)) return "<no-vft>";
     if (!IsValidPtr(vft)) return "<bad-vft>";
 
-    void* isValidPtr = nullptr;
-    void* getNamePtr = nullptr;
-    if (!SafeReadPtr((char*)vft + VFT_NAME_ISVALID_OFF, &isValidPtr)) return "<no-IsValid>";
-    if (!SafeReadPtr((char*)vft + VFT_NAME_GETNAME_OFF, &getNamePtr)) return "<no-GetName>";
+    void* isValidPtr = nullptr; void* getNamePtr = nullptr;
+    SafeReadPtr((char*)vft + VFT_NAME_ISVALID_OFF, &isValidPtr);
+    SafeReadPtr((char*)vft + VFT_NAME_GETNAME_OFF, &getNamePtr);
     if (!IsValidPtr(isValidPtr) || !IsValidPtr(getNamePtr)) return "<fn-invalid>";
 
-    LOGF("  [name] subObj=%p vft=%p IsValid=%p GetName=%p",
-         subObj, (void*)vft, isValidPtr, getNamePtr);
-
     IsValidFn_t isValid = (IsValidFn_t)isValidPtr;
-    bool ok = isValid(subObj);
-    LOGF("  [name] IsValid() = %d", (int)ok);
-    if (!ok) return "<invalid>";
+    if (!isValid(subObj)) return "<invalid>";
 
     GetNameFn_t getName = (GetNameFn_t)getNamePtr;
     FString16 out = getName(subObj);
-    LOGF("  [name] FString{ Data=%p, Num=%d, Max=%d }", out.Data, out.Num, out.Max);
 
     std::string res;
     if (out.Data && out.Num > 0) {
@@ -502,7 +538,7 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
             int16_t f3F2 = 0; uint8_t f120C = 0;
             SafeReadI16((char*)playerState + OFFSET_PS_3F2, &f3F2);
             SafeReadU8 ((char*)playerState + OFFSET_PS_120C, &f120C);
-            LOGF("  +0x3F2 (int16)=%d  +0x120C (uint8)=%u", (int)f3F2, (unsigned)f120C);
+            LOGF("  +0x3F2=%d  +0x120C=%u", (int)f3F2, (unsigned)f120C);
 
             std::string name = TryReadPlayerName(playerState);
             LOGF("  ⭐ PLAYER NAME = \"%s\"", name.c_str());
@@ -528,7 +564,7 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" Erbium Hook — Final v21 (Safe Scan)");
+    LOGF(" Erbium Hook — Final v22 (Deep GameSession Fix)");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
