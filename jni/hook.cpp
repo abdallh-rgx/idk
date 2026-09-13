@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v42: RestartPlayer attempts)
+// hook — Android JNI (v43: force pawn class)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -29,21 +29,17 @@
 #define ADDR_PlaylistHandler             0x5519710
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
+#define ADDR_SpawnDefaultPawnAtTransform 0x5511618
 
-// Candidate RestartPlayer-related functions
-#define ADDR_CAND_RestartPlayer          0x5516E50   // slot 0xE0
-#define ADDR_CAND_RestartAtStart1        0x93A01BC   // slot 0xDF
-#define ADDR_CAND_RestartAtStart2        0x93A04EC   // slot 0xDC
-#define ADDR_CAND_SpawnAtTransform       0x5511618   // slot 0xDE (known)
+// vtable slot for GetDefaultPawnClassForController (hypothesis)
+#define VFT_SLOT_GetDefaultPawnClassForController  0xDF
 
 #define OFF_PC_PlayerState               0x278
 #define OFF_PC_Pawn                      0x2B8
 #define OFF_PC_AckPawn                   0x2C0
-
 #define OFF_Pawn_Owner                   0x2A0
 #define OFF_Pawn_Controller              0x2A8
 #define OFF_Pawn_PlayerState             0x2D0
-
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
@@ -92,7 +88,7 @@ static bool SafeReadPtr(void* addr, void** out) {
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(void*);
 }
 static bool SafeReadBytes(void* addr, void* out, size_t n) {
-    if (!addr || !out || n == 0 || n > 256) return false;
+    if (!addr || !out || n == 0 || n > 512) return false;
     struct iovec local  = { out, n };
     struct iovec remote = { addr, n };
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
@@ -139,6 +135,8 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
+static void* g_pawn_class = nullptr;
+static void* g_gm_vft = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t g_StaticFindObject = nullptr;
@@ -146,6 +144,47 @@ static StaticFindObject_t g_StaticFindObject = nullptr;
 static bool IsValidPtr(void* ptr) {
     uintptr_t p = (uintptr_t)ptr;
     return (p >= 0x1000000000ULL && p <= 0x8000000000ULL);
+}
+
+// ------------------------------------------------------------
+// Find pawn class
+// ------------------------------------------------------------
+static void FindPawnClass() {
+    LOGF("");
+    LOGF("========== Find Pawn Class ==========");
+
+    static const char16_t* names[] = {
+        u"Athena_PlayerPawn_C",
+        u"BP_PlayerPawn_Athena_C",
+        u"FortPlayerPawn_Athena_C",
+        u"FortPlayerPawnAthena",
+        u"PlayerPawn_Athena_C",
+        u"PlayerPawn_Athena",
+        u"Athena_PlayerPawn",
+        u"DefaultPawn",
+    };
+
+    for (auto name : names) {
+        void* cls = g_StaticFindObject(nullptr, nullptr, name, false);
+        LOGF("  %s -> %p", u16_to_u8_local(name).c_str(), cls);
+        if (IsValidPtr(cls) && !g_pawn_class) {
+            g_pawn_class = cls;
+        }
+    }
+
+    LOGF("========== chose: %p ==========", g_pawn_class);
+}
+
+// helper for UTF-16 -> UTF-8 (avoid including Erbium stuff)
+static std::string u16_to_u8_local(const char16_t* str) {
+    if (!str) return "";
+    std::string res;
+    while (*str) {
+        uint16_t c = *str++;
+        if (c < 0x80) res += (char)c;
+        else res += '?';
+    }
+    return res;
 }
 
 // ------------------------------------------------------------
@@ -176,17 +215,66 @@ static bool InjectPlaylist(void* gm) {
 }
 
 // ------------------------------------------------------------
-// Attach Pawn to PC
+// Hook GetDefaultPawnClassForController (vtable 0xDF)
+// ------------------------------------------------------------
+typedef void* (*GetPawnClass_t)(void*, void*);
+static GetPawnClass_t g_orig_GetPawnClass = nullptr;
+static uint64_t g_gpc_calls = 0;
+
+static void* Hook_GetDefaultPawnClassForController(void* this_, void* controller) {
+    g_gpc_calls++;
+    if (g_gpc_calls < 20) {
+        LOGF("[GetPawnClass] this=%p controller=%p -> returning %p",
+             this_, controller, g_pawn_class);
+    }
+    if (IsValidPtr(g_pawn_class)) {
+        return g_pawn_class;
+    }
+    return g_orig_GetPawnClass ? g_orig_GetPawnClass(this_, controller) : nullptr;
+}
+
+static bool HookPawnClassGetter(void* gm) {
+    if (!gm) return false;
+    void* vft = nullptr;
+    if (!SafeReadPtr(gm, &vft) || !IsValidPtr(vft)) return false;
+
+    void** v = (void**)vft;
+    void** slot = &v[VFT_SLOT_GetDefaultPawnClassForController];
+    void* orig = *slot;
+
+    LOGF("[HookGPC] vft=%p slot[0x%X]=%p (offset +0x%lx)",
+         vft, VFT_SLOT_GetDefaultPawnClassForController, orig,
+         (unsigned long)((uintptr_t)orig - g_base));
+
+    const size_t ps = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t addr = (uintptr_t)slot;
+    uintptr_t pg = addr & ~(ps - 1);
+    size_t span = ps;
+    if ((addr + sizeof(void*)) > (pg + ps)) span += ps;
+
+    if (mprotect((void*)pg, span, PROT_READ | PROT_WRITE) != 0) {
+        LOGF("[HookGPC] mprotect RW failed");
+        return false;
+    }
+    g_orig_GetPawnClass = (GetPawnClass_t)orig;
+    *slot = (void*)Hook_GetDefaultPawnClassForController;
+    mprotect((void*)pg, span, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)pg, (char*)pg + span);
+    g_gm_vft = vft;
+    LOGF("[HookGPC] hooked");
+    return true;
+}
+
+// ------------------------------------------------------------
+// Attach Pawn
 // ------------------------------------------------------------
 static void AttachPawnToPC(void* pc, void* pawn) {
     if (!IsValidPtr(pc) || !IsValidPtr(pawn)) return;
-
     LOGF("[Possess] attach pawn=%p -> pc=%p", pawn, pc);
     SafeWritePtr((char*)pc + OFF_PC_Pawn, pawn);
     SafeWritePtr((char*)pc + OFF_PC_AckPawn, pawn);
     SafeWritePtr((char*)pawn + OFF_Pawn_Controller, pc);
     SafeWritePtr((char*)pawn + OFF_Pawn_Owner, pc);
-
     void* ps = nullptr;
     if (SafeReadPtr((char*)pc + OFF_PC_PlayerState, &ps) && IsValidPtr(ps)) {
         SafeWritePtr((char*)pawn + OFF_Pawn_PlayerState, ps);
@@ -201,36 +289,10 @@ static void AttachPawnToPC(void* pc, void* pawn) {
     LOGF("[Possess] done");
 }
 
-// ------------------------------------------------------------
-// Attempts
-// ------------------------------------------------------------
 static void* ReadPawn(void* pc) {
     void* p = nullptr;
     if (IsValidPtr(pc)) SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
     return p;
-}
-
-// Signature: (gm, pc)
-typedef void (*RP2_t)(void*, void*);
-// Signature: (gm, pc, startSpot)
-typedef void (*RP3_t)(void*, void*, void*);
-
-static bool TryRestart2(uintptr_t off, const char* name, void* gm, void* pc) {
-    LOGF("[RP] %s @ +0x%lx  (2 args)", name, (unsigned long)off);
-    RP2_t fn = (RP2_t)(g_base + off);
-    fn(gm, pc);
-    void* p = ReadPawn(pc);
-    LOGF("[RP] %s -> pawn=%p %s", name, p, IsValidPtr(p) ? "✅" : "❌");
-    return IsValidPtr(p);
-}
-
-static bool TryRestart3(uintptr_t off, const char* name, void* gm, void* pc, void* spot) {
-    LOGF("[RP] %s @ +0x%lx  (3 args, spot=%p)", name, (unsigned long)off, spot);
-    RP3_t fn = (RP3_t)(g_base + off);
-    fn(gm, pc, spot);
-    void* p = ReadPawn(pc);
-    LOGF("[RP] %s -> pawn=%p %s", name, p, IsValidPtr(p) ? "✅" : "❌");
-    return IsValidPtr(p);
 }
 
 // ------------------------------------------------------------
@@ -253,68 +315,40 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
     if (!IsValidPtr(this_) || !IsValidPtr(newPlayer)) return;
 
     std::thread([this_, newPlayer] {
-        // Wait for warmup
         std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-
-        void* gs = nullptr;
-        SafeReadPtr((char*)this_ + OFF_GM_GameState, &gs);
 
         LOGF("");
         LOGF("========== [Spawn attempts begin] ==========");
 
-        // Attempt 1: RestartPlayer (2 args) at 0x5516E50
-        if (TryRestart2(ADDR_CAND_RestartPlayer, "Cand-0xE0", this_, newPlayer)) {
-            AttachPawnToPC(newPlayer, ReadPawn(newPlayer));
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        typedef void* (*SpawnAt_t)(void*, void*, void*);
+        SpawnAt_t fn = (SpawnAt_t)(g_base + ADDR_SpawnDefaultPawnAtTransform);
 
-        // Attempt 2: RestartPlayerAtPlayerStart with GameState as startSpot
-        if (IsValidPtr(gs)) {
-            if (TryRestart3(ADDR_CAND_RestartAtStart1, "Cand-0xDF", this_, newPlayer, gs)) {
-                AttachPawnToPC(newPlayer, ReadPawn(newPlayer));
+        struct FTransform {
+            float qx,qy,qz,qw;
+            float tx,ty,tz,_p1;
+            float sx,sy,sz,_p2;
+        } xform;
+        memset(&xform, 0, sizeof(xform));
+        xform.qw = 1.0f;
+        xform.sx = xform.sy = xform.sz = 1.0f;
+
+        for (int i = 0; i < 8; i++) {
+            void* existing = ReadPawn(newPlayer);
+            if (IsValidPtr(existing)) {
+                LOGF("[worker] pawn already = %p", existing);
+                AttachPawnToPC(newPlayer, existing);
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-            if (TryRestart3(ADDR_CAND_RestartAtStart2, "Cand-0xDC", this_, newPlayer, gs)) {
-                AttachPawnToPC(newPlayer, ReadPawn(newPlayer));
-                return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-
-        // Attempt 3: SpawnDefaultPawnAtTransform with GameState as startSpot (still try)
-        {
-            LOGF("[RP] SpawnAtTransform with gs as spot");
-            typedef void* (*SpawnAt_t)(void*, void*, void*);
-            SpawnAt_t fn = (SpawnAt_t)(g_base + ADDR_CAND_SpawnAtTransform);
-            struct FTransform {
-                float qx,qy,qz,qw;
-                float tx,ty,tz,_p1;
-                float sx,sy,sz,_p2;
-            } xform;
-            memset(&xform, 0, sizeof(xform));
-            xform.qw = 1.0f;
-            xform.sx = xform.sy = xform.sz = 1.0f;
-            if (IsValidPtr(gs)) {
-                // Try to read transform from gs
-                void* root = nullptr;
-                if (SafeReadPtr((char*)gs + 0x198, &root) && IsValidPtr(root)) {
-                    SafeReadBytes((char*)root + 0x1F0, &xform, sizeof(xform));
-                    LOGF("[RP] read xform from gs: loc=(%.0f,%.0f,%.0f)",
-                         xform.tx, xform.ty, xform.tz);
-                }
-            }
+            LOGF("[worker] attempt %d", i + 1);
             void* pawn = fn(this_, newPlayer, &xform);
-            LOGF("[RP] SpawnAt -> pawn=%p", pawn);
+            LOGF("[worker] spawn returned %p", pawn);
             if (IsValidPtr(pawn)) {
                 AttachPawnToPC(newPlayer, pawn);
                 return;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
         }
-
-        LOGF("[RP] all attempts failed");
+        LOGF("[worker] gave up");
     }).detach();
 }
 
@@ -333,6 +367,7 @@ static StartAircraftPhase_t g_orig_SAP = nullptr;
 static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("[Aircraft] this=%p a2=%d", this_, (int)a2);
     InjectPlaylist(this_);
+    HookPawnClassGetter(this_);
     return g_orig_SAP ? g_orig_SAP(this_, a2) : false;
 }
 
@@ -354,7 +389,7 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" hook — v42 (RestartPlayer attempts)");
+    LOGF(" hook — v43 (force pawn class)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
@@ -369,6 +404,10 @@ static void RunHooks() {
 
     g_StaticFindObject = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     LOGF("StaticFindObject: %p", (void*)g_StaticFindObject);
+
+    // Find pawn class as soon as possible
+    FindPawnClass();
+
     LOGF(" All Hooks Installed.");
 }
 
