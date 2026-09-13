@@ -1,10 +1,10 @@
 // ============================================================
-// Erbium Android Hook — Final v7 (Char16_t Fix)
+// Erbium Android Hook — Final v10 (Playlist Fix)
 // 
-// التصحيحات في هذا الإصدار:
-// 1. تغيير wchar_t إلى char16_t لدعم Unreal Engine على Android
-// 2. إضافة دالة تحويل u16_to_u8 للطباعة الآمنة
-// 3. إضافة دالة GetShortName بديلة لـ wcsrchr
+// التصحيحات:
+// 1. تجربة كل من nullptr (Full Path) و -1 (Short Name)
+// 2. تأخير الحقن إلى ما بعد GamePhase = 3
+// 3. محاولات متعددة لمسارات Playlist
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -28,18 +28,17 @@
 #include "dobby.h"
 
 #define LOG_TAG "ErbiumHook"
-#define UNREAL_LIB_NAME  "libUnreal.so"
 
 // ============================================================
-// العناوين (مؤكدة من IDA)
+// العناوين
 // ============================================================
-#define ADDR_StaticFindObject   0x762A664   // ✅ التوقيع: (Class, InOuter, char16_t*, bool)
+#define ADDR_StaticFindObject   0x762A664
 #define ADDR_GetGameState       0x55B8AB0
 #define ADDR_PlaylistHandler    0x5519710
 #define ADDR_StartAircraftPhase 0x550A1F4
 
 // ============================================================
-// Offsets (مؤكدة من IDA)
+// Offsets
 // ============================================================
 #define OFFSET_GameMode_GameState      0x2D0
 #define OFFSET_GameState_GamePhase     0x2150
@@ -84,7 +83,7 @@ static void LOGF(const char* fmt, ...) {
 }
 
 // ============================================================
-// Helper: char16_t to UTF-8 (للطباعة في اللوغ)
+// Helpers
 // ============================================================
 static std::string u16_to_u8(const char16_t* str) {
     if (!str) return "nullptr";
@@ -104,9 +103,6 @@ static std::string u16_to_u8(const char16_t* str) {
     return res;
 }
 
-// ============================================================
-// Helper: استخراج الاسم القصير من المسار الكامل
-// ============================================================
 static const char16_t* GetShortName(const char16_t* full_path) {
     if (!full_path) return nullptr;
     const char16_t* lastDot = nullptr;
@@ -177,138 +173,79 @@ static void Hook_HandleMatchHasStarted(void*);
 static void* Hook_SpawnDefaultPawnFor(void*, void*, void*);
 
 // ============================================================
-// StaticFindObject (تم تصحيح النوع إلى char16_t)
+// StaticFindObject
 // ============================================================
 typedef void* (*StaticFindObject_t)(
     void* Class,
-    void* InOuter,       // pass -1 for ANY_PACKAGE, 0 for package from path
+    void* InOuter,
     const char16_t* Name,
     bool  ExactClass
 );
 static StaticFindObject_t g_StaticFindObject = nullptr;
 
 // ============================================================
-// اختبارات Sanity Check
+// بحث Playlist (شامل كل الاحتمالات)
 // ============================================================
-static void RunSanityCheck() {
-    if (!g_StaticFindObject) return;
-
-    LOGF("");
-    LOGF("========================================");
-    LOGF(" StaticFindObject Sanity Check");
-    LOGF("========================================");
-
-    struct Test { const char16_t* name; };
-    Test tests[] = {
-        { u"/Script/FortniteGame.FortGameModeAthena" },
-        { u"/Script/Engine.Actor" },
-        { u"FortGameModeAthena" },
-        { u"Actor" },
-    };
-
-    for (auto& t : tests) {
-        // مع InOuter = nullptr (0)
-        void* r0 = g_StaticFindObject(nullptr, nullptr, t.name, false);
-        // مع InOuter = -1 (ANY_PACKAGE)
-        void* rm = g_StaticFindObject(nullptr, (void*)-1, t.name, false);
-
-        LOGF("  \"%s\"", u16_to_u8(t.name).c_str());
-        LOGF("     [nullptr] -> %p %s", r0, r0 ? "✅" : "");
-        LOGF("     [ANY_PKG] -> %p %s", rm, rm ? "✅" : "");
-    }
-
-    LOGF("========================================");
-}
-
-// ============================================================
-// البحث عن Playlist بعدة طرق
-// ============================================================
-static void* FindPlaylistByName(const char16_t* full_path) {
+static void* FindPlaylistByName(const char16_t* fullPath) {
     if (!g_StaticFindObject) return nullptr;
 
     LOGF("");
     LOGF("========== Playlist Lookup ==========");
-    LOGF("Full path: %s", u16_to_u8(full_path).c_str());
+    LOGF("Full Path: %s", u16_to_u8(fullPath).c_str());
 
-    // ============================================================
-    // Trial 1: InOuter = nullptr (تحليل المسار)
-    // ============================================================
-    LOGF("");
-    LOGF("[Trial 1] InOuter=nullptr + Full Path");
-    void* r1 = g_StaticFindObject(nullptr, nullptr, full_path, false);
-    LOGF("  -> %p %s", r1, r1 ? "✅ FOUND" : "");
+    // 1. المسار الكامل مع nullptr
+    void* r1 = g_StaticFindObject(nullptr, nullptr, fullPath, false);
+    LOGF("  [nullptr + FullPath] -> %p %s", r1, r1 ? "✅" : "");
     if (r1) return r1;
 
-    // ============================================================
-    // Trial 2: استخرج الاسم القصير
-    // ============================================================
-    const char16_t* shortName = GetShortName(full_path);
-    LOGF("");
-    LOGF("[Trial 2] InOuter=-1 + Short Name \"%s\"", u16_to_u8(shortName).c_str());
+    // 2. الاسم القصير مع (void*)-1
+    const char16_t* shortName = GetShortName(fullPath);
     void* r2 = g_StaticFindObject(nullptr, (void*)-1, shortName, false);
-    LOGF("  -> %p %s", r2, r2 ? "✅ FOUND" : "");
+    LOGF("  [(void*)-1 + ShortName] -> %p %s", r2, r2 ? "✅" : "");
     if (r2) return r2;
 
-    // ============================================================
-    // Trial 3: كل المحاولات الأخرى
-    // ============================================================
-    const char16_t* alternates[] = {
+    // 3. بدائل (كل الاحتمالات)
+    const char16_t* alternatives[] = {
         u"Playlist_DefaultSolo",
+        u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo",
         u"/Game/Athena/Playlists/Playlist_DefaultSolo",
         u"/Game/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo",
-        u"/Game/Athena/Playlists/Playlist_DefaultSolo",
+        u"Playlist_DefaultDuo",
+        u"Playlist_DefaultSquad",
+        u"Playlist_PlaygroundV2"
     };
 
-    for (auto path : alternates) {
-        LOGF("");
-        LOGF("[Trial *] Trying: %s", u16_to_u8(path).c_str());
-
-        void* rn = g_StaticFindObject(nullptr, nullptr, path, false);
+    for (auto alt : alternatives) {
+        LOGF("[Try] %s", u16_to_u8(alt).c_str());
+        void* rn = g_StaticFindObject(nullptr, nullptr, alt, false);
         LOGF("  [nullptr] -> %p", rn);
         if (rn) return rn;
-
-        void* rm = g_StaticFindObject(nullptr, (void*)-1, path, false);
-        LOGF("  [ANY_PKG] -> %p", rm);
+        void* rm = g_StaticFindObject(nullptr, (void*)-1, alt, false);
+        LOGF("  [(void*)-1] -> %p", rm);
         if (rm) return rm;
     }
 
-    LOGF("");
-    LOGF("❌ Playlist NOT FOUND by any method");
-    LOGF("=====================================");
+    LOGF("❌ Playlist NOT FOUND");
     return nullptr;
 }
 
 // ============================================================
-// حقن Playlist في v4 + 0x2D8
+// حقن Playlist
 // ============================================================
 static bool InjectPlaylist(void* gameMode) {
     if (!gameMode) return false;
 
     void* v4 = *(void**)((char*)gameMode + OFFSET_GameMode_V4);
-    LOGF("[Inject] v4 = %p", v4);
-    if (!v4) {
-        LOGF("[Inject] v4 is NULL");
-        return false;
-    }
+    if (!v4) return false;
 
     void* current_v5 = *(void**)((char*)v4 + OFFSET_V4_V5);
-    LOGF("[Inject] current v5 = %p", current_v5);
-
-    if (current_v5 != nullptr) {
-        LOGF("[Inject] v5 already set");
-        return true;
-    }
+    if (current_v5 != nullptr) return true; // موجود مسبقاً
 
     if (!g_cached_playlist) {
-        // استخدام البادئة u بدل L
         g_cached_playlist = FindPlaylistByName(
             u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo"
         );
-
-        if (!g_cached_playlist) {
-            LOGF("[Inject] ❌ Cannot find Playlist");
-            return false;
-        }
+        if (!g_cached_playlist) return false;
     }
 
     *(void**)((char*)v4 + OFFSET_V4_V5) = g_cached_playlist;
@@ -317,7 +254,7 @@ static bool InjectPlaylist(void* gameMode) {
 }
 
 // ============================================================
-// تثبيت Hooks على VFT
+// VFT Installation
 // ============================================================
 static bool InstallVFTOnReal(void* gameMode) {
     if (!gameMode) return false;
@@ -330,62 +267,44 @@ static bool InstallVFTOnReal(void* gameMode) {
     }
 
     LOGF("[VFT] New VFT: %p (GameMode=%p)", real_vft, gameMode);
-
     void** vft = (void**)real_vft;
-    bool ok1 = VFTPatch(vft, VFT_INDEX_HandleMatchHasStarted,
-                        (void*)Hook_HandleMatchHasStarted, (void**)&g_orig_HMHS);
-    bool ok2 = VFTPatch(vft, VFT_INDEX_SpawnDefaultPawnFor,
-                        (void*)Hook_SpawnDefaultPawnFor, (void**)&g_orig_SDPF);
-
-    LOGF("[VFT] Hook 0x11C: %s | 0x0DD: %s",
-         ok1 ? "OK" : "FAIL", ok2 ? "OK" : "FAIL");
-
+    bool ok1 = VFTPatch(vft, VFT_INDEX_HandleMatchHasStarted, (void*)Hook_HandleMatchHasStarted, (void**)&g_orig_HMHS);
+    bool ok2 = VFTPatch(vft, VFT_INDEX_SpawnDefaultPawnFor, (void*)Hook_SpawnDefaultPawnFor, (void**)&g_orig_SDPF);
+    LOGF("[VFT] Hook 0x11C: %s | 0x0DD: %s", ok1 ? "OK" : "FAIL", ok2 ? "OK" : "FAIL");
     g_known_vfts.push_back(real_vft);
     return true;
 }
 
 // ============================================================
-// Hook: HandleMatchHasStarted
+// Hooks
 // ============================================================
 static void Hook_HandleMatchHasStarted(void* this_) {
     LOGF("[0x11C] HandleMatchHasStarted this=%p", this_);
-
     if (this_) {
         void* gs = *(void**)((char*)this_ + OFFSET_GameMode_GameState);
-        LOGF("  GameState = %p", gs);
         if (gs) {
             uint8_t p = *(uint8_t*)((char*)gs + OFFSET_GameState_GamePhase);
             LOGF("  GamePhase = %d", p);
         }
     }
-
     if (g_orig_HMHS) g_orig_HMHS(this_);
 }
 
-// ============================================================
-// Hook: SpawnDefaultPawnFor
-// ============================================================
 static void* Hook_SpawnDefaultPawnFor(void* a, void* b, void* c) {
     LOGF("[0xDD] SpawnDefaultPawnFor this=%p newPlayer=%p startSpot=%p", a, b, c);
     if (c == nullptr) LOGF("  [!] startSpot = NULL");
-
     void* r = g_orig_SDPF ? g_orig_SDPF(a, b, c) : nullptr;
     LOGF("  Return = %p", r);
     return r;
 }
 
-// ============================================================
-// Hook: Playlist Handler
-// ============================================================
 typedef int (*PlaylistHandler_t)(void*);
 static PlaylistHandler_t g_orig_Playlist = nullptr;
 
 static int Hook_PlaylistHandler(void* a1) {
     static int cc = 0;
     cc++;
-    bool log = (cc <= 5) || (cc % 100 == 0);
-
-    if (log) {
+    if (cc <= 5 || cc % 100 == 0) {
         LOGF("[Playlist #%d] a1=%p", cc, a1);
         if (a1) {
             void* v4 = *(void**)((char*)a1 + OFFSET_GameMode_V4);
@@ -395,15 +314,11 @@ static int Hook_PlaylistHandler(void* a1) {
             }
         }
     }
-
     int result = g_orig_Playlist ? g_orig_Playlist(a1) : 0;
-    if (log) LOGF("  -> %d %s", result, result ? "OK" : "FAIL");
+    if (cc <= 5 || cc % 100 == 0) LOGF("  -> %d %s", result, result ? "OK" : "FAIL");
     return result;
 }
 
-// ============================================================
-// Hook: StartAircraftPhase
-// ============================================================
 typedef bool (*StartAircraftPhase_t)(void*, char);
 static StartAircraftPhase_t g_orig_SAP = nullptr;
 
@@ -411,7 +326,6 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("");
     LOGF("========================================");
     LOGF("[Aircraft] StartAircraftPhase this=%p a2=%d", this_, (int)a2);
-
     InstallVFTOnReal(this_);
 
     void* gs = nullptr;
@@ -424,52 +338,29 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
         }
     }
 
-    // محاولة أولى
     bool result = g_orig_SAP ? g_orig_SAP(this_, a2) : false;
     LOGF("  Attempt 1 = %d", (int)result);
 
-    if (result) {
-        LOGF("  [✓] Success!");
-        LOGF("========================================");
-        return true;
-    }
-
-    // محاولة حقن Playlist
-    LOGF("  [!] Failed -> Injecting Playlist...");
-    if (InjectPlaylist(this_)) {
+    if (!result) {
+        LOGF("  [!] Failed -> Waiting for GamePhase 3 to inject Playlist...");
+        // ما نحقن هسة، نخلي Fallback يشتغل وننتظر GamePhase=3
         if (phase && *phase != 2) *phase = 2;
-
         result = g_orig_SAP ? g_orig_SAP(this_, a2) : false;
         LOGF("  Attempt 2 = %d", (int)result);
-
-        if (result) {
-            LOGF("  [✓✓] SUCCESS after Playlist injection!");
-            LOGF("========================================");
-            return true;
-        }
     }
 
-    // Fallback
-    LOGF("  [Fallback] Force GamePhase = 3");
-    if (phase) {
-        uint8_t old = *phase;
-        *phase = 3;
-        LOGF("  GamePhase: %d -> %d", old, *phase);
+    if (!result) {
+        LOGF("  [Fallback] Force GamePhase = 3");
+        if (phase) *phase = 3;
+        if (g_orig_HMHS) g_orig_HMHS(this_);
+        result = true;
     }
 
-    if (g_orig_HMHS) {
-        LOGF("  [Manual] Calling HandleMatchHasStarted...");
-        g_orig_HMHS(this_);
-    }
-
-    LOGF("  Final = true (forced)");
+    LOGF("  Final = %d", (int)result);
     LOGF("========================================");
-    return true;
+    return result;
 }
 
-// ============================================================
-// Hook: GetGameState
-// ============================================================
 typedef void* (*GetGameState_t)(void*);
 static GetGameState_t g_orig_GGS = nullptr;
 static uint64_t g_ggs_calls = 0;
@@ -477,9 +368,19 @@ static uint64_t g_ggs_calls = 0;
 static void* Hook_GetGameState(void* gm) {
     g_ggs_calls++;
     void* r = g_orig_GGS ? g_orig_GGS(gm) : nullptr;
-
     if (gm && g_ggs_calls > 3) {
         InstallVFTOnReal(gm);
+        // نحاول نحقن الـ Playlist إذا صار GamePhase = 3
+        if (g_ggs_calls % 50 == 0) { // كل 50 استدعاء
+            void* gs = *(void**)((char*)gm + OFFSET_GameMode_GameState);
+            if (gs) {
+                uint8_t phase = *(uint8_t*)((char*)gs + OFFSET_GameState_GamePhase);
+                if (phase == 3) {
+                    LOGF("[GGS] GamePhase=3 detected, injecting Playlist...");
+                    InjectPlaylist(gm);
+                }
+            }
+        }
     }
     return r;
 }
@@ -498,43 +399,20 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" Erbium Hook — Final v7 (Char16_t)");
+    LOGF(" Erbium Hook — Final v10");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
-    // Hook GetGameState
-    int r1 = DobbyHook((void*)(g_base + ADDR_GetGameState),
-                       (void*)Hook_GetGameState, (void**)&g_orig_GGS);
-    LOGF("Hook GetGameState:        %s", r1 == 0 ? "OK" : "FAIL");
+    DobbyHook((void*)(g_base + ADDR_GetGameState), (void*)Hook_GetGameState, (void**)&g_orig_GGS);
+    DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PlaylistHandler, (void**)&g_orig_Playlist);
+    DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_StartAircraftPhase, (void**)&g_orig_SAP);
 
-    // Hook Playlist Handler
-    int r2 = DobbyHook((void*)(g_base + ADDR_PlaylistHandler),
-                       (void*)Hook_PlaylistHandler, (void**)&g_orig_Playlist);
-    LOGF("Hook Playlist Handler:    %s", r2 == 0 ? "OK" : "FAIL");
-
-    // Hook StartAircraftPhase
-    int r3 = DobbyHook((void*)(g_base + ADDR_StartAircraftPhase),
-                       (void*)Hook_StartAircraftPhase, (void**)&g_orig_SAP);
-    LOGF("Hook StartAircraftPhase:  %s", r3 == 0 ? "OK" : "FAIL");
-
-    // StaticFindObject
     g_StaticFindObject = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    LOGF("StaticFindObject:         %p", (void*)g_StaticFindObject);
+    LOGF("StaticFindObject: %p", (void*)g_StaticFindObject);
 
-    // Sanity check
-    RunSanityCheck();
-
-    LOGF("");
-    LOGF("========================================");
-    LOGF(" All Hooks Installed");
-    LOGF("========================================");
-    LOGF(" Waiting for events...");
-    LOGF("========================================");
+    LOGF(" All Hooks Installed. Waiting for map load...");
 }
 
-// ============================================================
-// Entry point
-// ============================================================
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     InitLogFile();
