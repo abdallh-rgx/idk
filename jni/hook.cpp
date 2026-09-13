@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v29: crash-safe, RestartPlayer probes)
+// hook — Android JNI (v30: manual pawn spawn)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -16,7 +16,6 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
-#include <vector>
 #include <set>
 #include <android/log.h>
 #include <unistd.h>
@@ -31,23 +30,18 @@
 #define ADDR_PlaylistHandler            0x5519710
 #define ADDR_StartAircraftPhase         0x550A1F4
 #define ADDR_PostLogin                  0x550C610
-#define ADDR_RestartPlayerCand_A        0x550DB58   // slot 0x11A
-#define ADDR_RestartPlayerCand_B        0x551EB8C   // slot 0x11D
+#define ADDR_SpawnDefaultPawnFor        0x551A7C4
 
 #define OFFSET_GameMode_GameState       0x2D0
 #define OFFSET_GameState_Playlist2298   0x2298
-#define OFFSET_GameState_Playlist2290   0x2290
 #define OFFSET_PC_PlayerState           0x278
 #define OFFSET_PS_2A8                   0x2A8
 #define OFFSET_PS_3F2                   0x3F2
 #define OFFSET_PS_120C                  0x120C
+#define OFFSET_PC_Pawn                  0x2B8
 
 #define VFT_NAME_ISVALID_OFF            0x30
 #define VFT_NAME_GETNAME_OFF            0x38
-
-// Set to 1 to enable (risky)
-#define ENABLE_PATH1B 0
-#define ENABLE_PATH2  0
 
 // ------------------------------------------------------------
 // Logger
@@ -119,12 +113,8 @@ static bool SafeReadBytes(void* addr, void* out, size_t n) {
     struct iovec remote = { addr, n };
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
 }
-static bool SafeReadI16(void* addr, int16_t* out) {
-    return SafeReadBytes(addr, out, sizeof(int16_t));
-}
-static bool SafeReadU8(void* addr, uint8_t* out) {
-    return SafeReadBytes(addr, out, sizeof(uint8_t));
-}
+static bool SafeReadI16(void* addr, int16_t* out) { return SafeReadBytes(addr, out, sizeof(int16_t)); }
+static bool SafeReadU8(void* addr, uint8_t* out)  { return SafeReadBytes(addr, out, sizeof(uint8_t)); }
 
 // ------------------------------------------------------------
 // LibInfo
@@ -153,11 +143,13 @@ static LibInfo GetLibInfo() {
 // Globals
 // ------------------------------------------------------------
 static uintptr_t g_base = 0;
-static uintptr_t g_text_start = 0;
-static uintptr_t g_text_end = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
+
+// Latest PostLogin data for delayed spawn
+static void* g_last_gm = nullptr;
+static void* g_last_pc = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t g_StaticFindObject = nullptr;
@@ -169,19 +161,9 @@ static bool IsValidPtr(void* ptr) {
     uintptr_t p = (uintptr_t)ptr;
     return (p >= 0x1000000000ULL && p <= 0x8000000000ULL);
 }
-static bool IsValidHeapPtr(void* ptr) {
-    uintptr_t p = (uintptr_t)ptr;
-    if (p < 0x1000000000ULL || p > 0x8000000000ULL) return false;
-    if (g_base && p >= g_base && p < (g_base + 0x10000000ULL)) return false;
-    return true;
-}
-static bool IsTextPtr(void* ptr) {
-    uintptr_t p = (uintptr_t)ptr;
-    return (g_text_start && p >= g_text_start && p < g_text_end);
-}
 
 // ------------------------------------------------------------
-// Playlist lookup (direct only, no scan)
+// Playlist
 // ------------------------------------------------------------
 static void* FindPlaylist() {
     if (!g_StaticFindObject) return nullptr;
@@ -192,25 +174,19 @@ static void* FindPlaylist() {
     return r;
 }
 
-// ------------------------------------------------------------
-// Playlist injection (SAFE: Path1a only)
-// ------------------------------------------------------------
 static bool InjectPlaylist(void* gameMode) {
     if (!gameMode) return false;
-
     std::lock_guard<std::mutex> lock(g_inject_mutex);
     if (g_injected_gms.count(gameMode)) return false;
 
     if (!g_cached_playlist) {
         g_cached_playlist = FindPlaylist();
-        if (!g_cached_playlist) { LOGF("[Inject] Playlist not found"); return false; }
+        if (!g_cached_playlist) return false;
     }
 
     bool injected = false;
-
     void* gameState = nullptr;
     if (SafeReadPtr((char*)gameMode + OFFSET_GameMode_GameState, &gameState) && gameState) {
-        // Path1a — gameState + 0x2298
         void* p2298 = nullptr;
         SafeReadPtr((char*)gameState + OFFSET_GameState_Playlist2298, &p2298);
         if (!p2298) {
@@ -220,28 +196,53 @@ static bool InjectPlaylist(void* gameMode) {
         } else {
             LOGF("[Inject] [Path1a] already = %p", p2298);
         }
-
-#if ENABLE_PATH1B
-        // Path1b — gameState + 0x2290
-        void* p2290 = nullptr;
-        SafeReadPtr((char*)gameState + OFFSET_GameState_Playlist2290, &p2290);
-        if (!p2290) {
-            *(void**)((char*)gameState + OFFSET_GameState_Playlist2290) = g_cached_playlist;
-            LOGF("[Inject] [Path1b] SET gameState+0x2290 = %p", g_cached_playlist);
-            injected = true;
-        }
-#endif
-    } else {
-        LOGF("[Inject] gameState invalid");
     }
-
-#if ENABLE_PATH2
-    // Path2 — disabled by default (suspect of crash)
-    LOGF("[Inject] [Path2] disabled");
-#endif
-
     if (injected) g_injected_gms.insert(gameMode);
     return injected;
+}
+
+// ------------------------------------------------------------
+// Direct spawn function (from vtable slot 0xDD)
+// ------------------------------------------------------------
+typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
+static SpawnDefaultPawnFor_t g_SpawnDefaultPawnFor = nullptr;
+
+static void* CallSpawnDefaultPawnFor(void* gm, void* pc, void* startSpot) {
+    if (!g_SpawnDefaultPawnFor) return nullptr;
+    LOGF("[Spawn] calling SpawnDefaultPawnFor(gm=%p pc=%p startSpot=%p)", gm, pc, startSpot);
+    void* r = g_SpawnDefaultPawnFor(gm, pc, startSpot);
+    LOGF("[Spawn] returned pawn = %p", r);
+    return r;
+}
+
+// ------------------------------------------------------------
+// Delayed spawn thread
+// ------------------------------------------------------------
+static void DelayedSpawnThread(void* gm, void* pc, int delayMs) {
+    LOGF("[Spawn] thread started, delay=%dms gm=%p pc=%p", delayMs, gm, pc);
+    std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+
+    if (!IsValidPtr(gm) || !IsValidPtr(pc)) {
+        LOGF("[Spawn] invalid args after delay");
+        return;
+    }
+
+    // Check pawn state before
+    void* pawn = nullptr;
+    SafeReadPtr((char*)pc + OFFSET_PC_Pawn, &pawn);
+    LOGF("[Spawn] before: PC->Pawn = %p", pawn);
+
+    if (IsValidPtr(pawn)) {
+        LOGF("[Spawn] pawn already exists, skipping");
+        return;
+    }
+
+    // Try passing nullptr as startSpot first
+    void* r1 = CallSpawnDefaultPawnFor(gm, pc, nullptr);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    SafeReadPtr((char*)pc + OFFSET_PC_Pawn, &pawn);
+    LOGF("[Spawn] after nullptr startSpot: PC->Pawn = %p r=%p", pawn, r1);
 }
 
 // ------------------------------------------------------------
@@ -261,8 +262,7 @@ static std::string TryReadPlayerName(void* playerState) {
     if (!SafeReadPtr(subObj, (void**)&vft)) return "<no-vft>";
     if (!IsValidPtr(vft)) return "<bad-vft>";
 
-    void* isValidPtr = nullptr;
-    void* getNamePtr = nullptr;
+    void* isValidPtr = nullptr; void* getNamePtr = nullptr;
     SafeReadPtr((char*)vft + VFT_NAME_ISVALID_OFF, &isValidPtr);
     SafeReadPtr((char*)vft + VFT_NAME_GETNAME_OFF, &getNamePtr);
     if (!IsValidPtr(isValidPtr) || !IsValidPtr(getNamePtr)) return "<fn-invalid>";
@@ -303,36 +303,32 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
     LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
          (unsigned long long)g_postlogin_calls, this_, newPlayer);
 
-    if (IsValidPtr(newPlayer)) {
-        void* pawnB = nullptr;
-        SafeReadPtr((char*)newPlayer + 0x2B8, &pawnB);
+    g_last_gm = this_;
+    g_last_pc = newPlayer;
 
+    if (IsValidPtr(newPlayer)) {
         void* playerState = nullptr;
         SafeReadPtr((char*)newPlayer + OFFSET_PC_PlayerState, &playerState);
-
-        LOGF("  PC+0x2B8 BEFORE=%p  PS=%p", pawnB, playerState);
-
         if (IsValidPtr(playerState)) {
             int16_t f3F2 = 0; uint8_t f120C = 0;
             SafeReadI16((char*)playerState + OFFSET_PS_3F2, &f3F2);
             SafeReadU8 ((char*)playerState + OFFSET_PS_120C, &f120C);
             std::string name = TryReadPlayerName(playerState);
-            LOGF("  NAME=\"%s\"  +3F2=%d +120C=%u",
+            LOGF("  NAME=\"%s\" +3F2=%d +120C=%u",
                  name.c_str(), (int)f3F2, (unsigned)f120C);
         }
     }
 
     if (g_orig_PostLogin) g_orig_PostLogin(this_, newPlayer);
 
-    if (IsValidPtr(newPlayer)) {
-        void* pawnA = nullptr;
-        SafeReadPtr((char*)newPlayer + 0x2B8, &pawnA);
-        LOGF("  PC+0x2B8 AFTER=%p", pawnA);
+    // Launch delayed spawn (3.5s) — after PostLogin + world setup complete
+    if (IsValidPtr(this_) && IsValidPtr(newPlayer)) {
+        std::thread(DelayedSpawnThread, this_, newPlayer, 3500).detach();
     }
 }
 
 // ------------------------------------------------------------
-// PlaylistHandler
+// PlaylistHandler + StartAircraftPhase
 // ------------------------------------------------------------
 typedef int (*PlaylistHandler_t)(void*);
 static PlaylistHandler_t g_orig_Playlist = nullptr;
@@ -340,14 +336,11 @@ static PlaylistHandler_t g_orig_Playlist = nullptr;
 static int Hook_PlaylistHandler(void* a1) {
     LOGF("[Playlist] a1=%p", a1);
     if (a1) InjectPlaylist(a1);
-    int result = g_orig_Playlist ? g_orig_Playlist(a1) : 0;
-    LOGF("  -> returned: %d", result);
-    return result;
+    int r = g_orig_Playlist ? g_orig_Playlist(a1) : 0;
+    LOGF("  -> returned: %d", r);
+    return r;
 }
 
-// ------------------------------------------------------------
-// StartAircraftPhase
-// ------------------------------------------------------------
 typedef bool (*StartAircraftPhase_t)(void*, char);
 static StartAircraftPhase_t g_orig_SAP = nullptr;
 
@@ -363,35 +356,12 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
 }
 
 // ------------------------------------------------------------
-// GetGameState (read-only, no VFT install)
+// GetGameState (read-only)
 // ------------------------------------------------------------
 typedef void* (*GetGameState_t)(void*);
 static GetGameState_t g_orig_GGS = nullptr;
-
 static void* Hook_GetGameState(void* gm) {
-    void* r = g_orig_GGS ? g_orig_GGS(gm) : nullptr;
-    return r;
-}
-
-// ------------------------------------------------------------
-// RestartPlayer candidates — probe only
-// ------------------------------------------------------------
-typedef void (*RestartPlayerCandA_t)(void*, void*);
-static RestartPlayerCandA_t g_orig_RPC_A = nullptr;
-
-static void Hook_RestartPlayerCandA(void* this_, void* newPlayer) {
-    LOGF(">>> [CAND-A 0x550DB58] this=%p newPlayer=%p", this_, newPlayer);
-    if (g_orig_RPC_A) g_orig_RPC_A(this_, newPlayer);
-    LOGF("<<< [CAND-A] done");
-}
-
-typedef void (*RestartPlayerCandB_t)(void*, void*);
-static RestartPlayerCandB_t g_orig_RPC_B = nullptr;
-
-static void Hook_RestartPlayerCandB(void* this_, void* newPlayer) {
-    LOGF(">>> [CAND-B 0x551EB8C] this=%p newPlayer=%p", this_, newPlayer);
-    if (g_orig_RPC_B) g_orig_RPC_B(this_, newPlayer);
-    LOGF("<<< [CAND-B] done");
+    return g_orig_GGS ? g_orig_GGS(gm) : nullptr;
 }
 
 // ------------------------------------------------------------
@@ -407,11 +377,9 @@ static void RunHooks() {
     if (!info.base) { LOGF("[ERROR] libUnreal not found"); return; }
 
     g_base = info.base;
-    g_text_start = info.text_start;
-    g_text_end = info.text_end;
     LOGF("========================================");
-    LOGF(" hook — v29");
-    LOGF(" base=0x%lx text=0x%lx..0x%lx", g_base, g_text_start, g_text_end);
+    LOGF(" hook — v30 (manual pawn spawn)");
+    LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
     DobbyHook((void*)(g_base + ADDR_GetGameState),
@@ -423,13 +391,9 @@ static void RunHooks() {
     DobbyHook((void*)(g_base + ADDR_PostLogin),
               (void*)Hook_PostLogin,          (void**)&g_orig_PostLogin);
 
-    int rcA = DobbyHook((void*)(g_base + ADDR_RestartPlayerCand_A),
-                        (void*)Hook_RestartPlayerCandA, (void**)&g_orig_RPC_A);
-    LOGF("CAND-A hook rc=%d", rcA);
-
-    int rcB = DobbyHook((void*)(g_base + ADDR_RestartPlayerCand_B),
-                        (void*)Hook_RestartPlayerCandB, (void**)&g_orig_RPC_B);
-    LOGF("CAND-B hook rc=%d", rcB);
+    // Save original SpawnDefaultPawnFor address — call it directly later
+    g_SpawnDefaultPawnFor = (SpawnDefaultPawnFor_t)(g_base + ADDR_SpawnDefaultPawnFor);
+    LOGF("SpawnDefaultPawnFor @ %p", (void*)g_SpawnDefaultPawnFor);
 
     g_StaticFindObject = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     LOGF("StaticFindObject: %p", (void*)g_StaticFindObject);
