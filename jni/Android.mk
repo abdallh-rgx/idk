@@ -1,12 +1,12 @@
 LOCAL_PATH := $(call my-dir)
 
 # ============================================================
-# Dobby (مكتبة ثابتة جاهزة مرفوعة في الريبو)
+# Dobby (مكتبة ثابتة جاهزة)
 # ============================================================
 include $(CLEAR_VARS)
 LOCAL_MODULE            := dobby
-LOCAL_SRC_FILES         := ../third_party/dobby/lib/$(TARGET_ARCH_ABI)/libdobby.a
-LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/../third_party/dobby/include
+LOCAL_SRC_FILES         := ../third_party/lib/$(TARGET_ARCH_ABI)/libdobby.a
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/../third_party/include
 include $(PREBUILT_STATIC_LIBRARY)
 
 # ============================================================
