@@ -1,5 +1,10 @@
 // ============================================================
-// Erbium Android Hook — Final v13 (Assembly Proven Offsets)
+// Erbium Android Hook — Final v14 (Dual Path Injection)
+// 
+// التصحيحات:
+// 1. حقن الـ Playlist في GameState + 0x2298 (StartAircraftPhase)
+// 2. حقن الـ Playlist في GameMode + 0x478 -> 0x2D8 -> 0x298 (PlaylistHandler)
+// 3. إزالة أي Fallback أو تعديل قسري للـ GamePhase
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -33,11 +38,16 @@
 #define ADDR_StartAircraftPhase 0x550A1F4
 
 // ============================================================
-// Offsets (مثبتة من الـ Assembly)
+// Offsets
 // ============================================================
-#define OFFSET_GameMode_GameState      0x2D0   // GameMode -> GameState
-#define OFFSET_GameState_Playlist2298  0x2298  // GameState -> Playlist
-#define OFFSET_GameState_Playlist2290  0x2290  // GameState -> Playlist (Fallback)
+#define OFFSET_GameMode_GameState      0x2D0
+#define OFFSET_GameState_Playlist2298  0x2298
+#define OFFSET_GameState_Playlist2290  0x2290
+
+// PlaylistHandler Path (مثبت من الـ Assembly)
+#define OFFSET_GameMode_478            0x478
+#define OFFSET_478_2D8                 0x2D8
+#define OFFSET_2D8_298                 0x298
 
 // VFT indices
 #define VFT_INDEX_HandleMatchHasStarted  0x11C
@@ -196,49 +206,16 @@ static void* FindPlaylistByName(const char16_t* fullPath) {
     LOGF("  [(void*)-1 + ShortName] -> %p %s", r2, r2 ? "✅" : "");
     if (r2) return r2;
 
-    const char16_t* alternatives[] = {
-        u"Playlist_DefaultSolo",
-        u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo",
-        u"/Game/Athena/Playlists/Playlist_DefaultSolo",
-    };
-
-    for (auto alt : alternatives) {
-        void* rn = g_StaticFindObject(nullptr, nullptr, alt, false);
-        if (rn) { LOGF("  Found via nullptr: %s", u16_to_u8(alt).c_str()); return rn; }
-        void* rm = g_StaticFindObject(nullptr, (void*)-1, alt, false);
-        if (rm) { LOGF("  Found via (void*)-1: %s", u16_to_u8(alt).c_str()); return rm; }
-    }
-
-    LOGF("❌ Playlist NOT FOUND");
     return nullptr;
 }
 
 // ============================================================
-// حقن Playlist (باستخدام المسار المثبت من الـ Assembly)
+// حقن Playlist (المسارين)
 // ============================================================
 static bool InjectPlaylist(void* gameMode) {
     if (!gameMode) return false;
 
-    // 1. جلب GameState من GameMode + 0x2D0 (مثبت من sub_550A1F4)
-    void* gameState = *(void**)((char*)gameMode + OFFSET_GameMode_GameState);
-    LOGF("[Inject] gameMode=%p gameState=%p", gameMode, gameState);
-    if (!gameState) {
-        LOGF("[Inject] gameState is NULL");
-        return false;
-    }
-
-    // 2. فحص الـ Playlist الحالي (مثبت من sub_5533434)
-    void* p2298 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2298);
-    void* p2290 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2290);
-    LOGF("[Inject] gameState+0x2298 = %p", p2298);
-    LOGF("[Inject] gameState+0x2290 = %p", p2290);
-
-    if (p2298 || p2290) {
-        LOGF("[Inject] Playlist already exists");
-        return true;
-    }
-
-    // 3. جلب الـ Playlist إذا مو موجود
+    // جلب الـ Playlist إذا مو موجود
     if (!g_cached_playlist) {
         g_cached_playlist = FindPlaylistByName(
             u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo"
@@ -249,10 +226,44 @@ static bool InjectPlaylist(void* gameMode) {
         }
     }
 
-    // 4. حقن الـ Playlist في GameState + 0x2298
-    *(void**)((char*)gameState + OFFSET_GameState_Playlist2298) = g_cached_playlist;
-    LOGF("[Inject] ✅ SET gameState+0x2298 = %p", g_cached_playlist);
-    return true;
+    bool injected = false;
+
+    // ============================================================
+    // المسار 1: StartAircraftPhase (GameMode + 0x2D0 -> GameState + 0x2298)
+    // ============================================================
+    void* gameState = *(void**)((char*)gameMode + OFFSET_GameMode_GameState);
+    if (gameState) {
+        void* p2298 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2298);
+        void* p2290 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2290);
+        
+        if (!p2298 && !p2290) {
+            *(void**)((char*)gameState + OFFSET_GameState_Playlist2298) = g_cached_playlist;
+            LOGF("[Inject] ✅ [Path1] SET gameState+0x2298 = %p", g_cached_playlist);
+            injected = true;
+        }
+    }
+
+    // ============================================================
+    // المسار 2: PlaylistHandler (GameMode + 0x478 -> 0x2D8 -> 0x298)
+    // ============================================================
+    void* ptr478 = *(void**)((char*)gameMode + OFFSET_GameMode_478);
+    if (ptr478) {
+        void* ptr2D8 = *(void**)((char*)ptr478 + OFFSET_478_2D8);
+        if (ptr2D8) {
+            void* ptr298 = *(void**)((char*)ptr2D8 + OFFSET_2D8_298);
+            LOGF("[Inject] [Path2] ptr478=%p ptr2D8=%p ptr298=%p", ptr478, ptr2D8, ptr298);
+            
+            if (ptr298 == nullptr) {
+                *(void**)((char*)ptr2D8 + OFFSET_2D8_298) = g_cached_playlist;
+                LOGF("[Inject] ✅ [Path2] SET ptr2D8+0x298 = %p", g_cached_playlist);
+                injected = true;
+            } else {
+                LOGF("[Inject] [Path2] Playlist already exists");
+            }
+        }
+    }
+
+    return injected;
 }
 
 // ============================================================
@@ -301,20 +312,11 @@ static int Hook_PlaylistHandler(void* a1) {
     LOGF("[Playlist #%d] a1=%p", cc, a1);
     
     if (a1) {
-        void* gameState = *(void**)((char*)a1 + OFFSET_GameMode_GameState);
-        if (gameState) {
-            void* p2298 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2298);
-            LOGF("  gameState=%p p2298=%p %s", gameState, p2298, p2298 ? "" : "(NULL)");
-            
-            if (p2298 == nullptr) {
-                LOGF("  [!] Playlist NULL -> Injecting...");
-                InjectPlaylist(a1);
-            }
-        }
+        InjectPlaylist(a1); // نحاول نحقن في المسارين قبل الاستدعاء
     }
 
     int result = g_orig_Playlist ? g_orig_Playlist(a1) : 0;
-    LOGF("  -> Original returned: %d %s", result, result ? "OK" : "FAIL");
+    LOGF("  -> PlaylistHandler returned: %d %s", result, result ? "OK ✅" : "FAIL ❌");
     return result;
 }
 
@@ -327,7 +329,7 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("[Aircraft] StartAircraftPhase this=%p a2=%d", this_, (int)a2);
     InstallVFTOnReal(this_);
 
-    // ✅ التعديل الجوهري: نحقن الـ Playlist قبل استدعاء الدالة الأصلية
+    // نحقن الـ Playlist قبل استدعاء الدالة الأصلية
     LOGF("[Aircraft] Injecting Playlist before original call...");
     InjectPlaylist(this_);
 
@@ -367,7 +369,7 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" Erbium Hook — Final v13");
+    LOGF(" Erbium Hook — Final v14");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
