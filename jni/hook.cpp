@@ -1,10 +1,12 @@
 // ============================================================
-// Erbium Android Hook — Complete Solution
-// - Captures real VFT via sub_55B8AB0 (GetGameState)
-// - Hooks VFT[0x11C] HandleMatchHasStarted
-// - Hooks VFT[0xDD]  SpawnDefaultPawnFor
-// - Hooks sub_5519710 Playlist Handler (diagnostic + fix)
-// - Hooks sub_550A1F4 StartAircraftPhase (fix GamePhase on fail)
+// Erbium Android Hook — Final Complete Version
+// 
+// الميزات:
+// 1. Hook GetGameState → التقاط Real VFT (لأي GameMode)
+// 2. Hook StartAircraftPhase → إجبار GamePhase = 3 عند الفشل
+// 3. Hook Playlist handler → تشخيص تفصيلي
+// 4. إعادة تثبيت Hooks على VFT الجديد إذا اختلف
+// 5. استدعاء HandleMatchHasStarted يدوياً عند الحاجة
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <vector>
 #include <android/log.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -29,18 +32,23 @@
 // ============================================================
 // Offsets (مؤكدة من IDA)
 // ============================================================
-#define OFFSET_GameMode_GameState      0x2D0    // 720 - مؤكد من sub_550A1F4
-#define OFFSET_GameState_GamePhase     0x2150   // 8528 - مؤكد
-#define OFFSET_GameMode_V4             0x478    // 1144 - مؤكد من sub_5519710
+#define OFFSET_GameMode_GameState      0x2D0    // 720
+#define OFFSET_GameState_GamePhase     0x2150   // 8528
+#define OFFSET_GameMode_V4             0x478    // 1144
 #define OFFSET_V4_V5                   0x2D8    // 728
 #define OFFSET_V5_V6                   0x298    // 664
 
+// VFT indices
+#define VFT_INDEX_HandleMatchHasStarted  0x11C
+#define VFT_INDEX_SpawnDefaultPawnFor    0x0DD
+#define VFT_INDEX_ReadyToStartMatch      0x0B0    // للفحص فقط
+
 // ============================================================
-// عناوين الدوال (من IDA)
+// عناوين الدوال
 // ============================================================
-#define ADDR_GetGameState       0x55B8AB0    // GetGameState helper
-#define ADDR_PlaylistHandler    0x5519710    // Playlist check
-#define ADDR_StartAircraftPhase 0x550A1F4    // StartAircraftPhase
+#define ADDR_GetGameState       0x55B8AB0
+#define ADDR_PlaylistHandler    0x5519710
+#define ADDR_StartAircraftPhase 0x550A1F4
 
 // ============================================================
 // Logger
@@ -108,6 +116,8 @@ static LibInfo GetLibInfo() {
 // VFT Patch
 // ============================================================
 static bool VFTPatch(void** vtable, size_t idx, void* hook_fn, void** orig_out) {
+    if (!vtable) return false;
+
     void** slot = &vtable[idx];
     *orig_out = *slot;
 
@@ -132,16 +142,59 @@ static bool VFTPatch(void** vtable, size_t idx, void* hook_fn, void** orig_out) 
 // ============================================================
 // Global state
 // ============================================================
-static void*  g_gameMode       = nullptr;
-static void*  g_realVFT        = nullptr;
-static bool   g_hooks_installed = false;
+struct VFTInfo {
+    void* vft_addr;
+    void* gameMode;
+};
+
+static std::mutex g_vft_mutex;
+static std::vector<VFTInfo> g_known_vfts;
+
+// معالجات محفوظة (نحتاجها عند إعادة التثبيت)
+static void (*g_orig_HandleMatchHasStarted)(void*) = nullptr;
+static void* (*g_orig_SpawnDefaultPawnFor)(void*, void*, void*) = nullptr;
+
+// ============================================================
+// دالة مساعدة: تثبيت Hooks على VFT
+// ============================================================
+static bool InstallVFTOnReal(void* gameMode) {
+    if (!gameMode) return false;
+
+    void* real_vft = *(void**)gameMode;
+    if (!real_vft) return false;
+
+    std::lock_guard<std::mutex> lk(g_vft_mutex);
+
+    // هل نعرفه؟
+    for (auto& info : g_known_vfts) {
+        if (info.vft_addr == real_vft) {
+            return false;  // معروف مسبقاً
+        }
+    }
+
+    LOGF("");
+    LOGF("========================================");
+    LOGF(" NEW VFT DETECTED");
+    LOGF("========================================");
+    LOGF(" GameMode = %p", gameMode);
+    LOGF(" VFT      = %p", real_vft);
+
+    void** vft = (void**)real_vft;
+
+    LOGF(" VFT entries:");
+    LOGF("   [0x0B0] = %p", vft[VFT_INDEX_ReadyToStartMatch]);
+    LOGF("   [0x0DD] = %p", vft[VFT_INDEX_SpawnDefaultPawnFor]);
+    LOGF("   [0x11C] = %p", vft[VFT_INDEX_HandleMatchHasStarted]);
+
+    g_known_vfts.push_back({real_vft, gameMode});
+
+    LOGF("========================================");
+    return true;
+}
 
 // ============================================================
 // Hook: HandleMatchHasStarted (VFT[0x11C])
 // ============================================================
-typedef void (*HandleMatchHasStarted_t)(void*);
-static HandleMatchHasStarted_t g_orig_HandleMatchHasStarted = nullptr;
-
 static void Hook_HandleMatchHasStarted(void* this_) {
     LOGF("");
     LOGF("========================================");
@@ -149,7 +202,6 @@ static void Hook_HandleMatchHasStarted(void* this_) {
     LOGF("  this = %p", this_);
 
     if (this_) {
-        // اقرأ GameState (offset 0x2D0)
         void* gameState = *(void**)((char*)this_ + OFFSET_GameMode_GameState);
         LOGF("  GameState = %p", gameState);
 
@@ -158,17 +210,16 @@ static void Hook_HandleMatchHasStarted(void* this_) {
             LOGF("  GamePhase = %d", phase);
         }
 
-        // اقرأ السلسلة v4 → v5 → v6
         void* v4 = *(void**)((char*)this_ + OFFSET_GameMode_V4);
-        LOGF("  v4 (this+0x%X) = %p", OFFSET_GameMode_V4, v4);
+        LOGF("  v4 (0x%X) = %p", OFFSET_GameMode_V4, v4);
 
         if (v4) {
             void* v5 = *(void**)((char*)v4 + OFFSET_V4_V5);
-            LOGF("  v5 (v4+0x%X) = %p", OFFSET_V4_V5, v5);
+            LOGF("  v5 (0x%X) = %p", OFFSET_V4_V5, v5);
 
             if (v5) {
                 void* v6 = *(void**)((char*)v5 + OFFSET_V5_V6);
-                LOGF("  v6 (v5+0x%X) = %p", OFFSET_V5_V6, v6);
+                LOGF("  v6 (0x%X) = %p", OFFSET_V5_V6, v6);
             }
         }
     }
@@ -182,29 +233,27 @@ static void Hook_HandleMatchHasStarted(void* this_) {
 // ============================================================
 // Hook: SpawnDefaultPawnFor (VFT[0xDD])
 // ============================================================
-typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
-static SpawnDefaultPawnFor_t g_orig_SpawnDefaultPawnFor = nullptr;
-
 static void* Hook_SpawnDefaultPawnFor(void* a, void* b, void* c) {
     LOGF("");
     LOGF("========================================");
     LOGF("[Hook 0xDD] SpawnDefaultPawnFor");
     LOGF("  this=%p newPlayer=%p startSpot=%p", a, b, c);
+
     if (c == nullptr) {
         LOGF("  [!] startSpot = NULL");
     }
-    LOGF("========================================");
 
     void* result = nullptr;
     if (g_orig_SpawnDefaultPawnFor)
         result = g_orig_SpawnDefaultPawnFor(a, b, c);
 
     LOGF("  Return = %p", result);
+    LOGF("========================================");
     return result;
 }
 
 // ============================================================
-// Hook: Playlist Handler (sub_5519710) — تشخيصي
+// Hook: Playlist Handler (sub_5519710)
 // ============================================================
 typedef int (*PlaylistHandler_t)(void*);
 static PlaylistHandler_t g_orig_PlaylistHandler = nullptr;
@@ -213,8 +262,8 @@ static int Hook_PlaylistHandler(void* a1) {
     static int call_count = 0;
     call_count++;
 
-    // اطبع فقط أول 5 مرات + كل 100
     bool shouldLog = (call_count <= 5) || (call_count % 100 == 0);
+
     if (!shouldLog) {
         if (g_orig_PlaylistHandler)
             return g_orig_PlaylistHandler(a1);
@@ -226,22 +275,19 @@ static int Hook_PlaylistHandler(void* a1) {
     LOGF("[Hook Playlist] sub_5519710 #%d | a1=%p", call_count, a1);
 
     if (a1) {
-        // v4
         void* v4 = *(void**)((char*)a1 + OFFSET_GameMode_V4);
         LOGF("  v4 (0x%X) = %p", OFFSET_GameMode_V4, v4);
 
         if (v4) {
-            // v5
             void* v5 = *(void**)((char*)v4 + OFFSET_V4_V5);
             LOGF("  v5 (0x%X) = %p", OFFSET_V4_V5, v5);
 
             if (v5) {
-                // v6
                 void* v6 = *(void**)((char*)v5 + OFFSET_V5_V6);
                 LOGF("  v6 (0x%X) = %p", OFFSET_V5_V6, v6);
 
                 if (v6 == nullptr) {
-                    LOGF("  [!] v6 is NULL → هذا سبب فشل Playlist!");
+                    LOGF("  [!] v6 is NULL → سبب فشل Playlist!");
                 }
             } else {
                 LOGF("  [!] v5 is NULL!");
@@ -261,10 +307,13 @@ static int Hook_PlaylistHandler(void* a1) {
 }
 
 // ============================================================
-// Hook: StartAircraftPhase (sub_550A1F4) — مع إصلاح GamePhase
+// Hook: StartAircraftPhase (sub_550A1F4)
 // ============================================================
 typedef bool (*StartAircraftPhase_t)(void*, char);
 static StartAircraftPhase_t g_orig_StartAircraftPhase = nullptr;
+
+// ⭐ بعد نجاح Fix، سنستدعي HandleMatchHasStarted
+static bool g_handle_match_called = false;
 
 static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("");
@@ -273,6 +322,10 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("  this=%p a2=%d", this_, (int)a2);
 
     if (this_) {
+        // 1. تثبيت Hooks على VFT هذا GameMode (إذا لم نفعل)
+        InstallVFTOnReal(this_);
+
+        // 2. اقرأ GameState
         void* gameState = *(void**)((char*)this_ + OFFSET_GameMode_GameState);
         LOGF("  GameState = %p", gameState);
 
@@ -282,6 +335,7 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
         }
     }
 
+    // 3. استدعِ الأصلية
     bool result = false;
     if (g_orig_StartAircraftPhase)
         result = g_orig_StartAircraftPhase(this_, a2);
@@ -289,10 +343,11 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     LOGF("  Original return = %d", (int)result);
 
     // ============================================================
-    // 🎯 إصلاح: إذا فشلت، نجبر GamePhase = Aircraft (3)
+    // 🎯 إصلاح: إذا فشلت، أجبر GamePhase = Aircraft (3)
     // ============================================================
     if (!result && this_) {
         LOGF("  [!] StartAircraftPhase FAILED → forcing GamePhase");
+
         void* gameState = *(void**)((char*)this_ + OFFSET_GameMode_GameState);
 
         if (gameState) {
@@ -301,6 +356,16 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
             *phase = 3;  // Aircraft
             LOGF("  [✓] Forced GamePhase = %d", *phase);
             result = true;
+
+            // ============================================================
+            // استدعاء HandleMatchHasStarted يدوياً (إذا لم يُستدعى بعد)
+            // ============================================================
+            if (!g_handle_match_called && g_orig_HandleMatchHasStarted) {
+                g_handle_match_called = true;
+                LOGF("  [Manual] Calling HandleMatchHasStarted...");
+                g_orig_HandleMatchHasStarted(this_);
+                LOGF("  [✓] HandleMatchHasStarted called manually");
+            }
         }
     }
 
@@ -310,55 +375,22 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
 }
 
 // ============================================================
-// Hook: GetGameState (sub_55B8AB0) — لالتقاط real VFT
+// Hook: GetGameState (sub_55B8AB0) — لالتقاط Real VFT
 // ============================================================
 typedef void* (*GetGameState_t)(void*);
 static GetGameState_t g_orig_GetGameState = nullptr;
-static uint64_t g_call_count = 0;
+static uint64_t g_get_game_state_calls = 0;
 
 static void* Hook_GetGameState(void* gameMode) {
-    g_call_count++;
+    g_get_game_state_calls++;
 
     void* result = nullptr;
     if (g_orig_GetGameState)
         result = g_orig_GetGameState(gameMode);
 
-    // التقط real VFT
-    if (!g_hooks_installed && gameMode && g_call_count > 5) {
-        void* real_vft = *(void**)gameMode;
-
-        if (real_vft) {
-            g_gameMode = gameMode;
-            g_realVFT = real_vft;
-            g_hooks_installed = true;
-
-            LOGF("");
-            LOGF("========================================");
-            LOGF(" REAL VFT CAPTURED");
-            LOGF("========================================");
-            LOGF("GameMode = %p", gameMode);
-            LOGF("Real VFT = %p", real_vft);
-
-            void** vft = (void**)real_vft;
-            LOGF("  [0x0B0] = %p", vft[0x0B0]);
-            LOGF("  [0x0D4] = %p", vft[0x0D4]);
-            LOGF("  [0x0DD] = %p", vft[0x0DD]);
-            LOGF("  [0x11C] = %p", vft[0x11C]);
-
-            // ثبّت Hooks على real VFT
-            bool ok1 = VFTPatch(vft, 0x11C,
-                                (void*)Hook_HandleMatchHasStarted,
-                                (void**)&g_orig_HandleMatchHasStarted);
-            bool ok2 = VFTPatch(vft, 0x0DD,
-                                (void*)Hook_SpawnDefaultPawnFor,
-                                (void**)&g_orig_SpawnDefaultPawnFor);
-
-            LOGF("  Hook 0x11C: %s (orig=%p)", ok1 ? "OK" : "FAIL",
-                 g_orig_HandleMatchHasStarted);
-            LOGF("  Hook 0x0DD: %s (orig=%p)", ok2 ? "OK" : "FAIL",
-                 g_orig_SpawnDefaultPawnFor);
-            LOGF("========================================");
-        }
+    // التقط Real VFT (لكل GameMode جديد)
+    if (gameMode && g_get_game_state_calls > 5) {
+        InstallVFTOnReal(gameMode);
     }
 
     return result;
@@ -391,9 +423,7 @@ static void RunHooks() {
     LOGF(" text = 0x%lx .. 0x%lx", info.text_start, info.text_end);
     LOGF("========================================");
 
-    // ============================================================
-    // 1. Hook GetGameState → لالتقاط Real VFT
-    // ============================================================
+    // 1. Hook GetGameState
     uintptr_t addr_getGameState = info.base + ADDR_GetGameState;
     LOGF("Target GetGameState (0x%X) = 0x%lx",
          ADDR_GetGameState, addr_getGameState);
@@ -404,9 +434,7 @@ static void RunHooks() {
     LOGF("DobbyHook GetGameState ret = %d %s",
          ret1, ret1 == 0 ? "(OK)" : "(FAIL)");
 
-    // ============================================================
-    // 2. Hook Playlist Handler (sub_5519710)
-    // ============================================================
+    // 2. Hook Playlist Handler
     uintptr_t addr_playlist = info.base + ADDR_PlaylistHandler;
     LOGF("Target Playlist (0x%X) = 0x%lx",
          ADDR_PlaylistHandler, addr_playlist);
@@ -417,9 +445,7 @@ static void RunHooks() {
     LOGF("DobbyHook Playlist ret = %d %s",
          ret2, ret2 == 0 ? "(OK)" : "(FAIL)");
 
-    // ============================================================
-    // 3. Hook StartAircraftPhase (sub_550A1F4)
-    // ============================================================
+    // 3. Hook StartAircraftPhase
     uintptr_t addr_aircraft = info.base + ADDR_StartAircraftPhase;
     LOGF("Target StartAircraftPhase (0x%X) = 0x%lx",
          ADDR_StartAircraftPhase, addr_aircraft);
@@ -449,7 +475,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
     InitLogFile();
 
     LOGF("========================================");
-    LOGF(" Erbium Android Hook — Complete");
+    LOGF(" Erbium Android Hook — Final Version");
     LOGF(" Build: %s %s", __DATE__, __TIME__);
     LOGF(" PID: %d", getpid());
     LOGF("========================================");
