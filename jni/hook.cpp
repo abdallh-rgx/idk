@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v41: manual spawn + possess)
+// hook — Android JNI (v42: RestartPlayer attempts)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -29,22 +29,21 @@
 #define ADDR_PlaylistHandler             0x5519710
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
-#define ADDR_SpawnDefaultPawnFor         0x551A7C4
 
-// From v24 vtable dump: SpawnDefaultPawnAtTransform is at slot 0xDE
-#define VFT_SLOT_SpawnDefaultPawnAtTransform  0xDE
+// Candidate RestartPlayer-related functions
+#define ADDR_CAND_RestartPlayer          0x5516E50   // slot 0xE0
+#define ADDR_CAND_RestartAtStart1        0x93A01BC   // slot 0xDF
+#define ADDR_CAND_RestartAtStart2        0x93A04EC   // slot 0xDC
+#define ADDR_CAND_SpawnAtTransform       0x5511618   // slot 0xDE (known)
 
-// PC offsets (from v28 dump)
 #define OFF_PC_PlayerState               0x278
 #define OFF_PC_Pawn                      0x2B8
 #define OFF_PC_AckPawn                   0x2C0
 
-// Pawn offsets
 #define OFF_Pawn_Owner                   0x2A0
 #define OFF_Pawn_Controller              0x2A8
 #define OFF_Pawn_PlayerState             0x2D0
 
-// GameMode
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
@@ -177,55 +176,12 @@ static bool InjectPlaylist(void* gm) {
 }
 
 // ------------------------------------------------------------
-// FTransform
-// ------------------------------------------------------------
-struct FTransform {
-    float qx, qy, qz, qw;
-    float tx, ty, tz, _p1;
-    float sx, sy, sz, _p2;
-};
-static void IdentityXform(FTransform* t) {
-    memset(t, 0, sizeof(*t));
-    t->qw = 1.0f;
-    t->sx = t->sy = t->sz = 1.0f;
-}
-
-// ------------------------------------------------------------
-// Read transform from any UE Actor (fallback chain)
-// ------------------------------------------------------------
-static bool ReadActorTransform(void* actor, FTransform* out) {
-    if (!IsValidPtr(actor)) return false;
-
-    static const int kRootOffs[] = { 0x198, 0x1A0, 0x130, 0x1B0, 0x1C8 };
-    static const int kCompOffs[] = { 0x1F0, 0x1E0, 0x1D0, 0x250, 0x2B0 };
-
-    for (int ro : kRootOffs) {
-        void* root = nullptr;
-        if (!SafeReadPtr((char*)actor + ro, &root)) continue;
-        if (!IsValidPtr(root)) continue;
-        for (int co : kCompOffs) {
-            FTransform tmp;
-            if (!SafeReadBytes((char*)root + co, &tmp, sizeof(tmp))) continue;
-            float qmag = tmp.qx*tmp.qx + tmp.qy*tmp.qy + tmp.qz*tmp.qz + tmp.qw*tmp.qw;
-            if (qmag > 0.5f && qmag < 2.0f && tmp.sx > 0.001f && tmp.sx < 1000.0f) {
-                *out = tmp;
-                LOGF("  [xform] via root@0x%X comp@0x%X loc=(%.0f,%.0f,%.0f)",
-                     ro, co, tmp.tx, tmp.ty, tmp.tz);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// ------------------------------------------------------------
-// Attach Pawn to PC (Possess emulation)
+// Attach Pawn to PC
 // ------------------------------------------------------------
 static void AttachPawnToPC(void* pc, void* pawn) {
     if (!IsValidPtr(pc) || !IsValidPtr(pawn)) return;
 
     LOGF("[Possess] attach pawn=%p -> pc=%p", pawn, pc);
-
     SafeWritePtr((char*)pc + OFF_PC_Pawn, pawn);
     SafeWritePtr((char*)pc + OFF_PC_AckPawn, pawn);
     SafeWritePtr((char*)pawn + OFF_Pawn_Controller, pc);
@@ -234,71 +190,47 @@ static void AttachPawnToPC(void* pc, void* pawn) {
     void* ps = nullptr;
     if (SafeReadPtr((char*)pc + OFF_PC_PlayerState, &ps) && IsValidPtr(ps)) {
         SafeWritePtr((char*)pawn + OFF_Pawn_PlayerState, ps);
-
-        // Clear spectator flags — scan a narrow window
-        for (int off = 0x2B8; off <= 0x320; off += 1) {
+        for (int off = 0x2B8; off <= 0x320; off++) {
             uint8_t b = 0;
-            if (SafeReadBytes((char*)ps + off, &b, 1)) {
-                if (b == 0x01) {
-                    // only clear bit 0
-                    SafeWriteU8((char*)ps + off, 0x00);
-                    LOGF("[Possess] cleared PS+0x%X", off);
-                }
+            if (SafeReadBytes((char*)ps + off, &b, 1) && b == 0x01) {
+                SafeWriteU8((char*)ps + off, 0x00);
+                LOGF("[Possess] cleared PS+0x%X", off);
             }
         }
     }
-
     LOGF("[Possess] done");
 }
 
 // ------------------------------------------------------------
-// Manual spawn via SpawnDefaultPawnAtTransform
+// Attempts
 // ------------------------------------------------------------
-typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
+static void* ReadPawn(void* pc) {
+    void* p = nullptr;
+    if (IsValidPtr(pc)) SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
+    return p;
+}
 
-static void* ManualSpawn(void* gm, void* pc) {
-    if (!IsValidPtr(gm) || !IsValidPtr(pc)) return nullptr;
+// Signature: (gm, pc)
+typedef void (*RP2_t)(void*, void*);
+// Signature: (gm, pc, startSpot)
+typedef void (*RP3_t)(void*, void*, void*);
 
-    // Get GM vtable
-    void** vft = nullptr;
-    if (!SafeReadPtr(gm, (void**)&vft) || !IsValidPtr(vft)) {
-        LOGF("[Manual] GM vtable invalid");
-        return nullptr;
-    }
+static bool TryRestart2(uintptr_t off, const char* name, void* gm, void* pc) {
+    LOGF("[RP] %s @ +0x%lx  (2 args)", name, (unsigned long)off);
+    RP2_t fn = (RP2_t)(g_base + off);
+    fn(gm, pc);
+    void* p = ReadPawn(pc);
+    LOGF("[RP] %s -> pawn=%p %s", name, p, IsValidPtr(p) ? "✅" : "❌");
+    return IsValidPtr(p);
+}
 
-    // Read SpawnDefaultPawnAtTransform from vtable[0xDE]
-    void* fn = nullptr;
-    if (!SafeReadPtr((char*)vft + (size_t)VFT_SLOT_SpawnDefaultPawnAtTransform * 8, &fn)) {
-        LOGF("[Manual] read vtable[0xDE] failed");
-        return nullptr;
-    }
-    if (!IsValidPtr(fn)) {
-        LOGF("[Manual] vtable[0xDE] invalid = %p", fn);
-        return nullptr;
-    }
-
-    uintptr_t off = (uintptr_t)fn - g_base;
-    LOGF("[Manual] SpawnDefaultPawnAtTransform=%p (offset +0x%lx)",
-         fn, (unsigned long)off);
-
-    // Try to read transform from GameState (has WorldSettings)
-    FTransform xform;
-    IdentityXform(&xform);
-
-    void* gs = nullptr;
-    SafeReadPtr((char*)gm + OFF_GM_GameState, &gs);
-    if (IsValidPtr(gs)) {
-        FTransform tmp;
-        if (ReadActorTransform(gs, &tmp)) xform = tmp;
-    }
-
-    LOGF("[Manual] calling with loc=(%.0f,%.0f,%.0f)",
-         xform.tx, xform.ty, xform.tz);
-
-    SpawnDefaultPawnAtTransform_t call = (SpawnDefaultPawnAtTransform_t)fn;
-    void* pawn = call(gm, pc, &xform);
-    LOGF("[Manual] -> pawn=%p  %s", pawn, IsValidPtr(pawn) ? "OK" : "null");
-    return pawn;
+static bool TryRestart3(uintptr_t off, const char* name, void* gm, void* pc, void* spot) {
+    LOGF("[RP] %s @ +0x%lx  (3 args, spot=%p)", name, (unsigned long)off, spot);
+    RP3_t fn = (RP3_t)(g_base + off);
+    fn(gm, pc, spot);
+    void* p = ReadPawn(pc);
+    LOGF("[RP] %s -> pawn=%p %s", name, p, IsValidPtr(p) ? "✅" : "❌");
+    return IsValidPtr(p);
 }
 
 // ------------------------------------------------------------
@@ -318,34 +250,72 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
 
     if (g_orig_PostLogin) g_orig_PostLogin(this_, newPlayer);
 
-    if (IsValidPtr(this_) && IsValidPtr(newPlayer) && g_postlogin_calls == 1) {
-        std::thread([this_, newPlayer] {
-            // Wait for world to stabilize
-            std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-            LOGF("[worker] starting manual spawn attempt");
+    if (!IsValidPtr(this_) || !IsValidPtr(newPlayer)) return;
 
-            for (int attempt = 0; attempt < 8; attempt++) {
-                void* existing = nullptr;
-                SafeReadPtr((char*)newPlayer + OFF_PC_Pawn, &existing);
-                if (IsValidPtr(existing)) {
-                    LOGF("[worker] pawn already = %p", existing);
-                    AttachPawnToPC(newPlayer, existing);
-                    return;
-                }
+    std::thread([this_, newPlayer] {
+        // Wait for warmup
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 
-                LOGF("[worker] attempt %d", attempt + 1);
-                void* pawn = ManualSpawn(this_, newPlayer);
-                if (IsValidPtr(pawn)) {
-                    LOGF("[worker] spawn OK = %p", pawn);
-                    AttachPawnToPC(newPlayer, pawn);
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        void* gs = nullptr;
+        SafeReadPtr((char*)this_ + OFF_GM_GameState, &gs);
+
+        LOGF("");
+        LOGF("========== [Spawn attempts begin] ==========");
+
+        // Attempt 1: RestartPlayer (2 args) at 0x5516E50
+        if (TryRestart2(ADDR_CAND_RestartPlayer, "Cand-0xE0", this_, newPlayer)) {
+            AttachPawnToPC(newPlayer, ReadPawn(newPlayer));
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        // Attempt 2: RestartPlayerAtPlayerStart with GameState as startSpot
+        if (IsValidPtr(gs)) {
+            if (TryRestart3(ADDR_CAND_RestartAtStart1, "Cand-0xDF", this_, newPlayer, gs)) {
+                AttachPawnToPC(newPlayer, ReadPawn(newPlayer));
+                return;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-            LOGF("[worker] gave up");
-        }).detach();
-    }
+            if (TryRestart3(ADDR_CAND_RestartAtStart2, "Cand-0xDC", this_, newPlayer, gs)) {
+                AttachPawnToPC(newPlayer, ReadPawn(newPlayer));
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+
+        // Attempt 3: SpawnDefaultPawnAtTransform with GameState as startSpot (still try)
+        {
+            LOGF("[RP] SpawnAtTransform with gs as spot");
+            typedef void* (*SpawnAt_t)(void*, void*, void*);
+            SpawnAt_t fn = (SpawnAt_t)(g_base + ADDR_CAND_SpawnAtTransform);
+            struct FTransform {
+                float qx,qy,qz,qw;
+                float tx,ty,tz,_p1;
+                float sx,sy,sz,_p2;
+            } xform;
+            memset(&xform, 0, sizeof(xform));
+            xform.qw = 1.0f;
+            xform.sx = xform.sy = xform.sz = 1.0f;
+            if (IsValidPtr(gs)) {
+                // Try to read transform from gs
+                void* root = nullptr;
+                if (SafeReadPtr((char*)gs + 0x198, &root) && IsValidPtr(root)) {
+                    SafeReadBytes((char*)root + 0x1F0, &xform, sizeof(xform));
+                    LOGF("[RP] read xform from gs: loc=(%.0f,%.0f,%.0f)",
+                         xform.tx, xform.ty, xform.tz);
+                }
+            }
+            void* pawn = fn(this_, newPlayer, &xform);
+            LOGF("[RP] SpawnAt -> pawn=%p", pawn);
+            if (IsValidPtr(pawn)) {
+                AttachPawnToPC(newPlayer, pawn);
+                return;
+            }
+        }
+
+        LOGF("[RP] all attempts failed");
+    }).detach();
 }
 
 // ------------------------------------------------------------
@@ -384,7 +354,7 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" hook — v41 (manual spawn)");
+    LOGF(" hook — v42 (RestartPlayer attempts)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
