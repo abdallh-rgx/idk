@@ -19,7 +19,7 @@
 #include <sys/mman.h>
 #include "dobby.h"
 
-#define LOG_TAG "hook"
+#define LOG_TAG "GameHook"
 
 #define ADDR_StaticFindObject   0x762A664
 #define ADDR_GetGameState       0x55B8AB0
@@ -31,9 +31,6 @@
 #define OFFSET_GameMode_GameState      0x288
 #define OFFSET_GameState_Playlist2298  0x2298
 #define OFFSET_GameState_Playlist2290  0x2290
-
-#define OFFSET_478_2D8                 0x2D8
-#define OFFSET_2D8_298                 0x298
 
 #define VFT_INDEX_HandleMatchHasStarted  0x11C
 #define VFT_INDEX_SpawnDefaultPawnFor    0x07
@@ -149,7 +146,6 @@ static uintptr_t g_base = 0;
 static std::mutex g_vft_mutex;
 static std::vector<void*> g_known_vfts;
 static void* g_cached_playlist = nullptr;
-static void* g_cached_game_session = nullptr;
 
 static void (*g_orig_HMHS)(void*) = nullptr;
 static void* (*g_orig_SDPF)(void*, void*, void*) = nullptr;
@@ -164,22 +160,6 @@ typedef void* (*StaticFindObject_t)(
     bool  ExactClass
 );
 static StaticFindObject_t g_StaticFindObject = nullptr;
-
-static void* ScanGameModeForGameSession(void* gameMode) {
-    if (!gameMode) return nullptr;
-    LOGF("[Scan] Scanning GameMode=%p for GameSession...", gameMode);
-    for (int offset = 0x400; offset < 0x800; offset += 8) {
-        void* ptr = *(void**)((char*)gameMode + offset);
-        if (!IsValidPtr(ptr)) continue;
-        void* ptr2 = *(void**)((char*)ptr + OFFSET_478_2D8);
-        if (!IsValidPtr(ptr2)) continue;
-        void* ptr3 = *(void**)((char*)ptr2 + OFFSET_2D8_298);
-        LOGF("[Scan] GameMode+0x%X -> %p -> %p -> %p", offset, ptr, ptr2, ptr3);
-        if (IsValidPtr(ptr3)) return ptr;
-    }
-    LOGF("[Scan] Done.");
-    return nullptr;
-}
 
 static void* FindPlaylistByName(const char16_t* fullPath) {
     if (!g_StaticFindObject) return nullptr;
@@ -204,43 +184,26 @@ static bool InjectPlaylist(void* gameMode) {
         );
         if (!g_cached_playlist) return false;
     }
-    bool injected = false;
+    
     void* gameState = *(void**)((char*)gameMode + OFFSET_GameMode_GameState);
     if (!IsValidPtr(gameState)) {
         gameState = *(void**)((char*)gameMode + 0x2D0);
     }
+    
     if (IsValidPtr(gameState)) {
         void* p2298 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2298);
         if (!IsValidPtr(p2298)) {
             *(void**)((char*)gameState + OFFSET_GameState_Playlist2298) = g_cached_playlist;
             LOGF("[Inject] [Path1] SET gameState+0x2298 = %p", g_cached_playlist);
-            injected = true;
+            return true;
+        } else {
+            LOGF("[Inject] Playlist already exists at +0x2298.");
         }
+    } else {
+        LOGF("[Inject] GameState is invalid or null.");
     }
-    if (!g_cached_game_session) {
-        void* ptr478 = *(void**)((char*)gameMode + 0x478);
-        if (IsValidPtr(ptr478)) {
-            void* ptr2D8 = *(void**)((char*)ptr478 + OFFSET_478_2D8);
-            if (IsValidPtr(ptr2D8)) {
-                g_cached_game_session = ptr478;
-            }
-        }
-        if (!g_cached_game_session) {
-            g_cached_game_session = ScanGameModeForGameSession(gameMode);
-        }
-    }
-    if (g_cached_game_session) {
-        void* ptr2D8 = *(void**)((char*)g_cached_game_session + OFFSET_478_2D8);
-        if (IsValidPtr(ptr2D8)) {
-            void* ptr298 = *(void**)((char*)ptr2D8 + OFFSET_2D8_298);
-            if (!IsValidPtr(ptr298)) {
-                *(void**)((char*)ptr2D8 + OFFSET_2D8_298) = g_cached_playlist;
-                LOGF("[Inject] [Path2] SET ptr2D8+0x298 = %p", g_cached_playlist);
-                injected = true;
-            }
-        }
-    }
-    return injected;
+    
+    return false;
 }
 
 static bool InstallVFTOnReal(void* gameMode) {
@@ -323,33 +286,6 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
     if (this_) {
         LOGF("[PostLogin] Injecting Playlist...");
         InjectPlaylist(this_);
-        void* gameState = *(void**)((char*)this_ + OFFSET_GameMode_GameState);
-        LOGF("[PostLogin] GameState (at +0x288) = %p", gameState);
-        if (!IsValidPtr(gameState)) {
-            LOGF("[PostLogin] GameState is INVALID at 0x288! Trying 0x2D0...");
-            gameState = *(void**)((char*)this_ + 0x2D0);
-            LOGF("[PostLogin] GameState (at +0x2D0) = %p", gameState);
-        }
-        if (IsValidPtr(gameState)) {
-            void* p2298 = *(void**)((char*)gameState + OFFSET_GameState_Playlist2298);
-            LOGF("[PostLogin] GameState+0x2298 (Playlist) = %p", p2298);
-            if (!IsValidPtr(p2298)) {
-                LOGF("[PostLogin] Playlist is NULL! Injecting...");
-                InjectPlaylist(this_);
-            } else {
-                LOGF("[PostLogin] Playlist already exists.");
-            }
-        }
-        void* ptr478 = *(void**)((char*)this_ + 0x478);
-        LOGF("[PostLogin] GameMode+0x478 (GameSession)=%p", ptr478);
-        if (IsValidPtr(ptr478)) {
-            void* ptr2D8 = *(void**)((char*)ptr478 + OFFSET_478_2D8);
-            LOGF("[PostLogin] GameSession+0x2D8=%p", ptr2D8);
-            if (IsValidPtr(ptr2D8)) {
-                void* ptr298 = *(void**)((char*)ptr2D8 + OFFSET_2D8_298);
-                LOGF("[PostLogin] GameSession->0x2D8->0x298 (Playlist)=%p", ptr298);
-            }
-        }
     }
     if (g_orig_PostLogin) {
         g_orig_PostLogin(this_, newPlayer);
@@ -365,18 +301,12 @@ static void Hook_InitGameState(void* this_) {
     LOGF("");
     LOGF("========================================");
     LOGF("[InitGameState] Called. GameMode=%p", this_);
-    if (this_) {
-        LOGF("[InitGameState] Injecting Playlist...");
-        InjectPlaylist(this_);
-    }
+    
     if (g_orig_InitGameState) {
         g_orig_InitGameState(this_);
     }
-    if (this_) {
-        LOGF("[InitGameState] Secondary Inject...");
-        InjectPlaylist(this_);
-    }
-    LOGF("[InitGameState] Done.");
+    
+    LOGF("[InitGameState] Original returned. Done.");
     LOGF("========================================");
 }
 
