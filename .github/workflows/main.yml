@@ -1,4 +1,4 @@
-name: Build Hook
+name: Build hook
 
 on:
   push:
@@ -42,13 +42,13 @@ jobs:
 
       - name: Verify .so
         run: |
-          file libs/arm64-v8a/liberbium_hook.so
+          file libs/arm64-v8a/libhook.so
           echo "--- NEEDED libraries ---"
           ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf \
-            -d libs/arm64-v8a/liberbium_hook.so | grep NEEDED || true
+            -d libs/arm64-v8a/libhook.so | grep NEEDED || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: liberbium_hook-arm64
-          path: libs/arm64-v8a/liberbium_hook.so
+          path: libs/arm64-v8a/libhook.so
