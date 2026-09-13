@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v27: PostLogin + manual RestartPlayer)
+// hook — Android JNI (v28: match state + spectator fix)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -37,7 +37,6 @@
 #define OFFSET_478_2D8                  0x2D8
 #define OFFSET_2D8_298                  0x298
 #define OFFSET_PC_PlayerState           0x278
-#define OFFSET_PC_Pawn                  0x2B8
 #define OFFSET_PS_2A8                   0x2A8
 #define OFFSET_PS_3F2                   0x3F2
 #define OFFSET_PS_120C                  0x120C
@@ -128,6 +127,9 @@ static bool SafeReadBytes(void* addr, void* out, size_t n) {
     struct iovec remote = { addr, n };
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
 }
+static bool SafeReadU32(void* addr, uint32_t* out) {
+    return SafeReadBytes(addr, out, sizeof(uint32_t));
+}
 static bool SafeReadI16(void* addr, int16_t* out) {
     return SafeReadBytes(addr, out, sizeof(int16_t));
 }
@@ -189,15 +191,13 @@ static std::mutex g_vft_mutex;
 static std::vector<void*> g_known_vfts;
 static void* g_cached_playlist = nullptr;
 static void* g_cached_game_session = nullptr;
-
-static void (*g_orig_HMHS)(void*) = nullptr;
-static void Hook_HandleMatchHasStarted(void*);
+static void* g_real_gamemode = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t g_StaticFindObject = nullptr;
 
 // ------------------------------------------------------------
-// Pointer validation
+// Validation
 // ------------------------------------------------------------
 static bool IsValidPtr(void* ptr) {
     uintptr_t p = (uintptr_t)ptr;
@@ -224,7 +224,7 @@ static bool HasValidVtable(void* obj) {
 }
 
 // ------------------------------------------------------------
-// Memory dump
+// Memory dump (32-bit word view too)
 // ------------------------------------------------------------
 static void DumpMem(const char* tag, void* base, int start, int end) {
     if (!IsValidPtr(base)) return;
@@ -246,16 +246,19 @@ static void DumpMem(const char* tag, void* base, int start, int end) {
 // ------------------------------------------------------------
 // VTable dump
 // ------------------------------------------------------------
-static void DumpGameModeVtable(void* gameMode, const char* tag) {
-    if (!IsValidHeapPtr(gameMode)) return;
+static void DumpVtable(void* obj, const char* tag) {
+    if (!IsValidHeapPtr(obj)) return;
     void* vft = nullptr;
-    if (!SafeReadPtr(gameMode, &vft)) return;
+    if (!SafeReadPtr(obj, &vft)) return;
     if (!IsValidPtr(vft)) return;
 
-    LOGF("[vtdump:%s] GameMode=%p vtable=%p", tag, gameMode, vft);
+    LOGF("[vtdump:%s] obj=%p vtable=%p", tag, obj, vft);
 
     static const int slots[] = {
         0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
         0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9,
         0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1,
         0x11A, 0x11B, 0x11C, 0x11D, 0x11E, 0x11F, 0x120,
@@ -369,36 +372,32 @@ static bool InjectPlaylist(void* gameMode) {
 }
 
 // ------------------------------------------------------------
-// VFT install
+// Direct hooks
 // ------------------------------------------------------------
-static bool InstallVFTOnReal(void* gameMode) {
-    if (!gameMode) return false;
-    void* real_vft = nullptr;
-    if (!SafeReadPtr(gameMode, &real_vft)) return false;
-    if (!IsValidPtr(real_vft)) return false;
-
-    std::lock_guard<std::mutex> lock(g_vft_mutex);
-    for (auto* v : g_known_vfts) if (v == real_vft) return false;
-
-    LOGF("[VFT] New VFT: %p (GameMode=%p)", real_vft, gameMode);
-    void** vft = (void**)real_vft;
-    bool ok1 = VFTPatch(vft, VFT_SLOT_HandleMatchHasStarted,
-                        (void*)Hook_HandleMatchHasStarted, (void**)&g_orig_HMHS);
-    LOGF("[VFT] Hook slot 0x%X: %s", VFT_SLOT_HandleMatchHasStarted, ok1 ? "OK" : "FAIL");
-    g_known_vfts.push_back(real_vft);
-    return true;
-}
-
-// ------------------------------------------------------------
-// Hooks
-// ------------------------------------------------------------
-static void Hook_HandleMatchHasStarted(void* this_) {
-    LOGF("[slot 0x11C] HandleMatchHasStarted this=%p", this_);
-    if (g_orig_HMHS) g_orig_HMHS(this_);
-}
+typedef bool (*StartAircraftPhase_t)(void*, char);
+static StartAircraftPhase_t g_orig_SAP = nullptr;
 
 typedef int (*PlaylistHandler_t)(void*);
 static PlaylistHandler_t g_orig_Playlist = nullptr;
+
+static bool Hook_StartAircraftPhase(void* this_, char a2) {
+    LOGF("========================================");
+    LOGF("[Aircraft] this=%p a2=%d", this_, (int)a2);
+    g_real_gamemode = this_;
+
+    DumpVtable(this_, "gm");
+
+    LOGF("[Aircraft] InjectPlaylist...");
+    InjectPlaylist(this_);
+
+    // Dump GameMode interesting region BEFORE original call
+    DumpMem("GameMode[0x300..0x800]", this_, 0x300, 0x800);
+
+    bool result = g_orig_SAP ? g_orig_SAP(this_, a2) : false;
+    LOGF("[Aircraft] returned: %d %s", (int)result, result ? "SUCCESS" : "FAIL");
+    LOGF("========================================");
+    return result;
+}
 
 static int Hook_PlaylistHandler(void* a1) {
     LOGF("[Playlist] a1=%p", a1);
@@ -408,127 +407,18 @@ static int Hook_PlaylistHandler(void* a1) {
     return result;
 }
 
-typedef bool (*StartAircraftPhase_t)(void*, char);
-static StartAircraftPhase_t g_orig_SAP = nullptr;
-
-static bool Hook_StartAircraftPhase(void* this_, char a2) {
-    LOGF("========================================");
-    LOGF("[Aircraft] StartAircraftPhase this=%p a2=%d", this_, (int)a2);
-    DumpGameModeVtable(this_, "aircraft");
-    InstallVFTOnReal(this_);
-    InjectPlaylist(this_);
-    bool result = g_orig_SAP ? g_orig_SAP(this_, a2) : false;
-    LOGF("[Aircraft] returned: %d %s", (int)result, result ? "SUCCESS" : "FAIL");
-    LOGF("========================================");
-    return result;
-}
-
 typedef void* (*GetGameState_t)(void*);
 static GetGameState_t g_orig_GGS = nullptr;
-static uint64_t g_ggs_calls = 0;
 
 static void* Hook_GetGameState(void* gm) {
-    g_ggs_calls++;
     void* r = g_orig_GGS ? g_orig_GGS(gm) : nullptr;
-    if (gm && g_ggs_calls > 3) InstallVFTOnReal(gm);
+    // Do NOT install VFT here — we can't tell which object is which
     return r;
 }
 
-// ============================================================
-// RestartPlayer — find UFunction and call it manually
-// ============================================================
-typedef void (*ProcessEvent_t)(void*, void*, void*);
-
-static void* g_restartPlayerFn = nullptr;   // UFunction* for "RestartPlayer"
-static void* g_gameModeBaseClass = nullptr;
-static void* g_gameModeBaseCDO = nullptr;
-
-// Buffer large enough for a UFunction call frame (params).
-// RestartPlayer(APlayerController* NewPlayer) → 1 pointer param.
-struct RestartPlayer_Params {
-    void* NewPlayer;
-};
-
-static void* FindObject(const char16_t* name, void* outer = nullptr) {
-    if (!g_StaticFindObject) return nullptr;
-    return g_StaticFindObject(nullptr, outer, name, false);
-}
-
-// Find UClass* for a given class name
-static void* FindClass(const char16_t* className) {
-    if (!g_StaticFindObject) return nullptr;
-    // Class objects live under /Script/<Module>.<ClassName>
-    // Try various outers first
-    void* c = g_StaticFindObject(nullptr, nullptr, className, false);
-    if (c) return c;
-    // Try with -1 outer
-    c = g_StaticFindObject(nullptr, (void*)-1, className, false);
-    return c;
-}
-
-// Discover RestartPlayer UFunction via GameModeBase CDO
-static void LocateRestartPlayer() {
-    LOGF("");
-    LOGF("========== Locate RestartPlayer ==========");
-
-    // Find GameModeBase class
-    g_gameModeBaseClass = FindClass(u"GameModeBase");
-    LOGF("  GameModeBase class = %p", g_gameModeBaseClass);
-
-    if (!IsValidPtr(g_gameModeBaseClass)) {
-        LOGF("  cannot locate GameModeBase; skipping");
-        return;
-    }
-
-    // Try to find the CDO (ClassDefaultObject) via StaticFindObject
-    g_gameModeBaseCDO = FindObject(u"Default__GameModeBase");
-    LOGF("  Default__GameModeBase = %p", g_gameModeBaseCDO);
-
-    // Try to find the UFunction directly
-    g_restartPlayerFn = FindObject(u"RestartPlayer");
-    LOGF("  RestartPlayer (global) = %p", g_restartPlayerFn);
-
-    // Also try common alternatives
-    void* rpAtStart = FindObject(u"RestartPlayerAtPlayerStart");
-    LOGF("  RestartPlayerAtPlayerStart = %p", rpAtStart);
-
-    void* chooseStart = FindObject(u"ChoosePlayerStart");
-    LOGF("  ChoosePlayerStart = %p", chooseStart);
-
-    void* findStart = FindObject(u"FindPlayerStart");
-    LOGF("  FindPlayerStart = %p", findStart);
-
-    LOGF("==========================================");
-}
-
-// Call a UFunction via ProcessEvent
-static void InvokeUFunction(void* obj, void* ufunc, void* params, int paramSize) {
-    if (!IsValidPtr(obj) || !IsValidPtr(ufunc)) return;
-
-    // ProcessEvent is a virtual method. Its index differs by UE version.
-    // Common index on Fortnite (UE 5.x): vtable[0x44] (slot 68).
-    void** vft = nullptr;
-    if (!SafeReadPtr(obj, (void**)&vft)) return;
-    if (!IsValidPtr(vft)) return;
-
-    // Try several likely slots for ProcessEvent
-    // UObject::ProcessEvent UFunction* Function, void* Parms
-    for (int slot : {0x40, 0x44, 0x48, 0x4C}) {
-        void* fn = nullptr;
-        if (!SafeReadPtr((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!IsTextPtr(fn)) continue;
-
-        LOGF("  [ProcessEvent?] trying slot 0x%X fn=%p", slot, fn);
-        // We don't blindly call; log only
-    }
-
-    (void)params;
-    (void)paramSize;
-}
-
-// ============================================================
-// PostLogin — dump + manual RestartPlayer attempt
-// ============================================================
+// ------------------------------------------------------------
+// PostLogin — deep diagnostics + spectator hunt
+// ------------------------------------------------------------
 struct FString16 { char16_t* Data; int32_t Num; int32_t Max; ~FString16() {} };
 typedef bool       (*IsValidFn_t)(void*);
 typedef FString16  (*GetNameFn_t)(void*);
@@ -584,18 +474,14 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
     LOGF("");
     LOGF("========== [PostLogin #%llu] ==========",
          (unsigned long long)g_postlogin_calls);
-    LOGF("  this_(GM)=%p  newPlayer(PC)=%p", this_, newPlayer);
-
-    // Discover RestartPlayer once
-    if (!g_restartPlayerFn) LocateRestartPlayer();
+    LOGF("  GM=%p  PC=%p", this_, newPlayer);
 
     if (IsValidPtr(newPlayer)) {
-        // Pawn state BEFORE original PostLogin
+        // Pawn before
         void* pawnBefore = nullptr;
-        if (SafeReadPtr((char*)newPlayer + OFFSET_PC_Pawn, &pawnBefore))
-            LOGF("  PC->Pawn BEFORE = %p", pawnBefore);
+        SafeReadPtr((char*)newPlayer + 0x2B8, &pawnBefore);
+        LOGF("  PC+0x2B8 (Pawn?) BEFORE = %p", pawnBefore);
 
-        // PlayerState info
         void* playerState = nullptr;
         if (SafeReadPtr((char*)newPlayer + OFFSET_PC_PlayerState, &playerState))
             LOGF("  PlayerState = %p", playerState);
@@ -609,37 +495,22 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
             std::string name = TryReadPlayerName(playerState);
             LOGF("  PLAYER NAME = \"%s\"", name.c_str());
 
-            // Spectator flags region
-            DumpMem("PS[0x2B0..0x320]", playerState, 0x2B0, 0x320);
+            // Full PlayerState walk for spectator flags
+            DumpMem("PS[0x180..0x400]", playerState, 0x180, 0x400);
         }
 
-        // PC region with Pawn pointer
-        DumpMem("PC[0x270..0x310]", newPlayer, 0x270, 0x310);
+        // PC walk
+        DumpMem("PC[0x280..0x500]", newPlayer, 0x280, 0x500);
     }
 
-    // Call original PostLogin
     if (g_orig_PostLogin) g_orig_PostLogin(this_, newPlayer);
 
-    // Pawn state AFTER original PostLogin
+    // Pawn after
     if (IsValidPtr(newPlayer)) {
         void* pawnAfter = nullptr;
-        if (SafeReadPtr((char*)newPlayer + OFFSET_PC_Pawn, &pawnAfter))
-            LOGF("  PC->Pawn AFTER = %p", pawnAfter);
-
-        // Try manual RestartPlayer call via ProcessEvent if we found it
-        if (g_restartPlayerFn && IsValidPtr(this_) && g_postlogin_calls <= 2) {
-            LOGF("  attempting manual RestartPlayer via ProcessEvent...");
-            RestartPlayer_Params p{ newPlayer };
-            InvokeUFunction(this_, g_restartPlayerFn, &p, sizeof(p));
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            void* pawnRetry = nullptr;
-            if (SafeReadPtr((char*)newPlayer + OFFSET_PC_Pawn, &pawnRetry))
-                LOGF("  PC->Pawn AFTER manual call = %p", pawnRetry);
-        }
+        SafeReadPtr((char*)newPlayer + 0x2B8, &pawnAfter);
+        LOGF("  PC+0x2B8 (Pawn?) AFTER = %p", pawnAfter);
     }
-
     LOGF("========== [PostLogin END] ==========");
 }
 
@@ -659,9 +530,8 @@ static void RunHooks() {
     g_text_start = info.text_start;
     g_text_end = info.text_end;
     LOGF("========================================");
-    LOGF(" hook — v27");
-    LOGF(" base=0x%lx text=0x%lx..0x%lx",
-         g_base, g_text_start, g_text_end);
+    LOGF(" hook — v28");
+    LOGF(" base=0x%lx text=0x%lx..0x%lx", g_base, g_text_start, g_text_end);
     LOGF("========================================");
 
     DobbyHook((void*)(g_base + ADDR_GetGameState),
