@@ -1,11 +1,10 @@
 // ============================================================
-// Erbium Android Hook — Final v6 (StaticFindObject Fix)
+// Erbium Android Hook — Final v7 (Char16_t Fix)
 // 
 // التصحيحات في هذا الإصدار:
-// 1. استخدام nullptr بدلاً من -1 لتفعيل تحليل المسار
-// 2. اختبارات Sanity Check تلقائية
-// 3. محاولات متعددة لمسارات Playlist
-// 4. حل احتياطي عبر StaticLoadObject إن أمكن
+// 1. تغيير wchar_t إلى char16_t لدعم Unreal Engine على Android
+// 2. إضافة دالة تحويل u16_to_u8 للطباعة الآمنة
+// 3. إضافة دالة GetShortName بديلة لـ wcsrchr
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -16,6 +15,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cwchar>
+#include <string>
 #include <dlfcn.h>
 #include <link.h>
 #include <thread>
@@ -33,7 +33,7 @@
 // ============================================================
 // العناوين (مؤكدة من IDA)
 // ============================================================
-#define ADDR_StaticFindObject   0x762A664   // ✅ التوقيع: (Class, InOuter, wchar_t*, bool)
+#define ADDR_StaticFindObject   0x762A664   // ✅ التوقيع: (Class, InOuter, char16_t*, bool)
 #define ADDR_GetGameState       0x55B8AB0
 #define ADDR_PlaylistHandler    0x5519710
 #define ADDR_StartAircraftPhase 0x550A1F4
@@ -77,10 +77,45 @@ static void LOGF(const char* fmt, ...) {
     va_end(ap);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
     if (g_logfile) {
-        std::lock_guard<std::mutex> lk(GetMutex());
+        std::lock_guard<std::mutex> lock(GetMutex());
         fprintf(g_logfile, "%s\n", buf);
         fflush(g_logfile);
     }
+}
+
+// ============================================================
+// Helper: char16_t to UTF-8 (للطباعة في اللوغ)
+// ============================================================
+static std::string u16_to_u8(const char16_t* str) {
+    if (!str) return "nullptr";
+    std::string res;
+    while (*str) {
+        uint16_t c = *str++;
+        if (c < 0x80) res += (char)c;
+        else if (c < 0x800) {
+            res += (char)(0xC0 | (c >> 6));
+            res += (char)(0x80 | (c & 0x3F));
+        } else {
+            res += (char)(0xE0 | (c >> 12));
+            res += (char)(0x80 | ((c >> 6) & 0x3F));
+            res += (char)(0x80 | (c & 0x3F));
+        }
+    }
+    return res;
+}
+
+// ============================================================
+// Helper: استخراج الاسم القصير من المسار الكامل
+// ============================================================
+static const char16_t* GetShortName(const char16_t* full_path) {
+    if (!full_path) return nullptr;
+    const char16_t* lastDot = nullptr;
+    const char16_t* p = full_path;
+    while (*p) {
+        if (*p == u'.') lastDot = p;
+        p++;
+    }
+    return lastDot ? lastDot + 1 : full_path;
 }
 
 // ============================================================
@@ -142,12 +177,12 @@ static void Hook_HandleMatchHasStarted(void*);
 static void* Hook_SpawnDefaultPawnFor(void*, void*, void*);
 
 // ============================================================
-// StaticFindObject
+// StaticFindObject (تم تصحيح النوع إلى char16_t)
 // ============================================================
 typedef void* (*StaticFindObject_t)(
     void* Class,
     void* InOuter,       // pass -1 for ANY_PACKAGE, 0 for package from path
-    const wchar_t* Name,
+    const char16_t* Name,
     bool  ExactClass
 );
 static StaticFindObject_t g_StaticFindObject = nullptr;
@@ -163,12 +198,12 @@ static void RunSanityCheck() {
     LOGF(" StaticFindObject Sanity Check");
     LOGF("========================================");
 
-    struct Test { const wchar_t* name; };
+    struct Test { const char16_t* name; };
     Test tests[] = {
-        { L"/Script/FortniteGame.FortGameModeAthena" },
-        { L"/Script/Engine.Actor" },
-        { L"FortGameModeAthena" },
-        { L"Actor" },
+        { u"/Script/FortniteGame.FortGameModeAthena" },
+        { u"/Script/Engine.Actor" },
+        { u"FortGameModeAthena" },
+        { u"Actor" },
     };
 
     for (auto& t : tests) {
@@ -177,9 +212,9 @@ static void RunSanityCheck() {
         // مع InOuter = -1 (ANY_PACKAGE)
         void* rm = g_StaticFindObject(nullptr, (void*)-1, t.name, false);
 
-        LOGF("  \"%ls\"", t.name);
-        LOGF("     [nullptr] → %p %s", r0, r0 ? "✅" : "");
-        LOGF("     [ANY_PKG] → %p %s", rm, rm ? "✅" : "");
+        LOGF("  \"%s\"", u16_to_u8(t.name).c_str());
+        LOGF("     [nullptr] -> %p %s", r0, r0 ? "✅" : "");
+        LOGF("     [ANY_PKG] -> %p %s", rm, rm ? "✅" : "");
     }
 
     LOGF("========================================");
@@ -188,12 +223,12 @@ static void RunSanityCheck() {
 // ============================================================
 // البحث عن Playlist بعدة طرق
 // ============================================================
-static void* FindPlaylistByName(const wchar_t* full_path) {
+static void* FindPlaylistByName(const char16_t* full_path) {
     if (!g_StaticFindObject) return nullptr;
 
     LOGF("");
     LOGF("========== Playlist Lookup ==========");
-    LOGF("Full path: %ls", full_path);
+    LOGF("Full path: %s", u16_to_u8(full_path).c_str());
 
     // ============================================================
     // Trial 1: InOuter = nullptr (تحليل المسار)
@@ -201,40 +236,39 @@ static void* FindPlaylistByName(const wchar_t* full_path) {
     LOGF("");
     LOGF("[Trial 1] InOuter=nullptr + Full Path");
     void* r1 = g_StaticFindObject(nullptr, nullptr, full_path, false);
-    LOGF("  → %p %s", r1, r1 ? "✅ FOUND" : "");
+    LOGF("  -> %p %s", r1, r1 ? "✅ FOUND" : "");
     if (r1) return r1;
 
     // ============================================================
-    // Trial 2: استخرج الاسم القصير بعد آخر نقطة
+    // Trial 2: استخرج الاسم القصير
     // ============================================================
-    const wchar_t* lastDot = wcsrchr(full_path, L'.');
-    const wchar_t* shortName = lastDot ? lastDot + 1 : full_path;
+    const char16_t* shortName = GetShortName(full_path);
     LOGF("");
-    LOGF("[Trial 2] InOuter=-1 + Short Name \"%ls\"", shortName);
+    LOGF("[Trial 2] InOuter=-1 + Short Name \"%s\"", u16_to_u8(shortName).c_str());
     void* r2 = g_StaticFindObject(nullptr, (void*)-1, shortName, false);
-    LOGF("  → %p %s", r2, r2 ? "✅ FOUND" : "");
+    LOGF("  -> %p %s", r2, r2 ? "✅ FOUND" : "");
     if (r2) return r2;
 
     // ============================================================
     // Trial 3: كل المحاولات الأخرى
     // ============================================================
-    const wchar_t* alternates[] = {
-        L"Playlist_DefaultSolo",
-        L"/Game/Athena/Playlists/Playlist_DefaultSolo",
-        L"/Game/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo",
-        L"/Game/Athena/Playlists/Playlist_DefaultSolo",
+    const char16_t* alternates[] = {
+        u"Playlist_DefaultSolo",
+        u"/Game/Athena/Playlists/Playlist_DefaultSolo",
+        u"/Game/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo",
+        u"/Game/Athena/Playlists/Playlist_DefaultSolo",
     };
 
     for (auto path : alternates) {
         LOGF("");
-        LOGF("[Trial *] Trying: %ls", path);
+        LOGF("[Trial *] Trying: %s", u16_to_u8(path).c_str());
 
         void* rn = g_StaticFindObject(nullptr, nullptr, path, false);
-        LOGF("  [nullptr] → %p", rn);
+        LOGF("  [nullptr] -> %p", rn);
         if (rn) return rn;
 
         void* rm = g_StaticFindObject(nullptr, (void*)-1, path, false);
-        LOGF("  [ANY_PKG] → %p", rm);
+        LOGF("  [ANY_PKG] -> %p", rm);
         if (rm) return rm;
     }
 
@@ -266,8 +300,9 @@ static bool InjectPlaylist(void* gameMode) {
     }
 
     if (!g_cached_playlist) {
+        // استخدام البادئة u بدل L
         g_cached_playlist = FindPlaylistByName(
-            L"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo"
+            u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo"
         );
 
         if (!g_cached_playlist) {
@@ -289,7 +324,7 @@ static bool InstallVFTOnReal(void* gameMode) {
     void* real_vft = *(void**)gameMode;
     if (!real_vft) return false;
 
-    std::lock_guard<std::mutex> lk(g_vft_mutex);
+    std::lock_guard<std::mutex> lock(g_vft_mutex);
     for (auto* v : g_known_vfts) {
         if (v == real_vft) return false;
     }
@@ -362,7 +397,7 @@ static int Hook_PlaylistHandler(void* a1) {
     }
 
     int result = g_orig_Playlist ? g_orig_Playlist(a1) : 0;
-    if (log) LOGF("  → %d %s", result, result ? "OK" : "FAIL");
+    if (log) LOGF("  -> %d %s", result, result ? "OK" : "FAIL");
     return result;
 }
 
@@ -400,7 +435,7 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     }
 
     // محاولة حقن Playlist
-    LOGF("  [!] Failed → Injecting Playlist...");
+    LOGF("  [!] Failed -> Injecting Playlist...");
     if (InjectPlaylist(this_)) {
         if (phase && *phase != 2) *phase = 2;
 
@@ -419,7 +454,7 @@ static bool Hook_StartAircraftPhase(void* this_, char a2) {
     if (phase) {
         uint8_t old = *phase;
         *phase = 3;
-        LOGF("  GamePhase: %d → %d", old, *phase);
+        LOGF("  GamePhase: %d -> %d", old, *phase);
     }
 
     if (g_orig_HMHS) {
@@ -463,7 +498,7 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" Erbium Hook — Final v6");
+    LOGF(" Erbium Hook — Final v7 (Char16_t)");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
