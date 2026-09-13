@@ -45,6 +45,27 @@
 #define OFF_GS_Playlist2290              0x2290
 
 // ------------------------------------------------------------
+// UTF-16 -> UTF-8 helper (defined before use)
+// ------------------------------------------------------------
+static std::string u16_to_u8_local(const char16_t* str) {
+    if (!str) return "";
+    std::string res;
+    while (*str) {
+        uint16_t c = *str++;
+        if (c < 0x80) res += (char)c;
+        else if (c < 0x800) {
+            res += (char)(0xC0 | (c >> 6));
+            res += (char)(0x80 | (c & 0x3F));
+        } else {
+            res += (char)(0xE0 | (c >> 12));
+            res += (char)(0x80 | ((c >> 6) & 0x3F));
+            res += (char)(0x80 | (c & 0x3F));
+        }
+    }
+    return res;
+}
+
+// ------------------------------------------------------------
 // Logger
 // ------------------------------------------------------------
 static FILE* g_logfile = nullptr;
@@ -175,18 +196,6 @@ static void FindPawnClass() {
     LOGF("========== chose: %p ==========", g_pawn_class);
 }
 
-// helper for UTF-16 -> UTF-8 (avoid including Erbium stuff)
-static std::string u16_to_u8_local(const char16_t* str) {
-    if (!str) return "";
-    std::string res;
-    while (*str) {
-        uint16_t c = *str++;
-        if (c < 0x80) res += (char)c;
-        else res += '?';
-    }
-    return res;
-}
-
 // ------------------------------------------------------------
 // Playlist
 // ------------------------------------------------------------
@@ -309,6 +318,7 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
          (unsigned long long)g_postlogin_calls, this_, newPlayer);
 
     InjectPlaylist(this_);
+    HookPawnClassGetter(this_);
 
     if (g_orig_PostLogin) g_orig_PostLogin(this_, newPlayer);
 
