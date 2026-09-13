@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v39: Razer's SpawnDefaultPawnFor hook)
+// hook — Android JNI (v41: manual spawn + possess)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -31,14 +31,23 @@
 #define ADDR_PostLogin                   0x550C610
 #define ADDR_SpawnDefaultPawnFor         0x551A7C4
 
-// GameMode vtable slot for SpawnDefaultPawnAtTransform (from v24 dump)
+// From v24 vtable dump: SpawnDefaultPawnAtTransform is at slot 0xDE
 #define VFT_SLOT_SpawnDefaultPawnAtTransform  0xDE
 
-#define OFFSET_GameMode_GameState        0x2D0
-#define OFFSET_GameState_Playlist2298    0x2298
-#define OFFSET_GameState_Playlist2290    0x2290
-#define OFFSET_PC_PlayerState            0x278
-#define OFFSET_PC_Pawn                   0x2B8
+// PC offsets (from v28 dump)
+#define OFF_PC_PlayerState               0x278
+#define OFF_PC_Pawn                      0x2B8
+#define OFF_PC_AckPawn                   0x2C0
+
+// Pawn offsets
+#define OFF_Pawn_Owner                   0x2A0
+#define OFF_Pawn_Controller              0x2A8
+#define OFF_Pawn_PlayerState             0x2D0
+
+// GameMode
+#define OFF_GM_GameState                 0x2D0
+#define OFF_GS_Playlist2298              0x2298
+#define OFF_GS_Playlist2290              0x2290
 
 // ------------------------------------------------------------
 // Logger
@@ -88,6 +97,17 @@ static bool SafeReadBytes(void* addr, void* out, size_t n) {
     struct iovec local  = { out, n };
     struct iovec remote = { addr, n };
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+static bool SafeWritePtr(void* addr, void* value) {
+    if (!addr) return false;
+    struct iovec local  = { &value, sizeof(void*) };
+    struct iovec remote = { addr, sizeof(void*) };
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(void*);
+}
+static bool SafeWriteU8(void* addr, uint8_t v) {
+    struct iovec local  = { &v, 1 };
+    struct iovec remote = { addr, 1 };
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == 1;
 }
 
 // ------------------------------------------------------------
@@ -147,116 +167,137 @@ static bool InjectPlaylist(void* gm) {
         if (!g_cached_playlist) return false;
     }
     void* gs = nullptr;
-    if (!SafeReadPtr((char*)gm + OFFSET_GameMode_GameState, &gs) || !gs) return false;
+    if (!SafeReadPtr((char*)gm + OFF_GM_GameState, &gs) || !gs) return false;
 
-    *(void**)((char*)gs + OFFSET_GameState_Playlist2298) = g_cached_playlist;
-    *(void**)((char*)gs + OFFSET_GameState_Playlist2290) = g_cached_playlist;
+    *(void**)((char*)gs + OFF_GS_Playlist2298) = g_cached_playlist;
+    *(void**)((char*)gs + OFF_GS_Playlist2290) = g_cached_playlist;
     LOGF("[Inject] gs+2298/2290 = %p", g_cached_playlist);
     g_injected_gms.insert(gm);
     return true;
 }
 
 // ------------------------------------------------------------
-// FTransform (UE5 single-precision)
+// FTransform
 // ------------------------------------------------------------
 struct FTransform {
-    float qx, qy, qz, qw;  // FQuat rotation
-    float tx, ty, tz, _p1; // FVector translation
-    float sx, sy, sz, _p2; // FVector scale
+    float qx, qy, qz, qw;
+    float tx, ty, tz, _p1;
+    float sx, sy, sz, _p2;
 };
-
-static void MakeIdentityTransform(FTransform* t) {
+static void IdentityXform(FTransform* t) {
     memset(t, 0, sizeof(*t));
     t->qw = 1.0f;
     t->sx = t->sy = t->sz = 1.0f;
 }
 
 // ------------------------------------------------------------
-// Read transform from an AActor (via RootComponent::ComponentToWorld)
-// Falls back to a default transform if unavailable
+// Read transform from any UE Actor (fallback chain)
 // ------------------------------------------------------------
-static void ReadActorTransform(void* actor, FTransform* out) {
-    MakeIdentityTransform(out);
-    if (!IsValidPtr(actor)) return;
+static bool ReadActorTransform(void* actor, FTransform* out) {
+    if (!IsValidPtr(actor)) return false;
 
-    // Try common RootComponent offsets for UE5
-    static const int kRootOffsets[] = { 0x198, 0x1A0, 0x130, 0x1B0 };
-    for (int ro : kRootOffsets) {
+    static const int kRootOffs[] = { 0x198, 0x1A0, 0x130, 0x1B0, 0x1C8 };
+    static const int kCompOffs[] = { 0x1F0, 0x1E0, 0x1D0, 0x250, 0x2B0 };
+
+    for (int ro : kRootOffs) {
         void* root = nullptr;
         if (!SafeReadPtr((char*)actor + ro, &root)) continue;
         if (!IsValidPtr(root)) continue;
-
-        // Try common ComponentToWorld offsets
-        static const int kCompOffsets[] = { 0x1F0, 0x1E0, 0x1D0, 0x250 };
-        for (int co : kCompOffsets) {
+        for (int co : kCompOffs) {
             FTransform tmp;
             if (!SafeReadBytes((char*)root + co, &tmp, sizeof(tmp))) continue;
-
-            // Sanity: quat magnitude ~1, scale != 0
             float qmag = tmp.qx*tmp.qx + tmp.qy*tmp.qy + tmp.qz*tmp.qz + tmp.qw*tmp.qw;
-            if (qmag > 0.5f && qmag < 2.0f &&
-                tmp.sx > 0.001f && tmp.sx < 1000.0f) {
+            if (qmag > 0.5f && qmag < 2.0f && tmp.sx > 0.001f && tmp.sx < 1000.0f) {
                 *out = tmp;
-                LOGF("  [xform] actor=%p rootOff=0x%X compOff=0x%X loc=(%.0f,%.0f,%.0f)",
-                     actor, ro, co, tmp.tx, tmp.ty, tmp.tz);
-                return;
+                LOGF("  [xform] via root@0x%X comp@0x%X loc=(%.0f,%.0f,%.0f)",
+                     ro, co, tmp.tx, tmp.ty, tmp.tz);
+                return true;
             }
         }
     }
-    LOGF("  [xform] actor=%p -> fallback (identity)", actor);
+    return false;
 }
 
 // ------------------------------------------------------------
-// SpawnDefaultPawnAtTransform via vtable
+// Attach Pawn to PC (Possess emulation)
+// ------------------------------------------------------------
+static void AttachPawnToPC(void* pc, void* pawn) {
+    if (!IsValidPtr(pc) || !IsValidPtr(pawn)) return;
+
+    LOGF("[Possess] attach pawn=%p -> pc=%p", pawn, pc);
+
+    SafeWritePtr((char*)pc + OFF_PC_Pawn, pawn);
+    SafeWritePtr((char*)pc + OFF_PC_AckPawn, pawn);
+    SafeWritePtr((char*)pawn + OFF_Pawn_Controller, pc);
+    SafeWritePtr((char*)pawn + OFF_Pawn_Owner, pc);
+
+    void* ps = nullptr;
+    if (SafeReadPtr((char*)pc + OFF_PC_PlayerState, &ps) && IsValidPtr(ps)) {
+        SafeWritePtr((char*)pawn + OFF_Pawn_PlayerState, ps);
+
+        // Clear spectator flags — scan a narrow window
+        for (int off = 0x2B8; off <= 0x320; off += 1) {
+            uint8_t b = 0;
+            if (SafeReadBytes((char*)ps + off, &b, 1)) {
+                if (b == 0x01) {
+                    // only clear bit 0
+                    SafeWriteU8((char*)ps + off, 0x00);
+                    LOGF("[Possess] cleared PS+0x%X", off);
+                }
+            }
+        }
+    }
+
+    LOGF("[Possess] done");
+}
+
+// ------------------------------------------------------------
+// Manual spawn via SpawnDefaultPawnAtTransform
 // ------------------------------------------------------------
 typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
-typedef void* (*SpawnDefaultPawnFor_orig_t)(void*, void*, void*);
 
-static SpawnDefaultPawnFor_orig_t g_orig_SDPF = nullptr;
+static void* ManualSpawn(void* gm, void* pc) {
+    if (!IsValidPtr(gm) || !IsValidPtr(pc)) return nullptr;
 
-static void* Hook_SpawnDefaultPawnFor(void* gm, void* pc, void* startSpot) {
-    LOGF("");
-    LOGF("[SDPF-HOOK] gm=%p pc=%p startSpot=%p", gm, pc, startSpot);
-
-    // If pawn already exists, don't spawn
-    void* existing = nullptr;
-    if (IsValidPtr(pc)) SafeReadPtr((char*)pc + OFFSET_PC_Pawn, &existing);
-    if (IsValidPtr(existing)) {
-        LOGF("[SDPF-HOOK] pawn already = %p", existing);
-        return existing;
-    }
-
-    // Determine actual StartSpot (fallback to GameMode)
-    void* actualStartSpot = startSpot;
-    if (!IsValidPtr(actualStartSpot)) {
-        LOGF("[SDPF-HOOK] startSpot null -> using GameMode as fallback");
-        actualStartSpot = gm;
-    }
-
-    // Read transform from startSpot
-    FTransform xform;
-    ReadActorTransform(actualStartSpot, &xform);
-    LOGF("[SDPF-HOOK] transform loc=(%.0f, %.0f, %.0f)",
-         xform.tx, xform.ty, xform.tz);
-
-    // Get SpawnDefaultPawnAtTransform from GameMode vtable
+    // Get GM vtable
     void** vft = nullptr;
     if (!SafeReadPtr(gm, (void**)&vft) || !IsValidPtr(vft)) {
-        LOGF("[SDPF-HOOK] gm vtable invalid");
-        return g_orig_SDPF ? g_orig_SDPF(gm, pc, startSpot) : nullptr;
+        LOGF("[Manual] GM vtable invalid");
+        return nullptr;
     }
 
-    void* fnPtr = nullptr;
-    if (!SafeReadPtr((char*)vft + (size_t)VFT_SLOT_SpawnDefaultPawnAtTransform * 8, &fnPtr)
-        || !IsValidPtr(fnPtr)) {
-        LOGF("[SDPF-HOOK] SpawnDefaultPawnAtTransform not found in vtable");
-        return g_orig_SDPF ? g_orig_SDPF(gm, pc, startSpot) : nullptr;
+    // Read SpawnDefaultPawnAtTransform from vtable[0xDE]
+    void* fn = nullptr;
+    if (!SafeReadPtr((char*)vft + (size_t)VFT_SLOT_SpawnDefaultPawnAtTransform * 8, &fn)) {
+        LOGF("[Manual] read vtable[0xDE] failed");
+        return nullptr;
+    }
+    if (!IsValidPtr(fn)) {
+        LOGF("[Manual] vtable[0xDE] invalid = %p", fn);
+        return nullptr;
     }
 
-    LOGF("[SDPF-HOOK] calling SpawnDefaultPawnAtTransform=%p(gm, pc, &xform)", fnPtr);
-    SpawnDefaultPawnAtTransform_t fn = (SpawnDefaultPawnAtTransform_t)fnPtr;
-    void* pawn = fn(gm, pc, &xform);
-    LOGF("[SDPF-HOOK] -> pawn = %p  %s", pawn, IsValidPtr(pawn) ? "✅" : "❌");
+    uintptr_t off = (uintptr_t)fn - g_base;
+    LOGF("[Manual] SpawnDefaultPawnAtTransform=%p (offset +0x%lx)",
+         fn, (unsigned long)off);
+
+    // Try to read transform from GameState (has WorldSettings)
+    FTransform xform;
+    IdentityXform(&xform);
+
+    void* gs = nullptr;
+    SafeReadPtr((char*)gm + OFF_GM_GameState, &gs);
+    if (IsValidPtr(gs)) {
+        FTransform tmp;
+        if (ReadActorTransform(gs, &tmp)) xform = tmp;
+    }
+
+    LOGF("[Manual] calling with loc=(%.0f,%.0f,%.0f)",
+         xform.tx, xform.ty, xform.tz);
+
+    SpawnDefaultPawnAtTransform_t call = (SpawnDefaultPawnAtTransform_t)fn;
+    void* pawn = call(gm, pc, &xform);
+    LOGF("[Manual] -> pawn=%p  %s", pawn, IsValidPtr(pawn) ? "OK" : "null");
     return pawn;
 }
 
@@ -265,16 +306,46 @@ static void* Hook_SpawnDefaultPawnFor(void* gm, void* pc, void* startSpot) {
 // ------------------------------------------------------------
 typedef void (*PostLogin_t)(void*, void*);
 static PostLogin_t g_orig_PostLogin = nullptr;
+static uint64_t g_postlogin_calls = 0;
 
 static void Hook_PostLogin(void* this_, void* newPlayer) {
+    g_postlogin_calls++;
     LOGF("");
-    LOGF("========== [PostLogin] GM=%p PC=%p ==========", this_, newPlayer);
+    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
+         (unsigned long long)g_postlogin_calls, this_, newPlayer);
 
     InjectPlaylist(this_);
 
     if (g_orig_PostLogin) g_orig_PostLogin(this_, newPlayer);
 
-    LOGF("  PostLogin done");
+    if (IsValidPtr(this_) && IsValidPtr(newPlayer) && g_postlogin_calls == 1) {
+        std::thread([this_, newPlayer] {
+            // Wait for world to stabilize
+            std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+            LOGF("[worker] starting manual spawn attempt");
+
+            for (int attempt = 0; attempt < 8; attempt++) {
+                void* existing = nullptr;
+                SafeReadPtr((char*)newPlayer + OFF_PC_Pawn, &existing);
+                if (IsValidPtr(existing)) {
+                    LOGF("[worker] pawn already = %p", existing);
+                    AttachPawnToPC(newPlayer, existing);
+                    return;
+                }
+
+                LOGF("[worker] attempt %d", attempt + 1);
+                void* pawn = ManualSpawn(this_, newPlayer);
+                if (IsValidPtr(pawn)) {
+                    LOGF("[worker] spawn OK = %p", pawn);
+                    AttachPawnToPC(newPlayer, pawn);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            }
+
+            LOGF("[worker] gave up");
+        }).detach();
+    }
 }
 
 // ------------------------------------------------------------
@@ -313,15 +384,9 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" hook — v39 (Razer's SpawnDefaultPawnFor)");
+    LOGF(" hook — v41 (manual spawn)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
-
-    // Hook the SpawnDefaultPawnFor with our custom implementation
-    int rc = DobbyHook((void*)(g_base + ADDR_SpawnDefaultPawnFor),
-                       (void*)Hook_SpawnDefaultPawnFor,
-                       (void**)&g_orig_SDPF);
-    LOGF("SpawnDefaultPawnFor hook rc=%d", rc);
 
     DobbyHook((void*)(g_base + ADDR_GetGameState),
               (void*)Hook_GetGameState,       (void**)&g_orig_GGS);
