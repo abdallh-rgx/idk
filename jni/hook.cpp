@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v35: warmup-window spawn)
+// hook — Android JNI (v36: gamethread-safe spawn)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -24,9 +24,6 @@
 
 #define LOG_TAG "hook"
 
-// ============================================================
-// Function addresses
-// ============================================================
 #define ADDR_StaticFindObject                0x762A664
 #define ADDR_GetGameState                    0x55B8AB0
 #define ADDR_PlaylistHandler                 0x5519710
@@ -34,23 +31,21 @@
 #define ADDR_PostLogin                       0x550C610
 #define ADDR_RestartPlayerAtPlayerStart      0x093A07F0
 
-// ============================================================
-// Field offsets
-// ============================================================
 #define OFFSET_GameMode_GameState       0x2D0
 #define OFFSET_GameState_Playlist2298   0x2298
 #define OFFSET_PC_PlayerState           0x278
 #define OFFSET_PC_Pawn                  0x2B8
 #define OFFSET_PS_2A8                   0x2A8
-#define OFFSET_PS_3F2                   0x3F2
-#define OFFSET_PS_120C                  0x120C
 
 #define VFT_NAME_ISVALID_OFF            0x30
 #define VFT_NAME_GETNAME_OFF            0x38
 
-// ============================================================
+// Slot in GameMode vtable for HandleMatchHasStarted
+#define VFT_SLOT_HandleMatchHasStarted  0x11C
+
+// ------------------------------------------------------------
 // Logger
-// ============================================================
+// ------------------------------------------------------------
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() {
     static std::mutex* m = new std::mutex();
@@ -81,9 +76,9 @@ static void LOGF(const char* fmt, ...) {
     }
 }
 
-// ============================================================
+// ------------------------------------------------------------
 // Safe memory
-// ============================================================
+// ------------------------------------------------------------
 static bool SafeReadPtr(void* addr, void** out) {
     *out = nullptr;
     if (!addr) return false;
@@ -98,9 +93,9 @@ static bool SafeReadBytes(void* addr, void* out, size_t n) {
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
 }
 
-// ============================================================
+// ------------------------------------------------------------
 // LibInfo
-// ============================================================
+// ------------------------------------------------------------
 struct LibInfo { uintptr_t base, text_start, text_end; };
 static LibInfo GetLibInfo() {
     LibInfo info{0, 0, 0};
@@ -121,13 +116,37 @@ static LibInfo GetLibInfo() {
     return info;
 }
 
-// ============================================================
+// ------------------------------------------------------------
+// VFT patch
+// ------------------------------------------------------------
+static bool VFTPatch(void** vtable, size_t slot, void* hook_fn, void** orig_out) {
+    if (!vtable) return false;
+    void** ptr_slot = &vtable[slot];
+    *orig_out = *ptr_slot;
+
+    const size_t ps = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t addr = (uintptr_t)ptr_slot;
+    uintptr_t pg = addr & ~(ps - 1);
+    size_t span = ps;
+    if ((addr + sizeof(void*)) > (pg + ps)) span += ps;
+
+    if (mprotect((void*)pg, span, PROT_READ | PROT_WRITE) != 0) return false;
+    *ptr_slot = hook_fn;
+    mprotect((void*)pg, span, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)pg, (char*)pg + span);
+    return true;
+}
+
+// ------------------------------------------------------------
 // Globals
-// ============================================================
+// ------------------------------------------------------------
 static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
+static std::set<void*> g_known_vfts;
 static void* g_cached_playlist = nullptr;
+static void* g_last_gm = nullptr;
+static void* g_last_pc = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t g_StaticFindObject = nullptr;
@@ -136,16 +155,21 @@ static bool IsValidPtr(void* ptr) {
     uintptr_t p = (uintptr_t)ptr;
     return (p >= 0x1000000000ULL && p <= 0x8000000000ULL);
 }
+static bool IsValidHeapPtr(void* ptr) {
+    uintptr_t p = (uintptr_t)ptr;
+    if (p < 0x1000000000ULL || p > 0x8000000000ULL) return false;
+    if (g_base && p >= g_base && p < (g_base + 0x10000000ULL)) return false;
+    return true;
+}
 
-// ============================================================
+// ------------------------------------------------------------
 // Playlist
-// ============================================================
+// ------------------------------------------------------------
 static void* FindPlaylist() {
     if (!g_StaticFindObject) return nullptr;
-    LOGF("========== Playlist Lookup ==========");
     const char16_t* full = u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo";
     void* r = g_StaticFindObject(nullptr, nullptr, full, false);
-    LOGF("  -> %p %s", r, r ? "OK" : "");
+    LOGF("[Playlist] -> %p", r);
     return r;
 }
 
@@ -174,9 +198,9 @@ static bool InjectPlaylist(void* gameMode) {
     return injected;
 }
 
-// ============================================================
-// Manual Spawn via RestartPlayerAtPlayerStart
-// ============================================================
+// ------------------------------------------------------------
+// RestartPlayerAtPlayerStart
+// ------------------------------------------------------------
 typedef void (*RestartPlayerAtPlayerStart_t)(void*, void*, void*);
 static RestartPlayerAtPlayerStart_t g_RestartPlayerAtPlayerStart = nullptr;
 
@@ -186,111 +210,71 @@ static void* ReadPCPawn(void* pc) {
     return pawn;
 }
 
-static bool TrySpawn(void* gm, void* pc) {
-    if (!IsValidPtr(gm) || !IsValidPtr(pc)) return false;
-    if (!g_RestartPlayerAtPlayerStart) return false;
+// Called on GameThread — safe
+static void SpawnOnGameThread(const char* tag, void* gm, void* pc) {
+    if (!IsValidPtr(gm) || !IsValidPtr(pc) || !g_RestartPlayerAtPlayerStart) {
+        LOGF("[Spawn:%s] invalid args", tag);
+        return;
+    }
 
-    void* pawnBefore = ReadPCPawn(pc);
-    LOGF("[Spawn] calling RestartPlayerAtPlayerStart(gm=%p, pc=%p, null)", gm, pc);
+    void* before = ReadPCPawn(pc);
+    LOGF("[Spawn:%s] BEFORE pawn=%p", tag, before);
+    if (IsValidPtr(before)) {
+        LOGF("[Spawn:%s] pawn exists, skip", tag);
+        return;
+    }
+
+    LOGF("[Spawn:%s] calling RestartPlayerAtPlayerStart(gm=%p, pc=%p, null)", tag, gm, pc);
     g_RestartPlayerAtPlayerStart(gm, pc, nullptr);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-    void* pawnAfter = ReadPCPawn(pc);
-    LOGF("[Spawn] pawn before=%p  after=%p  %s",
-         pawnBefore, pawnAfter,
-         IsValidPtr(pawnAfter) ? "✅ SPAWNED!" : "❌ still null");
-    return IsValidPtr(pawnAfter);
+    void* after = ReadPCPawn(pc);
+    LOGF("[Spawn:%s] AFTER  pawn=%p  %s", tag, after,
+         IsValidPtr(after) ? "✅ SPAWNED!" : "❌ still null");
 }
 
-static void SpawnWorker(void* gm, void* pc) {
+// ------------------------------------------------------------
+// HandleMatchHasStarted hook (runs on GameThread, after PostLogin)
+// ------------------------------------------------------------
+static void (*g_orig_HMHS)(void*) = nullptr;
+static void Hook_HandleMatchHasStarted(void* this_) {
     LOGF("");
-    LOGF("============================================================");
-    LOGF("[Spawn] worker started gm=%p pc=%p", gm, pc);
-    LOGF("============================================================");
+    LOGF("========== [HandleMatchHasStarted] gm=%p ==========", this_);
+    LOGF("  last_pc=%p", g_last_pc);
 
-    // Wait for Warmup window (based on log timing: InProgress + Warmup
-    // happen ~1ms after PostLogin, so we wait a bit for world to settle)
-    for (int i = 0; i < 20; i++) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        void* pawn = ReadPCPawn(pc);
-        if (IsValidPtr(pawn)) {
-            LOGF("[Spawn] pawn already exists at +%dms: %p", (i+1)*250, pawn);
-            return;
-        }
-        if (i == 3) {
-            // ~1 second in — try
-            if (TrySpawn(gm, pc)) return;
-        }
+    // Call original first
+    if (g_orig_HMHS) g_orig_HMHS(this_);
+
+    // Now spawn on GameThread — this is safe
+    if (g_last_pc && IsValidPtr(g_last_pc)) {
+        SpawnOnGameThread("HMHS", this_, g_last_pc);
     }
-
-    // Persistent retry — up to 10 seconds
-    LOGF("[Spawn] first attempts failed, persistent retry...");
-    for (int i = 0; i < 20; i++) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        void* pawn = ReadPCPawn(pc);
-        if (IsValidPtr(pawn)) {
-            LOGF("[Spawn] pawn appeared at retry #%d: %p", i, pawn);
-            return;
-        }
-        if (i % 4 == 0) {
-            LOGF("[Spawn] retry attempt #%d", i);
-            g_RestartPlayerAtPlayerStart(gm, pc, nullptr);
-        }
-    }
-
-    LOGF("[Spawn] giving up after 20 retries");
-    LOGF("============================================================");
+    LOGF("========== [/HandleMatchHasStarted] ==========");
 }
 
-// ============================================================
-// PostLogin
-// ============================================================
-struct FString16 { char16_t* Data; int32_t Num; int32_t Max; ~FString16() {} };
-typedef bool       (*IsValidFn_t)(void*);
-typedef FString16  (*GetNameFn_t)(void*);
+// ------------------------------------------------------------
+// VFT install on GameMode
+// ------------------------------------------------------------
+static bool InstallVFTOnGameMode(void* gm) {
+    if (!gm || !IsValidHeapPtr(gm)) return false;
+    void* real_vft = nullptr;
+    if (!SafeReadPtr(gm, &real_vft)) return false;
+    if (!IsValidPtr(real_vft)) return false;
 
-static std::string TryReadPlayerName(void* playerState) {
-    if (!IsValidPtr(playerState)) return "<no-PS>";
-    void* subObj = nullptr;
-    if (!SafeReadPtr((char*)playerState + OFFSET_PS_2A8, &subObj)) return "<2A8-unread>";
-    if (!IsValidPtr(subObj)) return "<no-subObj>";
+    std::lock_guard<std::mutex> lock(g_inject_mutex);
+    if (g_known_vfts.count(real_vft)) return false;
 
-    void** vft = nullptr;
-    if (!SafeReadPtr(subObj, (void**)&vft)) return "<no-vft>";
-    if (!IsValidPtr(vft)) return "<bad-vft>";
-
-    void* isValidPtr = nullptr; void* getNamePtr = nullptr;
-    SafeReadPtr((char*)vft + VFT_NAME_ISVALID_OFF, &isValidPtr);
-    SafeReadPtr((char*)vft + VFT_NAME_GETNAME_OFF, &getNamePtr);
-    if (!IsValidPtr(isValidPtr) || !IsValidPtr(getNamePtr)) return "<fn-invalid>";
-
-    IsValidFn_t isValid = (IsValidFn_t)isValidPtr;
-    if (!isValid(subObj)) return "<invalid>";
-
-    GetNameFn_t getName = (GetNameFn_t)getNamePtr;
-    FString16 out = getName(subObj);
-
-    std::string res;
-    if (out.Data && out.Num > 0) {
-        int32_t n = out.Num > 256 ? 256 : out.Num;
-        for (int32_t i = 0; i < n; i++) {
-            uint16_t c = (uint16_t)out.Data[i];
-            if (c == 0) break;
-            if (c < 0x80) res += (char)c;
-            else if (c < 0x800) {
-                res += (char)(0xC0 | (c >> 6));
-                res += (char)(0x80 | (c & 0x3F));
-            } else {
-                res += (char)(0xE0 | (c >> 12));
-                res += (char)(0x80 | ((c >> 6) & 0x3F));
-                res += (char)(0x80 | (c & 0x3F));
-            }
-        }
-    }
-    return res.empty() ? "<empty>" : res;
+    LOGF("[VFT] new vft=%p (gm=%p)", real_vft, gm);
+    void** vft = (void**)real_vft;
+    bool ok = VFTPatch(vft, VFT_SLOT_HandleMatchHasStarted,
+                       (void*)Hook_HandleMatchHasStarted, (void**)&g_orig_HMHS);
+    LOGF("[VFT] Hook 0x11C: %s", ok ? "OK" : "FAIL");
+    g_known_vfts.insert(real_vft);
+    return true;
 }
 
+// ------------------------------------------------------------
+// PostLogin — save gm/pc, install VFT (all on GameThread)
+// ------------------------------------------------------------
 typedef void (*PostLogin_t)(void*, void*);
 static PostLogin_t g_orig_PostLogin = nullptr;
 static uint64_t g_postlogin_calls = 0;
@@ -301,30 +285,25 @@ static void Hook_PostLogin(void* this_, void* newPlayer) {
     LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
          (unsigned long long)g_postlogin_calls, this_, newPlayer);
 
-    if (IsValidPtr(newPlayer)) {
-        void* playerState = nullptr;
-        SafeReadPtr((char*)newPlayer + OFFSET_PC_PlayerState, &playerState);
-        if (IsValidPtr(playerState)) {
-            std::string name = TryReadPlayerName(playerState);
-            LOGF("  NAME=\"%s\"", name.c_str());
-        }
-    }
+    g_last_gm = this_;
+    g_last_pc = newPlayer;
+
+    // Install VFT hook BEFORE original runs (so HandleMatchHasStarted gets caught)
+    InstallVFTOnGameMode(this_);
 
     if (g_orig_PostLogin) g_orig_PostLogin(this_, newPlayer);
 
-    if (IsValidPtr(this_) && IsValidPtr(newPlayer) && g_postlogin_calls <= 1) {
-        std::thread(SpawnWorker, this_, newPlayer).detach();
-    }
+    LOGF("  PostLogin done, waiting for HandleMatchHasStarted...");
+    LOGF("========== [/PostLogin] ==========");
 }
 
-// ============================================================
-// Playlist + Aircraft
-// ============================================================
+// ------------------------------------------------------------
+// Playlist handler + Aircraft
+// ------------------------------------------------------------
 typedef int (*PlaylistHandler_t)(void*);
 static PlaylistHandler_t g_orig_Playlist = nullptr;
 
 static int Hook_PlaylistHandler(void* a1) {
-    LOGF("[Playlist] a1=%p", a1);
     if (a1) InjectPlaylist(a1);
     return g_orig_Playlist ? g_orig_Playlist(a1) : 0;
 }
@@ -344,9 +323,9 @@ static void* Hook_GetGameState(void* gm) {
     return g_orig_GGS ? g_orig_GGS(gm) : nullptr;
 }
 
-// ============================================================
+// ------------------------------------------------------------
 // Main
-// ============================================================
+// ------------------------------------------------------------
 static void RunHooks() {
     LibInfo info{0, 0, 0};
     for (int i = 0; i < 60; i++) {
@@ -358,11 +337,10 @@ static void RunHooks() {
 
     g_base = info.base;
     LOGF("========================================");
-    LOGF(" hook — v35 (warmup-window spawn)");
+    LOGF(" hook — v36 (gamethread-safe spawn)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
-    // Resolve RestartPlayerAtPlayerStart pointer
     g_RestartPlayerAtPlayerStart = (RestartPlayerAtPlayerStart_t)
                                    (g_base + ADDR_RestartPlayerAtPlayerStart);
     LOGF("RestartPlayerAtPlayerStart @ %p", (void*)g_RestartPlayerAtPlayerStart);
