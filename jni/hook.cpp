@@ -278,35 +278,72 @@ static void* Hook_GetGameState(void* gm) {
 
 typedef void (*PostLogin_t)(void*, void*);
 static PostLogin_t g_orig_PostLogin = nullptr;
+static uint64_t g_pl_calls = 0;
 
 static void Hook_PostLogin(void* this_, void* newPlayer) {
+    g_pl_calls++;
     LOGF("");
     LOGF("========================================");
-    LOGF("[PostLogin] this_=%p newPlayer=%p", this_, newPlayer);
+    LOGF("[PostLogin #%llu] this_=%p newPlayer=%p", (unsigned long long)g_pl_calls, this_, newPlayer);
+    
     if (this_) {
-        LOGF("[PostLogin] Injecting Playlist...");
-        InjectPlaylist(this_);
+        void* gs288 = *(void**)((char*)this_ + 0x288);
+        void* gs2D0 = *(void**)((char*)this_ + 0x2D0);
+        LOGF("  GameState @0x288 = %p", gs288);
+        LOGF("  GameState @0x2D0 = %p", gs2D0);
+        
+        if (IsValidPtr(gs288)) {
+            void* playlist = *(void**)((char*)gs288 + OFFSET_GameState_Playlist2298);
+            LOGF("    Playlist @0x2298 (from 0x288) = %p", playlist);
+        }
+        if (IsValidPtr(gs2D0)) {
+            void* playlist2 = *(void**)((char*)gs2D0 + OFFSET_GameState_Playlist2298);
+            LOGF("    Playlist @0x2298 (from 0x2D0) = %p", playlist2);
+        }
     }
+    
     if (g_orig_PostLogin) {
         g_orig_PostLogin(this_, newPlayer);
     }
-    LOGF("[PostLogin] Original returned.");
+    LOGF("[PostLogin #%llu] Original returned.", (unsigned long long)g_pl_calls);
     LOGF("========================================");
 }
 
 typedef void (*InitGameState_t)(void*);
 static InitGameState_t g_orig_InitGameState = nullptr;
+static uint64_t g_igs_calls = 0;
 
 static void Hook_InitGameState(void* this_) {
+    g_igs_calls++;
     LOGF("");
     LOGF("========================================");
-    LOGF("[InitGameState] Called. GameMode=%p", this_);
+    LOGF("[InitGameState #%llu] Called. GameMode=%p", (unsigned long long)g_igs_calls, this_);
+    
+    if (this_) {
+        void* gs288 = *(void**)((char*)this_ + 0x288);
+        void* gs2D0 = *(void**)((char*)this_ + 0x2D0);
+        LOGF("  GameState @0x288 = %p", gs288);
+        LOGF("  GameState @0x2D0 = %p", gs2D0);
+        
+        if (IsValidPtr(gs288)) {
+            void* playlist = *(void**)((char*)gs288 + OFFSET_GameState_Playlist2298);
+            LOGF("    Playlist @0x2298 (from 0x288) = %p", playlist);
+        }
+        if (IsValidPtr(gs2D0)) {
+            void* playlist2 = *(void**)((char*)gs2D0 + OFFSET_GameState_Playlist2298);
+            LOGF("    Playlist @0x2298 (from 0x2D0) = %p", playlist2);
+        }
+        
+        void* world1 = *(void**)((char*)this_ + 0x20);
+        void* world2 = *(void**)((char*)this_ + 0x28);
+        LOGF("  World candidates: +0x20=%p, +0x28=%p", world1, world2);
+    }
     
     if (g_orig_InitGameState) {
         g_orig_InitGameState(this_);
     }
     
-    LOGF("[InitGameState] Original returned. Done.");
+    LOGF("[InitGameState #%llu] Original returned. Done.", (unsigned long long)g_igs_calls);
     LOGF("========================================");
 }
 
