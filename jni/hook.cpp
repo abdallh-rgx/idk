@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v47: find World via ClassPrivate)
+// hook — Android JNI (v48: subclass-aware actor search)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -31,11 +31,12 @@
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 #define ADDR_SpawnDefaultPawnAtTransform 0x5511618
-#define ADDR_SpawnDefaultPawnFor         0x551A7C4
 
 #define OFF_UOBJ_CLASSPRIVATE            0x10
 #define OFF_UOBJ_NAMEPRIVATE             0x18
 #define OFF_UOBJ_OUTERPRIVATE            0x20
+// UStruct::SuperStruct — try several
+static const int kSuperOffs[] = { 0x40, 0x48, 0x38, 0x30, 0x50 };
 
 #define OFF_PC_PlayerState               0x278
 #define OFF_PC_Pawn                      0x2B8
@@ -120,9 +121,6 @@ static bool VPtr(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-// ------------------------------------------------------------
-// StaticFindObject with fallback patterns
-// ------------------------------------------------------------
 static void* SFO2(const char16_t* name) {
     if (!SFO) return nullptr;
     void* a = SFO(nullptr, nullptr, name, false);
@@ -132,31 +130,40 @@ static void* SFO2(const char16_t* name) {
     return nullptr;
 }
 
-// ------------------------------------------------------------
-// Walk outer chain comparing ClassPrivate
-// ------------------------------------------------------------
+// Walk class hierarchy: is cls a subclass of target?
+static bool IsSubclassOf(void* cls, void* target) {
+    if (!VPtr(cls) || !VPtr(target)) return false;
+    if (cls == target) return true;
+
+    void* cur = cls;
+    for (int i = 0; i < 20; i++) {
+        // Try each possible SuperStruct offset
+        void* super = nullptr;
+        bool found = false;
+        for (int so : kSuperOffs) {
+            void* s = nullptr;
+            if (RP((char*)cur + so, &s) && VPtr(s)) {
+                super = s;
+                found = true;
+                break;
+            }
+        }
+        if (!found || !VPtr(super)) break;
+        if (super == target) return true;
+        cur = super;
+    }
+    return false;
+}
+
+// World via ClassPrivate walk
 static void* FindWorldByClass(void* start, void* worldCls) {
     if (!VPtr(start) || !VPtr(worldCls)) return nullptr;
-
-    LOGF("");
-    LOGF("========== Walk outer from %p (worldCls=%p) ==========", start, worldCls);
     void* cur = start;
     for (int i = 0; i < 10; i++) {
         if (!VPtr(cur)) break;
-
         void* cls = nullptr;
-        if (!RP((char*)cur + OFF_UOBJ_CLASSPRIVATE, &cls)) {
-            LOGF("  [%d] %p  class read failed", i, cur);
-            break;
-        }
-        const char* tag = (cls == worldCls) ? "  ⭐ WORLD!" : "";
-        LOGF("  [%d] %p  class=%p%s", i, cur, cls, tag);
-
-        if (cls == worldCls) {
-            LOGF("  ✅ WORLD FOUND: %p", cur);
-            return cur;
-        }
-
+        if (!RP((char*)cur + OFF_UOBJ_CLASSPRIVATE, &cls)) break;
+        if (cls == worldCls) return cur;
         void* outer = nullptr;
         if (!RP((char*)cur + OFF_UOBJ_OUTERPRIVATE, &outer)) break;
         if (!VPtr(outer)) break;
@@ -165,96 +172,109 @@ static void* FindWorldByClass(void* start, void* worldCls) {
     return nullptr;
 }
 
-// ------------------------------------------------------------
-// Dump a UE object (class, name bytes)
-// ------------------------------------------------------------
-static void DumpObj(const char* tag, void* obj) {
-    if (!VPtr(obj)) { LOGF("  [%s] %p <invalid>", tag, obj); return; }
-    void* cls = nullptr; RP((char*)obj + OFF_UOBJ_CLASSPRIVATE, &cls);
-    void* nameRaw = nullptr; RP((char*)obj + OFF_UOBJ_NAMEPRIVATE, &nameRaw);
-    void* outer = nullptr; RP((char*)obj + OFF_UOBJ_OUTERPRIVATE, &outer);
-    LOGF("  [%s] obj=%p cls=%p name=%p outer=%p", tag, obj, cls, nameRaw, outer);
-}
+// UWorld::Levels — TArray<ULevel*>
+struct TArrayNative { void* Data; int32_t Num; int32_t Max; };
 
-// ------------------------------------------------------------
-// Find PlayerStart instance in world via levels/actors
-// ------------------------------------------------------------
-static void* FindActorByClassInWorld(void* world, void* targetCls, const char* label) {
+// Search all levels for an actor whose class is (or inherits from) targetCls
+static void* FindActorByHierarchy(void* world, void* targetCls, const char* label) {
     if (!VPtr(world) || !VPtr(targetCls)) return nullptr;
 
     LOGF("");
-    LOGF("========== FindActorByClass(%s) world=%p ==========", label, world);
+    LOGF("========== FindActorByHierarchy(%s) world=%p target=%p ==========",
+         label, world, targetCls);
 
-    // UWorld::PersistentLevel at various offsets (UE5)
-    static const int lvlOffs[] = { 0x30, 0x38, 0x28, 0x20, 0x40, 0x90 };
+    // Try World->Levels offsets (UE5)
+    static const int levelsOffs[] = { 0x1D0, 0x1C0, 0x1E0, 0x1F0, 0x2C0, 0x2A0, 0x250, 0x130, 0x290, 0x2B0 };
 
-    for (int lo : lvlOffs) {
-        void* lvl = nullptr;
-        if (!RP((char*)world + lo, &lvl) || !VPtr(lvl)) continue;
-        LOGF("  [try World+0x%X] level=%p", lo, lvl);
+    for (int lvOff : levelsOffs) {
+        TArrayNative levels;
+        if (!RB((char*)world + lvOff, &levels, sizeof(levels))) continue;
+        if (levels.Num <= 0 || levels.Num > 500) continue;
+        if (!VPtr(levels.Data)) continue;
 
-        // ULevel::Actors at various offsets
-        static const int actOffs[] = { 0x98, 0xA0, 0x90, 0xA8, 0xB0, 0xC0, 0x88, 0x150 };
+        LOGF("  [Levels@0x%X] Data=%p Num=%d", lvOff, levels.Data, levels.Num);
 
-        for (int ao : actOffs) {
-            void* data = nullptr;
-            int32_t num = 0, max = 0;
-            if (!RB((char*)lvl + ao, &data, 8)) continue;
-            if (!RB((char*)lvl + ao + 8, &num, 4)) continue;
-            if (!RB((char*)lvl + ao + 12, &max, 4)) continue;
-            if (!VPtr(data)) continue;
-            if (num <= 0 || num > 500000) continue;
+        for (int li = 0; li < levels.Num && li < 200; li++) {
+            void* lvl = nullptr;
+            if (!RP((char*)levels.Data + li * 8, &lvl)) continue;
+            if (!VPtr(lvl)) continue;
 
-            LOGF("    [L+0x%X] Data=%p Num=%d Max=%d", ao, data, num, max);
+            static const int actorsOffs[] = { 0x98, 0xA0, 0x90, 0xA8, 0xB0, 0xC0, 0x88, 0x150 };
 
-            int lim = num > 30000 ? 30000 : num;
-            int matches = 0;
-            for (int i = 0; i < lim; i++) {
-                void* actor = nullptr;
-                if (!RP((char*)data + i * 8, &actor)) continue;
-                if (!VPtr(actor)) continue;
-                void* ac = nullptr;
-                if (!RP((char*)actor + OFF_UOBJ_CLASSPRIVATE, &ac)) continue;
-                if (ac == targetCls) {
-                    LOGF("      ✅ MATCH %s at [%d] = %p", label, i, actor);
-                    return actor;
+            for (int acOff : actorsOffs) {
+                TArrayNative actors;
+                if (!RB((char*)lvl + acOff, &actors, sizeof(actors))) continue;
+                if (actors.Num <= 0 || actors.Num > 500000) continue;
+                if (!VPtr(actors.Data)) continue;
+
+                LOGF("    [L%d] Actors@0x%X Num=%d", li, acOff, actors.Num);
+
+                int lim = actors.Num > 50000 ? 50000 : actors.Num;
+                for (int ai = 0; ai < lim; ai++) {
+                    void* actor = nullptr;
+                    if (!RP((char*)actors.Data + ai * 8, &actor)) continue;
+                    if (!VPtr(actor)) continue;
+                    void* ac = nullptr;
+                    if (!RP((char*)actor + OFF_UOBJ_CLASSPRIVATE, &ac)) continue;
+
+                    if (IsSubclassOf(ac, targetCls)) {
+                        LOGF("      ✅ MATCH %s at L%d A%d = actor=%p cls=%p",
+                             label, li, ai, actor, ac);
+                        return actor;
+                    }
                 }
-                matches++;
             }
-            LOGF("    scanned %d actors, no match", matches);
         }
     }
-    LOGF("  ❌ %s not found", label);
+    LOGF("  ❌ %s not found in any level", label);
     return nullptr;
 }
 
-// ------------------------------------------------------------
-// Read actor location (RootComponent -> RelativeLocation)
-// ------------------------------------------------------------
-static bool ReadActorLocation(void* actor, float out[3]) {
-    out[0] = out[1] = out[2] = 0;
-    if (!VPtr(actor)) return false;
+// Dump first N actors with their class to understand the actor pool
+static void DumpActorClasses(void* world, int maxLevels, int maxActors) {
+    if (!VPtr(world)) return;
+    LOGF("");
+    LOGF("========== Dump Actor Classes (first %d) ==========", maxActors);
 
-    static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280 };
-    static const int locOffs[]  = { 0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110,
-                                    0x118, 0x1A8, 0x1B0, 0x1B8 };
+    static const int levelsOffs[] = { 0x1D0, 0x1C0, 0x130, 0x2C0 };
 
-    for (int ro : rootOffs) {
-        void* root = nullptr;
-        if (!RP((char*)actor + ro, &root) || !VPtr(root)) continue;
-        for (int lo : locOffs) {
-            float xyz[3];
-            if (!RB((char*)root + lo, xyz, 12)) continue;
-            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
-            if (fabsf(xyz[0]) > 500000 || fabsf(xyz[1]) > 500000) continue;
-            if (xyz[2] < -2000 || xyz[2] > 20000) continue;
-            if (xyz[0] == 0 && xyz[1] == 0 && xyz[2] == 0) continue;
-            out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
-            LOGF("  [loc] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)", ro, lo, out[0], out[1], out[2]);
-            return true;
+    for (int lvOff : levelsOffs) {
+        TArrayNative levels;
+        if (!RB((char*)world + lvOff, &levels, sizeof(levels))) continue;
+        if (levels.Num <= 0 || levels.Num > 500) continue;
+        if (!VPtr(levels.Data)) continue;
+
+        LOGF("  [Levels@0x%X] Num=%d", lvOff, levels.Num);
+        int dumped = 0;
+
+        for (int li = 0; li < levels.Num && li < maxLevels; li++) {
+            void* lvl = nullptr;
+            if (!RP((char*)levels.Data + li * 8, &lvl)) continue;
+            if (!VPtr(lvl)) continue;
+
+            for (int acOff : { 0x98, 0xA0, 0x90 }) {
+                TArrayNative actors;
+                if (!RB((char*)lvl + acOff, &actors, sizeof(actors))) continue;
+                if (actors.Num <= 0 || actors.Num > 500000) continue;
+                if (!VPtr(actors.Data)) continue;
+
+                LOGF("    [L%d @0x%X] Num=%d — class pointers:",
+                     li, acOff, actors.Num);
+
+                int lim = actors.Num > maxActors ? maxActors : actors.Num;
+                for (int ai = 0; ai < lim && dumped < maxActors; ai++) {
+                    void* actor = nullptr;
+                    if (!RP((char*)actors.Data + ai * 8, &actor)) continue;
+                    if (!VPtr(actor)) continue;
+                    void* ac = nullptr;
+                    if (!RP((char*)actor + OFF_UOBJ_CLASSPRIVATE, &ac)) continue;
+                    LOGF("      A%d: actor=%p cls=%p", ai, actor, ac);
+                    dumped++;
+                }
+                if (dumped >= maxActors) return;
+            }
         }
     }
-    return false;
 }
 
 // ------------------------------------------------------------
@@ -306,6 +326,32 @@ static void* ReadPawn(void* pc) {
     return p;
 }
 
+static bool ReadActorLocation(void* actor, float out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!VPtr(actor)) return false;
+
+    static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280 };
+    static const int locOffs[]  = { 0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110,
+                                    0x118, 0x1A8, 0x1B0, 0x1B8 };
+
+    for (int ro : rootOffs) {
+        void* root = nullptr;
+        if (!RP((char*)actor + ro, &root) || !VPtr(root)) continue;
+        for (int lo : locOffs) {
+            float xyz[3];
+            if (!RB((char*)root + lo, xyz, 12)) continue;
+            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
+            if (fabsf(xyz[0]) > 500000 || fabsf(xyz[1]) > 500000) continue;
+            if (xyz[2] < -2000 || xyz[2] > 20000) continue;
+            if (xyz[0] == 0 && xyz[1] == 0 && xyz[2] == 0) continue;
+            out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
+            LOGF("  [loc] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)", ro, lo, out[0], out[1], out[2]);
+            return true;
+        }
+    }
+    return false;
+}
+
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_1; float sx,sy,sz,_2; };
 static void MakeXform(float x, float y, float z, FTransform* t) {
     memset(t, 0, sizeof(*t));
@@ -315,8 +361,6 @@ static void MakeXform(float x, float y, float z, FTransform* t) {
 }
 
 // ------------------------------------------------------------
-// Main spawn worker
-// ------------------------------------------------------------
 static void SpawnWorker(void* gm, void* pc) {
     LOGF("");
     LOGF("============================================================");
@@ -325,70 +369,55 @@ static void SpawnWorker(void* gm, void* pc) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 
-    // 1) Find key classes
+    // 1) Find classes
     void* worldCls = SFO2(u"World");
-    void* levelCls = SFO2(u"Level");
     void* psCls    = SFO2(u"PlayerStart");
-    LOGF("[W] classes: World=%p Level=%p PlayerStart=%p", worldCls, levelCls, psCls);
+    void* fpsCls   = SFO2(u"FortPlayerStartWarmup");
+    void* fpCls    = SFO2(u"FortPlayerStart");
+    LOGF("[W] classes: World=%p PlayerStart=%p FortPlayerStartWarmup=%p FortPlayerStart=%p",
+         worldCls, psCls, fpsCls, fpCls);
 
-    // 2) Dump PC/GS
-    DumpObj("PC", pc);
+    // 2) Find World
     void* gs = nullptr;
     RP((char*)gm + OFF_GM_GameState, &gs);
-    DumpObj("GS", gs);
-    DumpObj("GM", gm);
 
-    // 3) Find World via outer chain from GS, then PC
     void* world = nullptr;
     if (VPtr(gs) && VPtr(worldCls)) world = FindWorldByClass(gs, worldCls);
     if (!world && VPtr(pc) && VPtr(worldCls)) world = FindWorldByClass(pc, worldCls);
     if (!world && VPtr(gm) && VPtr(worldCls)) world = FindWorldByClass(gm, worldCls);
-
     LOGF("[W] World = %p", world);
 
-    // 4) Find PlayerStart actor in world
+    // 3) Dump first 40 actors' classes
+    if (world) DumpActorClasses(world, 3, 40);
+
+    // 4) Find PlayerStart actor via hierarchy
     float spawnX = 0, spawnY = 0, spawnZ = 5000;
     bool gotLoc = false;
+    void* psActor = nullptr;
 
-    if (world && VPtr(psCls)) {
-        void* psActor = FindActorByClassInWorld(world, psCls, "PlayerStart");
-        if (VPtr(psActor)) {
-            float loc[3];
-            if (ReadActorLocation(psActor, loc)) {
-                spawnX = loc[0]; spawnY = loc[1]; spawnZ = loc[2] + 200;
-                gotLoc = true;
-                LOGF("[W] using PlayerStart loc (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
-            }
+    if (world) {
+        if (VPtr(psCls))  psActor = FindActorByHierarchy(world, psCls,  "PlayerStart");
+        if (!psActor && VPtr(fpsCls)) psActor = FindActorByHierarchy(world, fpsCls, "FortPlayerStartWarmup");
+        if (!psActor && VPtr(fpCls))  psActor = FindActorByHierarchy(world, fpCls,  "FortPlayerStart");
+    }
+
+    if (VPtr(psActor)) {
+        float loc[3];
+        if (ReadActorLocation(psActor, loc)) {
+            spawnX = loc[0]; spawnY = loc[1]; spawnZ = loc[2] + 200;
+            gotLoc = true;
+            LOGF("[W] using PlayerStart loc (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
         }
     }
+    if (!gotLoc) LOGF("[W] using fallback loc (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
 
-    if (!gotLoc) {
-        LOGF("[W] using fallback loc (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
-    }
-
-    // 5) Dump GameMode fields (find DefaultPawnClass)
-    LOGF("--- GM[0x2A0..0x380] pointer scan ---");
-    for (int off = 0x2A0; off < 0x380; off += 8) {
-        void* v = nullptr;
-        if (!RP((char*)gm + off, &v)) continue;
-        if (!VPtr(v)) continue;
-        // read target class
-        void* tc = nullptr;
-        RP((char*)v + OFF_UOBJ_CLASSPRIVATE, &tc);
-        LOGF("  GM+0x%X = %p  (tgt class=%p)", off, v, tc);
-    }
-
-    // 6) Try spawn
+    // 5) Try spawn
     typedef void* (*SDPAT_t)(void*, void*, void*);
     SDPAT_t fn = (SDPAT_t)(g_base + ADDR_SpawnDefaultPawnAtTransform);
 
     for (int i = 0; i < 8; i++) {
         void* ex = ReadPawn(pc);
-        if (VPtr(ex)) {
-            LOGF("[W] pawn exists: %p", ex);
-            Attach(pc, ex);
-            return;
-        }
+        if (VPtr(ex)) { LOGF("[W] pawn exists: %p", ex); Attach(pc, ex); return; }
 
         LOGF("[W] attempt %d loc=(%.0f, %.0f, %.0f)", i + 1, spawnX, spawnY, spawnZ + i * 200.0f);
         FTransform t;
@@ -443,7 +472,7 @@ static void Run() {
     if (!i.base) { LOGF("[ERR] libUnreal not found"); return; }
     g_base = i.base;
     LOGF("========================================");
-    LOGF(" hook — v47 (ClassPrivate-based World search)");
+    LOGF(" hook — v48 (subclass-aware actor search)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
