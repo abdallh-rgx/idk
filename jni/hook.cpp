@@ -125,11 +125,7 @@ static void DumpUFunction(void* fn) {
         }
 
         if (!IVP(v)) {
-            if ((uintptr_t)v < 0x1000) {
-                LOGF("  +0x%03zX = 0x%lX", off, (unsigned long)(uintptr_t)v);
-            } else {
-                LOGF("  +0x%03zX = %p", off, v);
-            }
+            LOGF("  +0x%03zX = 0x%lX", off, (unsigned long)(uintptr_t)v);
             continue;
         }
 
@@ -215,6 +211,28 @@ static void ReadSpawnDefaultPawnAtTransform() {
     }
 }
 
+// ============================================================
+// تشخيص مؤجل - ينفذ فقط داخل PostLogin عندما المحرك جاهز
+// ============================================================
+static bool g_diag_done = false;
+
+static void RunDiagnostics() {
+    if (g_diag_done) return;
+    g_diag_done = true;
+
+    LOGF("========================================");
+    LOGF("[Diag] Starting UFunction diagnostics...");
+    LOGF("========================================");
+
+    void* fn = FindSpawnDefaultPawnForFunc();
+    LOGF("[Diag] SpawnDefaultPawnFor UFunction = %p", fn);
+    if (IVP(fn)) {
+        DumpUFunction(fn);
+    } else {
+        LOGF("[Diag] UFunction not found - all paths missed");
+    }
+}
+
 typedef void (*PL_t)(void*, void*);
 static PL_t o_PL = nullptr;
 static uint64_t g_calls = 0;
@@ -231,7 +249,10 @@ static void Hook_PL(void* gm, void* pc) {
 
     ClearSpectator(pc);
 
-    // محاولة Spawn يدوية عبر SpawnDefaultPawnAtTransform
+    // تشخيص UFunction بعد ما المحرك جهز
+    RunDiagnostics();
+
+    // محاولة Spawn يدوية (اختيارية - قد تفشل إذا World ما بدأ)
     if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
         FTransform sky;
         memset(&sky, 0, sizeof(sky));
@@ -273,28 +294,24 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v13 - UFunction dump only");
+    LOGF(" hook v14 - diag inside PostLogin");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     LOGF(" SFO = %p (RVA=0x%X)", (void*)SFO, ADDR_StaticFindObject);
 
+    // هذا آمن - فقط قراءة من Static VFT
     ReadSpawnDefaultPawnAtTransform();
 
-    // فقط Dump UFunction - بدون أي Hook عليه
-    void* fn = FindSpawnDefaultPawnForFunc();
-    LOGF(" SpawnDefaultPawnFor UFunction = %p", fn);
-    if (IVP(fn)) {
-        DumpUFunction(fn);
-    } else {
-        LOGF("[WARN] UFunction not found - check paths");
-    }
+    // ما نستدعي SFO هنا إطلاقاً!
+    // فقط نركب الـ hooks
 
-    // فقط الـ hooks الآمنة (كانت تشتغل قبل)
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
+
+    LOGF("[Run] All hooks installed. Waiting for PostLogin...");
 }
 
 extern "C" JNIEXPORT jint JNICALL
