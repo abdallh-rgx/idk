@@ -35,7 +35,7 @@
 #define OFF_GS_Playlist2290              0x2290
 #define OFF_PS_SpectatorByte             0x27A
 
-#define SKY_Z                            10000.0f
+#define SKY_Z                            1000.0f
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -274,6 +274,16 @@ static void Hook_PL(void* gm, void* pc) {
     if (o_PL) o_PL(gm, pc);
 
     ClearSpectator(pc);
+
+    if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
+        FTransform sky;
+        MakeSkyXform(&sky);
+        LOGF("[Force Sky] Trying manual spawn at Z=%.1f", sky.tz);
+        void* pawn = SpawnDefaultPawnAtTransform(gm, pc, &sky);
+        LOGF("[Force Sky] Pawn = %p", pawn);
+        ClearSpectator(pc);
+    }
+
     LOGF("[PostLogin] done");
 }
 
@@ -303,7 +313,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook vft v5 - postlogin instance");
+    LOGF(" hook vft v6 - force spawn");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
