@@ -26,7 +26,6 @@
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
-#define OFF_GM_GLOBAL                    0xBDB8BC0
 #define VFT_IDX_SpawnDefaultPawnFor      0xDD
 #define VFT_IDX_SpawnDefaultPawnAtTransform 0xDE
 
@@ -101,7 +100,6 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
-static void* g_gmObj = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
@@ -114,12 +112,17 @@ static bool IVP(void* p) {
 static bool VFTHook(void* obj, size_t vft_index, void* hook_fn, void** orig_out) {
     if (!obj || !hook_fn) return false;
 
-    void** vtable = *reinterpret_cast<void***>(obj);
-    if (!vtable) return false;
+    void** vtable = nullptr;
+    if (!RP(obj, (void**)&vtable)) return false;
+    if (!IVP(vtable)) return false;
 
-    void** slot = &vtable[vft_index];
+    void** slot = nullptr;
+    if (!RP((char*)vtable + vft_index * sizeof(void*), (void**)&slot)) return false;
 
-    if (orig_out) *orig_out = *slot;
+    void* current = nullptr;
+    if (!RP(slot, &current)) return false;
+
+    if (orig_out) *orig_out = current;
 
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     uintptr_t addr = reinterpret_cast<uintptr_t>(slot);
@@ -175,7 +178,7 @@ static void* Hook_SpawnDefaultPawnFor(void* gm, void* controller, void* startSpo
             LOGF("========================================");
             return pawn;
         }
-        LOGF("[Sky] FAILED -> fallback to original");
+        LOGF("[Sky] FAILED -> fallback");
     }
 
     void* res = o_SpawnDefaultPawnFor ? o_SpawnDefaultPawnFor(gm, controller, startSpot) : nullptr;
@@ -219,6 +222,37 @@ static void ClearSpectator(void* pc) {
     }
 }
 
+static bool g_vftHooked = false;
+
+static void ApplyVftHooks(void* gm) {
+    if (!IVP(gm)) { LOGF("[VFT] gm invalid"); return; }
+
+    void** vft = nullptr;
+    if (!RP(gm, (void**)&vft) || !IVP(vft)) {
+        LOGF("[VFT] vft invalid");
+        return;
+    }
+    LOGF("[VFT] gm=%p vft=%p", gm, (void*)vft);
+
+    void* at = nullptr;
+    if (RP((char*)vft + VFT_IDX_SpawnDefaultPawnAtTransform * sizeof(void*), &at) && IVP(at)) {
+        SpawnDefaultPawnAtTransform = (SpawnDefaultPawnAtTransform_t)at;
+        LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p",
+             VFT_IDX_SpawnDefaultPawnAtTransform, (void*)at);
+    } else {
+        LOGF("[VFT] SpawnDefaultPawnAtTransform read FAILED");
+        return;
+    }
+
+    void* orig = nullptr;
+    bool ok = VFTHook(gm, VFT_IDX_SpawnDefaultPawnFor,
+                      (void*)Hook_SpawnDefaultPawnFor,
+                      &orig);
+    o_SpawnDefaultPawnFor = (SpawnDefaultPawnFor_t)orig;
+    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)",
+         VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL", orig);
+}
+
 typedef void (*PL_t)(void*, void*);
 static PL_t o_PL = nullptr;
 static uint64_t g_calls = 0;
@@ -228,10 +262,19 @@ static void Hook_PL(void* gm, void* pc) {
     LOGF("");
     LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
          (unsigned long long)g_calls, gm, pc);
+
+    if (!g_vftHooked && IVP(gm)) {
+        ApplyVftHooks(gm);
+        g_vftHooked = true;
+    }
+
     InjectPlaylist(gm);
     ClearSpectator(pc);
+
     if (o_PL) o_PL(gm, pc);
+
     ClearSpectator(pc);
+    LOGF("[PostLogin] done");
 }
 
 typedef bool (*SAP_t)(void*, char);
@@ -250,47 +293,6 @@ static int Hook_PH(void* a1) {
     return o_PH ? o_PH(a1) : 0;
 }
 
-static void* GetGameMode() {
-    void* p = nullptr;
-    if (RP((void*)(g_base + OFF_GM_GLOBAL), &p) && IVP(p)) {
-        LOGF("[GM] pointer-read -> %p", p);
-        return p;
-    }
-    typedef void* (*Getter_t)();
-    Getter_t getter = (Getter_t)(g_base + OFF_GM_GLOBAL);
-    void* gm = getter();
-    if (IVP(gm)) {
-        LOGF("[GM] getter-call -> %p", gm);
-        return gm;
-    }
-    return nullptr;
-}
-
-static void ApplyVftHooks() {
-    if (!IVP(g_gmObj)) {
-        LOGF("[VFT] GameMode invalid, aborting");
-        return;
-    }
-
-    void** vft = *reinterpret_cast<void***>(g_gmObj);
-    if (!vft) {
-        LOGF("[VFT] vft NULL");
-        return;
-    }
-    LOGF("[VFT] vft=%p", (void*)vft);
-
-    SpawnDefaultPawnAtTransform = (SpawnDefaultPawnAtTransform_t)vft[VFT_IDX_SpawnDefaultPawnAtTransform];
-    LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p",
-         VFT_IDX_SpawnDefaultPawnAtTransform, (void*)SpawnDefaultPawnAtTransform);
-
-    bool ok = VFTHook(g_gmObj, VFT_IDX_SpawnDefaultPawnFor,
-                      (void*)Hook_SpawnDefaultPawnFor,
-                      (void**)&o_SpawnDefaultPawnFor);
-    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)",
-         VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL",
-         (void*)o_SpawnDefaultPawnFor);
-}
-
 static void Run() {
     LibInfo i{0,0,0};
     for (int k = 0; k < 60; k++) {
@@ -301,7 +303,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook vft sky spawn");
+    LOGF(" hook vft v5 - postlogin instance");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
@@ -311,18 +313,6 @@ static void Run() {
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
-
-    for (int k = 0; k < 300; k++) {
-        void* gm = GetGameMode();
-        if (IVP(gm)) {
-            g_gmObj = gm;
-            LOGF("[GM] resolved at attempt %d", k);
-            ApplyVftHooks();
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    LOGF("[GM] TIMEOUT waiting for GameMode instance");
 }
 
 extern "C" JNIEXPORT jint JNICALL
