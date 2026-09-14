@@ -1,6 +1,3 @@
-// ============================================================
-// hook — Android JNI (v60: clear bOnlySpectator + fix Pawn)
-// ============================================================
 #include <jni.h>
 #include <cstdint>
 #include <cstddef>
@@ -32,10 +29,10 @@
 #define ADDR_SpawnActor                   0x947F4FC
 #define ADDR_GetAllActorsOfClass          0x93A4744
 #define ADDR_SpawnPlayerCameraManager     0x968BDDC
+#define ADDR_RestartPlayer                0x93A0664
 
 #define OFF_UOBJ_OUTERPRIVATE             0x20
 
-// PC offsets
 #define OFF_PC_PlayerState                0x278
 #define OFF_PC_Pawn                       0x2B8
 #define OFF_PC_AckPawn                    0x2C0
@@ -43,28 +40,21 @@
 #define OFF_PC_CameraManagerClass         0x330
 #define OFF_PC_ViewTarget_Target          0x2E0
 
-// Pawn offsets
 #define OFF_Pawn_Controller               0x2A8
 #define OFF_Pawn_Owner                    0x2A0
 
-// GameMode
 #define OFF_GM_GameState                  0x2D0
 #define OFF_GS_Playlist2298               0x2298
 #define OFF_GS_Playlist2290               0x2290
 
-// PlayerState — CORRECTED from IDA
 #define OFF_PS_SpectatorByte              0x27A
-//       bit 3 = bIsSpectator
-//       bit 4 = bOnlySpectator  ← المشكلة
-//       bit 5 = ?
-//       bit 6 = ?
-//       bit 7 = ?
 #define MASK_bIsSpectator                 0x08
 #define MASK_bOnlySpectator               0x10
 #define MASK_ALL_SPECTATOR_BITS           (0x08 | 0x10 | 0x20 | 0x40)
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
+
 static void InitLogFile() {
     const char* p[] = {
         "/storage/emulated/0/Android/data/com.epicgames.fortnite/files/hook.log",
@@ -73,6 +63,7 @@ static void InitLogFile() {
     };
     for (auto x : p) { FILE* f = fopen(x, "w"); if (f) { g_logfile = f; return; } }
 }
+
 static void LOGF(const char* fmt, ...) {
     char buf[4096]; va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
@@ -88,26 +79,31 @@ static bool RP(void* a, void** o) {
     struct iovec l = { o, sizeof(void*) }, r = { a, sizeof(void*) };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
+
 static bool RB(void* a, void* o, size_t n) {
     if (!a || !o || n == 0 || n > 4096) return false;
     struct iovec l = { o, n }, r = { a, n };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
 }
+
 static bool WP(void* a, void* v) {
     if (!a) return false;
     struct iovec l = { &v, sizeof(void*) }, r = { a, sizeof(void*) };
     return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
+
 static bool WU8(void* a, uint8_t v) {
     struct iovec l = { &v, 1 }, r = { a, 1 };
     return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == 1;
 }
+
 static bool RU8(void* a, uint8_t* v) {
     struct iovec l = { v, 1 }, r = { a, 1 };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 1;
 }
 
 struct LibInfo { uintptr_t base, text_start, text_end; };
+
 static LibInfo GetLibInfo() {
     LibInfo info{0, 0, 0};
     dl_iterate_phdr([](struct dl_phdr_info* ph, size_t, void* d) -> int {
@@ -138,14 +134,19 @@ static void* g_last_pc = nullptr;
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
 
+typedef void (*RestartPlayer_t)(void*, void*);
+static RestartPlayer_t RestartPlayer = nullptr;
+
 static bool IVP(void* p) {
     uintptr_t v = (uintptr_t)p;
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
+
 static bool ITP(void* p) {
     uintptr_t v = (uintptr_t)p;
     return (g_text_start && v >= g_text_start && v < g_text_end);
 }
+
 static void* SFO2(const char16_t* name) {
     if (!SFO) return nullptr;
     void* a = SFO(nullptr, nullptr, name, false);
@@ -154,6 +155,7 @@ static void* SFO2(const char16_t* name) {
     if (IVP(b)) return b;
     return nullptr;
 }
+
 static void* WalkOuter(void* start, int hops) {
     void* cur = start;
     for (int i = 0; i < hops; i++) {
@@ -167,11 +169,13 @@ static void* WalkOuter(void* start, int hops) {
 }
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
+
 static void MakeXform(float x, float y, float z, FTransform* t) {
     memset(t, 0, sizeof(*t));
     t->qw = 1.0f; t->tx = x; t->ty = y; t->tz = z;
     t->sx = t->sy = t->sz = 1.0f;
 }
+
 struct TArrayN { void* Data; int32_t Num; int32_t Max; int32_t pad; };
 
 static bool FindTransformInActor(void* actor, float out[3]) {
@@ -194,64 +198,8 @@ static bool FindTransformInActor(void* actor, float out[3]) {
     return false;
 }
 
-// ============================================================
-// ⭐ CRITICAL: Clear ALL spectator bits
-// ============================================================
-static void FixSpectatorFlags(void* ps, const char* tag) {
-    if (!IVP(ps)) return;
-    uint8_t b = 0;
-    if (!RU8((char*)ps + OFF_PS_SpectatorByte, &b)) return;
-
-    LOGF("[Fix:%s] PS+0x%X BEFORE = 0x%02X (bits: %d%d%d%d%d%d%d%d)",
-         tag, OFF_PS_SpectatorByte, b,
-         (b>>7)&1, (b>>6)&1, (b>>5)&1, (b>>4)&1,
-         (b>>3)&1, (b>>2)&1, (b>>1)&1, b&1);
-
-    uint8_t nb = b & ~MASK_ALL_SPECTATOR_BITS;
-
-    if (nb != b) {
-        WU8((char*)ps + OFF_PS_SpectatorByte, nb);
-        LOGF("[Fix:%s] PS+0x%X AFTER  = 0x%02X (cleared bits 3,4,5,6)",
-             tag, OFF_PS_SpectatorByte, nb);
-    } else {
-        LOGF("[Fix:%s] no change needed", tag);
-    }
-}
-
-// ============================================================
-// Fix Pawn->PlayerState (offset search)
-// ============================================================
-static void FixPawnPlayerState(void* pawn, void* ps) {
-    if (!IVP(pawn) || !IVP(ps)) return;
-
-    LOGF("[PawnFix] searching for Pawn->PlayerState offset (pawn=%p ps=%p)", pawn, ps);
-
-    // Try common offsets. We write PS to candidates that are currently null.
-    static const int candidates[] = {
-        0x2B0, 0x2B8, 0x2C0, 0x2C8, 0x2D0, 0x2D8, 0x2E0, 0x2E8,
-        0x2A8, 0x2B4, 0x2A0, 0x298, 0x290, 0x280, 0x270
-    };
-
-    int written = 0;
-    for (int off : candidates) {
-        void* cur = nullptr;
-        if (!RP((char*)pawn + off, &cur)) continue;
-        if (IVP(cur)) continue; // occupied, skip
-
-        WP((char*)pawn + off, ps);
-        written++;
-        LOGF("[PawnFix] wrote PS to Pawn+0x%X (was null)", off);
-
-        // Limit to first 3 writes to avoid corrupting
-        if (written >= 3) break;
-    }
-    LOGF("[PawnFix] wrote to %d offsets", written);
-}
-
-// ============================================================
-// GetAllActors
-// ============================================================
 typedef void (*GA_t)(void*, void*, void*);
+
 static int CallGetAllActors(void* ctx, void* cls, void* out[128]) {
     if (!IVP(ctx) || !IVP(cls)) return 0;
     GA_t fn = (GA_t)(g_base + ADDR_GetAllActorsOfClass);
@@ -271,6 +219,7 @@ static int CallGetAllActors(void* ctx, void* cls, void* out[128]) {
 }
 
 typedef void* (*SAT_t)(void*, void*, void*, void*);
+
 static void* DoSpawnActor(void* world, void* cls, FTransform* xform) {
     if (!IVP(world) || !IVP(cls)) return nullptr;
     uint8_t params[0x100];
@@ -284,6 +233,7 @@ static void* FindPlaylist() {
     return SFO(nullptr, nullptr,
         u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
 }
+
 static bool InjectPlaylist(void* gm) {
     if (!gm) return false;
     std::lock_guard<std::mutex> lock(g_inject_mutex);
@@ -299,6 +249,7 @@ static bool InjectPlaylist(void* gm) {
     g_injected_gms.insert(gm);
     return true;
 }
+
 static void* FindPawnClass() {
     static const char16_t* names[] = {
         u"FortPlayerPawnAthena", u"FortPlayerPawnAthena_C",
@@ -311,9 +262,6 @@ static void* FindPawnClass() {
     return nullptr;
 }
 
-// ============================================================
-// Main spawn
-// ============================================================
 static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("");
     LOGF("============================================================");
@@ -322,117 +270,59 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
 
     if (!IVP(gm) || !IVP(pc)) return;
 
-    // ===== STEP 1: Fix spectator bits FIRST =====
+    InjectPlaylist(gm);
+
     void* ps = nullptr;
     RP((char*)pc + OFF_PC_PlayerState, &ps);
+
     if (IVP(ps)) {
-        FixSpectatorFlags(ps, "step1");
-    } else {
-        LOGF("[Spawn] PlayerState is NULL!");
-    }
-
-    // ===== STEP 2: Get or spawn Pawn =====
-    void* pawn = nullptr;
-    RP((char*)pc + OFF_PC_Pawn, &pawn);
-
-    void* world = nullptr;
-    void* gs = nullptr;
-    RP((char*)gm + OFF_GM_GameState, &gs);
-    if (IVP(gs)) world = WalkOuter(gs, 2);
-    if (!world && IVP(pc)) world = WalkOuter(pc, 2);
-    if (!world && IVP(gm)) world = WalkOuter(gm, 2);
-    LOGF("[Spawn] World = %p", world);
-
-    if (!IVP(pawn)) {
-        float loc[3] = { 0.0f, 0.0f, 50000.0f };
-        bool gotLoc = false;
-
-        void* fpsCls = SFO2(u"FortPlayerStartWarmup");
-        if (!IVP(fpsCls)) fpsCls = SFO2(u"PlayerStart");
-        void* actors[128] = {0};
-        int n = CallGetAllActors(pc, fpsCls, actors);
-        LOGF("[Spawn] candidates=%d", n);
-
-        float bestZ = -1e9f;
-        for (int i = 0; i < n && i < 128; i++) {
-            if (!IVP(actors[i])) continue;
-            float tmp[3];
-            if (!FindTransformInActor(actors[i], tmp)) continue;
-            if (tmp[2] > bestZ) {
-                bestZ = tmp[2];
-                loc[0] = tmp[0]; loc[1] = tmp[1]; loc[2] = tmp[2];
-                gotLoc = true;
-            }
+        uint8_t b = 0;
+        if (RU8((char*)ps + OFF_PS_SpectatorByte, &b)) {
+            LOGF("[Spawn] PS bits BEFORE = 0x%02X", b);
+            uint8_t nb = b & ~MASK_ALL_SPECTATOR_BITS;
+            WU8((char*)ps + OFF_PS_SpectatorByte, nb);
+            LOGF("[Spawn] PS bits AFTER  = 0x%02X", nb);
         }
-        if (!gotLoc) LOGF("[Spawn] fallback loc");
-
-        void* pawnCls = FindPawnClass();
-        if (!IVP(pawnCls)) return;
-
-        FTransform xform;
-        MakeXform(loc[0], loc[1], loc[2], &xform);
-        pawn = DoSpawnActor(world, pawnCls, &xform);
-        LOGF("[Spawn] spawned pawn = %p", pawn);
-        if (!IVP(pawn)) return;
     } else {
-        LOGF("[Spawn] using existing pawn = %p", pawn);
+        LOGF("[Spawn] PlayerState is NULL");
     }
 
-    // ===== STEP 3: Full attach =====
-    WP((char*)pc + OFF_PC_Pawn, pawn);
-    WP((char*)pc + OFF_PC_AckPawn, pawn);
-    WP((char*)pawn + OFF_Pawn_Controller, pc);
-    WP((char*)pawn + OFF_Pawn_Owner, pc);
-    WP((char*)pc + OFF_PC_ViewTarget_Target, pawn);
-
-    // ===== STEP 4: Fix Pawn->PlayerState (critical!) =====
-    if (IVP(ps)) {
-        FixPawnPlayerState(pawn, ps);
+    if (!RestartPlayer) {
+        LOGF("[Spawn] RestartPlayer not resolved");
+        return;
     }
 
-    // ===== STEP 5: Clear spectator bits AGAIN (after all changes) =====
-    if (IVP(ps)) {
-        FixSpectatorFlags(ps, "step5");
-    }
+    LOGF("[Spawn] calling RestartPlayer(gm=%p, pc=%p)", gm, pc);
+    RestartPlayer(gm, pc);
+    LOGF("[Spawn] RestartPlayer returned");
 
-    // ===== STEP 6: Ensure CameraManager =====
-    void* cm = nullptr;
-    RP((char*)pc + OFF_PC_CameraManager, &cm);
-    if (!IVP(cm)) {
-        LOGF("[Cam] spawning camera manager...");
-        typedef void (*SpawnCam_t)(void*);
-        SpawnCam_t fn = (SpawnCam_t)(g_base + ADDR_SpawnPlayerCameraManager);
-        fn(pc);
-        RP((char*)pc + OFF_PC_CameraManager, &cm);
-        LOGF("[Cam] CamMgr now = %p", cm);
-    } else {
-        LOGF("[Cam] CamMgr already = %p", cm);
-    }
-
-    // ===== FINAL DUMP =====
-    void* final_pawn = nullptr; void* final_ps = nullptr;
+    void* final_pawn = nullptr;
+    void* final_ps = nullptr;
     uint8_t final_byte = 0;
     RP((char*)pc + OFF_PC_Pawn, &final_pawn);
     RP((char*)pc + OFF_PC_PlayerState, &final_ps);
     if (IVP(final_ps)) RU8((char*)final_ps + OFF_PS_SpectatorByte, &final_byte);
+
+    void* cm = nullptr;
+    RP((char*)pc + OFF_PC_CameraManager, &cm);
+
     LOGF("");
     LOGF("========== FINAL STATE ==========");
-    LOGF("Pawn = %p", final_pawn);
+    LOGF("Pawn        = %p", final_pawn);
     LOGF("PlayerState = %p", final_ps);
-    LOGF("PS+0x27A byte = 0x%02X (spec=%d only=%d)",
+    LOGF("CameraMgr   = %p", cm);
+    LOGF("PS bits     = 0x%02X (spec=%d only=%d)",
          final_byte,
          (final_byte >> 3) & 1,
          (final_byte >> 4) & 1);
     LOGF("=================================");
-    LOGF("[Spawn] ===== DONE =====");
+    LOGF("[Spawn] DONE");
 }
 
-// ============================================================
-// Hooks
-// ============================================================
 typedef void (*PL_t)(void*, void*);
 static PL_t o_PL = nullptr;
 static uint64_t g_calls = 0;
+
 static void Hook_PL(void* gm, void* pc) {
     g_calls++;
     LOGF("");
@@ -447,6 +337,7 @@ static void Hook_PL(void* gm, void* pc) {
 typedef bool (*SAP_t)(void*, char);
 static SAP_t o_SAP = nullptr;
 static bool g_spawned = false;
+
 static bool Hook_SAP(void* gm, char a2) {
     LOGF("");
     LOGF("========================================");
@@ -463,13 +354,18 @@ static bool Hook_SAP(void* gm, char a2) {
 
 typedef int (*PH_t)(void*);
 static PH_t o_PH = nullptr;
+
 static int Hook_PH(void* a1) {
     if (a1) InjectPlaylist(a1);
     return o_PH ? o_PH(a1) : 0;
 }
+
 typedef void* (*GGS_t)(void*);
 static GGS_t o_GGS = nullptr;
-static void* Hook_GGS(void* gm) { return o_GGS ? o_GGS(gm) : nullptr; }
+
+static void* Hook_GGS(void* gm) {
+    return o_GGS ? o_GGS(gm) : nullptr;
+}
 
 static void Run() {
     LibInfo i{0,0,0};
@@ -477,29 +373,31 @@ static void Run() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         i = GetLibInfo(); if (i.base) break;
     }
-    if (!i.base) { LOGF("[ERR]"); return; }
+    if (!i.base) { LOGF("[ERR] libUnreal not found"); return; }
     g_base = i.base;
     g_text_start = i.text_start;
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook — v60 (bOnlySpectator fix)");
-    LOGF(" base=0x%lx", g_base);
+    LOGF(" hook v61 - RestartPlayer fix");
+    LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
+
+    SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
+    RestartPlayer = (RestartPlayer_t)(g_base + ADDR_RestartPlayer);
+    LOGF(" SFO            = %p", (void*)SFO);
+    LOGF(" RestartPlayer  = %p", (void*)RestartPlayer);
 
     DobbyHook((void*)(g_base + ADDR_GetGameState), (void*)Hook_GGS, (void**)&o_GGS);
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
-
-    SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    LOGF("SFO: %p", (void*)SFO);
 }
 
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     InitLogFile();
-    LOGF(" hook — %s %s", __DATE__, __TIME__);
-    std::thread([]{ try { Run(); } catch (...) { LOGF("[ERR]"); } }).detach();
+    LOGF(" hook loaded %s %s", __DATE__, __TIME__);
+    std::thread([]{ try { Run(); } catch (...) { LOGF("[ERR] exception in Run"); } }).detach();
     return JNI_VERSION_1_6;
 }
