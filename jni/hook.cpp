@@ -29,7 +29,7 @@
 #define ADDR_SpawnActor                   0x947F4FC
 #define ADDR_GetAllActorsOfClass          0x93A4744
 #define ADDR_SpawnPlayerCameraManager     0x968BDDC
-#define ADDR_RestartPlayer                0x93A0664
+#define ADDR_FinishRestartPlayer          0x550FEFC
 
 #define OFF_UOBJ_OUTERPRIVATE             0x20
 
@@ -134,8 +134,8 @@ static void* g_last_pc = nullptr;
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
 
-typedef void (*RestartPlayer_t)(void*, void*);
-static RestartPlayer_t RestartPlayer = nullptr;
+typedef void (*FinishRestartPlayer_t)(void*, void*, void*);
+static FinishRestartPlayer_t FinishRestartPlayer = nullptr;
 
 static bool IVP(void* p) {
     uintptr_t v = (uintptr_t)p;
@@ -274,7 +274,6 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
 
     void* ps = nullptr;
     RP((char*)pc + OFF_PC_PlayerState, &ps);
-
     if (IVP(ps)) {
         uint8_t b = 0;
         if (RU8((char*)ps + OFF_PS_SpectatorByte, &b)) {
@@ -287,14 +286,14 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
         LOGF("[Spawn] PlayerState is NULL");
     }
 
-    if (!RestartPlayer) {
-        LOGF("[Spawn] RestartPlayer not resolved");
+    if (!FinishRestartPlayer) {
+        LOGF("[Spawn] FinishRestartPlayer not resolved");
         return;
     }
 
-    LOGF("[Spawn] calling RestartPlayer(gm=%p, pc=%p)", gm, pc);
-    RestartPlayer(gm, pc);
-    LOGF("[Spawn] RestartPlayer returned");
+    LOGF("[Spawn] calling FinishRestartPlayer(gm=%p, pc=%p, null)", gm, pc);
+    FinishRestartPlayer(gm, pc, nullptr);
+    LOGF("[Spawn] FinishRestartPlayer returned");
 
     void* final_pawn = nullptr;
     void* final_ps = nullptr;
@@ -379,14 +378,14 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook v61 - RestartPlayer fix");
+    LOGF(" hook v62 - FinishRestartPlayer fix");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    RestartPlayer = (RestartPlayer_t)(g_base + ADDR_RestartPlayer);
-    LOGF(" SFO            = %p", (void*)SFO);
-    LOGF(" RestartPlayer  = %p", (void*)RestartPlayer);
+    FinishRestartPlayer = (FinishRestartPlayer_t)(g_base + ADDR_FinishRestartPlayer);
+    LOGF(" SFO                 = %p", (void*)SFO);
+    LOGF(" FinishRestartPlayer = %p", (void*)FinishRestartPlayer);
 
     DobbyHook((void*)(g_base + ADDR_GetGameState), (void*)Hook_GGS, (void**)&o_GGS);
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
