@@ -277,10 +277,14 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (IVP(ps)) {
         uint8_t b = 0;
         if (RU8((char*)ps + OFF_PS_SpectatorByte, &b)) {
-            LOGF("[Spawn] PS bits BEFORE = 0x%02X", b);
-            uint8_t nb = b & ~MASK_ALL_SPECTATOR_BITS;
+            LOGF("[Spawn] V63 ACTIVE - PS bits BEFORE = 0x%02X", b);
             WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
-            LOGF("[Spawn] PS bits AFTER  = 0x%02X", nb);
+            uint8_t check = 0xFF;
+            if (RU8((char*)ps + OFF_PS_SpectatorByte, &check)) {
+                LOGF("[Spawn] verify readback = 0x%02X", check);
+            } else {
+                LOGF("[Spawn] verify readback FAILED");
+            }
         }
     } else {
         LOGF("[Spawn] PlayerState is NULL");
@@ -378,7 +382,7 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook v62 - FinishRestartPlayer fix");
+    LOGF(" hook v63 - clear byte 0x27A fully");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
