@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v59: spawn camera manager)
+// hook — Android JNI (v60: clear bOnlySpectator + fix Pawn)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -31,29 +31,37 @@
 #define ADDR_PostLogin                    0x550C610
 #define ADDR_SpawnActor                   0x947F4FC
 #define ADDR_GetAllActorsOfClass          0x93A4744
-#define ADDR_SpawnPlayerCameraManager     0x968BDDC   // ⭐ من IDA
+#define ADDR_SpawnPlayerCameraManager     0x968BDDC
 
-// ============================================================
-// CORRECT offsets (from IDA)
-// ============================================================
 #define OFF_UOBJ_OUTERPRIVATE             0x20
 
+// PC offsets
 #define OFF_PC_PlayerState                0x278
 #define OFF_PC_Pawn                       0x2B8
 #define OFF_PC_AckPawn                    0x2C0
-#define OFF_PC_CameraManager              0x328   // ⭐
-#define OFF_PC_CameraManagerClass         0x330   // ⭐
-#define OFF_PC_ViewTarget_Target          0x2E0   // FViewTarget.Target (guess)
+#define OFF_PC_CameraManager              0x328
+#define OFF_PC_CameraManagerClass         0x330
+#define OFF_PC_ViewTarget_Target          0x2E0
 
+// Pawn offsets
 #define OFF_Pawn_Controller               0x2A8
 #define OFF_Pawn_Owner                    0x2A0
-#define OFF_Pawn_PlayerState              0x2D0
 
+// GameMode
 #define OFF_GM_GameState                  0x2D0
 #define OFF_GS_Playlist2298               0x2298
 #define OFF_GS_Playlist2290               0x2290
+
+// PlayerState — CORRECTED from IDA
 #define OFF_PS_SpectatorByte              0x27A
-#define BIT_PS_Spectator                  0x08
+//       bit 3 = bIsSpectator
+//       bit 4 = bOnlySpectator  ← المشكلة
+//       bit 5 = ?
+//       bit 6 = ?
+//       bit 7 = ?
+#define MASK_bIsSpectator                 0x08
+#define MASK_bOnlySpectator               0x10
+#define MASK_ALL_SPECTATOR_BITS           (0x08 | 0x10 | 0x20 | 0x40)
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -186,17 +194,63 @@ static bool FindTransformInActor(void* actor, float out[3]) {
     return false;
 }
 
-static void ClearSpecBit(void* ps) {
+// ============================================================
+// ⭐ CRITICAL: Clear ALL spectator bits
+// ============================================================
+static void FixSpectatorFlags(void* ps, const char* tag) {
     if (!IVP(ps)) return;
     uint8_t b = 0;
     if (!RU8((char*)ps + OFF_PS_SpectatorByte, &b)) return;
-    uint8_t nb = b & ~BIT_PS_Spectator;
+
+    LOGF("[Fix:%s] PS+0x%X BEFORE = 0x%02X (bits: %d%d%d%d%d%d%d%d)",
+         tag, OFF_PS_SpectatorByte, b,
+         (b>>7)&1, (b>>6)&1, (b>>5)&1, (b>>4)&1,
+         (b>>3)&1, (b>>2)&1, (b>>1)&1, b&1);
+
+    uint8_t nb = b & ~MASK_ALL_SPECTATOR_BITS;
+
     if (nb != b) {
         WU8((char*)ps + OFF_PS_SpectatorByte, nb);
-        LOGF("[Spec] 0x%02X -> 0x%02X", b, nb);
+        LOGF("[Fix:%s] PS+0x%X AFTER  = 0x%02X (cleared bits 3,4,5,6)",
+             tag, OFF_PS_SpectatorByte, nb);
+    } else {
+        LOGF("[Fix:%s] no change needed", tag);
     }
 }
 
+// ============================================================
+// Fix Pawn->PlayerState (offset search)
+// ============================================================
+static void FixPawnPlayerState(void* pawn, void* ps) {
+    if (!IVP(pawn) || !IVP(ps)) return;
+
+    LOGF("[PawnFix] searching for Pawn->PlayerState offset (pawn=%p ps=%p)", pawn, ps);
+
+    // Try common offsets. We write PS to candidates that are currently null.
+    static const int candidates[] = {
+        0x2B0, 0x2B8, 0x2C0, 0x2C8, 0x2D0, 0x2D8, 0x2E0, 0x2E8,
+        0x2A8, 0x2B4, 0x2A0, 0x298, 0x290, 0x280, 0x270
+    };
+
+    int written = 0;
+    for (int off : candidates) {
+        void* cur = nullptr;
+        if (!RP((char*)pawn + off, &cur)) continue;
+        if (IVP(cur)) continue; // occupied, skip
+
+        WP((char*)pawn + off, ps);
+        written++;
+        LOGF("[PawnFix] wrote PS to Pawn+0x%X (was null)", off);
+
+        // Limit to first 3 writes to avoid corrupting
+        if (written >= 3) break;
+    }
+    LOGF("[PawnFix] wrote to %d offsets", written);
+}
+
+// ============================================================
+// GetAllActors
+// ============================================================
 typedef void (*GA_t)(void*, void*, void*);
 static int CallGetAllActors(void* ctx, void* cls, void* out[128]) {
     if (!IVP(ctx) || !IVP(cls)) return 0;
@@ -245,7 +299,6 @@ static bool InjectPlaylist(void* gm) {
     g_injected_gms.insert(gm);
     return true;
 }
-
 static void* FindPawnClass() {
     static const char16_t* names[] = {
         u"FortPlayerPawnAthena", u"FortPlayerPawnAthena_C",
@@ -258,23 +311,8 @@ static void* FindPawnClass() {
     return nullptr;
 }
 
-static void* FindCameraManagerClass() {
-    static const char16_t* names[] = {
-        u"FortPlayerCameraManager",
-        u"FortPlayerCameraManager_C",
-        u"AthenaPlayerCameraManager",
-        u"PlayerCameraManager",
-    };
-    for (auto n : names) {
-        void* c = SFO2(n);
-        if (IVP(c)) { LOGF("[CamClass] found: %p", c); return c; }
-    }
-    LOGF("[CamClass] none found via SFO");
-    return nullptr;
-}
-
 // ============================================================
-// MAIN SPAWN
+// Main spawn
 // ============================================================
 static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("");
@@ -284,12 +322,16 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
 
     if (!IVP(gm) || !IVP(pc)) return;
 
-    // --- Clear spectator ---
+    // ===== STEP 1: Fix spectator bits FIRST =====
     void* ps = nullptr;
     RP((char*)pc + OFF_PC_PlayerState, &ps);
-    if (IVP(ps)) ClearSpecBit(ps);
+    if (IVP(ps)) {
+        FixSpectatorFlags(ps, "step1");
+    } else {
+        LOGF("[Spawn] PlayerState is NULL!");
+    }
 
-    // --- Existing pawn check ---
+    // ===== STEP 2: Get or spawn Pawn =====
     void* pawn = nullptr;
     RP((char*)pc + OFF_PC_Pawn, &pawn);
 
@@ -301,7 +343,6 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (!world && IVP(gm)) world = WalkOuter(gm, 2);
     LOGF("[Spawn] World = %p", world);
 
-    // --- Spawn Pawn if needed ---
     if (!IVP(pawn)) {
         float loc[3] = { 0.0f, 0.0f, 50000.0f };
         bool gotLoc = false;
@@ -321,109 +362,68 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
                 bestZ = tmp[2];
                 loc[0] = tmp[0]; loc[1] = tmp[1]; loc[2] = tmp[2];
                 gotLoc = true;
-                LOGF("[Spawn] actor[%d] = (%.0f,%.0f,%.0f)", i, tmp[0], tmp[1], tmp[2]);
             }
         }
-        if (!gotLoc) LOGF("[Spawn] no good loc, using fallback");
+        if (!gotLoc) LOGF("[Spawn] fallback loc");
 
         void* pawnCls = FindPawnClass();
         if (!IVP(pawnCls)) return;
 
         FTransform xform;
         MakeXform(loc[0], loc[1], loc[2], &xform);
-
         pawn = DoSpawnActor(world, pawnCls, &xform);
-        LOGF("[Spawn] pawn = %p", pawn);
+        LOGF("[Spawn] spawned pawn = %p", pawn);
         if (!IVP(pawn)) return;
+    } else {
+        LOGF("[Spawn] using existing pawn = %p", pawn);
     }
 
-    // --- Write Pawn to PC (BEFORE spawning camera!) ---
+    // ===== STEP 3: Full attach =====
     WP((char*)pc + OFF_PC_Pawn, pawn);
     WP((char*)pc + OFF_PC_AckPawn, pawn);
     WP((char*)pawn + OFF_Pawn_Controller, pc);
     WP((char*)pawn + OFF_Pawn_Owner, pc);
-    if (IVP(ps)) WP((char*)pawn + OFF_Pawn_PlayerState, ps);
-
-    // Also write ViewTarget.Target
     WP((char*)pc + OFF_PC_ViewTarget_Target, pawn);
-    LOGF("[Attach] PC->Pawn = %p", pawn);
 
-    // ============================================================
-    // Camera Manager
-    // ============================================================
-    void* cm = nullptr;
-    void* cmCls = nullptr;
-    RP((char*)pc + OFF_PC_CameraManager, &cm);
-    RP((char*)pc + OFF_PC_CameraManagerClass, &cmCls);
-
-    LOGF("[Cam] BEFORE: PC->CamMgr = %p, PC->CamMgrClass = %p", cm, cmCls);
-
-    // If class null, try to set it
-    if (!IVP(cmCls)) {
-        // 1) Try GM's CameraManagerClass (scan GM memory for UClass*)
-        void* foundCls = nullptr;
-
-        // Try known offsets in GM
-        for (int off = 0x2A0; off < 0x500; off += 8) {
-            void* v = nullptr;
-            if (!RP((char*)gm + off, &v)) continue;
-            if (!IVP(v)) continue;
-            // Check if v is a UClass — try reading its name
-            // (skip for now, just log candidates)
-        }
-
-        // 2) Try SFO
-        foundCls = FindCameraManagerClass();
-
-        if (IVP(foundCls)) {
-            WP((char*)pc + OFF_PC_CameraManagerClass, foundCls);
-            LOGF("[Cam] SET PC->CamMgrClass = %p", foundCls);
-        } else {
-            LOGF("[Cam] WARN: couldn't find CameraManagerClass");
-        }
+    // ===== STEP 4: Fix Pawn->PlayerState (critical!) =====
+    if (IVP(ps)) {
+        FixPawnPlayerState(pawn, ps);
     }
 
-    // ============================================================
-    // Call SpawnPlayerCameraManager (0x968BDDC)
-    // ============================================================
+    // ===== STEP 5: Clear spectator bits AGAIN (after all changes) =====
+    if (IVP(ps)) {
+        FixSpectatorFlags(ps, "step5");
+    }
+
+    // ===== STEP 6: Ensure CameraManager =====
+    void* cm = nullptr;
+    RP((char*)pc + OFF_PC_CameraManager, &cm);
     if (!IVP(cm)) {
-        LOGF("[Cam] calling SpawnPlayerCameraManager(pc)...");
+        LOGF("[Cam] spawning camera manager...");
         typedef void (*SpawnCam_t)(void*);
         SpawnCam_t fn = (SpawnCam_t)(g_base + ADDR_SpawnPlayerCameraManager);
         fn(pc);
         RP((char*)pc + OFF_PC_CameraManager, &cm);
-        LOGF("[Cam] AFTER: PC->CamMgr = %p", cm);
+        LOGF("[Cam] CamMgr now = %p", cm);
+    } else {
+        LOGF("[Cam] CamMgr already = %p", cm);
     }
 
-    // ============================================================
-    // If CamMgr exists, try to find its ViewTarget.Target and set it to pawn
-    // ============================================================
-    if (IVP(cm)) {
-        // Scan PlayerCameraManager memory for a pointer == pawn (it might already be set)
-        LOGF("[Cam] scanning CamMgr for view target...");
-        int found = 0;
-        for (int off = 0x100; off < 0x600 && found < 5; off += 8) {
-            void* v = nullptr;
-            if (!RP((char*)cm + off, &v)) continue;
-            if (!IVP(v)) continue;
-            if (v == pawn) {
-                LOGF("[Cam] CamMgr+0x%X = pawn", off);
-                found++;
-            }
-        }
-
-        // Write ViewTarget.Target on PC too
-        WP((char*)pc + OFF_PC_ViewTarget_Target, pawn);
-    }
-
-    // ============================================================
-    // Final dump
-    // ============================================================
-    void* pc_pawn = nullptr; void* pc_cm = nullptr; void* pc_vt = nullptr;
-    RP((char*)pc + OFF_PC_Pawn, &pc_pawn);
-    RP((char*)pc + OFF_PC_CameraManager, &pc_cm);
-    RP((char*)pc + OFF_PC_ViewTarget_Target, &pc_vt);
-    LOGF("[Final] Pawn=%p CamMgr=%p VT.Target=%p", pc_pawn, pc_cm, pc_vt);
+    // ===== FINAL DUMP =====
+    void* final_pawn = nullptr; void* final_ps = nullptr;
+    uint8_t final_byte = 0;
+    RP((char*)pc + OFF_PC_Pawn, &final_pawn);
+    RP((char*)pc + OFF_PC_PlayerState, &final_ps);
+    if (IVP(final_ps)) RU8((char*)final_ps + OFF_PS_SpectatorByte, &final_byte);
+    LOGF("");
+    LOGF("========== FINAL STATE ==========");
+    LOGF("Pawn = %p", final_pawn);
+    LOGF("PlayerState = %p", final_ps);
+    LOGF("PS+0x27A byte = 0x%02X (spec=%d only=%d)",
+         final_byte,
+         (final_byte >> 3) & 1,
+         (final_byte >> 4) & 1);
+    LOGF("=================================");
     LOGF("[Spawn] ===== DONE =====");
 }
 
@@ -483,7 +483,7 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook — v59 (SpawnPlayerCameraManager)");
+    LOGF(" hook — v60 (bOnlySpectator fix)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
