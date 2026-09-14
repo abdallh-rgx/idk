@@ -26,14 +26,15 @@
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
-#define STATIC_VFT_RVA                   0xBDB8BC0
-#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDE
+#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
+#define VFT_IDX_SpawnDefaultPawnFor         0xDE
 
 #define OFF_PC_PlayerState               0x278
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
 #define OFF_PS_SpectatorByte             0x27A
+#define OFF_GM_DefaultPawnClass          0x330
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -63,6 +64,11 @@ static bool RP(void* a, void** o) {
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
 
+static bool WP(void* a, void* v) {
+    struct iovec l = { &v, sizeof(void*) }, r = { a, sizeof(void*) };
+    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
+}
+
 static bool RU8(void* a, uint8_t* v) {
     struct iovec l = { v, 1 }, r = { a, 1 };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 1;
@@ -86,7 +92,7 @@ static LibInfo GetLibInfo() {
             const auto& p = ph->dlpi_phdr[i];
             if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
             o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end = o->text_start + p.p_memsz;
+            o->text_end = o->text_start + p.p_vaddr;
             break;
         }
         return 1;
@@ -107,65 +113,45 @@ static bool IVP(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
-static SpawnDefaultPawnAtTransform_t SpawnDefaultPawnAtTransform = nullptr;
+typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*, void*);
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
-static void DumpUFunction(void* fn) {
-    if (!IVP(fn)) { LOGF("[Dump] UFunction invalid"); return; }
-
-    LOGF("========== UFunction Dump %p ==========", fn);
-
-    for (size_t off = 0x00; off < 0x200; off += 8) {
-        void* v = nullptr;
-        if (!RP((char*)fn + off, &v)) {
-            LOGF("  +0x%03zX = <unreadable>", off);
-            continue;
-        }
-
-        if (!IVP(v)) {
-            LOGF("  +0x%03zX = 0x%lX", off, (unsigned long)(uintptr_t)v);
-            continue;
-        }
-
-        uintptr_t rva = (uintptr_t)v - g_base;
-        if (rva < 0x20000000ULL) {
-            LOGF("  +0x%03zX = %p   (RVA=0x%lX)   <=== FUNCTION CANDIDATE",
-                 off, v, (unsigned long)rva);
-        } else {
-            LOGF("  +0x%03zX = %p   (RVA too large)", off, v);
-        }
+static void* GetPawnClass(void* gm) {
+    void* pawnClass = nullptr;
+    RP((char*)gm + OFF_GM_DefaultPawnClass, &pawnClass);
+    if (!IVP(pawnClass) && SFO) {
+        pawnClass = SFO(nullptr, nullptr, u"/Script/FortniteGame.FortPlayerPawnAthena", false);
     }
-
-    LOGF("========== End UFunction Dump ==========");
+    return pawnClass;
 }
 
-static void* FindSpawnDefaultPawnForFunc() {
-    if (!SFO) return nullptr;
+static void DirectSpawn(void* gm, void* pc) {
+    if (!IVP(gm) || !IVP(pc)) return;
 
-    const char16_t* paths[] = {
-        u"/Script/FortniteGame.FortGameMode.SpawnDefaultPawnFor",
-        u"/Script/FortniteGame.FortGameModeAthena.SpawnDefaultPawnFor",
-        u"/Script/FortniteGame.FortGameModeBase.SpawnDefaultPawnFor",
-        u"/Script/Engine.GameModeBase.SpawnDefaultPawnFor",
-    };
+    void** vft = *(void***)gm;
+    if (!vft) return;
 
-    for (auto p : paths) {
-        void* fn = SFO(nullptr, nullptr, p, false);
-        if (IVP(fn)) {
-            LOGF("[Find] FOUND '%ls' -> %p", p, fn);
-            return fn;
-        }
-        LOGF("[Find] miss '%ls' -> %p", p, fn);
-    }
-    return nullptr;
+    auto SpawnAtTransform = (SpawnDefaultPawnAtTransform_t)vft[VFT_IDX_SpawnDefaultPawnAtTransform];
+    if (!SpawnAtTransform) return;
+
+    void* pawnClass = GetPawnClass(gm);
+
+    FTransform sky;
+    memset(&sky, 0, sizeof(sky));
+    sky.qw = 1.0f;
+    sky.tx = 0.0f;
+    sky.ty = 0.0f;
+    sky.tz = 4000.0f;
+    sky.sx = sky.sy = sky.sz = 1.0f;
+
+    void* newPawn = SpawnAtTransform(gm, pc, &sky, pawnClass);
+    LOGF("[Spawn] Result Pawn = %p", newPawn);
 }
 
 static void* FindPlaylist() {
     if (!SFO) return nullptr;
-    return SFO(nullptr, nullptr,
-        u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
+    return SFO(nullptr, nullptr, u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
 }
 
 static bool InjectPlaylist(void* gm) {
@@ -197,50 +183,13 @@ static void ClearSpectator(void* pc) {
     }
 }
 
-static void ReadSpawnDefaultPawnAtTransform() {
-    void** vft = (void**)(g_base + STATIC_VFT_RVA);
-    if (!IVP(vft)) { LOGF("[VFT] invalid"); return; }
-
-    void* at = nullptr;
-    if (RP((char*)vft + VFT_IDX_SpawnDefaultPawnAtTransform * sizeof(void*), &at) && IVP(at)) {
-        SpawnDefaultPawnAtTransform = (SpawnDefaultPawnAtTransform_t)at;
-        LOGF("[VFT] SpawnDefaultPawnAtTransform = %p (RVA=0x%lX)",
-             at, (unsigned long)((uintptr_t)at - g_base));
-    } else {
-        LOGF("[VFT] SpawnDefaultPawnAtTransform read FAILED");
-    }
-}
-
-// ============================================================
-// تشخيص مؤجل - ينفذ فقط داخل PostLogin عندما المحرك جاهز
-// ============================================================
-static bool g_diag_done = false;
-
-static void RunDiagnostics() {
-    if (g_diag_done) return;
-    g_diag_done = true;
-
-    LOGF("========================================");
-    LOGF("[Diag] Starting UFunction diagnostics...");
-    LOGF("========================================");
-
-    void* fn = FindSpawnDefaultPawnForFunc();
-    LOGF("[Diag] SpawnDefaultPawnFor UFunction = %p", fn);
-    if (IVP(fn)) {
-        DumpUFunction(fn);
-    } else {
-        LOGF("[Diag] UFunction not found - all paths missed");
-    }
-}
-
 typedef void (*PL_t)(void*, void*);
 static PL_t o_PL = nullptr;
 static uint64_t g_calls = 0;
 
 static void Hook_PL(void* gm, void* pc) {
     g_calls++;
-    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
-         (unsigned long long)g_calls, gm, pc);
+    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========", (unsigned long long)g_calls, gm, pc);
 
     InjectPlaylist(gm);
     ClearSpectator(pc);
@@ -249,21 +198,11 @@ static void Hook_PL(void* gm, void* pc) {
 
     ClearSpectator(pc);
 
-    // تشخيص UFunction بعد ما المحرك جهز
-    RunDiagnostics();
-
-    // محاولة Spawn يدوية (اختيارية - قد تفشل إذا World ما بدأ)
-    if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
-        FTransform sky;
-        memset(&sky, 0, sizeof(sky));
-        sky.qw = 1.0f;
-        sky.tz = 500.0f;
-        sky.sx = sky.sy = sky.sz = 1.0f;
-
-        LOGF("[Spawn] Attempting manual spawn...");
-        void* pawn = SpawnDefaultPawnAtTransform(gm, pc, &sky);
-        LOGF("[Spawn] pawn = %p", pawn);
-    }
+    std::thread([gm, pc]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        ClearSpectator(pc);
+        DirectSpawn(gm, pc);
+    }).detach();
 
     LOGF("[PostLogin] done");
 }
@@ -294,18 +233,12 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v14 - diag inside PostLogin");
+    LOGF(" hook v16 - Direct Spawn VFT Fixed");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     LOGF(" SFO = %p (RVA=0x%X)", (void*)SFO, ADDR_StaticFindObject);
-
-    // هذا آمن - فقط قراءة من Static VFT
-    ReadSpawnDefaultPawnAtTransform();
-
-    // ما نستدعي SFO هنا إطلاقاً!
-    // فقط نركب الـ hooks
 
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
