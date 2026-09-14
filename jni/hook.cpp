@@ -69,6 +69,11 @@ static bool RP(void* a, void** o) {
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
 
+static bool WP(void* a, void* v) {
+    struct iovec l = { &v, sizeof(void*) }, r = { a, sizeof(void*) };
+    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
+}
+
 static bool WU8(void* a, uint8_t v) {
     struct iovec l = { &v, 1 }, r = { a, 1 };
     return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == 1;
@@ -104,6 +109,8 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
+static void* g_cached_pawn_class = nullptr;
+static size_t g_pawn_class_offset = 0;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
@@ -134,9 +141,6 @@ static bool VFTHook(void* vft, size_t vft_index, void* hook_fn, void** orig_out)
     return true;
 }
 
-// ============================================================
-// فحص Slot 78 باستخدام Static VFT RVA فقط (بدون عنوان ثابت)
-// ============================================================
 static void DumpSlot78() {
     LOGF("========================================");
     LOGF("[Slot78] Static VFT RVA = 0x%X", STATIC_VFT_RVA);
@@ -207,6 +211,24 @@ static void* FindPlaylist() {
     return SFO(nullptr, nullptr, u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
 }
 
+static void* FindPlayerPawnClass() {
+    if (!SFO) return nullptr;
+
+    const char16_t* paths[] = {
+        u"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
+        u"/Game/Athena/Player/FortPlayerPawn.FortPlayerPawn_C",
+        u"/Game/Athena/Player/FortPlayerPawnAthena.FortPlayerPawnAthena_C",
+        u"/Game/PlayerPawn_Athena.PlayerPawn_Athena_C",
+    };
+
+    for (auto path : paths) {
+        void* cls = SFO(nullptr, nullptr, path, false);
+        LOGF("[PawnClass] try -> %p", cls);
+        if (IVP(cls)) return cls;
+    }
+    return nullptr;
+}
+
 static bool InjectPlaylist(void* gm) {
     if (!gm) return false;
     std::lock_guard<std::mutex> lock(g_inject_mutex);
@@ -234,6 +256,59 @@ static void ClearSpectator(void* pc) {
         WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
         LOGF("[Spectator] 0x%02X -> 0x00", b);
     }
+}
+
+// ============================================================
+// حقن DefaultPawnClass داخل GameMode
+// ============================================================
+static bool InjectDefaultPawnClassAt(void* gm, void* pawnClass, size_t off) {
+    void* prev = nullptr;
+    if (!RP((char*)gm + off, &prev)) return false;
+    if (!WP((char*)gm + off, pawnClass)) return false;
+    LOGF("[PawnInject] wrote at 0x%zX (prev=%p) -> %p", off, prev, pawnClass);
+    return true;
+}
+
+static void* TrySpawnWithInjectedClass(void* gm, void* pc, void* pawnClass, size_t off) {
+    if (!InjectDefaultPawnClassAt(gm, pawnClass, off)) return nullptr;
+
+    FTransform sky;
+    MakeSkyXform(&sky);
+    void* pawn = SpawnDefaultPawnAtTransform ? SpawnDefaultPawnAtTransform(gm, pc, &sky) : nullptr;
+    LOGF("[PawnInject] spawn @0x%zX -> %p", off, pawn);
+
+    if (IVP(pawn)) {
+        g_pawn_class_offset = off;
+        LOGF("[PawnInject] *** FOUND OFFSET 0x%zX ***", off);
+        return pawn;
+    }
+    return nullptr;
+}
+
+static void* InjectDefaultPawnClass(void* gm, void* pc, void* pawnClass) {
+    if (!IVP(gm) || !IVP(pc) || !IVP(pawnClass)) {
+        LOGF("[PawnInject] invalid args");
+        return nullptr;
+    }
+
+    if (g_pawn_class_offset != 0) {
+        LOGF("[PawnInject] Using cached offset 0x%zX", g_pawn_class_offset);
+        return TrySpawnWithInjectedClass(gm, pc, pawnClass, g_pawn_class_offset);
+    }
+
+    size_t candidates[] = {
+        0x2D8, 0x2E0, 0x2E8, 0x2F0, 0x2F8, 0x300, 0x308,
+        0x310, 0x318, 0x320, 0x328, 0x330, 0x338, 0x340,
+        0x348, 0x350, 0x358, 0x360, 0x368, 0x370,
+    };
+
+    for (size_t off : candidates) {
+        void* pawn = TrySpawnWithInjectedClass(gm, pc, pawnClass, off);
+        if (IVP(pawn)) return pawn;
+    }
+
+    LOGF("[PawnInject] All candidate offsets failed.");
+    return nullptr;
 }
 
 static bool g_vftHooked = false;
@@ -287,34 +362,22 @@ static void Hook_PL(void* gm, void* pc) {
     ClearSpectator(pc);
 
     if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
-        LOGF("[PostLogin] Forcing IMMEDIATE spawn at Z=%.1f", SKY_Z);
+        if (!g_cached_pawn_class) {
+            g_cached_pawn_class = FindPlayerPawnClass();
+            LOGF("[PawnClass] Cached = %p", g_cached_pawn_class);
+        }
 
-        FTransform sky;
-        MakeSkyXform(&sky);
-        void* pawn = SpawnDefaultPawnAtTransform(gm, pc, &sky);
-        LOGF("[PostLogin] First spawn attempt: Pawn=%p", pawn);
-
-        if (IVP(pawn)) {
-            LOGF("[PostLogin] SUCCESS! Player spawned immediately.");
-            ClearSpectator(pc);
+        if (IVP(g_cached_pawn_class)) {
+            LOGF("[PostLogin] Injecting DefaultPawnClass and spawning...");
+            void* pawn = InjectDefaultPawnClass(gm, pc, g_cached_pawn_class);
+            if (IVP(pawn)) {
+                ClearSpectator(pc);
+                LOGF("[PostLogin] SUCCESS! Pawn=%p (offset=0x%zX)", pawn, g_pawn_class_offset);
+            } else {
+                LOGF("[PostLogin] Failed to spawn with injected class.");
+            }
         } else {
-            LOGF("[PostLogin] First attempt failed. Retrying quickly...");
-            std::thread([gm, pc]() {
-                for (int i = 0; i < 20; i++) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    if (!SpawnDefaultPawnAtTransform) return;
-                    FTransform s;
-                    MakeSkyXform(&s);
-                    void* p = SpawnDefaultPawnAtTransform(gm, pc, &s);
-                    LOGF("[Retry] attempt=%d pawn=%p", i, p);
-                    if (IVP(p)) {
-                        ClearSpectator(pc);
-                        LOGF("[Retry] SUCCESS on attempt %d!", i);
-                        return;
-                    }
-                }
-                LOGF("[Retry] All attempts failed.");
-            }).detach();
+            LOGF("[PostLogin] PawnClass not found, cannot inject.");
         }
     }
 
@@ -347,14 +410,13 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook vft v10 - slot78 RVA check");
+    LOGF(" hook vft v11 - DefaultPawnClass inject");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     LOGF(" SFO = %p (RVA=0x%X)", (void*)SFO, ADDR_StaticFindObject);
 
-    // فحص Slot 78 بالطريقة الـ Static RVA فقط
     DumpSlot78();
 
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
