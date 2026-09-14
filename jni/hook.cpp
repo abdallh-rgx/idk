@@ -26,6 +26,10 @@
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
+#define STATIC_VFT_RVA                   0xBDB8BC0
+#define VFT_SLOT_CHECK                   78
+#define VFT_SLOT_CHECK_OFF               (VFT_SLOT_CHECK * sizeof(void*))
+
 #define VFT_IDX_SpawnDefaultPawnFor      0xDD
 #define VFT_IDX_SpawnDefaultPawnAtTransform 0xDE
 
@@ -35,7 +39,6 @@
 #define OFF_GS_Playlist2290              0x2290
 #define OFF_PS_SpectatorByte             0x27A
 
-// تم تعديل الارتفاع ليكون فوق الماب وليس تحت
 #define SKY_Z                            500.0f
 
 static FILE* g_logfile = nullptr;
@@ -131,6 +134,43 @@ static bool VFTHook(void* vft, size_t vft_index, void* hook_fn, void** orig_out)
     return true;
 }
 
+// ============================================================
+// فحص Slot 78 باستخدام Static VFT RVA فقط (بدون عنوان ثابت)
+// ============================================================
+static void DumpSlot78() {
+    LOGF("========================================");
+    LOGF("[Slot78] Static VFT RVA = 0x%X", STATIC_VFT_RVA);
+    LOGF("[Slot78] Slot = %d, Slot Offset = 0x%zX", VFT_SLOT_CHECK, (size_t)VFT_SLOT_CHECK_OFF);
+
+    void** vft = (void**)(g_base + STATIC_VFT_RVA);
+    LOGF("[Slot78] Static VFT Addr = %p (g_base + 0x%X)", (void*)vft, STATIC_VFT_RVA);
+
+    if (!IVP(vft)) {
+        LOGF("[Slot78] VFT pointer invalid");
+        return;
+    }
+
+    void* slot78 = nullptr;
+    if (!RP((char*)vft + VFT_SLOT_CHECK_OFF, &slot78)) {
+        LOGF("[Slot78] read failed");
+        return;
+    }
+
+    if (!IVP(slot78)) {
+        LOGF("[Slot78] slot value invalid: %p", slot78);
+        return;
+    }
+
+    uintptr_t addr = (uintptr_t)slot78;
+    uintptr_t rva = addr - g_base;
+
+    LOGF("[Slot78] VTable[%d] @ (vft+0x%zX) = %p",
+         VFT_SLOT_CHECK, (size_t)VFT_SLOT_CHECK_OFF, slot78);
+    LOGF("[Slot78] Runtime Addr = 0x%lX", (unsigned long)addr);
+    LOGF("[Slot78] Function RVA = 0x%lX", (unsigned long)rva);
+    LOGF("========================================");
+}
+
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
 static void MakeSkyXform(FTransform* t) {
@@ -198,20 +238,21 @@ static void ClearSpectator(void* pc) {
 
 static bool g_vftHooked = false;
 
-// تم استخدام VFT الثابت بناءً على كلام Mariki
 static void ApplyVftHooks() {
-    void** vft = (void**)(g_base + 0xBDB8BC0);
-    
+    void** vft = (void**)(g_base + STATIC_VFT_RVA);
+
     if (!IVP(vft)) {
         LOGF("[VFT] Static VFT pointer invalid: %p", vft);
         return;
     }
-    LOGF("[VFT] Using Static VFT = %p", vft);
+    LOGF("[VFT] Using Static VFT = %p (RVA=0x%X)", vft, STATIC_VFT_RVA);
 
     void* at = nullptr;
     if (RP((char*)vft + VFT_IDX_SpawnDefaultPawnAtTransform * sizeof(void*), &at) && IVP(at)) {
         SpawnDefaultPawnAtTransform = (SpawnDefaultPawnAtTransform_t)at;
-        LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p", VFT_IDX_SpawnDefaultPawnAtTransform, at);
+        LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p (RVA=0x%lX)",
+             VFT_IDX_SpawnDefaultPawnAtTransform, at,
+             (unsigned long)((uintptr_t)at - g_base));
     } else {
         LOGF("[VFT] SpawnDefaultPawnAtTransform read FAILED");
         return;
@@ -220,7 +261,8 @@ static void ApplyVftHooks() {
     void* orig = nullptr;
     bool ok = VFTHook(vft, VFT_IDX_SpawnDefaultPawnFor, (void*)Hook_SpawnDefaultPawnFor, &orig);
     o_SpawnDefaultPawnFor = (SpawnDefaultPawnFor_t)orig;
-    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)", VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL", orig);
+    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)",
+         VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL", orig);
 }
 
 typedef void (*PL_t)(void*, void*);
@@ -229,7 +271,8 @@ static uint64_t g_calls = 0;
 
 static void Hook_PL(void* gm, void* pc) {
     g_calls++;
-    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========", (unsigned long long)g_calls, gm, pc);
+    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
+         (unsigned long long)g_calls, gm, pc);
 
     if (!g_vftHooked) {
         ApplyVftHooks();
@@ -243,28 +286,26 @@ static void Hook_PL(void* gm, void* pc) {
 
     ClearSpectator(pc);
 
-    // هنا التنفيذ الفوري: نحاول نرسبن اللاعب فوراً بمجرد استدعاء PostLogin
     if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
         LOGF("[PostLogin] Forcing IMMEDIATE spawn at Z=%.1f", SKY_Z);
-        
+
         FTransform sky;
         MakeSkyXform(&sky);
         void* pawn = SpawnDefaultPawnAtTransform(gm, pc, &sky);
         LOGF("[PostLogin] First spawn attempt: Pawn=%p", pawn);
-        
+
         if (IVP(pawn)) {
             LOGF("[PostLogin] SUCCESS! Player spawned immediately.");
             ClearSpectator(pc);
         } else {
-            // إذا فشل، ننتظر أجزاء من الثانية (وليس الباص) ونحاول مرة أخرى بسرعة
-            LOGF("[PostLogin] First attempt failed (DefaultPawnClass might be null). Retrying quickly...");
+            LOGF("[PostLogin] First attempt failed. Retrying quickly...");
             std::thread([gm, pc]() {
                 for (int i = 0; i < 20; i++) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 50ms فقط
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     if (!SpawnDefaultPawnAtTransform) return;
-                    FTransform sky;
-                    MakeSkyXform(&sky);
-                    void* p = SpawnDefaultPawnAtTransform(gm, pc, &sky);
+                    FTransform s;
+                    MakeSkyXform(&s);
+                    void* p = SpawnDefaultPawnAtTransform(gm, pc, &s);
                     LOGF("[Retry] attempt=%d pawn=%p", i, p);
                     if (IVP(p)) {
                         ClearSpectator(pc);
@@ -272,7 +313,7 @@ static void Hook_PL(void* gm, void* pc) {
                         return;
                     }
                 }
-                LOGF("[Retry] All attempts failed. You need to set DefaultPawnClass on GameMode!");
+                LOGF("[Retry] All attempts failed.");
             }).detach();
         }
     }
@@ -306,12 +347,15 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook vft v9 - IMMEDIATE PostLogin Spawn");
+    LOGF(" hook vft v10 - slot78 RVA check");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    LOGF(" SFO = %p", (void*)SFO);
+    LOGF(" SFO = %p (RVA=0x%X)", (void*)SFO, ADDR_StaticFindObject);
+
+    // فحص Slot 78 بالطريقة الـ Static RVA فقط
+    DumpSlot78();
 
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
