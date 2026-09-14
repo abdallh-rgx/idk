@@ -35,7 +35,8 @@
 #define OFF_GS_Playlist2290              0x2290
 #define OFF_PS_SpectatorByte             0x27A
 
-#define SKY_Z                            1000.0f
+// تم تعديل الارتفاع ليكون فوق الماب وليس تحت
+#define SKY_Z                            500.0f
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -109,39 +110,24 @@ static bool IVP(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-static bool VFTHook(void* obj, size_t vft_index, void* hook_fn, void** orig_out) {
-    if (!obj || !hook_fn) return false;
-
-    void** vtable = nullptr;
-    if (!RP(obj, (void**)&vtable)) return false;
-    if (!IVP(vtable)) return false;
-
+static bool VFTHook(void* vft, size_t vft_index, void* hook_fn, void** orig_out) {
+    if (!vft || !hook_fn) return false;
     void** slot = nullptr;
-    if (!RP((char*)vtable + vft_index * sizeof(void*), (void**)&slot)) return false;
-
+    if (!RP((char*)vft + vft_index * sizeof(void*), (void**)&slot)) return false;
     void* current = nullptr;
     if (!RP(slot, &current)) return false;
-
     if (orig_out) *orig_out = current;
 
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     uintptr_t addr = reinterpret_cast<uintptr_t>(slot);
     uintptr_t page_start = addr & ~(page_size - 1);
-
     size_t span = page_size;
     if ((addr + sizeof(void*)) > (page_start + page_size)) span += page_size;
 
-    if (mprotect(reinterpret_cast<void*>(page_start), span,
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        return false;
-    }
-
+    if (mprotect(reinterpret_cast<void*>(page_start), span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
     *slot = hook_fn;
-
     mprotect(reinterpret_cast<void*>(page_start), span, PROT_READ | PROT_EXEC);
-
-    __builtin___clear_cache(reinterpret_cast<char*>(page_start),
-                            reinterpret_cast<char*>(page_start + span));
+    __builtin___clear_cache(reinterpret_cast<char*>(page_start), reinterpret_cast<char*>(page_start + span));
     return true;
 }
 
@@ -150,8 +136,6 @@ struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; }
 static void MakeSkyXform(FTransform* t) {
     memset(t, 0, sizeof(*t));
     t->qw = 1.0f;
-    t->tx = 0.0f;
-    t->ty = 0.0f;
     t->tz = SKY_Z;
     t->sx = t->sy = t->sz = 1.0f;
 }
@@ -163,34 +147,24 @@ typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
 static SpawnDefaultPawnAtTransform_t SpawnDefaultPawnAtTransform = nullptr;
 
 static void* Hook_SpawnDefaultPawnFor(void* gm, void* controller, void* startSpot) {
-    LOGF("");
-    LOGF("========================================");
     LOGF("[SpawnDefaultPawnFor] gm=%p ctrl=%p spot=%p", gm, controller, startSpot);
-
     if (IVP(gm) && IVP(controller) && SpawnDefaultPawnAtTransform) {
-        FTransform sky;
-        MakeSkyXform(&sky);
-        LOGF("[Sky] Forcing spawn at Z=%.1f", sky.tz);
-
-        void* pawn = SpawnDefaultPawnAtTransform(gm, controller, &sky);
+        FTransform transform;
+        MakeSkyXform(&transform);
+        void* pawn = SpawnDefaultPawnAtTransform(gm, controller, &transform);
         if (IVP(pawn)) {
-            LOGF("[Sky] SUCCESS Pawn=%p", pawn);
-            LOGF("========================================");
+            LOGF("[SpawnDefaultPawnFor] SUCCESS Pawn=%p", pawn);
             return pawn;
         }
-        LOGF("[Sky] FAILED -> fallback");
     }
-
     void* res = o_SpawnDefaultPawnFor ? o_SpawnDefaultPawnFor(gm, controller, startSpot) : nullptr;
     LOGF("[SpawnDefaultPawnFor] fallback Pawn=%p", res);
-    LOGF("========================================");
     return res;
 }
 
 static void* FindPlaylist() {
     if (!SFO) return nullptr;
-    return SFO(nullptr, nullptr,
-        u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
+    return SFO(nullptr, nullptr, u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
 }
 
 static bool InjectPlaylist(void* gm) {
@@ -218,39 +192,35 @@ static void ClearSpectator(void* pc) {
     uint8_t b = 0;
     if (RU8((char*)ps + OFF_PS_SpectatorByte, &b) && b != 0) {
         WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
-        LOGF("[Spectator] 0x%02X -> 0x00 (PS=%p)", b, ps);
+        LOGF("[Spectator] 0x%02X -> 0x00", b);
     }
 }
 
 static bool g_vftHooked = false;
 
-static void ApplyVftHooks(void* gm) {
-    if (!IVP(gm)) { LOGF("[VFT] gm invalid"); return; }
-
-    void** vft = nullptr;
-    if (!RP(gm, (void**)&vft) || !IVP(vft)) {
-        LOGF("[VFT] vft invalid");
+// تم استخدام VFT الثابت بناءً على كلام Mariki
+static void ApplyVftHooks() {
+    void** vft = (void**)(g_base + 0xBDB8BC0);
+    
+    if (!IVP(vft)) {
+        LOGF("[VFT] Static VFT pointer invalid: %p", vft);
         return;
     }
-    LOGF("[VFT] gm=%p vft=%p", gm, (void*)vft);
+    LOGF("[VFT] Using Static VFT = %p", vft);
 
     void* at = nullptr;
     if (RP((char*)vft + VFT_IDX_SpawnDefaultPawnAtTransform * sizeof(void*), &at) && IVP(at)) {
         SpawnDefaultPawnAtTransform = (SpawnDefaultPawnAtTransform_t)at;
-        LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p",
-             VFT_IDX_SpawnDefaultPawnAtTransform, (void*)at);
+        LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p", VFT_IDX_SpawnDefaultPawnAtTransform, at);
     } else {
         LOGF("[VFT] SpawnDefaultPawnAtTransform read FAILED");
         return;
     }
 
     void* orig = nullptr;
-    bool ok = VFTHook(gm, VFT_IDX_SpawnDefaultPawnFor,
-                      (void*)Hook_SpawnDefaultPawnFor,
-                      &orig);
+    bool ok = VFTHook(vft, VFT_IDX_SpawnDefaultPawnFor, (void*)Hook_SpawnDefaultPawnFor, &orig);
     o_SpawnDefaultPawnFor = (SpawnDefaultPawnFor_t)orig;
-    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)",
-         VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL", orig);
+    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)", VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL", orig);
 }
 
 typedef void (*PL_t)(void*, void*);
@@ -259,12 +229,10 @@ static uint64_t g_calls = 0;
 
 static void Hook_PL(void* gm, void* pc) {
     g_calls++;
-    LOGF("");
-    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
-         (unsigned long long)g_calls, gm, pc);
+    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========", (unsigned long long)g_calls, gm, pc);
 
-    if (!g_vftHooked && IVP(gm)) {
-        ApplyVftHooks(gm);
+    if (!g_vftHooked) {
+        ApplyVftHooks();
         g_vftHooked = true;
     }
 
@@ -275,13 +243,38 @@ static void Hook_PL(void* gm, void* pc) {
 
     ClearSpectator(pc);
 
+    // هنا التنفيذ الفوري: نحاول نرسبن اللاعب فوراً بمجرد استدعاء PostLogin
     if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
+        LOGF("[PostLogin] Forcing IMMEDIATE spawn at Z=%.1f", SKY_Z);
+        
         FTransform sky;
         MakeSkyXform(&sky);
-        LOGF("[Force Sky] Trying manual spawn at Z=%.1f", sky.tz);
         void* pawn = SpawnDefaultPawnAtTransform(gm, pc, &sky);
-        LOGF("[Force Sky] Pawn = %p", pawn);
-        ClearSpectator(pc);
+        LOGF("[PostLogin] First spawn attempt: Pawn=%p", pawn);
+        
+        if (IVP(pawn)) {
+            LOGF("[PostLogin] SUCCESS! Player spawned immediately.");
+            ClearSpectator(pc);
+        } else {
+            // إذا فشل، ننتظر أجزاء من الثانية (وليس الباص) ونحاول مرة أخرى بسرعة
+            LOGF("[PostLogin] First attempt failed (DefaultPawnClass might be null). Retrying quickly...");
+            std::thread([gm, pc]() {
+                for (int i = 0; i < 20; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 50ms فقط
+                    if (!SpawnDefaultPawnAtTransform) return;
+                    FTransform sky;
+                    MakeSkyXform(&sky);
+                    void* p = SpawnDefaultPawnAtTransform(gm, pc, &sky);
+                    LOGF("[Retry] attempt=%d pawn=%p", i, p);
+                    if (IVP(p)) {
+                        ClearSpectator(pc);
+                        LOGF("[Retry] SUCCESS on attempt %d!", i);
+                        return;
+                    }
+                }
+                LOGF("[Retry] All attempts failed. You need to set DefaultPawnClass on GameMode!");
+            }).detach();
+        }
     }
 
     LOGF("[PostLogin] done");
@@ -313,7 +306,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook vft v6 - force spawn");
+    LOGF(" hook vft v9 - IMMEDIATE PostLogin Spawn");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
