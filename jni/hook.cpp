@@ -29,7 +29,6 @@
 #define ADDR_SpawnActor                   0x947F4FC
 #define ADDR_GetAllActorsOfClass          0x93A4744
 #define ADDR_SpawnPlayerCameraManager     0x968BDDC
-#define ADDR_FinishRestartPlayer          0x550FEFC
 
 #define OFF_UOBJ_OUTERPRIVATE             0x20
 
@@ -39,6 +38,7 @@
 #define OFF_PC_CameraManager              0x328
 #define OFF_PC_CameraManagerClass         0x330
 #define OFF_PC_ViewTarget_Target          0x2E0
+#define OFF_PC_World                      0x180
 
 #define OFF_Pawn_Controller               0x2A8
 #define OFF_Pawn_Owner                    0x2A0
@@ -133,9 +133,6 @@ static void* g_last_pc = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
-
-typedef void (*FinishRestartPlayer_t)(void*, void*, void*);
-static FinishRestartPlayer_t FinishRestartPlayer = nullptr;
 
 static bool IVP(void* p) {
     uintptr_t v = (uintptr_t)p;
@@ -265,7 +262,7 @@ static void* FindPawnClass() {
 static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("");
     LOGF("============================================================");
-    LOGF("[Spawn] GM=%p PC=%p", gm, pc);
+    LOGF("[Spawn] Manual Spawn GM=%p PC=%p", gm, pc);
     LOGF("============================================================");
 
     if (!IVP(gm) || !IVP(pc)) return;
@@ -277,48 +274,34 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (IVP(ps)) {
         uint8_t b = 0;
         if (RU8((char*)ps + OFF_PS_SpectatorByte, &b)) {
-            LOGF("[Spawn] V63 ACTIVE - PS bits BEFORE = 0x%02X", b);
             WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
-            uint8_t check = 0xFF;
-            if (RU8((char*)ps + OFF_PS_SpectatorByte, &check)) {
-                LOGF("[Spawn] verify readback = 0x%02X", check);
-            } else {
-                LOGF("[Spawn] verify readback FAILED");
-            }
+        }
+    }
+
+    void* world = nullptr;
+    RP((char*)pc + OFF_PC_World, &world);
+    if (!IVP(world)) {
+        RP((char*)gm + OFF_PC_World, &world);
+    }
+
+    void* pawnClass = FindPawnClass();
+
+    if (IVP(world) && IVP(pawnClass)) {
+        FTransform customTransform;
+        MakeXform(0.0f, 0.0f, 10000.0f, &customTransform);
+
+        void* new_pawn = DoSpawnActor(world, pawnClass, &customTransform);
+
+        if (IVP(new_pawn)) {
+            WP((char*)pc + OFF_PC_Pawn, new_pawn);
+            WP((char*)pc + OFF_PC_AckPawn, new_pawn);
+            LOGF("[Spawn] Manual Spawn SUCCESS. Pawn=%p", new_pawn);
+        } else {
+            LOGF("[Spawn] Manual Spawn FAILED.");
         }
     } else {
-        LOGF("[Spawn] PlayerState is NULL");
+        LOGF("[Spawn] Invalid World or PawnClass.");
     }
-
-    if (!FinishRestartPlayer) {
-        LOGF("[Spawn] FinishRestartPlayer not resolved");
-        return;
-    }
-
-    LOGF("[Spawn] calling FinishRestartPlayer(gm=%p, pc=%p, null)", gm, pc);
-    FinishRestartPlayer(gm, pc, nullptr);
-    LOGF("[Spawn] FinishRestartPlayer returned");
-
-    void* final_pawn = nullptr;
-    void* final_ps = nullptr;
-    uint8_t final_byte = 0;
-    RP((char*)pc + OFF_PC_Pawn, &final_pawn);
-    RP((char*)pc + OFF_PC_PlayerState, &final_ps);
-    if (IVP(final_ps)) RU8((char*)final_ps + OFF_PS_SpectatorByte, &final_byte);
-
-    void* cm = nullptr;
-    RP((char*)pc + OFF_PC_CameraManager, &cm);
-
-    LOGF("");
-    LOGF("========== FINAL STATE ==========");
-    LOGF("Pawn        = %p", final_pawn);
-    LOGF("PlayerState = %p", final_ps);
-    LOGF("CameraMgr   = %p", cm);
-    LOGF("PS bits     = 0x%02X (spec=%d only=%d)",
-         final_byte,
-         (final_byte >> 3) & 1,
-         (final_byte >> 4) & 1);
-    LOGF("=================================");
     LOGF("[Spawn] DONE");
 }
 
@@ -382,14 +365,12 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook v63 - clear byte 0x27A fully");
+    LOGF(" hook manual spawn");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    FinishRestartPlayer = (FinishRestartPlayer_t)(g_base + ADDR_FinishRestartPlayer);
-    LOGF(" SFO                 = %p", (void*)SFO);
-    LOGF(" FinishRestartPlayer = %p", (void*)FinishRestartPlayer);
+    LOGF(" SFO = %p", (void*)SFO);
 
     DobbyHook((void*)(g_base + ADDR_GetGameState), (void*)Hook_GGS, (void**)&o_GGS);
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
