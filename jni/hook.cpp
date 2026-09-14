@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v45: PlayerStart-based spawn)
+// hook — Android JNI (v46: enumerate PlayerStart actors)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -16,6 +16,7 @@
 #include <chrono>
 #include <mutex>
 #include <set>
+#include <vector>
 #include <android/log.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -41,10 +42,15 @@
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
 
-// Fallback spawn Z for Artemis map (well above terrain)
-static const float kFallbackX = 0.0f;
-static const float kFallbackY = 0.0f;
-static const float kFallbackZ = 5000.0f;
+// UObject::OuterPrivate offset (UE5)
+#define OFF_UOBJ_OUTER                   0x20
+#define OFF_UOBJ_CLASS                   0x10
+#define OFF_UOBJ_NAME                    0x18
+
+// Common World offsets to try
+static const int kWorldLevelsOffsets[]  = { 0x1D0, 0x1C0, 0x1E0, 0x2C0, 0x2A0, 0x250, 0x130, 0x290, 0x2B0, 0x1F0 };
+// Common Level->Actors offsets
+static const int kLevelActorsOffsets[]  = { 0x98, 0xA0, 0x90, 0xA8, 0xB0, 0xC0, 0x88 };
 
 // ------------------------------------------------------------
 static std::string u16(const char16_t* s) {
@@ -74,13 +80,14 @@ static void LOGF(const char* fmt, ...) {
     }
 }
 
+// Safe memory
 static bool RP(void* a, void** o) {
     *o = nullptr; if (!a) return false;
     struct iovec l = { o, sizeof(void*) }, r = { a, sizeof(void*) };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
 static bool RB(void* a, void* o, size_t n) {
-    if (!a || !o || n == 0 || n > 512) return false;
+    if (!a || !o || n == 0 || n > 1024) return false;
     struct iovec l = { o, n }, r = { a, n };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
 }
@@ -118,6 +125,7 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
+static void* g_playerstart_class = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
@@ -127,97 +135,125 @@ static bool VPtr(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-// ------------------------------------------------------------
-// Try to find PlayerStart actor
-// ------------------------------------------------------------
-static void* FindAnyPlayerStart() {
-    LOGF("");
-    LOGF("========== Find PlayerStart ==========");
+// GetName
+struct FString16 { char16_t* Data; int32_t Num; int32_t Max; ~FString16() {} };
+typedef FString16 (*GetName_t)(void*);
 
-    static const char16_t* names[] = {
-        u"PlayerStart_0",
-        u"PlayerStart_1",
-        u"PlayerStart_2",
-        u"PlayerStart_3",
-        u"PlayerStart_4",
-        u"PlayerStart_5",
-        u"PlayerStart_6",
-        u"PlayerStart_7",
-        u"Athena_PlayerStart_C_0",
-        u"Athena_PlayerStart_C_1",
-        u"Athena_PlayerStart_0",
-        u"Athena_PlayerStart_1",
-        u"FortPlayerStart_Athena_0",
-        u"FortPlayerStart_Athena_1",
-        u"PlayerStart_C_0",
-        u"PlayerStart",
-        u"PlayerStart_C",
-        u"Athena_PlayerStart",
-        u"Athena_PlayerStart_C",
-    };
-
-    for (auto n : names) {
-        void* a = SFO(nullptr, nullptr, n, false);
-        void* b = SFO(nullptr, (void*)-1, n, false);
-        if (VPtr(a) || VPtr(b)) {
-            void* result = VPtr(a) ? a : b;
-            LOGF("  ✅ %s -> %p", u16(n).c_str(), result);
-            return result;
+static std::string ObjName(void* obj) {
+    if (!VPtr(obj)) return "<bad>";
+    void** vft = nullptr;
+    if (!RP(obj, (void**)&vft)) return "<no vft>";
+    if (!VPtr(vft)) return "<bad vft>";
+    void* fn = nullptr;
+    if (!RP((char*)vft + 0x38, &fn)) return "<no fn>";
+    if (!VPtr(fn)) return "<bad fn>";
+    GetName_t gn = (GetName_t)fn;
+    FString16 out = gn(obj);
+    std::string r;
+    if (out.Data && out.Num > 0) {
+        int n = out.Num > 128 ? 128 : out.Num;
+        for (int i = 0; i < n; i++) {
+            uint16_t c = out.Data[i];
+            if (!c) break;
+            r += (c < 0x80) ? (char)c : '?';
         }
-        LOGF("  ❌ %s", u16(n).c_str());
     }
+    return r;
+}
 
-    LOGF("========== no PlayerStart found ==========");
+// Find World by walking outer chain
+static void* FindWorldFrom(void* obj) {
+    LOGF("");
+    LOGF("========== Walk outer chain from %p ==========", obj);
+    void* cur = obj;
+    for (int i = 0; i < 8; i++) {
+        if (!VPtr(cur)) break;
+        std::string nm = ObjName(cur);
+        LOGF("  outer[%d] %p  %s", i, cur, nm.c_str());
+
+        if (nm.find("World") != std::string::npos ||
+            nm.find("Terrain") != std::string::npos ||
+            nm.find("Artemis") != std::string::npos) {
+            LOGF("  ✅ Found World: %p (%s)", cur, nm.c_str());
+            return cur;
+        }
+
+        void* outer = nullptr;
+        if (!RP((char*)cur + OFF_UOBJ_OUTER, &outer)) break;
+        if (!VPtr(outer)) break;
+        cur = outer;
+    }
+    LOGF("  ❌ World not found in outer chain");
     return nullptr;
 }
 
-// ------------------------------------------------------------
-// Read actor location (try many offsets)
-// ------------------------------------------------------------
-static bool ReadActorLocation(void* actor, float out[3]) {
-    out[0] = out[1] = out[2] = 0;
-    if (!VPtr(actor)) return false;
+// Read TArray (UE5: TArray64 is different, classic TArray is 16 bytes)
+struct TArrayNative {
+    void* Data;
+    int32_t Num;
+    int32_t Max;
+};
 
-    // RootComponent offsets (common UE5)
-    static const int rootOffs[] = {
-        0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250
-    };
+// Enumerate actors of a class
+static void* FindActorOfClass(void* world, void* targetClass, const char* label) {
+    if (!VPtr(world) || !VPtr(targetClass)) return nullptr;
 
-    // ComponentToWorld.Translation offsets (usually +0x10 inside ComponentToWorld)
-    // But the transform offset inside USceneComponent varies
-    static const int locOffs[] = {
-        0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110
-    };
+    LOGF("");
+    LOGF("========== FindActorOfClass(%s) world=%p class=%p ==========",
+         label, world, targetClass);
 
-    for (int ro : rootOffs) {
-        void* root = nullptr;
-        if (!RP((char*)actor + ro, &root)) continue;
-        if (!VPtr(root)) continue;
+    for (int lvOff : kWorldLevelsOffsets) {
+        TArrayNative levels;
+        if (!RB((char*)world + lvOff, &levels, sizeof(levels))) continue;
+        if (levels.Num <= 0 || levels.Num > 200) continue;
+        if (!VPtr(levels.Data)) continue;
 
-        for (int lo : locOffs) {
-            float xyz[3];
-            if (!RB((char*)root + lo, xyz, 12)) continue;
+        LOGF("  [try Levels@0x%X] Data=%p Num=%d Max=%d",
+             lvOff, levels.Data, levels.Num, levels.Max);
 
-            // Sanity checks for Artemis map coordinates
-            // Island spans roughly -100000..100000 X/Y, Z roughly -500..5000
-            bool ok = true;
-            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) ok = false;
-            if (fabsf(xyz[0]) > 500000.0f) ok = false;
-            if (fabsf(xyz[1]) > 500000.0f) ok = false;
-            if (xyz[2] < -2000.0f || xyz[2] > 20000.0f) ok = false;
-            if (xyz[0] == 0 && xyz[1] == 0 && xyz[2] == 0) ok = false;
+        int levelsN = levels.Num > 50 ? 50 : levels.Num;
+        for (int li = 0; li < levelsN; li++) {
+            void* lvl = nullptr;
+            if (!RP((char*)levels.Data + li * 8, &lvl)) continue;
+            if (!VPtr(lvl)) continue;
 
-            if (ok) {
-                out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
-                LOGF("  [loc] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
-                     ro, lo, out[0], out[1], out[2]);
-                return true;
+            for (int acOff : kLevelActorsOffsets) {
+                TArrayNative actors;
+                if (!RB((char*)lvl + acOff, &actors, sizeof(actors))) continue;
+                if (actors.Num <= 0 || actors.Num > 500000) continue;
+                if (!VPtr(actors.Data)) continue;
+
+                LOGF("    [L%d] Actors@0x%X Data=%p Num=%d",
+                     li, acOff, actors.Data, actors.Num);
+
+                int actorsN = actors.Num > 20000 ? 20000 : actors.Num;
+                int found = 0;
+                for (int ai = 0; ai < actorsN; ai++) {
+                    void* actor = nullptr;
+                    if (!RP((char*)actors.Data + ai * 8, &actor)) continue;
+                    if (!VPtr(actor)) continue;
+
+                    void* actorClass = nullptr;
+                    if (!RP((char*)actor + OFF_UOBJ_CLASS, &actorClass)) continue;
+                    if (actorClass == targetClass) {
+                        LOGF("      ✅ MATCH actor=%p", actor);
+                        return actor;
+                    }
+                    // Also check via IsA? For now compare direct + log first few
+                    if (ai < 3) {
+                        std::string cls = ObjName(actorClass);
+                        std::string nm = ObjName(actor);
+                        LOGF("        [%d] actor=%p class=%p(%s) name=%s",
+                             ai, actor, actorClass, cls.c_str(), nm.c_str());
+                    }
+                    found = 0;
+                }
+                (void)found;
             }
         }
     }
-
-    LOGF("  [loc] no valid location for actor %p", actor);
-    return false;
+    LOGF("  ❌ no actor of target class");
+    return nullptr;
 }
 
 // ------------------------------------------------------------
@@ -270,16 +306,9 @@ static void* ReadPawn(void* pc) {
     return p;
 }
 
-// ------------------------------------------------------------
-// FTransform
-// ------------------------------------------------------------
-struct FTransform {
-    float qx, qy, qz, qw;
-    float tx, ty, tz, _p1;
-    float sx, sy, sz, _p2;
-};
+struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_1; float sx,sy,sz,_2; };
 
-static void MakeIdentityAt(float x, float y, float z, FTransform* t) {
+static void MakeXform(float x, float y, float z, FTransform* t) {
     memset(t, 0, sizeof(*t));
     t->qw = 1.0f;
     t->tx = x; t->ty = y; t->tz = z;
@@ -305,52 +334,78 @@ static void Hook_PostLogin(void* gm, void* pc) {
     std::thread([gm, pc] {
         std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 
-        // 1) Find PlayerStart
-        void* ps_actor = FindAnyPlayerStart();
+        // 1) Find PlayerStart UClass
+        void* psClass = SFO(nullptr, nullptr, u"PlayerStart", false);
+        if (!VPtr(psClass)) psClass = SFO(nullptr, (void*) -1, u"PlayerStart", false);
+        LOGF("[spawn] PlayerStart class = %p", psClass);
+        g_playerstart_class = psClass;
 
-        float spawnX = kFallbackX, spawnY = kFallbackY, spawnZ = kFallbackZ;
-        bool gotLoc = false;
-
-        if (VPtr(ps_actor)) {
-            float loc[3];
-            if (ReadActorLocation(ps_actor, loc)) {
-                spawnX = loc[0]; spawnY = loc[1]; spawnZ = loc[2] + 100.0f;
-                gotLoc = true;
-                LOGF("[spawn] using PlayerStart loc (%.0f, %.0f, %.0f)",
-                     spawnX, spawnY, spawnZ);
+        // 2) Find World by walking outer chain from PC then from GameState
+        void* world = FindWorldFrom(pc);
+        if (!world) {
+            void* gs = nullptr;
+            if (RP((char*)gm + OFF_GM_GameState, &gs) && VPtr(gs)) {
+                world = FindWorldFrom(gs);
             }
         }
+        if (!world) {
+            void* gs = nullptr;
+            if (RP((char*)gm + OFF_GM_GameState, &gs) && VPtr(gs)) {
+                world = FindWorldFrom(gs);
+            }
+        }
+        LOGF("[spawn] World = %p", world);
 
-        if (!gotLoc) {
-            LOGF("[spawn] fallback to default (%.0f, %.0f, %.0f)",
-                 spawnX, spawnY, spawnZ);
+        // 3) Find a PlayerStart actor
+        void* ps_actor = nullptr;
+        if (world && VPtr(psClass)) {
+            ps_actor = FindActorOfClass(world, psClass, "PlayerStart");
+        }
+        LOGF("[spawn] PlayerStart actor = %p", ps_actor);
+
+        // 4) Read location
+        float spawnX = 0, spawnY = 0, spawnZ = 5000;
+        if (VPtr(ps_actor)) {
+            static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250 };
+            static const int locOffs[]  = { 0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110 };
+            bool got = false;
+            for (int ro : rootOffs) {
+                void* root = nullptr;
+                if (!RP((char*)ps_actor + ro, &root) || !VPtr(root)) continue;
+                for (int lo : locOffs) {
+                    float xyz[3];
+                    if (!RB((char*)root + lo, xyz, 12)) continue;
+                    if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
+                    if (fabsf(xyz[0]) > 500000 || fabsf(xyz[1]) > 500000) continue;
+                    if (xyz[2] < -2000 || xyz[2] > 20000) continue;
+                    if (xyz[0] == 0 && xyz[1] == 0 && xyz[2] == 0) continue;
+                    spawnX = xyz[0]; spawnY = xyz[1]; spawnZ = xyz[2] + 100;
+                    LOGF("[spawn] loc from root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
+                         ro, lo, spawnX, spawnY, spawnZ);
+                    got = true;
+                    break;
+                }
+                if (got) break;
+            }
+            if (!got) LOGF("[spawn] could not read PlayerStart location");
         }
 
-        // 2) Try spawn
+        LOGF("[spawn] using loc = (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
+
+        // 5) Try spawn
         typedef void* (*SDPAT_t)(void*, void*, void*);
         SDPAT_t fn = (SDPAT_t)(g_base + ADDR_SpawnDefaultPawnAtTransform);
 
         for (int i = 0; i < 8; i++) {
             void* ex = ReadPawn(pc);
-            if (VPtr(ex)) {
-                LOGF("[W] pawn exists: %p", ex);
-                Attach(pc, ex);
-                return;
-            }
+            if (VPtr(ex)) { LOGF("[W] pawn exists: %p", ex); Attach(pc, ex); return; }
 
-            // Slightly vary Z each attempt
-            float z = spawnZ + (i * 200.0f);
-            LOGF("[W] attempt %d loc=(%.0f, %.0f, %.0f)", i + 1, spawnX, spawnY, z);
-
+            LOGF("[W] attempt %d", i + 1);
             FTransform t;
-            MakeIdentityAt(spawnX, spawnY, z, &t);
-
+            MakeXform(spawnX, spawnY, spawnZ + i * 200.0f, &t);
             void* pawn = fn(gm, pc, &t);
             LOGF("[W] spawn -> %p", pawn);
-            if (VPtr(pawn)) {
-                Attach(pc, pawn);
-                return;
-            }
+            if (VPtr(pawn)) { Attach(pc, pawn); return; }
             std::this_thread::sleep_for(std::chrono::milliseconds(700));
         }
         LOGF("[W] gave up");
@@ -384,7 +439,7 @@ static void Run() {
     if (!i.base) { LOGF("[ERR] libUnreal not found"); return; }
     g_base = i.base;
     LOGF("========================================");
-    LOGF(" hook — v45 (PlayerStart-based spawn)");
+    LOGF(" hook — v46 (enumerate PlayerStart)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
