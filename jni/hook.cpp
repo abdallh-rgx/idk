@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v58: full possess + camera)
+// hook — Android JNI (v59: spawn camera manager)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -31,14 +31,24 @@
 #define ADDR_PostLogin                    0x550C610
 #define ADDR_SpawnActor                   0x947F4FC
 #define ADDR_GetAllActorsOfClass          0x93A4744
+#define ADDR_SpawnPlayerCameraManager     0x968BDDC   // ⭐ من IDA
 
+// ============================================================
+// CORRECT offsets (from IDA)
+// ============================================================
 #define OFF_UOBJ_OUTERPRIVATE             0x20
+
 #define OFF_PC_PlayerState                0x278
 #define OFF_PC_Pawn                       0x2B8
 #define OFF_PC_AckPawn                    0x2C0
+#define OFF_PC_CameraManager              0x328   // ⭐
+#define OFF_PC_CameraManagerClass         0x330   // ⭐
+#define OFF_PC_ViewTarget_Target          0x2E0   // FViewTarget.Target (guess)
+
 #define OFF_Pawn_Controller               0x2A8
 #define OFF_Pawn_Owner                    0x2A0
 #define OFF_Pawn_PlayerState              0x2D0
+
 #define OFF_GM_GameState                  0x2D0
 #define OFF_GS_Playlist2298               0x2298
 #define OFF_GS_Playlist2290               0x2290
@@ -156,121 +166,24 @@ static void MakeXform(float x, float y, float z, FTransform* t) {
 }
 struct TArrayN { void* Data; int32_t Num; int32_t Max; int32_t pad; };
 
-// ============================================================
-// Location search — STRICT quality
-// ============================================================
-static bool QualityLoc(float t[3]) {
-    if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) return false;
-    // Island coordinates should be large
-    float magXY = fabsf(t[0]) + fabsf(t[1]);
-    if (magXY < 5000.0f) return false;       // island is huge
-    if (fabsf(t[0]) > 200000.0f) return false;
-    if (fabsf(t[1]) > 200000.0f) return false;
-    if (t[2] < 50.0f || t[2] > 5000.0f) return false;
-    return true;
-}
-
-static bool FindTransformInActor(void* actor, float out[3], int* offOut) {
+static bool FindTransformInActor(void* actor, float out[3]) {
     if (!IVP(actor)) return false;
     for (int off = 0x100; off < 0x800; off += 4) {
         float q[4];
         if (!RB((char*)actor + off, q, 16)) continue;
         float qm = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
         if (qm < 0.9f || qm > 1.1f) continue;
-
         float t[3];
         if (!RB((char*)actor + off + 16, t, 12)) continue;
-        if (!QualityLoc(t)) continue;
-
+        if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) continue;
+        float magXY = fabsf(t[0]) + fabsf(t[1]);
+        if (magXY < 5000.0f) continue;
+        if (fabsf(t[0]) > 200000.0f || fabsf(t[1]) > 200000.0f) continue;
+        if (t[2] < 50.0f || t[2] > 5000.0f) continue;
         out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
-        if (offOut) *offOut = off;
         return true;
     }
     return false;
-}
-
-// ============================================================
-// Find PlayerCameraManager by scanning PC
-// ============================================================
-static void* FindCameraMgr(void* pc) {
-    if (!IVP(pc)) return nullptr;
-    // Try known offsets for PC->PlayerCameraManager in UE5
-    static const int offs[] = {
-        0x2D8, 0x2B8, 0x2E0, 0x2E8, 0x2F0, 0x2C8, 0x300, 0x308,
-        0x310, 0x318, 0x320, 0x328, 0x330
-    };
-    for (int off : offs) {
-        void* v = nullptr;
-        if (!RP((char*)pc + off, &v)) continue;
-        if (!IVP(v)) continue;
-        // Verify it's a UObject
-        void* cls = nullptr;
-        if (!RP((char*)v + 0x10, &cls)) continue;
-        if (!IVP(cls)) continue;
-        LOGF("[CamMgr] candidate pc+0x%X = %p cls=%p", off, v, cls);
-        return v;
-    }
-    return nullptr;
-}
-
-// ============================================================
-// Possess + Camera via virtuals
-// ============================================================
-typedef void (*VF1_t)(void*, void*);
-typedef void (*VF2_t)(void*, void*, float);
-
-static void TryPossessFull(void* pc, void* pawn) {
-    if (!IVP(pc) || !IVP(pawn)) return;
-    void** vft = nullptr;
-    if (!RP(pc, (void**)&vft) || !IVP(vft)) return;
-
-    // 1) Possess at 0x1D0 (known working)
-    void* possessFn = nullptr;
-    if (RP((char*)vft + 0x1D0 * 8, &possessFn) && ITP(possessFn)) {
-        LOGF("[Possess] calling slot 0x1D0");
-        ((VF1_t)possessFn)(pc, pawn);
-    }
-
-    // 2) Try AcknowledgePossession (usually nearby: 0x1D8-0x1E8)
-    for (int slot = 0x1D8; slot <= 0x1F0; slot += 8) {
-        void* fn = nullptr;
-        if (!RP((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!ITP(fn)) continue;
-        LOGF("[Possess] trying slot 0x%X", slot);
-        ((VF1_t)fn)(pc, pawn);
-    }
-}
-
-static void TrySetViewTarget(void* pc, void* pawn) {
-    if (!IVP(pc) || !IVP(pawn)) return;
-    void** vft = nullptr;
-    if (!RP(pc, (void**)&vft) || !IVP(vft)) return;
-
-    // SetViewTarget is often 0x1F8 or 0x200 (after Possess)
-    // Try slots 0x1F0 - 0x220
-    for (int slot = 0x1F0; slot <= 0x220; slot += 8) {
-        void* fn = nullptr;
-        if (!RP((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!ITP(fn)) continue;
-        uintptr_t off = (uintptr_t)fn - g_base;
-        LOGF("[View] trying slot 0x%X (+0x%lx)", slot, (unsigned long)off);
-        ((VF1_t)fn)(pc, pawn);
-    }
-}
-
-// Also try SetViewTargetWithBlend (3 args)
-static void TrySetViewTargetBlend(void* pc, void* pawn) {
-    if (!IVP(pc) || !IVP(pawn)) return;
-    void** vft = nullptr;
-    if (!RP(pc, (void**)&vft) || !IVP(vft)) return;
-
-    for (int slot = 0x1F8; slot <= 0x220; slot += 8) {
-        void* fn = nullptr;
-        if (!RP((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!ITP(fn)) continue;
-        LOGF("[ViewBlend] trying slot 0x%X with (pawn, 0.0f)", slot);
-        ((VF2_t)fn)(pc, pawn, 0.0f);
-    }
 }
 
 static void ClearSpecBit(void* ps) {
@@ -312,18 +225,6 @@ static void* DoSpawnActor(void* world, void* cls, FTransform* xform) {
     return fn(world, cls, xform, params);
 }
 
-static void AttachPawn(void* pc, void* pawn) {
-    if (!IVP(pc) || !IVP(pawn)) return;
-    WP((char*)pc + OFF_PC_Pawn, pawn);
-    WP((char*)pc + OFF_PC_AckPawn, pawn);
-    WP((char*)pawn + OFF_Pawn_Controller, pc);
-    WP((char*)pawn + OFF_Pawn_Owner, pc);
-    void* ps = nullptr;
-    if (RP((char*)pc + OFF_PC_PlayerState, &ps) && IVP(ps)) {
-        WP((char*)pawn + OFF_Pawn_PlayerState, ps);
-    }
-}
-
 static void* FindPlaylist() {
     if (!SFO) return nullptr;
     return SFO(nullptr, nullptr,
@@ -344,6 +245,7 @@ static bool InjectPlaylist(void* gm) {
     g_injected_gms.insert(gm);
     return true;
 }
+
 static void* FindPawnClass() {
     static const char16_t* names[] = {
         u"FortPlayerPawnAthena", u"FortPlayerPawnAthena_C",
@@ -356,8 +258,23 @@ static void* FindPawnClass() {
     return nullptr;
 }
 
+static void* FindCameraManagerClass() {
+    static const char16_t* names[] = {
+        u"FortPlayerCameraManager",
+        u"FortPlayerCameraManager_C",
+        u"AthenaPlayerCameraManager",
+        u"PlayerCameraManager",
+    };
+    for (auto n : names) {
+        void* c = SFO2(n);
+        if (IVP(c)) { LOGF("[CamClass] found: %p", c); return c; }
+    }
+    LOGF("[CamClass] none found via SFO");
+    return nullptr;
+}
+
 // ============================================================
-// Main spawn
+// MAIN SPAWN
 // ============================================================
 static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("");
@@ -367,14 +284,14 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
 
     if (!IVP(gm) || !IVP(pc)) return;
 
-    // ---- Clear PS spectator ----
+    // --- Clear spectator ---
     void* ps = nullptr;
     RP((char*)pc + OFF_PC_PlayerState, &ps);
     if (IVP(ps)) ClearSpecBit(ps);
 
-    // ---- Check existing Pawn ----
-    void* existing = nullptr;
-    RP((char*)pc + OFF_PC_Pawn, &existing);
+    // --- Existing pawn check ---
+    void* pawn = nullptr;
+    RP((char*)pc + OFF_PC_Pawn, &pawn);
 
     void* world = nullptr;
     void* gs = nullptr;
@@ -382,11 +299,11 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (IVP(gs)) world = WalkOuter(gs, 2);
     if (!world && IVP(pc)) world = WalkOuter(pc, 2);
     if (!world && IVP(gm)) world = WalkOuter(gm, 2);
+    LOGF("[Spawn] World = %p", world);
 
-    void* pawn = existing;
+    // --- Spawn Pawn if needed ---
     if (!IVP(pawn)) {
-        // Find location from PlayerStart with QUALITY filter
-        float bestLoc[3] = { 0.0f, 0.0f, 50000.0f };
+        float loc[3] = { 0.0f, 0.0f, 50000.0f };
         bool gotLoc = false;
 
         void* fpsCls = SFO2(u"FortPlayerStartWarmup");
@@ -396,61 +313,117 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
         LOGF("[Spawn] candidates=%d", n);
 
         float bestZ = -1e9f;
-        int bestIdx = -1;
-        int bestOff = -1;
         for (int i = 0; i < n && i < 128; i++) {
             if (!IVP(actors[i])) continue;
             float tmp[3];
-            int off = -1;
-            if (!FindTransformInActor(actors[i], tmp, &off)) continue;
-            LOGF("[Spawn] actor[%d] @0x%X = (%.0f,%.0f,%.0f)",
-                 i, off, tmp[0], tmp[1], tmp[2]);
+            if (!FindTransformInActor(actors[i], tmp)) continue;
             if (tmp[2] > bestZ) {
                 bestZ = tmp[2];
-                bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
+                loc[0] = tmp[0]; loc[1] = tmp[1]; loc[2] = tmp[2];
                 gotLoc = true;
-                bestIdx = i; bestOff = off;
+                LOGF("[Spawn] actor[%d] = (%.0f,%.0f,%.0f)", i, tmp[0], tmp[1], tmp[2]);
             }
         }
-        if (gotLoc) {
-            LOGF("[Spawn] ✅ loc from actor[%d]@0x%X = (%.0f,%.0f,%.0f)",
-                 bestIdx, bestOff, bestLoc[0], bestLoc[1], bestLoc[2]);
-        } else {
-            LOGF("[Spawn] no quality loc — using Z=50000 fallback");
-        }
+        if (!gotLoc) LOGF("[Spawn] no good loc, using fallback");
 
         void* pawnCls = FindPawnClass();
         if (!IVP(pawnCls)) return;
 
         FTransform xform;
-        MakeXform(bestLoc[0], bestLoc[1], bestLoc[2], &xform);
+        MakeXform(loc[0], loc[1], loc[2], &xform);
 
         pawn = DoSpawnActor(world, pawnCls, &xform);
-        if (!IVP(pawn)) { LOGF("[Spawn] SpawnActor failed"); return; }
-
-        AttachPawn(pc, pawn);
+        LOGF("[Spawn] pawn = %p", pawn);
+        if (!IVP(pawn)) return;
     }
 
-    LOGF("[Spawn] Pawn = %p", pawn);
+    // --- Write Pawn to PC (BEFORE spawning camera!) ---
+    WP((char*)pc + OFF_PC_Pawn, pawn);
+    WP((char*)pc + OFF_PC_AckPawn, pawn);
+    WP((char*)pawn + OFF_Pawn_Controller, pc);
+    WP((char*)pawn + OFF_Pawn_Owner, pc);
+    if (IVP(ps)) WP((char*)pawn + OFF_Pawn_PlayerState, ps);
 
-    // ---- Full possess sequence ----
-    LOGF("[Possess] full sequence...");
-    TryPossessFull(pc, pawn);
+    // Also write ViewTarget.Target
+    WP((char*)pc + OFF_PC_ViewTarget_Target, pawn);
+    LOGF("[Attach] PC->Pawn = %p", pawn);
 
-    // ---- Camera ----
-    void* cm = FindCameraMgr(pc);
-    LOGF("[CamMgr] = %p", cm);
+    // ============================================================
+    // Camera Manager
+    // ============================================================
+    void* cm = nullptr;
+    void* cmCls = nullptr;
+    RP((char*)pc + OFF_PC_CameraManager, &cm);
+    RP((char*)pc + OFF_PC_CameraManagerClass, &cmCls);
 
-    LOGF("[View] setting view target...");
-    TrySetViewTarget(pc, pawn);
-    TrySetViewTargetBlend(pc, pawn);
+    LOGF("[Cam] BEFORE: PC->CamMgr = %p, PC->CamMgrClass = %p", cm, cmCls);
 
-    // Re-check PC state
-    void* pc_pawn = nullptr; void* pc_vt = nullptr; void* pc_cm = nullptr;
+    // If class null, try to set it
+    if (!IVP(cmCls)) {
+        // 1) Try GM's CameraManagerClass (scan GM memory for UClass*)
+        void* foundCls = nullptr;
+
+        // Try known offsets in GM
+        for (int off = 0x2A0; off < 0x500; off += 8) {
+            void* v = nullptr;
+            if (!RP((char*)gm + off, &v)) continue;
+            if (!IVP(v)) continue;
+            // Check if v is a UClass — try reading its name
+            // (skip for now, just log candidates)
+        }
+
+        // 2) Try SFO
+        foundCls = FindCameraManagerClass();
+
+        if (IVP(foundCls)) {
+            WP((char*)pc + OFF_PC_CameraManagerClass, foundCls);
+            LOGF("[Cam] SET PC->CamMgrClass = %p", foundCls);
+        } else {
+            LOGF("[Cam] WARN: couldn't find CameraManagerClass");
+        }
+    }
+
+    // ============================================================
+    // Call SpawnPlayerCameraManager (0x968BDDC)
+    // ============================================================
+    if (!IVP(cm)) {
+        LOGF("[Cam] calling SpawnPlayerCameraManager(pc)...");
+        typedef void (*SpawnCam_t)(void*);
+        SpawnCam_t fn = (SpawnCam_t)(g_base + ADDR_SpawnPlayerCameraManager);
+        fn(pc);
+        RP((char*)pc + OFF_PC_CameraManager, &cm);
+        LOGF("[Cam] AFTER: PC->CamMgr = %p", cm);
+    }
+
+    // ============================================================
+    // If CamMgr exists, try to find its ViewTarget.Target and set it to pawn
+    // ============================================================
+    if (IVP(cm)) {
+        // Scan PlayerCameraManager memory for a pointer == pawn (it might already be set)
+        LOGF("[Cam] scanning CamMgr for view target...");
+        int found = 0;
+        for (int off = 0x100; off < 0x600 && found < 5; off += 8) {
+            void* v = nullptr;
+            if (!RP((char*)cm + off, &v)) continue;
+            if (!IVP(v)) continue;
+            if (v == pawn) {
+                LOGF("[Cam] CamMgr+0x%X = pawn", off);
+                found++;
+            }
+        }
+
+        // Write ViewTarget.Target on PC too
+        WP((char*)pc + OFF_PC_ViewTarget_Target, pawn);
+    }
+
+    // ============================================================
+    // Final dump
+    // ============================================================
+    void* pc_pawn = nullptr; void* pc_cm = nullptr; void* pc_vt = nullptr;
     RP((char*)pc + OFF_PC_Pawn, &pc_pawn);
-    RP((char*)pc + 0x2E0, &pc_vt);
-    RP((char*)pc + 0x2D8, &pc_cm);
-    LOGF("[Final] Pawn=%p VT=%p CM=%p", pc_pawn, pc_vt, pc_cm);
+    RP((char*)pc + OFF_PC_CameraManager, &pc_cm);
+    RP((char*)pc + OFF_PC_ViewTarget_Target, &pc_vt);
+    LOGF("[Final] Pawn=%p CamMgr=%p VT.Target=%p", pc_pawn, pc_cm, pc_vt);
     LOGF("[Spawn] ===== DONE =====");
 }
 
@@ -510,7 +483,7 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook — v58 (full possess + camera)");
+    LOGF(" hook — v59 (SpawnPlayerCameraManager)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
