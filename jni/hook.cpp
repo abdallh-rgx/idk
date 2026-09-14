@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v46: enumerate PlayerStart actors)
+// hook — Android JNI (v47: find World via ClassPrivate)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -31,6 +31,11 @@
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 #define ADDR_SpawnDefaultPawnAtTransform 0x5511618
+#define ADDR_SpawnDefaultPawnFor         0x551A7C4
+
+#define OFF_UOBJ_CLASSPRIVATE            0x10
+#define OFF_UOBJ_NAMEPRIVATE             0x18
+#define OFF_UOBJ_OUTERPRIVATE            0x20
 
 #define OFF_PC_PlayerState               0x278
 #define OFF_PC_Pawn                      0x2B8
@@ -41,24 +46,6 @@
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
-
-// UObject::OuterPrivate offset (UE5)
-#define OFF_UOBJ_OUTER                   0x20
-#define OFF_UOBJ_CLASS                   0x10
-#define OFF_UOBJ_NAME                    0x18
-
-// Common World offsets to try
-static const int kWorldLevelsOffsets[]  = { 0x1D0, 0x1C0, 0x1E0, 0x2C0, 0x2A0, 0x250, 0x130, 0x290, 0x2B0, 0x1F0 };
-// Common Level->Actors offsets
-static const int kLevelActorsOffsets[]  = { 0x98, 0xA0, 0x90, 0xA8, 0xB0, 0xC0, 0x88 };
-
-// ------------------------------------------------------------
-static std::string u16(const char16_t* s) {
-    if (!s) return "";
-    std::string r;
-    while (*s) { uint16_t c = *s++; r += (c < 0x80) ? (char)c : '?'; }
-    return r;
-}
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -80,14 +67,13 @@ static void LOGF(const char* fmt, ...) {
     }
 }
 
-// Safe memory
 static bool RP(void* a, void** o) {
     *o = nullptr; if (!a) return false;
     struct iovec l = { o, sizeof(void*) }, r = { a, sizeof(void*) };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
 static bool RB(void* a, void* o, size_t n) {
-    if (!a || !o || n == 0 || n > 1024) return false;
+    if (!a || !o || n == 0 || n > 2048) return false;
     struct iovec l = { o, n }, r = { a, n };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
 }
@@ -125,7 +111,6 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
-static void* g_playerstart_class = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
@@ -135,131 +120,146 @@ static bool VPtr(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-// GetName
-struct FString16 { char16_t* Data; int32_t Num; int32_t Max; ~FString16() {} };
-typedef FString16 (*GetName_t)(void*);
-
-static std::string ObjName(void* obj) {
-    if (!VPtr(obj)) return "<bad>";
-    void** vft = nullptr;
-    if (!RP(obj, (void**)&vft)) return "<no vft>";
-    if (!VPtr(vft)) return "<bad vft>";
-    void* fn = nullptr;
-    if (!RP((char*)vft + 0x38, &fn)) return "<no fn>";
-    if (!VPtr(fn)) return "<bad fn>";
-    GetName_t gn = (GetName_t)fn;
-    FString16 out = gn(obj);
-    std::string r;
-    if (out.Data && out.Num > 0) {
-        int n = out.Num > 128 ? 128 : out.Num;
-        for (int i = 0; i < n; i++) {
-            uint16_t c = out.Data[i];
-            if (!c) break;
-            r += (c < 0x80) ? (char)c : '?';
-        }
-    }
-    return r;
-}
-
-// Find World by walking outer chain
-static void* FindWorldFrom(void* obj) {
-    LOGF("");
-    LOGF("========== Walk outer chain from %p ==========", obj);
-    void* cur = obj;
-    for (int i = 0; i < 8; i++) {
-        if (!VPtr(cur)) break;
-        std::string nm = ObjName(cur);
-        LOGF("  outer[%d] %p  %s", i, cur, nm.c_str());
-
-        if (nm.find("World") != std::string::npos ||
-            nm.find("Terrain") != std::string::npos ||
-            nm.find("Artemis") != std::string::npos) {
-            LOGF("  ✅ Found World: %p (%s)", cur, nm.c_str());
-            return cur;
-        }
-
-        void* outer = nullptr;
-        if (!RP((char*)cur + OFF_UOBJ_OUTER, &outer)) break;
-        if (!VPtr(outer)) break;
-        cur = outer;
-    }
-    LOGF("  ❌ World not found in outer chain");
-    return nullptr;
-}
-
-// Read TArray (UE5: TArray64 is different, classic TArray is 16 bytes)
-struct TArrayNative {
-    void* Data;
-    int32_t Num;
-    int32_t Max;
-};
-
-// Enumerate actors of a class
-static void* FindActorOfClass(void* world, void* targetClass, const char* label) {
-    if (!VPtr(world) || !VPtr(targetClass)) return nullptr;
-
-    LOGF("");
-    LOGF("========== FindActorOfClass(%s) world=%p class=%p ==========",
-         label, world, targetClass);
-
-    for (int lvOff : kWorldLevelsOffsets) {
-        TArrayNative levels;
-        if (!RB((char*)world + lvOff, &levels, sizeof(levels))) continue;
-        if (levels.Num <= 0 || levels.Num > 200) continue;
-        if (!VPtr(levels.Data)) continue;
-
-        LOGF("  [try Levels@0x%X] Data=%p Num=%d Max=%d",
-             lvOff, levels.Data, levels.Num, levels.Max);
-
-        int levelsN = levels.Num > 50 ? 50 : levels.Num;
-        for (int li = 0; li < levelsN; li++) {
-            void* lvl = nullptr;
-            if (!RP((char*)levels.Data + li * 8, &lvl)) continue;
-            if (!VPtr(lvl)) continue;
-
-            for (int acOff : kLevelActorsOffsets) {
-                TArrayNative actors;
-                if (!RB((char*)lvl + acOff, &actors, sizeof(actors))) continue;
-                if (actors.Num <= 0 || actors.Num > 500000) continue;
-                if (!VPtr(actors.Data)) continue;
-
-                LOGF("    [L%d] Actors@0x%X Data=%p Num=%d",
-                     li, acOff, actors.Data, actors.Num);
-
-                int actorsN = actors.Num > 20000 ? 20000 : actors.Num;
-                int found = 0;
-                for (int ai = 0; ai < actorsN; ai++) {
-                    void* actor = nullptr;
-                    if (!RP((char*)actors.Data + ai * 8, &actor)) continue;
-                    if (!VPtr(actor)) continue;
-
-                    void* actorClass = nullptr;
-                    if (!RP((char*)actor + OFF_UOBJ_CLASS, &actorClass)) continue;
-                    if (actorClass == targetClass) {
-                        LOGF("      ✅ MATCH actor=%p", actor);
-                        return actor;
-                    }
-                    // Also check via IsA? For now compare direct + log first few
-                    if (ai < 3) {
-                        std::string cls = ObjName(actorClass);
-                        std::string nm = ObjName(actor);
-                        LOGF("        [%d] actor=%p class=%p(%s) name=%s",
-                             ai, actor, actorClass, cls.c_str(), nm.c_str());
-                    }
-                    found = 0;
-                }
-                (void)found;
-            }
-        }
-    }
-    LOGF("  ❌ no actor of target class");
+// ------------------------------------------------------------
+// StaticFindObject with fallback patterns
+// ------------------------------------------------------------
+static void* SFO2(const char16_t* name) {
+    if (!SFO) return nullptr;
+    void* a = SFO(nullptr, nullptr, name, false);
+    if (VPtr(a)) return a;
+    void* b = SFO(nullptr, (void*)-1, name, false);
+    if (VPtr(b)) return b;
     return nullptr;
 }
 
 // ------------------------------------------------------------
+// Walk outer chain comparing ClassPrivate
+// ------------------------------------------------------------
+static void* FindWorldByClass(void* start, void* worldCls) {
+    if (!VPtr(start) || !VPtr(worldCls)) return nullptr;
+
+    LOGF("");
+    LOGF("========== Walk outer from %p (worldCls=%p) ==========", start, worldCls);
+    void* cur = start;
+    for (int i = 0; i < 10; i++) {
+        if (!VPtr(cur)) break;
+
+        void* cls = nullptr;
+        if (!RP((char*)cur + OFF_UOBJ_CLASSPRIVATE, &cls)) {
+            LOGF("  [%d] %p  class read failed", i, cur);
+            break;
+        }
+        const char* tag = (cls == worldCls) ? "  ⭐ WORLD!" : "";
+        LOGF("  [%d] %p  class=%p%s", i, cur, cls, tag);
+
+        if (cls == worldCls) {
+            LOGF("  ✅ WORLD FOUND: %p", cur);
+            return cur;
+        }
+
+        void* outer = nullptr;
+        if (!RP((char*)cur + OFF_UOBJ_OUTERPRIVATE, &outer)) break;
+        if (!VPtr(outer)) break;
+        cur = outer;
+    }
+    return nullptr;
+}
+
+// ------------------------------------------------------------
+// Dump a UE object (class, name bytes)
+// ------------------------------------------------------------
+static void DumpObj(const char* tag, void* obj) {
+    if (!VPtr(obj)) { LOGF("  [%s] %p <invalid>", tag, obj); return; }
+    void* cls = nullptr; RP((char*)obj + OFF_UOBJ_CLASSPRIVATE, &cls);
+    void* nameRaw = nullptr; RP((char*)obj + OFF_UOBJ_NAMEPRIVATE, &nameRaw);
+    void* outer = nullptr; RP((char*)obj + OFF_UOBJ_OUTERPRIVATE, &outer);
+    LOGF("  [%s] obj=%p cls=%p name=%p outer=%p", tag, obj, cls, nameRaw, outer);
+}
+
+// ------------------------------------------------------------
+// Find PlayerStart instance in world via levels/actors
+// ------------------------------------------------------------
+static void* FindActorByClassInWorld(void* world, void* targetCls, const char* label) {
+    if (!VPtr(world) || !VPtr(targetCls)) return nullptr;
+
+    LOGF("");
+    LOGF("========== FindActorByClass(%s) world=%p ==========", label, world);
+
+    // UWorld::PersistentLevel at various offsets (UE5)
+    static const int lvlOffs[] = { 0x30, 0x38, 0x28, 0x20, 0x40, 0x90 };
+
+    for (int lo : lvlOffs) {
+        void* lvl = nullptr;
+        if (!RP((char*)world + lo, &lvl) || !VPtr(lvl)) continue;
+        LOGF("  [try World+0x%X] level=%p", lo, lvl);
+
+        // ULevel::Actors at various offsets
+        static const int actOffs[] = { 0x98, 0xA0, 0x90, 0xA8, 0xB0, 0xC0, 0x88, 0x150 };
+
+        for (int ao : actOffs) {
+            void* data = nullptr;
+            int32_t num = 0, max = 0;
+            if (!RB((char*)lvl + ao, &data, 8)) continue;
+            if (!RB((char*)lvl + ao + 8, &num, 4)) continue;
+            if (!RB((char*)lvl + ao + 12, &max, 4)) continue;
+            if (!VPtr(data)) continue;
+            if (num <= 0 || num > 500000) continue;
+
+            LOGF("    [L+0x%X] Data=%p Num=%d Max=%d", ao, data, num, max);
+
+            int lim = num > 30000 ? 30000 : num;
+            int matches = 0;
+            for (int i = 0; i < lim; i++) {
+                void* actor = nullptr;
+                if (!RP((char*)data + i * 8, &actor)) continue;
+                if (!VPtr(actor)) continue;
+                void* ac = nullptr;
+                if (!RP((char*)actor + OFF_UOBJ_CLASSPRIVATE, &ac)) continue;
+                if (ac == targetCls) {
+                    LOGF("      ✅ MATCH %s at [%d] = %p", label, i, actor);
+                    return actor;
+                }
+                matches++;
+            }
+            LOGF("    scanned %d actors, no match", matches);
+        }
+    }
+    LOGF("  ❌ %s not found", label);
+    return nullptr;
+}
+
+// ------------------------------------------------------------
+// Read actor location (RootComponent -> RelativeLocation)
+// ------------------------------------------------------------
+static bool ReadActorLocation(void* actor, float out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!VPtr(actor)) return false;
+
+    static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280 };
+    static const int locOffs[]  = { 0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110,
+                                    0x118, 0x1A8, 0x1B0, 0x1B8 };
+
+    for (int ro : rootOffs) {
+        void* root = nullptr;
+        if (!RP((char*)actor + ro, &root) || !VPtr(root)) continue;
+        for (int lo : locOffs) {
+            float xyz[3];
+            if (!RB((char*)root + lo, xyz, 12)) continue;
+            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
+            if (fabsf(xyz[0]) > 500000 || fabsf(xyz[1]) > 500000) continue;
+            if (xyz[2] < -2000 || xyz[2] > 20000) continue;
+            if (xyz[0] == 0 && xyz[1] == 0 && xyz[2] == 0) continue;
+            out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
+            LOGF("  [loc] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)", ro, lo, out[0], out[1], out[2]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ------------------------------------------------------------
 static void* FindPlaylist() {
-    if (!SFO) return nullptr;
-    return SFO(nullptr, nullptr, u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
+    return SFO2(u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
 }
 
 static bool InjectPlaylist(void* gm) {
@@ -307,12 +307,98 @@ static void* ReadPawn(void* pc) {
 }
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_1; float sx,sy,sz,_2; };
-
 static void MakeXform(float x, float y, float z, FTransform* t) {
     memset(t, 0, sizeof(*t));
     t->qw = 1.0f;
     t->tx = x; t->ty = y; t->tz = z;
     t->sx = t->sy = t->sz = 1.0f;
+}
+
+// ------------------------------------------------------------
+// Main spawn worker
+// ------------------------------------------------------------
+static void SpawnWorker(void* gm, void* pc) {
+    LOGF("");
+    LOGF("============================================================");
+    LOGF("[W] worker started gm=%p pc=%p", gm, pc);
+    LOGF("============================================================");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+
+    // 1) Find key classes
+    void* worldCls = SFO2(u"World");
+    void* levelCls = SFO2(u"Level");
+    void* psCls    = SFO2(u"PlayerStart");
+    LOGF("[W] classes: World=%p Level=%p PlayerStart=%p", worldCls, levelCls, psCls);
+
+    // 2) Dump PC/GS
+    DumpObj("PC", pc);
+    void* gs = nullptr;
+    RP((char*)gm + OFF_GM_GameState, &gs);
+    DumpObj("GS", gs);
+    DumpObj("GM", gm);
+
+    // 3) Find World via outer chain from GS, then PC
+    void* world = nullptr;
+    if (VPtr(gs) && VPtr(worldCls)) world = FindWorldByClass(gs, worldCls);
+    if (!world && VPtr(pc) && VPtr(worldCls)) world = FindWorldByClass(pc, worldCls);
+    if (!world && VPtr(gm) && VPtr(worldCls)) world = FindWorldByClass(gm, worldCls);
+
+    LOGF("[W] World = %p", world);
+
+    // 4) Find PlayerStart actor in world
+    float spawnX = 0, spawnY = 0, spawnZ = 5000;
+    bool gotLoc = false;
+
+    if (world && VPtr(psCls)) {
+        void* psActor = FindActorByClassInWorld(world, psCls, "PlayerStart");
+        if (VPtr(psActor)) {
+            float loc[3];
+            if (ReadActorLocation(psActor, loc)) {
+                spawnX = loc[0]; spawnY = loc[1]; spawnZ = loc[2] + 200;
+                gotLoc = true;
+                LOGF("[W] using PlayerStart loc (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
+            }
+        }
+    }
+
+    if (!gotLoc) {
+        LOGF("[W] using fallback loc (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
+    }
+
+    // 5) Dump GameMode fields (find DefaultPawnClass)
+    LOGF("--- GM[0x2A0..0x380] pointer scan ---");
+    for (int off = 0x2A0; off < 0x380; off += 8) {
+        void* v = nullptr;
+        if (!RP((char*)gm + off, &v)) continue;
+        if (!VPtr(v)) continue;
+        // read target class
+        void* tc = nullptr;
+        RP((char*)v + OFF_UOBJ_CLASSPRIVATE, &tc);
+        LOGF("  GM+0x%X = %p  (tgt class=%p)", off, v, tc);
+    }
+
+    // 6) Try spawn
+    typedef void* (*SDPAT_t)(void*, void*, void*);
+    SDPAT_t fn = (SDPAT_t)(g_base + ADDR_SpawnDefaultPawnAtTransform);
+
+    for (int i = 0; i < 8; i++) {
+        void* ex = ReadPawn(pc);
+        if (VPtr(ex)) {
+            LOGF("[W] pawn exists: %p", ex);
+            Attach(pc, ex);
+            return;
+        }
+
+        LOGF("[W] attempt %d loc=(%.0f, %.0f, %.0f)", i + 1, spawnX, spawnY, spawnZ + i * 200.0f);
+        FTransform t;
+        MakeXform(spawnX, spawnY, spawnZ + i * 200.0f, &t);
+        void* pawn = fn(gm, pc, &t);
+        LOGF("[W] spawn -> %p", pawn);
+        if (VPtr(pawn)) { Attach(pc, pawn); return; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    }
+    LOGF("[W] gave up");
 }
 
 // ------------------------------------------------------------
@@ -325,94 +411,12 @@ static void Hook_PostLogin(void* gm, void* pc) {
     LOGF("");
     LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
          (unsigned long long)g_calls, gm, pc);
-
     InjectPlaylist(gm);
     if (o_PostLogin) o_PostLogin(gm, pc);
-
     if (!VPtr(gm) || !VPtr(pc)) return;
-
-    std::thread([gm, pc] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-
-        // 1) Find PlayerStart UClass
-        void* psClass = SFO(nullptr, nullptr, u"PlayerStart", false);
-        if (!VPtr(psClass)) psClass = SFO(nullptr, (void*) -1, u"PlayerStart", false);
-        LOGF("[spawn] PlayerStart class = %p", psClass);
-        g_playerstart_class = psClass;
-
-        // 2) Find World by walking outer chain from PC then from GameState
-        void* world = FindWorldFrom(pc);
-        if (!world) {
-            void* gs = nullptr;
-            if (RP((char*)gm + OFF_GM_GameState, &gs) && VPtr(gs)) {
-                world = FindWorldFrom(gs);
-            }
-        }
-        if (!world) {
-            void* gs = nullptr;
-            if (RP((char*)gm + OFF_GM_GameState, &gs) && VPtr(gs)) {
-                world = FindWorldFrom(gs);
-            }
-        }
-        LOGF("[spawn] World = %p", world);
-
-        // 3) Find a PlayerStart actor
-        void* ps_actor = nullptr;
-        if (world && VPtr(psClass)) {
-            ps_actor = FindActorOfClass(world, psClass, "PlayerStart");
-        }
-        LOGF("[spawn] PlayerStart actor = %p", ps_actor);
-
-        // 4) Read location
-        float spawnX = 0, spawnY = 0, spawnZ = 5000;
-        if (VPtr(ps_actor)) {
-            static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250 };
-            static const int locOffs[]  = { 0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110 };
-            bool got = false;
-            for (int ro : rootOffs) {
-                void* root = nullptr;
-                if (!RP((char*)ps_actor + ro, &root) || !VPtr(root)) continue;
-                for (int lo : locOffs) {
-                    float xyz[3];
-                    if (!RB((char*)root + lo, xyz, 12)) continue;
-                    if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
-                    if (fabsf(xyz[0]) > 500000 || fabsf(xyz[1]) > 500000) continue;
-                    if (xyz[2] < -2000 || xyz[2] > 20000) continue;
-                    if (xyz[0] == 0 && xyz[1] == 0 && xyz[2] == 0) continue;
-                    spawnX = xyz[0]; spawnY = xyz[1]; spawnZ = xyz[2] + 100;
-                    LOGF("[spawn] loc from root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
-                         ro, lo, spawnX, spawnY, spawnZ);
-                    got = true;
-                    break;
-                }
-                if (got) break;
-            }
-            if (!got) LOGF("[spawn] could not read PlayerStart location");
-        }
-
-        LOGF("[spawn] using loc = (%.0f, %.0f, %.0f)", spawnX, spawnY, spawnZ);
-
-        // 5) Try spawn
-        typedef void* (*SDPAT_t)(void*, void*, void*);
-        SDPAT_t fn = (SDPAT_t)(g_base + ADDR_SpawnDefaultPawnAtTransform);
-
-        for (int i = 0; i < 8; i++) {
-            void* ex = ReadPawn(pc);
-            if (VPtr(ex)) { LOGF("[W] pawn exists: %p", ex); Attach(pc, ex); return; }
-
-            LOGF("[W] attempt %d", i + 1);
-            FTransform t;
-            MakeXform(spawnX, spawnY, spawnZ + i * 200.0f, &t);
-            void* pawn = fn(gm, pc, &t);
-            LOGF("[W] spawn -> %p", pawn);
-            if (VPtr(pawn)) { Attach(pc, pawn); return; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(700));
-        }
-        LOGF("[W] gave up");
-    }).detach();
+    if (g_calls == 1) std::thread(SpawnWorker, gm, pc).detach();
 }
 
-// ------------------------------------------------------------
 typedef int (*PH_t)(void*);
 static PH_t o_PH = nullptr;
 static int Hook_PH(void* a1) { if (a1) InjectPlaylist(a1); return o_PH ? o_PH(a1) : 0; }
@@ -439,7 +443,7 @@ static void Run() {
     if (!i.base) { LOGF("[ERR] libUnreal not found"); return; }
     g_base = i.base;
     LOGF("========================================");
-    LOGF(" hook — v46 (enumerate PlayerStart)");
+    LOGF(" hook — v47 (ClassPrivate-based World search)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
