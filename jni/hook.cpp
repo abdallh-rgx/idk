@@ -38,7 +38,6 @@
 #define OFF_PC_CameraManager              0x328
 #define OFF_PC_CameraManagerClass         0x330
 #define OFF_PC_ViewTarget_Target          0x2E0
-#define OFF_PC_World                      0x180
 
 #define OFF_Pawn_Controller               0x2A8
 #define OFF_Pawn_Owner                    0x2A0
@@ -250,12 +249,59 @@ static bool InjectPlaylist(void* gm) {
 static void* FindPawnClass() {
     static const char16_t* names[] = {
         u"FortPlayerPawnAthena", u"FortPlayerPawnAthena_C",
-        u"Athena_PlayerPawn_C", u"FortPlayerPawn",
+        u"Athena_PlayerPawn_C", u"FortPlayerPawn", u"FortPlayerPawn_C",
+        u"BP_PlayerPawn_Athena_C", u"PlayerPawn_Athena_C",
+        u"FortPlayerPawnAthena_BP_C", u"PlayerPawn_Athena",
+        u"FortPlayerPawnAthena_PC", u"FortPlayerPawnAthenaPC",
     };
     for (auto n : names) {
         void* c = SFO2(n);
-        if (IVP(c)) return c;
+        if (IVP(c)) {
+            LOGF("[FindPawnClass] FOUND: %p", c);
+            return c;
+        }
     }
+    LOGF("[FindPawnClass] NOT FOUND any class name");
+    return nullptr;
+}
+
+static void* GetWorldFromPC(void* pc, void* gm) {
+    if (IVP(pc)) {
+        uint32_t offsets[] = { 0x180, 0x188, 0x190, 0x198, 0x1A0, 0x1B0, 0x1C0, 0x1E0 };
+        for (auto off : offsets) {
+            void* w = nullptr;
+            if (RP((char*)pc + off, &w) && IVP(w)) {
+                LOGF("[World] PC+0x%X -> %p", off, w);
+                return w;
+            }
+        }
+    }
+    if (IVP(gm)) {
+        uint32_t offsets[] = { 0x180, 0x188, 0x190, 0x198, 0x1A0, 0x1B0, 0x1C0, 0x1E0 };
+        for (auto off : offsets) {
+            void* w = nullptr;
+            if (RP((char*)gm + off, &w) && IVP(w)) {
+                LOGF("[World] GM+0x%X -> %p", off, w);
+                return w;
+            }
+        }
+    }
+    if (IVP(pc)) {
+        void* outer = nullptr;
+        if (RP((char*)pc + OFF_UOBJ_OUTERPRIVATE, &outer) && IVP(outer)) {
+            for (int i = 0; i < 6; i++) {
+                void* w = nullptr;
+                if (RP((char*)outer + 0x180, &w) && IVP(w)) {
+                    LOGF("[World] Outer walk +0x180 -> %p", w);
+                    return w;
+                }
+                void* next = nullptr;
+                if (!RP((char*)outer + OFF_UOBJ_OUTERPRIVATE, &next) || !IVP(next)) break;
+                outer = next;
+            }
+        }
+    }
+    LOGF("[World] FAILED to find World");
     return nullptr;
 }
 
@@ -265,7 +311,10 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("[Spawn] Manual Spawn GM=%p PC=%p", gm, pc);
     LOGF("============================================================");
 
-    if (!IVP(gm) || !IVP(pc)) return;
+    if (!IVP(gm) || !IVP(pc)) {
+        LOGF("[Spawn] Invalid GM or PC");
+        return;
+    }
 
     InjectPlaylist(gm);
 
@@ -274,33 +323,38 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (IVP(ps)) {
         uint8_t b = 0;
         if (RU8((char*)ps + OFF_PS_SpectatorByte, &b)) {
+            LOGF("[Spawn] Spectator byte = 0x%02X, clearing", b);
             WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
         }
+    } else {
+        LOGF("[Spawn] PlayerState NULL");
     }
 
-    void* world = nullptr;
-    RP((char*)pc + OFF_PC_World, &world);
-    if (!IVP(world)) {
-        RP((char*)gm + OFF_PC_World, &world);
-    }
-
+    void* world = GetWorldFromPC(pc, gm);
     void* pawnClass = FindPawnClass();
 
-    if (IVP(world) && IVP(pawnClass)) {
-        FTransform customTransform;
-        MakeXform(0.0f, 0.0f, 10000.0f, &customTransform);
+    LOGF("[Spawn] World=%p PawnClass=%p", world, pawnClass);
 
-        void* new_pawn = DoSpawnActor(world, pawnClass, &customTransform);
+    if (!IVP(world)) {
+        LOGF("[Spawn] ABORT: World invalid");
+        return;
+    }
+    if (!IVP(pawnClass)) {
+        LOGF("[Spawn] ABORT: PawnClass invalid");
+        return;
+    }
 
-        if (IVP(new_pawn)) {
-            WP((char*)pc + OFF_PC_Pawn, new_pawn);
-            WP((char*)pc + OFF_PC_AckPawn, new_pawn);
-            LOGF("[Spawn] Manual Spawn SUCCESS. Pawn=%p", new_pawn);
-        } else {
-            LOGF("[Spawn] Manual Spawn FAILED.");
-        }
+    FTransform customTransform;
+    MakeXform(0.0f, 0.0f, 10000.0f, &customTransform);
+
+    void* new_pawn = DoSpawnActor(world, pawnClass, &customTransform);
+
+    if (IVP(new_pawn)) {
+        WP((char*)pc + OFF_PC_Pawn, new_pawn);
+        WP((char*)pc + OFF_PC_AckPawn, new_pawn);
+        LOGF("[Spawn] SUCCESS! New Pawn = %p", new_pawn);
     } else {
-        LOGF("[Spawn] Invalid World or PawnClass.");
+        LOGF("[Spawn] SpawnActor returned NULL");
     }
     LOGF("[Spawn] DONE");
 }
@@ -365,7 +419,7 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook manual spawn");
+    LOGF(" hook manual spawn v2");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
