@@ -279,7 +279,7 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
         if (RU8((char*)ps + OFF_PS_SpectatorByte, &b)) {
             LOGF("[Spawn] PS bits BEFORE = 0x%02X", b);
             uint8_t nb = b & ~MASK_ALL_SPECTATOR_BITS;
-            WU8((char*)ps + OFF_PS_SpectatorByte, nb);
+            WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
             LOGF("[Spawn] PS bits AFTER  = 0x%02X", nb);
         }
     } else {
