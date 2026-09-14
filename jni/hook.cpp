@@ -27,17 +27,17 @@
 #define ADDR_PostLogin                   0x550C610
 
 #define STATIC_VFT_RVA                   0xBDB8BC0
-#define VFT_SLOT_CHECK                   78
-#define VFT_SLOT_CHECK_OFF               (VFT_SLOT_CHECK * sizeof(void*))
 
-#define VFT_IDX_SpawnDefaultPawnFor      0xDD
 #define VFT_IDX_SpawnDefaultPawnAtTransform 0xDE
+#define VFT_IDX_ProcessEvent             0x42
 
 #define OFF_PC_PlayerState               0x278
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
 #define OFF_PS_SpectatorByte             0x27A
+
+#define OFF_UFUNCTION_FUNC               0xE0
 
 #define SKY_Z                            500.0f
 
@@ -109,8 +109,6 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
-static void* g_cached_pawn_class = nullptr;
-static size_t g_pawn_class_offset = 0;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
@@ -141,40 +139,6 @@ static bool VFTHook(void* vft, size_t vft_index, void* hook_fn, void** orig_out)
     return true;
 }
 
-static void DumpSlot78() {
-    LOGF("========================================");
-    LOGF("[Slot78] Static VFT RVA = 0x%X", STATIC_VFT_RVA);
-    LOGF("[Slot78] Slot = %d, Slot Offset = 0x%zX", VFT_SLOT_CHECK, (size_t)VFT_SLOT_CHECK_OFF);
-
-    void** vft = (void**)(g_base + STATIC_VFT_RVA);
-    LOGF("[Slot78] Static VFT Addr = %p (g_base + 0x%X)", (void*)vft, STATIC_VFT_RVA);
-
-    if (!IVP(vft)) {
-        LOGF("[Slot78] VFT pointer invalid");
-        return;
-    }
-
-    void* slot78 = nullptr;
-    if (!RP((char*)vft + VFT_SLOT_CHECK_OFF, &slot78)) {
-        LOGF("[Slot78] read failed");
-        return;
-    }
-
-    if (!IVP(slot78)) {
-        LOGF("[Slot78] slot value invalid: %p", slot78);
-        return;
-    }
-
-    uintptr_t addr = (uintptr_t)slot78;
-    uintptr_t rva = addr - g_base;
-
-    LOGF("[Slot78] VTable[%d] @ (vft+0x%zX) = %p",
-         VFT_SLOT_CHECK, (size_t)VFT_SLOT_CHECK_OFF, slot78);
-    LOGF("[Slot78] Runtime Addr = 0x%lX", (unsigned long)addr);
-    LOGF("[Slot78] Function RVA = 0x%lX", (unsigned long)rva);
-    LOGF("========================================");
-}
-
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
 static void MakeSkyXform(FTransform* t) {
@@ -184,49 +148,110 @@ static void MakeSkyXform(FTransform* t) {
     t->sx = t->sy = t->sz = 1.0f;
 }
 
-typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
-static SpawnDefaultPawnFor_t o_SpawnDefaultPawnFor = nullptr;
-
 typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
 static SpawnDefaultPawnAtTransform_t SpawnDefaultPawnAtTransform = nullptr;
 
-static void* Hook_SpawnDefaultPawnFor(void* gm, void* controller, void* startSpot) {
-    LOGF("[SpawnDefaultPawnFor] gm=%p ctrl=%p spot=%p", gm, controller, startSpot);
-    if (IVP(gm) && IVP(controller) && SpawnDefaultPawnAtTransform) {
-        FTransform transform;
-        MakeSkyXform(&transform);
-        void* pawn = SpawnDefaultPawnAtTransform(gm, controller, &transform);
-        if (IVP(pawn)) {
-            LOGF("[SpawnDefaultPawnFor] SUCCESS Pawn=%p", pawn);
-            return pawn;
+typedef void (*ProcessEvent_t)(void*, void*, void*);
+static ProcessEvent_t ProcessEvent = nullptr;
+
+typedef void (*UFunctionHook_t)(void*, void*, void*);
+static UFunctionHook_t o_SpawnDefaultPawnForFunc = nullptr;
+
+static void* g_cached_gm = nullptr;
+static void* g_cached_pc = nullptr;
+static void* g_spawn_func = nullptr;
+
+// ============================================================
+// UFunction hook signature:
+//   void execXXX(UObject* Context, FFrame& Stack, void* Result)
+// ============================================================
+static void Hook_SpawnDefaultPawnForFunc(void* Context, void* Stack, void* Result) {
+    LOGF("[SpawnDefaultPawnFor] CALLED! ctx=%p stack=%p result=%p", Context, Stack, Result);
+
+    if (!IVP(g_cached_pc) || !SpawnDefaultPawnAtTransform) {
+        LOGF("[SpawnDefaultPawnFor] no cached pc, fallback to original");
+        if (o_SpawnDefaultPawnForFunc) o_SpawnDefaultPawnForFunc(Context, Stack, Result);
+        return;
+    }
+
+    FTransform sky;
+    MakeSkyXform(&sky);
+    void* pawn = SpawnDefaultPawnAtTransform(Context, g_cached_pc, &sky);
+    LOGF("[SpawnDefaultPawnFor] custom spawn pawn=%p", pawn);
+
+    if (IVP(pawn)) {
+        if (Result) *(void**)Result = pawn;
+        return;
+    }
+
+    LOGF("[SpawnDefaultPawnFor] custom failed, call original");
+    if (o_SpawnDefaultPawnForFunc) o_SpawnDefaultPawnForFunc(Context, Stack, Result);
+}
+
+static void DumpUFunction(void* fn) {
+    LOGF("========== UFunction Dump %p ==========", fn);
+    for (size_t off = 0x80; off < 0x140; off += 8) {
+        void* v = nullptr;
+        if (!RP((char*)fn + off, &v)) continue;
+        if (!IVP(v)) {
+            LOGF("  +0x%zX = %p", off, v);
+            continue;
+        }
+        uintptr_t rva = (uintptr_t)v - g_base;
+        if (rva < 0x20000000ULL) {
+            LOGF("  +0x%zX = %p   (RVA=0x%lX)  <-- candidate Func",
+                 off, v, (unsigned long)rva);
+        } else {
+            LOGF("  +0x%zX = %p", off, v);
         }
     }
-    void* res = o_SpawnDefaultPawnFor ? o_SpawnDefaultPawnFor(gm, controller, startSpot) : nullptr;
-    LOGF("[SpawnDefaultPawnFor] fallback Pawn=%p", res);
-    return res;
+}
+
+static void* FindSpawnDefaultPawnForFunc() {
+    if (!SFO) return nullptr;
+
+    const char16_t* paths[] = {
+        u"/Script/FortniteGame.FortGameMode.SpawnDefaultPawnFor",
+        u"/Script/FortniteGame.FortGameModeBase.SpawnDefaultPawnFor",
+        u"/Script/Engine.GameModeBase.SpawnDefaultPawnFor",
+        u"/Game/Athena/FortGameMode.FortGameMode_C.SpawnDefaultPawnFor",
+    };
+
+    for (auto p : paths) {
+        void* fn = SFO(nullptr, nullptr, p, false);
+        LOGF("[Find] '%ls' -> %p", p, fn);
+        if (IVP(fn)) return fn;
+    }
+    return nullptr;
+}
+
+static bool HookUFunction(void* ufunc, void* hook, void** orig_out) {
+    if (!IVP(ufunc) || !hook) return false;
+
+    void* current = nullptr;
+    if (!RP((char*)ufunc + OFF_UFUNCTION_FUNC, &current)) {
+        LOGF("[UFunctionHook] cannot read Func at +0x%X", OFF_UFUNCTION_FUNC);
+        return false;
+    }
+
+    uintptr_t rva = (uintptr_t)current - g_base;
+    LOGF("[UFunctionHook] Func @+0x%X = %p (RVA=0x%lX)",
+         OFF_UFUNCTION_FUNC, current, (unsigned long)rva);
+
+    if (orig_out) *orig_out = current;
+
+    if (!WP((char*)ufunc + OFF_UFUNCTION_FUNC, hook)) {
+        LOGF("[UFunctionHook] write failed");
+        return false;
+    }
+    LOGF("[UFunctionHook] replaced Func with %p", hook);
+    return true;
 }
 
 static void* FindPlaylist() {
     if (!SFO) return nullptr;
-    return SFO(nullptr, nullptr, u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
-}
-
-static void* FindPlayerPawnClass() {
-    if (!SFO) return nullptr;
-
-    const char16_t* paths[] = {
-        u"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
-        u"/Game/Athena/Player/FortPlayerPawn.FortPlayerPawn_C",
-        u"/Game/Athena/Player/FortPlayerPawnAthena.FortPlayerPawnAthena_C",
-        u"/Game/PlayerPawn_Athena.PlayerPawn_Athena_C",
-    };
-
-    for (auto path : paths) {
-        void* cls = SFO(nullptr, nullptr, path, false);
-        LOGF("[PawnClass] try -> %p", cls);
-        if (IVP(cls)) return cls;
-    }
-    return nullptr;
+    return SFO(nullptr, nullptr,
+        u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
 }
 
 static bool InjectPlaylist(void* gm) {
@@ -258,59 +283,6 @@ static void ClearSpectator(void* pc) {
     }
 }
 
-// ============================================================
-// حقن DefaultPawnClass داخل GameMode
-// ============================================================
-static bool InjectDefaultPawnClassAt(void* gm, void* pawnClass, size_t off) {
-    void* prev = nullptr;
-    if (!RP((char*)gm + off, &prev)) return false;
-    if (!WP((char*)gm + off, pawnClass)) return false;
-    LOGF("[PawnInject] wrote at 0x%zX (prev=%p) -> %p", off, prev, pawnClass);
-    return true;
-}
-
-static void* TrySpawnWithInjectedClass(void* gm, void* pc, void* pawnClass, size_t off) {
-    if (!InjectDefaultPawnClassAt(gm, pawnClass, off)) return nullptr;
-
-    FTransform sky;
-    MakeSkyXform(&sky);
-    void* pawn = SpawnDefaultPawnAtTransform ? SpawnDefaultPawnAtTransform(gm, pc, &sky) : nullptr;
-    LOGF("[PawnInject] spawn @0x%zX -> %p", off, pawn);
-
-    if (IVP(pawn)) {
-        g_pawn_class_offset = off;
-        LOGF("[PawnInject] *** FOUND OFFSET 0x%zX ***", off);
-        return pawn;
-    }
-    return nullptr;
-}
-
-static void* InjectDefaultPawnClass(void* gm, void* pc, void* pawnClass) {
-    if (!IVP(gm) || !IVP(pc) || !IVP(pawnClass)) {
-        LOGF("[PawnInject] invalid args");
-        return nullptr;
-    }
-
-    if (g_pawn_class_offset != 0) {
-        LOGF("[PawnInject] Using cached offset 0x%zX", g_pawn_class_offset);
-        return TrySpawnWithInjectedClass(gm, pc, pawnClass, g_pawn_class_offset);
-    }
-
-    size_t candidates[] = {
-        0x2D8, 0x2E0, 0x2E8, 0x2F0, 0x2F8, 0x300, 0x308,
-        0x310, 0x318, 0x320, 0x328, 0x330, 0x338, 0x340,
-        0x348, 0x350, 0x358, 0x360, 0x368, 0x370,
-    };
-
-    for (size_t off : candidates) {
-        void* pawn = TrySpawnWithInjectedClass(gm, pc, pawnClass, off);
-        if (IVP(pawn)) return pawn;
-    }
-
-    LOGF("[PawnInject] All candidate offsets failed.");
-    return nullptr;
-}
-
 static bool g_vftHooked = false;
 
 static void ApplyVftHooks() {
@@ -320,24 +292,51 @@ static void ApplyVftHooks() {
         LOGF("[VFT] Static VFT pointer invalid: %p", vft);
         return;
     }
-    LOGF("[VFT] Using Static VFT = %p (RVA=0x%X)", vft, STATIC_VFT_RVA);
+    LOGF("[VFT] Static VFT = %p (RVA=0x%X)", vft, STATIC_VFT_RVA);
 
     void* at = nullptr;
     if (RP((char*)vft + VFT_IDX_SpawnDefaultPawnAtTransform * sizeof(void*), &at) && IVP(at)) {
         SpawnDefaultPawnAtTransform = (SpawnDefaultPawnAtTransform_t)at;
-        LOGF("[VFT] SpawnDefaultPawnAtTransform [0x%X] = %p (RVA=0x%lX)",
-             VFT_IDX_SpawnDefaultPawnAtTransform, at,
-             (unsigned long)((uintptr_t)at - g_base));
+        LOGF("[VFT] SpawnDefaultPawnAtTransform = %p (RVA=0x%lX)",
+             at, (unsigned long)((uintptr_t)at - g_base));
     } else {
         LOGF("[VFT] SpawnDefaultPawnAtTransform read FAILED");
+    }
+
+    void* pe = nullptr;
+    if (RP((char*)vft + VFT_IDX_ProcessEvent * sizeof(void*), &pe) && IVP(pe)) {
+        ProcessEvent = (ProcessEvent_t)pe;
+        LOGF("[VFT] ProcessEvent = %p (RVA=0x%lX)",
+             pe, (unsigned long)((uintptr_t)pe - g_base));
+    } else {
+        LOGF("[VFT] ProcessEvent read FAILED");
+    }
+}
+
+static void CallSpawnDefaultPawnForViaProcessEvent(void* gm, void* pc) {
+    if (!IVP(gm) || !IVP(pc)) return;
+    if (!IVP(g_spawn_func) || !ProcessEvent) {
+        LOGF("[Call] cannot call, g_spawn_func=%p ProcessEvent=%p",
+             g_spawn_func, (void*)ProcessEvent);
         return;
     }
 
-    void* orig = nullptr;
-    bool ok = VFTHook(vft, VFT_IDX_SpawnDefaultPawnFor, (void*)Hook_SpawnDefaultPawnFor, &orig);
-    o_SpawnDefaultPawnFor = (SpawnDefaultPawnFor_t)orig;
-    LOGF("[VFT] Hook SpawnDefaultPawnFor [0x%X]: %s (orig=%p)",
-         VFT_IDX_SpawnDefaultPawnFor, ok ? "OK" : "FAIL", orig);
+    uint8_t params[0x40];
+    memset(params, 0, sizeof(params));
+
+    *(void**)(params + 0x00) = pc;
+    *(void**)(params + 0x08) = nullptr;
+
+    LOGF("[Call] ProcessEvent(gm=%p, func=%p, params=%p)", gm, g_spawn_func, params);
+    ProcessEvent(gm, g_spawn_func, params);
+
+    void* result = *(void**)(params + 0x10);
+    LOGF("[Call] result (params+0x10) = %p", result);
+
+    if (!IVP(result)) {
+        result = *(void**)(params + 0x00);
+        LOGF("[Call] try params+0x00 = %p", result);
+    }
 }
 
 typedef void (*PL_t)(void*, void*);
@@ -348,6 +347,9 @@ static void Hook_PL(void* gm, void* pc) {
     g_calls++;
     LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========",
          (unsigned long long)g_calls, gm, pc);
+
+    g_cached_gm = gm;
+    g_cached_pc = pc;
 
     if (!g_vftHooked) {
         ApplyVftHooks();
@@ -361,24 +363,8 @@ static void Hook_PL(void* gm, void* pc) {
 
     ClearSpectator(pc);
 
-    if (IVP(gm) && IVP(pc) && SpawnDefaultPawnAtTransform) {
-        if (!g_cached_pawn_class) {
-            g_cached_pawn_class = FindPlayerPawnClass();
-            LOGF("[PawnClass] Cached = %p", g_cached_pawn_class);
-        }
-
-        if (IVP(g_cached_pawn_class)) {
-            LOGF("[PostLogin] Injecting DefaultPawnClass and spawning...");
-            void* pawn = InjectDefaultPawnClass(gm, pc, g_cached_pawn_class);
-            if (IVP(pawn)) {
-                ClearSpectator(pc);
-                LOGF("[PostLogin] SUCCESS! Pawn=%p (offset=0x%zX)", pawn, g_pawn_class_offset);
-            } else {
-                LOGF("[PostLogin] Failed to spawn with injected class.");
-            }
-        } else {
-            LOGF("[PostLogin] PawnClass not found, cannot inject.");
-        }
+    if (IVP(gm) && IVP(pc)) {
+        CallSpawnDefaultPawnForViaProcessEvent(gm, pc);
     }
 
     LOGF("[PostLogin] done");
@@ -410,14 +396,21 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook vft v11 - DefaultPawnClass inject");
+    LOGF(" hook v12 - UFunction SpawnDefaultPawnFor");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     LOGF(" SFO = %p (RVA=0x%X)", (void*)SFO, ADDR_StaticFindObject);
 
-    DumpSlot78();
+    g_spawn_func = FindSpawnDefaultPawnForFunc();
+    LOGF(" SpawnDefaultPawnFor UFunction = %p", g_spawn_func);
+
+    if (IVP(g_spawn_func)) {
+        DumpUFunction(g_spawn_func);
+        HookUFunction(g_spawn_func, (void*)Hook_SpawnDefaultPawnForFunc,
+                      (void**)&o_SpawnDefaultPawnForFunc);
+    }
 
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
