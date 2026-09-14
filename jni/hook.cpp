@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v56: FTransform pattern search)
+// hook — Android JNI (v57: camera + aggressive location)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -36,6 +36,8 @@
 #define OFF_PC_PlayerState                0x278
 #define OFF_PC_Pawn                       0x2B8
 #define OFF_PC_AckPawn                    0x2C0
+#define OFF_PC_CameraManager              0x2D8
+#define OFF_PC_ViewTarget                 0x2E0
 #define OFF_Pawn_Controller               0x2A8
 #define OFF_Pawn_Owner                    0x2A0
 #define OFF_Pawn_PlayerState              0x2D0
@@ -44,6 +46,10 @@
 #define OFF_GS_Playlist2290               0x2290
 #define OFF_PS_SpectatorByte              0x27A
 #define BIT_PS_Spectator                  0x08
+
+static const int kPossessSlots[] = {
+    0x1D0, 0x1D8, 0x1C8, 0x1E0, 0x1E8, 0x1F0, 0x1B8, 0x1C0, 0x1A8, 0x1B0
+};
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -128,7 +134,6 @@ static bool IsTextPtr(void* p) {
     uintptr_t v = (uintptr_t)p;
     return (g_text_start && v >= g_text_start && v < g_text_end);
 }
-
 static void* SFO2(const char16_t* name) {
     if (!SFO) return nullptr;
     void* a = SFO(nullptr, nullptr, name, false);
@@ -137,7 +142,6 @@ static void* SFO2(const char16_t* name) {
     if (IsValidPtr(b)) return b;
     return nullptr;
 }
-
 static void* WalkOuter(void* start, int hops) {
     void* cur = start;
     for (int i = 0; i < hops; i++) {
@@ -159,106 +163,133 @@ static void MakeXform(float x, float y, float z, FTransform* t) {
 struct TArrayN { void* Data; int32_t Num; int32_t Max; int32_t pad; };
 
 // ============================================================
-// ⭐ KEY FUNCTION: Find FTransform by pattern search
-//     looks for FQuat with |q|² ≈ 1.0, then reads FVector +16
+// Aggressive transform search — RELAXED bounds
 // ============================================================
 static bool FindTransformInActor(void* actor, float out[3], int* foundOffset) {
     if (!IsValidPtr(actor)) return false;
     if (foundOffset) *foundOffset = -1;
 
-    // Scan actor memory from 0x100 to 0x500 in 4-byte steps
-    for (int off = 0x100; off < 0x500; off += 4) {
+    // Scan from 0x100 to 0x800, step 4
+    for (int off = 0x100; off < 0x800; off += 4) {
         float q[4];
         if (!SafeReadBytes((char*)actor + off, q, 16)) continue;
-
-        // Check quaternion magnitude ≈ 1.0
         float qmag = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
-        if (qmag < 0.9f || qmag > 1.1f) continue;
-
-        // Check all components finite
+        if (qmag < 0.8f || qmag > 1.2f) continue;
         if (!std::isfinite(q[0]) || !std::isfinite(q[1]) ||
             !std::isfinite(q[2]) || !std::isfinite(q[3])) continue;
 
-        // Read Translation immediately after FQuat
         float t[3];
         if (!SafeReadBytes((char*)actor + off + 16, t, 12)) continue;
         if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) continue;
 
-        // Validate coordinates: X, Y, Z in Fortnite range
-        // Island X: -50000..50000, Y: -80000..80000, Z: -500..5000
-        if (fabsf(t[0]) > 300000.0f) continue;
-        if (fabsf(t[1]) > 300000.0f) continue;
-        if (t[2] < -1000.0f || t[2] > 10000.0f) continue;
+        // Very relaxed bounds
+        if (fabsf(t[0]) > 500000.0f) continue;
+        if (fabsf(t[1]) > 500000.0f) continue;
+        if (t[2] < -5000.0f || t[2] > 50000.0f) continue;
 
-        // Must have non-zero X or Y
-        float magXY = fabsf(t[0]) + fabsf(t[1]);
-        if (magXY < 500.0f) continue;
+        // must have meaningful magnitude
+        if (fabsf(t[0]) < 50.0f && fabsf(t[1]) < 50.0f) continue;
 
         out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
         if (foundOffset) *foundOffset = off;
-        LOGF("  [XFOUND] actor=%p offset=0x%X loc=(%.0f,%.0f,%.0f)",
+        LOGF("  [XFOUND] actor=%p off=0x%X loc=(%.0f,%.0f,%.0f)",
              actor, off, t[0], t[1], t[2]);
         return true;
     }
+    return false;
+}
 
-    // Second pass: try RootComponent + FTransform search
-    static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280, 0x2E0 };
+// Try RootComponent explicitly
+static bool FindTransformViaRoot(void* actor, float out[3]) {
+    static const int rootOffs[] = {
+        0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280, 0x2E0,
+        0x2A0, 0x2B0, 0x2C0, 0x2D0
+    };
     for (int ro : rootOffs) {
         void* root = nullptr;
         if (!SafeReadPtr((char*)actor + ro, &root) || !IsValidPtr(root)) continue;
-
-        for (int off = 0x100; off < 0x400; off += 4) {
+        for (int off = 0x100; off < 0x500; off += 4) {
             float q[4];
             if (!SafeReadBytes((char*)root + off, q, 16)) continue;
             float qmag = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
-            if (qmag < 0.9f || qmag > 1.1f) continue;
-            if (!std::isfinite(q[0]) || !std::isfinite(q[1]) ||
-                !std::isfinite(q[2]) || !std::isfinite(q[3])) continue;
-
+            if (qmag < 0.8f || qmag > 1.2f) continue;
             float t[3];
             if (!SafeReadBytes((char*)root + off + 16, t, 12)) continue;
             if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) continue;
-            if (fabsf(t[0]) > 300000.0f) continue;
-            if (fabsf(t[1]) > 300000.0f) continue;
-            if (t[2] < -1000.0f || t[2] > 10000.0f) continue;
-            float magXY = fabsf(t[0]) + fabsf(t[1]);
-            if (magXY < 500.0f) continue;
-
+            if (fabsf(t[0]) > 500000.0f) continue;
+            if (fabsf(t[1]) > 500000.0f) continue;
+            if (t[2] < -5000.0f || t[2] > 50000.0f) continue;
+            if (fabsf(t[0]) < 50.0f && fabsf(t[1]) < 50.0f) continue;
             out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
-            if (foundOffset) *foundOffset = off;
-            LOGF("  [XFOUND-root] actor=%p root@0x%X offset=0x%X loc=(%.0f,%.0f,%.0f)",
+            LOGF("  [XFOUND-root] actor=%p root@0x%X off=0x%X loc=(%.0f,%.0f,%.0f)",
                  actor, ro, off, t[0], t[1], t[2]);
             return true;
         }
     }
-
     return false;
 }
 
 // ============================================================
-// Possess
+// Possess + Camera fix
 // ============================================================
-typedef void (*PossessFn_t)(void*, void*);
+typedef void (*VtableFn_t)(void*, void*);
+
+static void DumpPCCritical(void* pc) {
+    void* cm = nullptr;
+    void* vt = nullptr;
+    SafeReadPtr((char*)pc + OFF_PC_CameraManager, &cm);
+    SafeReadPtr((char*)pc + OFF_PC_ViewTarget, &vt);
+    void* pawn = nullptr;
+    SafeReadPtr((char*)pc + OFF_PC_Pawn, &pawn);
+    LOGF("[PC] Pawn=%p CameraMgr=%p ViewTarget=%p", pawn, cm, vt);
+}
+
 static bool TryPossessVtable(void* pc, void* pawn) {
     if (!IsValidPtr(pc) || !IsValidPtr(pawn)) return false;
     void** vft = nullptr;
     if (!SafeReadPtr(pc, (void**)&vft)) return false;
     if (!IsValidPtr(vft)) return false;
 
-    // Known success: slot 0x1D0
-    void* fn = nullptr;
-    if (!SafeReadPtr((char*)vft + 0x1D0 * 8, &fn) || !IsTextPtr(fn)) return false;
+    // Try slot 0x1D0 first (known from v54)
+    for (int slot : kPossessSlots) {
+        void* fn = nullptr;
+        if (!SafeReadPtr((char*)vft + (size_t)slot * 8, &fn)) continue;
+        if (!IsTextPtr(fn)) continue;
 
-    LOGF("[Possess] calling slot 0x1D0 -> %p", fn);
-    ((PossessFn_t)fn)(pc, pawn);
-    void* p = nullptr;
-    SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
-    if (p == pawn) {
-        LOGF("[Possess] ✅ SUCCESS");
-        return true;
+        LOGF("[Possess] trying slot 0x%X -> +0x%lx",
+             slot, (unsigned long)((uintptr_t)fn - g_base));
+
+        ((VtableFn_t)fn)(pc, pawn);
+
+        void* p = nullptr;
+        SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
+        if (p == pawn) {
+            LOGF("[Possess] ✅ slot 0x%X set PC->Pawn", slot);
+            return true;
+        }
     }
-    LOGF("[Possess] ⚠️ slot 0x1D0 didn't stick");
     return false;
+}
+
+// Try SetViewTarget — call a 1-arg function on pawn to update camera
+static void TryForceCamera(void* pc, void* pawn) {
+    // Method 1: write ViewTarget directly
+    if (SafeWritePtr((char*)pc + OFF_PC_ViewTarget, pawn)) {
+        LOGF("[Camera] wrote ViewTarget = %p", pawn);
+    }
+
+    // Method 2: call ClientSetViewTarget via vtable
+    void** vft = nullptr;
+    if (!SafeReadPtr(pc, (void**)&vft) || !IsValidPtr(vft)) return;
+
+    // Try several slots in 0x200-0x280 range (camera-related)
+    for (int slot = 0x1F0; slot <= 0x2C0; slot += 8) {
+        void* fn = nullptr;
+        if (!SafeReadPtr((char*)vft + (size_t)slot * 8, &fn)) continue;
+        if (!IsTextPtr(fn)) continue;
+        LOGF("[Camera] candidate slot 0x%X -> +0x%lx",
+             slot, (unsigned long)((uintptr_t)fn - g_base));
+    }
 }
 
 static void ClearSpectatorBit(void* ps) {
@@ -266,7 +297,10 @@ static void ClearSpectatorBit(void* ps) {
     uint8_t b = 0;
     if (!SafeReadU8((char*)ps + OFF_PS_SpectatorByte, &b)) return;
     uint8_t nb = b & ~BIT_PS_Spectator;
-    if (nb != b) SafeWriteU8((char*)ps + OFF_PS_SpectatorByte, nb);
+    if (nb != b) {
+        SafeWriteU8((char*)ps + OFF_PS_SpectatorByte, nb);
+        LOGF("[Spec] 0x%02X -> 0x%02X", b, nb);
+    }
 }
 
 typedef void (*GetAllActorsFn_t)(void* context, void* cls, void* outTArray);
@@ -294,10 +328,10 @@ static void* DoSpawnActor(void* world, void* cls, FTransform* xform) {
     uint8_t params[0x100];
     memset(params, 0, sizeof(params));
     SpawnActor_t fn = (SpawnActor_t)(g_base + ADDR_SpawnActor);
-    LOGF("[Spawn] SpawnActor(world=%p cls=%p loc=(%.0f,%.0f,%.0f))",
+    LOGF("[Spawn] world=%p cls=%p loc=(%.0f,%.0f,%.0f)",
          world, cls, xform->tx, xform->ty, xform->tz);
     void* result = fn(world, cls, xform, params);
-    LOGF("[Spawn] returned %p %s", result, IsValidPtr(result) ? "OK" : "NULL");
+    LOGF("[Spawn] -> %p %s", result, IsValidPtr(result) ? "OK" : "NULL");
     return result;
 }
 
@@ -347,7 +381,7 @@ static void* FindPawnClass() {
 }
 
 // ============================================================
-// Spawn
+// Main spawn
 // ============================================================
 static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("");
@@ -364,8 +398,10 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     void* existing = nullptr;
     SafeReadPtr((char*)pc + OFF_PC_Pawn, &existing);
     if (IsValidPtr(existing)) {
+        LOGF("[Spawn] existing pawn: %p", existing);
         AttachPawnToPC(pc, existing);
         TryPossessVtable(pc, existing);
+        TryForceCamera(pc, existing);
         return;
     }
 
@@ -378,68 +414,61 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("[Spawn] World = %p", world);
     if (!IsValidPtr(world)) return;
 
-    // ============================================================
-    // Find PlayerStart location
-    // ============================================================
+    // ============ Find location ============
+    float bestLoc[3] = { 0.0f, 0.0f, 5000.0f };
+    bool gotLoc = false;
+
+    // ---- Try PlayerStart actors ----
     void* fpsCls = SFO2(u"FortPlayerStartWarmup");
     if (!IsValidPtr(fpsCls)) fpsCls = SFO2(u"PlayerStart");
-
     void* actors[128] = {0};
     int n = CallGetAllActors(pc, fpsCls, actors);
-    LOGF("[Spawn] candidates = %d", n);
+    LOGF("[Spawn] candidates=%d", n);
 
-    float bestLoc[3] = { 0.0f, 0.0f, 5000.0f };
     float bestZ = -1e9f;
-    bool gotLoc = false;
     int bestIdx = -1;
-    int bestOff = -1;
 
-    // Try to find a PlayerStart with a valid transform
     for (int i = 0; i < n && i < 128; i++) {
         if (!IsValidPtr(actors[i])) continue;
         float tmp[3];
-        int off = -1;
-        if (!FindTransformInActor(actors[i], tmp, &off)) continue;
-
-        LOGF("[Spawn] actor[%d] @ offset 0x%X loc=(%.0f,%.0f,%.0f)",
-             i, off, tmp[0], tmp[1], tmp[2]);
-
+        if (!FindTransformInActor(actors[i], tmp, nullptr)) continue;
         if (tmp[2] > bestZ) {
             bestZ = tmp[2];
-            bestLoc[0] = tmp[0];
-            bestLoc[1] = tmp[1];
-            bestLoc[2] = tmp[2];
+            bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
             gotLoc = true;
             bestIdx = i;
-            bestOff = off;
         }
     }
-
     if (gotLoc) {
-        LOGF("[Spawn] ✅ BEST from actor[%d]@0x%X = (%.0f, %.0f, %.0f)",
-             bestIdx, bestOff, bestLoc[0], bestLoc[1], bestLoc[2]);
-    } else {
-        // Try search in the first actor
-        for (int i = 0; i < n && i < 128 && !gotLoc; i++) {
-            if (!IsValidPtr(actors[i])) continue;
-            float tmp[3];
-            int off = -1;
-            if (FindTransformInActor(actors[i], tmp, &off)) {
-                bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
-                gotLoc = true;
-                LOGF("[Spawn] ⚠️ fallback actor[%d] = (%.0f,%.0f,%.0f)", i, tmp[0], tmp[1], tmp[2]);
+        LOGF("[Spawn] ✅ location from actor[%d] = (%.0f,%.0f,%.0f)",
+             bestIdx, bestLoc[0], bestLoc[1], bestLoc[2]);
+    }
+
+    // ---- Fallback: Aircraft location ----
+    if (!gotLoc) {
+        void* aircraftCls = SFO2(u"FortAthenaAircraft");
+        if (!IsValidPtr(aircraftCls)) aircraftCls = SFO2(u"AthenaAircraft");
+        if (IsValidPtr(aircraftCls)) {
+            void* acActors[8] = {0};
+            int an = CallGetAllActors(pc, aircraftCls, acActors);
+            LOGF("[Spawn] aircraft candidates=%d", an);
+            for (int i = 0; i < an && i < 8; i++) {
+                if (!IsValidPtr(acActors[i])) continue;
+                float tmp[3];
+                if (FindTransformInActor(acActors[i], tmp, nullptr) ||
+                    FindTransformViaRoot(acActors[i], tmp)) {
+                    bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
+                    gotLoc = true;
+                    LOGF("[Spawn] ✅ aircraft[%d] loc = (%.0f,%.0f,%.0f)",
+                         i, tmp[0], tmp[1], tmp[2]);
+                    break;
+                }
             }
         }
     }
 
     if (!gotLoc) {
-        LOGF("[Spawn] no location found in any actor — using (0,0,5000)");
-    }
-
-    // Boost Z if too low
-    if (bestLoc[2] < 500.0f) {
-        LOGF("[Spawn] Z too low (%.0f) → set to 3000", bestLoc[2]);
-        bestLoc[2] = 3000.0f;
+        LOGF("[Spawn] no location — using fallback (0,0,5000)");
     }
 
     void* pawnCls = FindPawnClass();
@@ -452,9 +481,9 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (!IsValidPtr(pawn)) return;
 
     AttachPawnToPC(pc, pawn);
-    if (TryPossessVtable(pc, pawn)) {
-        LOGF("[Spawn] ✅ POSSESSED");
-    }
+    TryPossessVtable(pc, pawn);
+    TryForceCamera(pc, pawn);
+    DumpPCCritical(pc);
     LOGF("[Spawn] ===== DONE =====");
 }
 
@@ -514,7 +543,7 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook — v56 (FTransform pattern)");
+    LOGF(" hook — v57 (camera + aggressive loc)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
