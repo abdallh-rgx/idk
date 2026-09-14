@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v54: fix location + Possess)
+// hook — Android JNI (v55: fix location)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -45,10 +45,8 @@
 #define OFF_PS_SpectatorByte              0x27A
 #define BIT_PS_Spectator                  0x08
 
-// APlayerController::Possess vtable slots (try in order)
-static const int kPossessSlots[] = {
-    0x1D0, 0x1D8, 0x1C8, 0x1E0, 0x1E8, 0x1F0, 0x1B8, 0x1C0, 0x1A8, 0x1B0
-};
+// Possess vtable candidates (from v54 success: 0x1D0 was best)
+static const int kPossessSlots[] = { 0x1D0, 0x1D8, 0x1C8 };
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -92,10 +90,6 @@ static bool SafeWriteU8(void* addr, uint8_t v) {
 static bool SafeReadU8(void* addr, uint8_t* v) {
     struct iovec l = { v, 1 }, r = { addr, 1 };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 1;
-}
-static bool SafeWriteFloat(void* addr, float v) {
-    struct iovec l = { &v, 4 }, r = { addr, 4 };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == 4;
 }
 
 struct LibInfo { uintptr_t base, text_start, text_end; };
@@ -159,9 +153,6 @@ static void* WalkOuter(void* start, int hops) {
     return cur;
 }
 
-// ============================================================
-// FTransform
-// ============================================================
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 static void MakeXform(float x, float y, float z, FTransform* t) {
     memset(t, 0, sizeof(*t));
@@ -171,49 +162,25 @@ static void MakeXform(float x, float y, float z, FTransform* t) {
 struct TArrayN { void* Data; int32_t Num; int32_t Max; int32_t pad; };
 
 // ============================================================
-// Location via vtable K2_GetActorLocation (common UE5 slot)
-// ============================================================
-typedef void (*GetActorLocation_t)(void* actor, void* outVector);
-static const int kGetLocSlots[] = { 0x68, 0x70, 0x60, 0x78, 0x80, 0x58, 0x50 };
-
-static bool TryVtableLocation(void* actor, float out[3]) {
-    if (!IsValidPtr(actor)) return false;
-    void** vft = nullptr;
-    if (!SafeReadPtr(actor, (void**)&vft)) return false;
-    if (!IsValidPtr(vft)) return false;
-
-    for (int slot : kGetLocSlots) {
-        void* fn = nullptr;
-        if (!SafeReadPtr((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!IsTextPtr(fn)) continue;
-
-        float tmp[3] = { 0 };
-        GetActorLocation_t f = (GetActorLocation_t)fn;
-        // K2_GetActorLocation returns FVector by value — uses sret
-        // That's hard to call blindly. Skip for now.
-    }
-    return false;
-}
-
-// ============================================================
-// Read transform from actor — MANY offsets
+// ReadActorLocation — EXPANDED with STRICT pass
 // ============================================================
 static bool ReadActorLocation(void* actor, float out[3]) {
     out[0] = out[1] = out[2] = 0;
     if (!IsValidPtr(actor)) return false;
 
-    // RootComponent offsets (expanded)
     static const int rootOffs[] = {
         0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280, 0x290,
         0x2A0, 0x2B0, 0x2C0, 0x2D0, 0x2E0, 0x2F0, 0x300, 0x310, 0x320,
+        0x330, 0x1D0, 0x1E0, 0x1F0, 0x200,
     };
-    // Translation offsets inside USceneComponent
     static const int locOffs[] = {
         0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110,
         0x118, 0x1A8, 0x1B0, 0x1B8, 0x150, 0x158, 0x160, 0x168,
-        0x120, 0x1D8, 0x1F8, 0x200, 0x208, 0x210,
+        0x120, 0x1D8, 0x1F8, 0x200, 0x208, 0x210, 0x218, 0x220,
+        0x228, 0x230, 0x238, 0x240, 0x248, 0x260, 0x268, 0x2D0,
     };
 
+    // ---- STRICT pass: require X, Y non-zero AND Z in valid range ----
     for (int ro : rootOffs) {
         void* root = nullptr;
         if (!SafeReadPtr((char*)actor + ro, &root) || !IsValidPtr(root)) continue;
@@ -221,13 +188,34 @@ static bool ReadActorLocation(void* actor, float out[3]) {
             float xyz[3];
             if (!SafeReadBytes((char*)root + lo, xyz, 12)) continue;
             if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
-            if (fabsf(xyz[0]) > 500000 || fabsf(xyz[1]) > 500000) continue;
-            if (xyz[2] < -2000 || xyz[2] > 20000) continue;
-            // Reject near-zero (unset) values
-            float mag = fabsf(xyz[0]) + fabsf(xyz[1]);
-            if (mag < 100.0f) continue;   // island coords are huge (thousands)
+
+            // strict: X, Y > 100, Z in [200, 8000]
+            if (fabsf(xyz[0]) < 100.0f) continue;
+            if (fabsf(xyz[1]) < 100.0f) continue;
+            if (xyz[2] < 200.0f || xyz[2] > 8000.0f) continue;
+            if (fabsf(xyz[0]) > 300000 || fabsf(xyz[1]) > 300000) continue;
+
             out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
-            LOGF("  [loc✅] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)", ro, lo, out[0], out[1], out[2]);
+            LOGF("  [loc-STRICT] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
+                 ro, lo, out[0], out[1], out[2]);
+            return true;
+        }
+    }
+
+    // ---- LOOSE pass: accept if Z in range, ignore X/Y zero ----
+    for (int ro : rootOffs) {
+        void* root = nullptr;
+        if (!SafeReadPtr((char*)actor + ro, &root) || !IsValidPtr(root)) continue;
+        for (int lo : locOffs) {
+            float xyz[3];
+            if (!SafeReadBytes((char*)root + lo, xyz, 12)) continue;
+            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
+            if (xyz[2] < 200.0f || xyz[2] > 8000.0f) continue;
+            if (fabsf(xyz[0]) > 300000 || fabsf(xyz[1]) > 300000) continue;
+
+            out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
+            LOGF("  [loc-LOOSE] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
+                 ro, lo, out[0], out[1], out[2]);
             return true;
         }
     }
@@ -235,17 +223,14 @@ static bool ReadActorLocation(void* actor, float out[3]) {
 }
 
 // ============================================================
-// Possess via vtable scan
+// Possess via vtable
 // ============================================================
 typedef void (*PossessFn_t)(void*, void*);
-
 static bool TryPossessVtable(void* pc, void* pawn) {
     if (!IsValidPtr(pc) || !IsValidPtr(pawn)) return false;
     void** vft = nullptr;
     if (!SafeReadPtr(pc, (void**)&vft)) return false;
     if (!IsValidPtr(vft)) return false;
-
-    LOGF("[Possess] trying vtable slots on pc=%p", pc);
 
     for (int slot : kPossessSlots) {
         void* fn = nullptr;
@@ -253,25 +238,14 @@ static bool TryPossessVtable(void* pc, void* pawn) {
         if (!IsTextPtr(fn)) continue;
 
         uintptr_t off = (uintptr_t)fn - g_base;
-        LOGF("[Possess]   slot 0x%X -> %p (+0x%lx)",
-             slot, fn, (unsigned long)off);
-    }
+        LOGF("[Possess] trying slot 0x%X -> +0x%lx", slot, (unsigned long)off);
 
-    // Try each candidate slot with 1 argument (pawn)
-    for (int slot : kPossessSlots) {
-        void* fn = nullptr;
-        if (!SafeReadPtr((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!IsTextPtr(fn)) continue;
-
-        LOGF("[Possess] attempting slot 0x%X ...", slot);
         PossessFn_t f = (PossessFn_t)fn;
         f(pc, pawn);
 
-        // Check if PC->Pawn changed / was set
         void* p = nullptr;
         SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
         LOGF("[Possess] after slot 0x%X: PC->Pawn=%p", slot, p);
-
         if (p == pawn) {
             LOGF("[Possess] ✅ SUCCESS at slot 0x%X", slot);
             return true;
@@ -280,9 +254,6 @@ static bool TryPossessVtable(void* pc, void* pawn) {
     return false;
 }
 
-// ============================================================
-// Clear spectator bit
-// ============================================================
 static void ClearSpectatorBit(void* ps) {
     if (!IsValidPtr(ps)) return;
     uint8_t b = 0;
@@ -294,9 +265,6 @@ static void ClearSpectatorBit(void* ps) {
     }
 }
 
-// ============================================================
-// GetAllActors
-// ============================================================
 typedef void (*GetAllActorsFn_t)(void* context, void* cls, void* outTArray);
 static int CallGetAllActors(void* ctx, void* cls, void* out[128]) {
     if (!IsValidPtr(ctx) || !IsValidPtr(cls)) return 0;
@@ -316,9 +284,6 @@ static int CallGetAllActors(void* ctx, void* cls, void* out[128]) {
     return n;
 }
 
-// ============================================================
-// SpawnActor
-// ============================================================
 typedef void* (*SpawnActor_t)(void* world, void* cls, void* xform, void* params);
 static void* DoSpawnActor(void* world, void* cls, FTransform* xform) {
     if (!IsValidPtr(world) || !IsValidPtr(cls)) return nullptr;
@@ -344,9 +309,6 @@ static void AttachPawnToPC(void* pc, void* pawn) {
     }
 }
 
-// ============================================================
-// Playlist
-// ============================================================
 static void* FindPlaylist() {
     if (!SFO) return nullptr;
     void* r = SFO(nullptr, nullptr,
@@ -368,12 +330,10 @@ static bool InjectPlaylist(void* gm) {
     g_injected_gms.insert(gm);
     return true;
 }
-
 static void* FindPawnClass() {
     static const char16_t* names[] = {
         u"FortPlayerPawnAthena", u"FortPlayerPawnAthena_C",
         u"Athena_PlayerPawn_C", u"FortPlayerPawn",
-        u"BP_PlayerPawn_Athena_C", u"PlayerPawn_Athena_C",
     };
     for (auto n : names) {
         void* c = SFO2(n);
@@ -400,7 +360,7 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     void* existing = nullptr;
     SafeReadPtr((char*)pc + OFF_PC_Pawn, &existing);
     if (IsValidPtr(existing)) {
-        LOGF("[Spawn] Pawn already exists: %p", existing);
+        LOGF("[Spawn] Pawn exists: %p", existing);
         AttachPawnToPC(pc, existing);
         TryPossessVtable(pc, existing);
         return;
@@ -415,41 +375,76 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("[Spawn] World = %p", world);
     if (!IsValidPtr(world)) return;
 
-    // Find PlayerStart location
-    float loc[3] = { 0.0f, 0.0f, 5000.0f };
-    bool gotLoc = false;
-
+    // ============================================================
+    // Gather ALL PlayerStart candidates and pick the BEST location
+    // ============================================================
     void* fpsCls = SFO2(u"FortPlayerStartWarmup");
+    if (!IsValidPtr(fpsCls)) fpsCls = SFO2(u"PlayerStart");
+
     void* actors[128] = {0};
-    int n = 0;
-    if (IsValidPtr(fpsCls)) n = CallGetAllActors(pc, fpsCls, actors);
-    LOGF("[Spawn] FPW count = %d", n);
+    int n = CallGetAllActors(pc, fpsCls, actors);
+    LOGF("[Spawn] candidates = %d", n);
+
+    float bestLoc[3] = { 0.0f, 0.0f, 5000.0f };
+    float bestZ = -1e9f;
+    bool gotLoc = false;
+    int bestIdx = -1;
 
     for (int i = 0; i < n && i < 128; i++) {
         if (!IsValidPtr(actors[i])) continue;
-        if (ReadActorLocation(actors[i], loc)) {
+        float tmp[3];
+        if (!ReadActorLocation(actors[i], tmp)) continue;
+        LOGF("[Spawn] actor[%d] loc = (%.0f, %.0f, %.0f)", i, tmp[0], tmp[1], tmp[2]);
+
+        // Prefer actor with the highest Z AND non-zero X/Y
+        float z = tmp[2];
+        float xy = fabsf(tmp[0]) + fabsf(tmp[1]);
+        if (xy < 100.0f) continue;  // skip origin-like
+        if (z > bestZ) {
+            bestZ = z;
+            bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
             gotLoc = true;
-            LOGF("[Spawn] loc from actor[%d] = (%.0f, %.0f, %.0f)", i, loc[0], loc[1], loc[2]);
-            break;
+            bestIdx = i;
         }
     }
-    if (!gotLoc) LOGF("[Spawn] fallback loc (%.0f, %.0f, %.0f)", loc[0], loc[1], loc[2]);
+
+    if (gotLoc) {
+        LOGF("[Spawn] ✅ best loc from actor[%d] = (%.0f, %.0f, %.0f)",
+             bestIdx, bestLoc[0], bestLoc[1], bestLoc[2]);
+    } else {
+        // Fallback: use first actor's raw location even if partial
+        for (int i = 0; i < n && i < 128 && !gotLoc; i++) {
+            if (!IsValidPtr(actors[i])) continue;
+            float tmp[3];
+            if (ReadActorLocation(actors[i], tmp)) {
+                bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
+                gotLoc = true;
+                LOGF("[Spawn] ⚠️ fallback to actor[%d] = (%.0f, %.0f, %.0f)",
+                     i, bestLoc[0], bestLoc[1], bestLoc[2]);
+            }
+        }
+    }
+
+    // If Z is still too low, boost it
+    if (bestLoc[2] < 500.0f) {
+        LOGF("[Spawn] Z low (%.0f) → boosting to 3000", bestLoc[2]);
+        bestLoc[2] = 3000.0f;
+    }
 
     void* pawnCls = FindPawnClass();
     if (!IsValidPtr(pawnCls)) { LOGF("[Spawn] no PawnClass"); return; }
 
     FTransform xform;
-    MakeXform(loc[0], loc[1], loc[2] + 200.0f, &xform);
+    MakeXform(bestLoc[0], bestLoc[1], bestLoc[2], &xform);
 
     void* pawn = DoSpawnActor(world, pawnCls, &xform);
     if (!IsValidPtr(pawn)) return;
 
     AttachPawnToPC(pc, pawn);
-    LOGF("[Possess] attempting to possess...");
     if (TryPossessVtable(pc, pawn)) {
         LOGF("[Spawn] ✅ POSSESSED");
     } else {
-        LOGF("[Spawn] ⚠️ attach only (Possess failed)");
+        LOGF("[Spawn] ⚠️ attach only");
     }
     LOGF("[Spawn] ===== DONE =====");
 }
@@ -498,7 +493,6 @@ typedef void* (*GetGameState_t)(void*);
 static GetGameState_t o_GGS = nullptr;
 static void* Hook_GGS(void* gm) { return o_GGS ? o_GGS(gm) : nullptr; }
 
-// ============================================================
 static void Run() {
     LibInfo i{0,0,0};
     for (int k = 0; k < 60; k++) {
@@ -511,8 +505,8 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook — v54 (fix loc + Possess)");
-    LOGF(" base=0x%lx text=[0x%lx..0x%lx]", g_base, g_text_start, g_text_end);
+    LOGF(" hook — v55 (fix location)");
+    LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
     DobbyHook((void*)(g_base + ADDR_GetGameState), (void*)Hook_GGS, (void**)&o_GGS);
