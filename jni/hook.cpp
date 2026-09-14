@@ -1,5 +1,5 @@
 // ============================================================
-// hook — Android JNI (v55: fix location)
+// hook — Android JNI (v56: FTransform pattern search)
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -44,9 +44,6 @@
 #define OFF_GS_Playlist2290               0x2290
 #define OFF_PS_SpectatorByte              0x27A
 #define BIT_PS_Spectator                  0x08
-
-// Possess vtable candidates (from v54 success: 0x1D0 was best)
-static const int kPossessSlots[] = { 0x1D0, 0x1D8, 0x1C8 };
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -162,68 +159,84 @@ static void MakeXform(float x, float y, float z, FTransform* t) {
 struct TArrayN { void* Data; int32_t Num; int32_t Max; int32_t pad; };
 
 // ============================================================
-// ReadActorLocation — EXPANDED with STRICT pass
+// ⭐ KEY FUNCTION: Find FTransform by pattern search
+//     looks for FQuat with |q|² ≈ 1.0, then reads FVector +16
 // ============================================================
-static bool ReadActorLocation(void* actor, float out[3]) {
-    out[0] = out[1] = out[2] = 0;
+static bool FindTransformInActor(void* actor, float out[3], int* foundOffset) {
     if (!IsValidPtr(actor)) return false;
+    if (foundOffset) *foundOffset = -1;
 
-    static const int rootOffs[] = {
-        0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280, 0x290,
-        0x2A0, 0x2B0, 0x2C0, 0x2D0, 0x2E0, 0x2F0, 0x300, 0x310, 0x320,
-        0x330, 0x1D0, 0x1E0, 0x1F0, 0x200,
-    };
-    static const int locOffs[] = {
-        0x128, 0x1F0, 0x1E0, 0x1D0, 0x250, 0x130, 0x100, 0x110,
-        0x118, 0x1A8, 0x1B0, 0x1B8, 0x150, 0x158, 0x160, 0x168,
-        0x120, 0x1D8, 0x1F8, 0x200, 0x208, 0x210, 0x218, 0x220,
-        0x228, 0x230, 0x238, 0x240, 0x248, 0x260, 0x268, 0x2D0,
-    };
+    // Scan actor memory from 0x100 to 0x500 in 4-byte steps
+    for (int off = 0x100; off < 0x500; off += 4) {
+        float q[4];
+        if (!SafeReadBytes((char*)actor + off, q, 16)) continue;
 
-    // ---- STRICT pass: require X, Y non-zero AND Z in valid range ----
+        // Check quaternion magnitude ≈ 1.0
+        float qmag = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+        if (qmag < 0.9f || qmag > 1.1f) continue;
+
+        // Check all components finite
+        if (!std::isfinite(q[0]) || !std::isfinite(q[1]) ||
+            !std::isfinite(q[2]) || !std::isfinite(q[3])) continue;
+
+        // Read Translation immediately after FQuat
+        float t[3];
+        if (!SafeReadBytes((char*)actor + off + 16, t, 12)) continue;
+        if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) continue;
+
+        // Validate coordinates: X, Y, Z in Fortnite range
+        // Island X: -50000..50000, Y: -80000..80000, Z: -500..5000
+        if (fabsf(t[0]) > 300000.0f) continue;
+        if (fabsf(t[1]) > 300000.0f) continue;
+        if (t[2] < -1000.0f || t[2] > 10000.0f) continue;
+
+        // Must have non-zero X or Y
+        float magXY = fabsf(t[0]) + fabsf(t[1]);
+        if (magXY < 500.0f) continue;
+
+        out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
+        if (foundOffset) *foundOffset = off;
+        LOGF("  [XFOUND] actor=%p offset=0x%X loc=(%.0f,%.0f,%.0f)",
+             actor, off, t[0], t[1], t[2]);
+        return true;
+    }
+
+    // Second pass: try RootComponent + FTransform search
+    static const int rootOffs[] = { 0x130, 0x198, 0x1A0, 0x1B0, 0x220, 0x240, 0x250, 0x280, 0x2E0 };
     for (int ro : rootOffs) {
         void* root = nullptr;
         if (!SafeReadPtr((char*)actor + ro, &root) || !IsValidPtr(root)) continue;
-        for (int lo : locOffs) {
-            float xyz[3];
-            if (!SafeReadBytes((char*)root + lo, xyz, 12)) continue;
-            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
 
-            // strict: X, Y > 100, Z in [200, 8000]
-            if (fabsf(xyz[0]) < 100.0f) continue;
-            if (fabsf(xyz[1]) < 100.0f) continue;
-            if (xyz[2] < 200.0f || xyz[2] > 8000.0f) continue;
-            if (fabsf(xyz[0]) > 300000 || fabsf(xyz[1]) > 300000) continue;
+        for (int off = 0x100; off < 0x400; off += 4) {
+            float q[4];
+            if (!SafeReadBytes((char*)root + off, q, 16)) continue;
+            float qmag = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+            if (qmag < 0.9f || qmag > 1.1f) continue;
+            if (!std::isfinite(q[0]) || !std::isfinite(q[1]) ||
+                !std::isfinite(q[2]) || !std::isfinite(q[3])) continue;
 
-            out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
-            LOGF("  [loc-STRICT] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
-                 ro, lo, out[0], out[1], out[2]);
+            float t[3];
+            if (!SafeReadBytes((char*)root + off + 16, t, 12)) continue;
+            if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) continue;
+            if (fabsf(t[0]) > 300000.0f) continue;
+            if (fabsf(t[1]) > 300000.0f) continue;
+            if (t[2] < -1000.0f || t[2] > 10000.0f) continue;
+            float magXY = fabsf(t[0]) + fabsf(t[1]);
+            if (magXY < 500.0f) continue;
+
+            out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
+            if (foundOffset) *foundOffset = off;
+            LOGF("  [XFOUND-root] actor=%p root@0x%X offset=0x%X loc=(%.0f,%.0f,%.0f)",
+                 actor, ro, off, t[0], t[1], t[2]);
             return true;
         }
     }
 
-    // ---- LOOSE pass: accept if Z in range, ignore X/Y zero ----
-    for (int ro : rootOffs) {
-        void* root = nullptr;
-        if (!SafeReadPtr((char*)actor + ro, &root) || !IsValidPtr(root)) continue;
-        for (int lo : locOffs) {
-            float xyz[3];
-            if (!SafeReadBytes((char*)root + lo, xyz, 12)) continue;
-            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) continue;
-            if (xyz[2] < 200.0f || xyz[2] > 8000.0f) continue;
-            if (fabsf(xyz[0]) > 300000 || fabsf(xyz[1]) > 300000) continue;
-
-            out[0] = xyz[0]; out[1] = xyz[1]; out[2] = xyz[2];
-            LOGF("  [loc-LOOSE] root@0x%X loc@0x%X = (%.0f, %.0f, %.0f)",
-                 ro, lo, out[0], out[1], out[2]);
-            return true;
-        }
-    }
     return false;
 }
 
 // ============================================================
-// Possess via vtable
+// Possess
 // ============================================================
 typedef void (*PossessFn_t)(void*, void*);
 static bool TryPossessVtable(void* pc, void* pawn) {
@@ -232,25 +245,19 @@ static bool TryPossessVtable(void* pc, void* pawn) {
     if (!SafeReadPtr(pc, (void**)&vft)) return false;
     if (!IsValidPtr(vft)) return false;
 
-    for (int slot : kPossessSlots) {
-        void* fn = nullptr;
-        if (!SafeReadPtr((char*)vft + (size_t)slot * 8, &fn)) continue;
-        if (!IsTextPtr(fn)) continue;
+    // Known success: slot 0x1D0
+    void* fn = nullptr;
+    if (!SafeReadPtr((char*)vft + 0x1D0 * 8, &fn) || !IsTextPtr(fn)) return false;
 
-        uintptr_t off = (uintptr_t)fn - g_base;
-        LOGF("[Possess] trying slot 0x%X -> +0x%lx", slot, (unsigned long)off);
-
-        PossessFn_t f = (PossessFn_t)fn;
-        f(pc, pawn);
-
-        void* p = nullptr;
-        SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
-        LOGF("[Possess] after slot 0x%X: PC->Pawn=%p", slot, p);
-        if (p == pawn) {
-            LOGF("[Possess] ✅ SUCCESS at slot 0x%X", slot);
-            return true;
-        }
+    LOGF("[Possess] calling slot 0x1D0 -> %p", fn);
+    ((PossessFn_t)fn)(pc, pawn);
+    void* p = nullptr;
+    SafeReadPtr((char*)pc + OFF_PC_Pawn, &p);
+    if (p == pawn) {
+        LOGF("[Possess] ✅ SUCCESS");
+        return true;
     }
+    LOGF("[Possess] ⚠️ slot 0x1D0 didn't stick");
     return false;
 }
 
@@ -259,10 +266,7 @@ static void ClearSpectatorBit(void* ps) {
     uint8_t b = 0;
     if (!SafeReadU8((char*)ps + OFF_PS_SpectatorByte, &b)) return;
     uint8_t nb = b & ~BIT_PS_Spectator;
-    if (nb != b) {
-        SafeWriteU8((char*)ps + OFF_PS_SpectatorByte, nb);
-        LOGF("[Spec] PS+0x%X: 0x%02X -> 0x%02X", OFF_PS_SpectatorByte, b, nb);
-    }
+    if (nb != b) SafeWriteU8((char*)ps + OFF_PS_SpectatorByte, nb);
 }
 
 typedef void (*GetAllActorsFn_t)(void* context, void* cls, void* outTArray);
@@ -343,7 +347,7 @@ static void* FindPawnClass() {
 }
 
 // ============================================================
-// Spawn on GameThread
+// Spawn
 // ============================================================
 static void DoSpawnOnGameThread(void* gm, void* pc) {
     LOGF("");
@@ -360,7 +364,6 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     void* existing = nullptr;
     SafeReadPtr((char*)pc + OFF_PC_Pawn, &existing);
     if (IsValidPtr(existing)) {
-        LOGF("[Spawn] Pawn exists: %p", existing);
         AttachPawnToPC(pc, existing);
         TryPossessVtable(pc, existing);
         return;
@@ -376,7 +379,7 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     if (!IsValidPtr(world)) return;
 
     // ============================================================
-    // Gather ALL PlayerStart candidates and pick the BEST location
+    // Find PlayerStart location
     // ============================================================
     void* fpsCls = SFO2(u"FortPlayerStartWarmup");
     if (!IsValidPtr(fpsCls)) fpsCls = SFO2(u"PlayerStart");
@@ -389,50 +392,58 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     float bestZ = -1e9f;
     bool gotLoc = false;
     int bestIdx = -1;
+    int bestOff = -1;
 
+    // Try to find a PlayerStart with a valid transform
     for (int i = 0; i < n && i < 128; i++) {
         if (!IsValidPtr(actors[i])) continue;
         float tmp[3];
-        if (!ReadActorLocation(actors[i], tmp)) continue;
-        LOGF("[Spawn] actor[%d] loc = (%.0f, %.0f, %.0f)", i, tmp[0], tmp[1], tmp[2]);
+        int off = -1;
+        if (!FindTransformInActor(actors[i], tmp, &off)) continue;
 
-        // Prefer actor with the highest Z AND non-zero X/Y
-        float z = tmp[2];
-        float xy = fabsf(tmp[0]) + fabsf(tmp[1]);
-        if (xy < 100.0f) continue;  // skip origin-like
-        if (z > bestZ) {
-            bestZ = z;
-            bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
+        LOGF("[Spawn] actor[%d] @ offset 0x%X loc=(%.0f,%.0f,%.0f)",
+             i, off, tmp[0], tmp[1], tmp[2]);
+
+        if (tmp[2] > bestZ) {
+            bestZ = tmp[2];
+            bestLoc[0] = tmp[0];
+            bestLoc[1] = tmp[1];
+            bestLoc[2] = tmp[2];
             gotLoc = true;
             bestIdx = i;
+            bestOff = off;
         }
     }
 
     if (gotLoc) {
-        LOGF("[Spawn] ✅ best loc from actor[%d] = (%.0f, %.0f, %.0f)",
-             bestIdx, bestLoc[0], bestLoc[1], bestLoc[2]);
+        LOGF("[Spawn] ✅ BEST from actor[%d]@0x%X = (%.0f, %.0f, %.0f)",
+             bestIdx, bestOff, bestLoc[0], bestLoc[1], bestLoc[2]);
     } else {
-        // Fallback: use first actor's raw location even if partial
+        // Try search in the first actor
         for (int i = 0; i < n && i < 128 && !gotLoc; i++) {
             if (!IsValidPtr(actors[i])) continue;
             float tmp[3];
-            if (ReadActorLocation(actors[i], tmp)) {
+            int off = -1;
+            if (FindTransformInActor(actors[i], tmp, &off)) {
                 bestLoc[0] = tmp[0]; bestLoc[1] = tmp[1]; bestLoc[2] = tmp[2];
                 gotLoc = true;
-                LOGF("[Spawn] ⚠️ fallback to actor[%d] = (%.0f, %.0f, %.0f)",
-                     i, bestLoc[0], bestLoc[1], bestLoc[2]);
+                LOGF("[Spawn] ⚠️ fallback actor[%d] = (%.0f,%.0f,%.0f)", i, tmp[0], tmp[1], tmp[2]);
             }
         }
     }
 
-    // If Z is still too low, boost it
+    if (!gotLoc) {
+        LOGF("[Spawn] no location found in any actor — using (0,0,5000)");
+    }
+
+    // Boost Z if too low
     if (bestLoc[2] < 500.0f) {
-        LOGF("[Spawn] Z low (%.0f) → boosting to 3000", bestLoc[2]);
+        LOGF("[Spawn] Z too low (%.0f) → set to 3000", bestLoc[2]);
         bestLoc[2] = 3000.0f;
     }
 
     void* pawnCls = FindPawnClass();
-    if (!IsValidPtr(pawnCls)) { LOGF("[Spawn] no PawnClass"); return; }
+    if (!IsValidPtr(pawnCls)) return;
 
     FTransform xform;
     MakeXform(bestLoc[0], bestLoc[1], bestLoc[2], &xform);
@@ -443,8 +454,6 @@ static void DoSpawnOnGameThread(void* gm, void* pc) {
     AttachPawnToPC(pc, pawn);
     if (TryPossessVtable(pc, pawn)) {
         LOGF("[Spawn] ✅ POSSESSED");
-    } else {
-        LOGF("[Spawn] ⚠️ attach only");
     }
     LOGF("[Spawn] ===== DONE =====");
 }
@@ -505,7 +514,7 @@ static void Run() {
     g_text_end = i.text_end;
 
     LOGF("========================================");
-    LOGF(" hook — v55 (fix location)");
+    LOGF(" hook — v56 (FTransform pattern)");
     LOGF(" base=0x%lx", g_base);
     LOGF("========================================");
 
