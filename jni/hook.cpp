@@ -1,6 +1,6 @@
 // ============================================================
-// FNamePool Scanner — Fortnite 21.30 (UE 5.0.1)
-// Sig Scan للذاكرة — لا يحتاج hooks
+// FNamePool Finder — Fortnite 21.30 (UE 5.0.1)
+// يبحث عن بصمة "None" + "ByteProperty" بدون null terminators
 // ============================================================
 #include <jni.h>
 #include <cstdint>
@@ -19,13 +19,9 @@
 #include <android/log.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include "dobby.h"
 
 #define LOG_TAG "FNamePool"
 
-// ============================================================
-// Globals
-// ============================================================
 static FILE* g_logfile = nullptr;
 static std::mutex g_mutex;
 static uintptr_t g_base = 0;
@@ -42,25 +38,16 @@ static void InitLogFile() {
     };
     for (auto p : paths) {
         FILE* f = fopen(p, "w");
-        if (f) {
-            g_logfile = f;
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[FILE] opened: %s", p);
-            return;
-        }
-        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "[FILE] failed: %s (errno=%d)", p, errno);
+        if (f) { g_logfile = f; return; }
     }
-    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[FILE] all paths failed — logcat only");
 }
 
 static void LOGF(const char* fmt, ...) {
     char buf[4096];
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
-
     if (g_logfile) {
         std::lock_guard<std::mutex> lock(g_mutex);
         fprintf(g_logfile, "%s\n", buf);
@@ -69,31 +56,7 @@ static void LOGF(const char* fmt, ...) {
 }
 
 // ============================================================
-// LibInfo
-// ============================================================
-struct LibInfo { uintptr_t base, text_start, text_end; };
-
-static LibInfo GetLibInfo() {
-    LibInfo info{0, 0, 0};
-    dl_iterate_phdr([](struct dl_phdr_info* ph, size_t, void* d) -> int {
-        auto* o = (LibInfo*)d;
-        if (!ph->dlpi_name || !*ph->dlpi_name) return 0;
-        if (!strstr(ph->dlpi_name, "libUnreal")) return 0;
-        o->base = ph->dlpi_addr;
-        for (int i = 0; i < ph->dlpi_phnum; i++) {
-            const auto& p = ph->dlpi_phdr[i];
-            if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
-            o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end   = o->text_start + p.p_memsz;
-            break;
-        }
-        return 1;
-    }, &info);
-    return info;
-}
-
-// ============================================================
-// Segment Scanner  (مصحح: flags نوعه uint32_t)
+// Segments (libUnreal.so فقط)
 // ============================================================
 struct Segment {
     uintptr_t addr;
@@ -101,7 +64,7 @@ struct Segment {
     uint32_t  flags;
 };
 
-static std::vector<Segment> GetWritableSegments() {
+static std::vector<Segment> GetAllWritableSegments() {
     std::vector<Segment> segs;
     dl_iterate_phdr([](struct dl_phdr_info* ph, size_t, void* data) -> int {
         auto* out = (std::vector<Segment>*)data;
@@ -111,15 +74,13 @@ static std::vector<Segment> GetWritableSegments() {
         for (int i = 0; i < ph->dlpi_phnum; i++) {
             const auto& p = ph->dlpi_phdr[i];
             if (p.p_type != PT_LOAD) continue;
+            if ((p.p_flags & (PF_W | PF_R)) != (PF_W | PF_R)) continue;
 
-            // writable + readable
-            if ((p.p_flags & (PF_W | PF_R)) == (PF_W | PF_R)) {
-                Segment s;
-                s.addr  = ph->dlpi_addr + p.p_vaddr;
-                s.size  = p.p_memsz;
-                s.flags = (uint32_t)p.p_flags;
-                out->push_back(s);
-            }
+            Segment s;
+            s.addr  = ph->dlpi_addr + p.p_vaddr;
+            s.size  = p.p_memsz;
+            s.flags = (uint32_t)p.p_flags;
+            out->push_back(s);
         }
         return 1;
     }, &segs);
@@ -127,7 +88,7 @@ static std::vector<Segment> GetWritableSegments() {
 }
 
 // ============================================================
-// Safe Read Helpers
+// Safe read
 // ============================================================
 static bool IsValidHeapPtr(uint64_t p) {
     return p >= 0x1000000000ULL && p <= 0x8000000000ULL;
@@ -140,206 +101,304 @@ static bool SafeRead(uintptr_t addr, void* buf, size_t n) {
 }
 
 // ============================================================
-// FName Reader (لـ التحقق من صحة FNamePool)
+// فحص: هل هذا FNameEntry صالح؟
+// يقرأ header ويستخرج الاسم بدون null terminator
 // ============================================================
-static std::string ReadFNameFromPool(uintptr_t pool, uint32_t nameId) {
-    uint32_t blockIdx      = nameId >> 16;
-    uint32_t offsetInBlock = nameId & 0xFFFF;
-    if (blockIdx >= 8192) return "<oob>";
+static std::string ReadFNameEntry(uintptr_t entryAddr, bool* ok) {
+    *ok = false;
+    uint16_t hdr = 0;
+    if (!SafeRead(entryAddr, &hdr, 2)) return "";
 
-    uint64_t blockPtr = 0;
-    if (!SafeRead(pool + 0x7C + blockIdx * 8, &blockPtr, 8)) return "<rdfail>";
-    if (!IsValidHeapPtr(blockPtr)) return "<null>";
+    // UE5.0 FNameEntry header:
+    //   bits 0-5:  unused
+    //   bits 6-14: length
+    //   bit 15:    bIsWide
+    // أو صيغة أخرى:
+    //   bit 0: bIsWide, bits 1-15: length
 
-    uintptr_t entryPtr = blockPtr + offsetInBlock * 2;
+    // جرب الصيغة الأولى
+    uint32_t len1 = (hdr >> 6) & 0x1FF;
+    bool wide1 = (hdr & 0x8000) != 0;
 
-    uint16_t header = 0;
-    if (!SafeRead(entryPtr, &header, 2)) return "<rd>";
+    // جرب الصيغة الثانية
+    uint32_t len2 = (hdr >> 1) & 0x7FFF;
+    bool wide2 = (hdr & 1) != 0;
 
-    uint32_t len    = (header >> 6) & 0x3FF;
-    bool     isWide = (header & 0x8000) != 0;
-    if (len == 0 || len > 1023) return "<badlen>";
-
-    char buf[1024] = {};
-    if (isWide) {
-        char16_t wide[512] = {};
-        uint32_t nBytes = len * 2;
-        if (nBytes > sizeof(wide) - 2) nBytes = sizeof(wide) - 2;
-        if (!SafeRead(entryPtr + 2, wide, nBytes)) return "<rd>";
-        for (uint32_t i = 0; i < len; i++) buf[i] = (char)(wide[i] & 0x7F);
+    // اختر واحدة معقولة
+    uint32_t len;
+    bool wide;
+    if (len1 >= 1 && len1 <= 200 && !wide1) {
+        len = len1;
+        wide = false;
+    } else if (len2 >= 1 && len2 <= 200 && !wide2) {
+        len = len2;
+        wide = false;
     } else {
-        uint32_t nBytes = len;
-        if (nBytes > sizeof(buf) - 1) nBytes = sizeof(buf) - 1;
-        if (!SafeRead(entryPtr + 2, buf, nBytes)) return "<rd>";
+        return "";
     }
+
+    char buf[256] = {};
+    if (!SafeRead(entryAddr + 2, buf, std::min<uint32_t>(len, 250))) return "";
+
+    // تحقق: كل الحروف ASCII قابلة للطباعة
+    for (uint32_t i = 0; i < len; i++) {
+        char c = buf[i];
+        if (c < 0x20 || c > 0x7E) return "";
+    }
+
+    *ok = true;
     return std::string(buf, len);
 }
 
 // ============================================================
-// Validator: هل هذا FNamePool حقيقي؟
+// STEP 1: ابحث عن block0
+// بحث عن: "None" ثم "ByteProperty" في نطاق 24 بايت
 // ============================================================
-static bool ValidateFNamePool(uintptr_t candidate) {
-    // 1) CurrentBlock منطقي؟
-    uint32_t cb = 0;
-    if (!SafeRead(candidate + 0x38, &cb, 4)) return false;
-    if (cb > 200) return false;
+struct Block0Candidate {
+    uintptr_t addr;
+    std::string first;   // "None"
+    std::string second;  // "ByteProperty"
+};
 
-    // 2) البلوك الأول صالح؟
-    uint64_t block0 = 0;
-    if (!SafeRead(candidate + 0x7C, &block0, 8)) return false;
-    if (!IsValidHeapPtr(block0)) return false;
+static std::vector<Block0Candidate> FindBlock0Candidates(
+        const std::vector<Segment>& segs) {
 
-    // 3) أول 5 entries يجب أن تكون معروفة
-    static const char* expected[] = {
-        "None", "ByteProperty", "IntProperty", "BoolProperty", "FloatProperty"
+    std::vector<Block0Candidate> out;
+    const size_t CHUNK = 0x400000; // 4MB
+    std::vector<uint8_t> buf(CHUNK + 64);
+
+    // "None" = 4E 6F 6E 65
+    // "ByteProperty" = 42 79 74 65 50 72 6F 70 65 72 74 79
+    const uint8_t noneBytes[]    = { 0x4E, 0x6F, 0x6E, 0x65 };
+    const uint8_t bytePropBytes[] = {
+        0x42, 0x79, 0x74, 0x65, 0x50, 0x72, 0x6F, 0x70, 0x65, 0x72, 0x74, 0x79
     };
 
-    for (int i = 0; i < 5; i++) {
-        std::string name = ReadFNameFromPool(candidate, i);
-        if (name != expected[i]) return false;
-    }
-
-    return true;
-}
-
-// ============================================================
-// Scanner الرئيسي
-// ============================================================
-static uintptr_t ScanForFNamePool() {
-    LOGF("");
-    LOGF("========================================");
-    LOGF("Starting memory scan for FNamePool...");
-    LOGF("========================================");
-
-    auto segs = GetWritableSegments();
-    LOGF("Found %zu writable segments", segs.size());
-
-    const size_t CHUNK = 0x100000;  // 1MB
-    std::vector<uint8_t> buf(CHUNK);
-
-    size_t totalScanned = 0;
-    auto startTime = std::chrono::steady_clock::now();
-
     for (auto& seg : segs) {
-        LOGF("");
-        LOGF("Segment: addr=0x%lx size=0x%lx flags=0x%x",
-             seg.addr, seg.size, seg.flags);
+        LOGF("[Find] Scanning segment 0x%lx size=0x%lx",
+             seg.addr, seg.size);
 
         for (size_t off = 0; off < seg.size; off += CHUNK) {
-            size_t toRead = std::min(CHUNK, seg.size - off);
+            size_t toRead = std::min(CHUNK + 64, seg.size - off);
 
             struct iovec l = { buf.data(), toRead };
             struct iovec r = { (void*)(seg.addr + off), toRead };
             ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+            if (got < 32) continue;
 
-            if (got < 0x84) continue;
-            totalScanned += got;
+            for (ssize_t i = 0; i + 24 < got; i++) {
+                // "None" موجود؟
+                if (memcmp(buf.data() + i, noneBytes, 4) != 0) continue;
 
-            // امسح كل 8 بايت
-            for (size_t i = 0; i + 0x84 <= (size_t)got; i += 8) {
-                uintptr_t candidate = seg.addr + off + i;
+                // "ByteProperty" خلال 24 بايت بعدها؟
+                for (ssize_t j = i + 4; j < i + 24 && j + 12 <= got; j++) {
+                    if (memcmp(buf.data() + j, bytePropBytes, 12) != 0)
+                        continue;
 
-                // فحص سريع 1: CurrentBlock @ +0x38
-                uint32_t cb = *(uint32_t*)(buf.data() + i + 0x38);
-                if (cb > 200) continue;
+                    // 🎯 وجدنا بصمة block0!
+                    // الموضع i = نهاية "None"، إذن block0 يبدأ قبله:
+                    // header(2 bytes) + name(4 bytes) → header عند i - 2
+                    uintptr_t block0Addr = seg.addr + off + i - 2;
 
-                // فحص سريع 2: block ptr @ +0x7C
-                uint64_t blockPtr = *(uint64_t*)(buf.data() + i + 0x7C);
-                if (!IsValidHeapPtr(blockPtr)) continue;
+                    Block0Candidate c;
+                    c.addr   = block0Addr;
+                    c.first  = "None";
+                    c.second = "ByteProperty";
+                    out.push_back(c);
 
-                // فحص سريع 3: أول entry = "None"?
-                uint8_t entry[16];
-                if (!SafeRead(blockPtr, entry, 16)) continue;
-
-                uint16_t header = *(uint16_t*)entry;
-                uint32_t len    = (header >> 6) & 0x3FF;
-                bool isWide     = (header & 0x8000) != 0;
-
-                if (isWide || len != 4) continue;
-                if (entry[2] != 'N' || entry[3] != 'o' ||
-                    entry[4] != 'n' || entry[5] != 'e') continue;
-
-                // 🎯 مرشح قوي — افحص بعمق
-                LOGF("");
-                LOGF("Candidate @ 0x%lx (cb=%u block0=0x%lx)",
-                     candidate, cb, blockPtr);
-
-                if (ValidateFNamePool(candidate)) {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::now() - startTime).count();
-
-                    LOGF("");
-                    LOGF("##########################################");
-                    LOGF("###  *** FNamePool FOUND! ***         ###");
-                    LOGF("##########################################");
-                    LOGF("FNamePool    @ 0x%lx", candidate);
-                    LOGF("libBase      @ 0x%lx", g_base);
-                    LOGF("Offset       = 0x%lx   <- SAVE THIS!", candidate - g_base);
-                    LOGF("CurrentBlock = %u", cb);
-                    LOGF("Scanned      = %.1f MB in %lds",
-                         totalScanned / (1024.0 * 1024.0), (long)elapsed);
-                    LOGF("##########################################");
-                    LOGF("");
-
-                    // اطبع أول 30 entry للتأكد
-                    LOGF("--- First 30 FNames ---");
-                    for (uint32_t j = 0; j < 30; j++) {
-                        LOGF("[%2u] = %s", j, ReadFNameFromPool(candidate, j).c_str());
-                    }
-
-                    return candidate;
+                    LOGF("[Find] Candidate @ 0x%lx (offset in block0: +0x%lx)",
+                         block0Addr, (uintptr_t)i - 2);
+                    break;
                 }
             }
         }
     }
 
-    LOGF("");
-    LOGF("!!! FNamePool NOT FOUND in writable segments !!!");
-    LOGF("Scanned: %.1f MB", totalScanned / (1024.0 * 1024.0));
-    return 0;
+    return out;
+}
+
+// ============================================================
+// STEP 2: ابحث عن pointer إلى block0
+// ============================================================
+struct PoolCandidate {
+    uintptr_t poolAddr;
+    uintptr_t ptrLoc;
+    uintptr_t blocksOffset;
+};
+
+static std::vector<PoolCandidate> FindPoolFromBlock0(
+        const std::vector<Segment>& segs,
+        uintptr_t block0Addr) {
+
+    std::vector<PoolCandidate> out;
+    const size_t CHUNK = 0x400000;
+    std::vector<uint8_t> buf(CHUNK + 8);
+
+    // جرّب offsets محتملة لـ Blocks[] داخل FNamePool
+    const uint32_t possibleBlocksOffsets[] = {
+        0x40,    // بعد CurrentBlock مباشرة
+        0x50,    // محاذاة 16
+        0x7C,    // من تحليل assembly الأول
+        0x80,    // محاذاة 128
+        0x100,   // محاذاة 256
+        0x1000,
+        0x10000,
+        0x10040, // 0x40 + 8192*8
+        0x10080, // 0x80 + 8192*8
+    };
+
+    for (auto& seg : segs) {
+        for (size_t off = 0; off < seg.size; off += CHUNK) {
+            size_t toRead = std::min(CHUNK + 8, seg.size - off);
+
+            struct iovec l = { buf.data(), toRead };
+            struct iovec r = { (void*)(seg.addr + off), toRead };
+            ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+            if (got < 8) continue;
+
+            for (ssize_t i = 0; i + 8 <= got; i += 8) {
+                uint64_t val = *(uint64_t*)(buf.data() + i);
+                if (val != block0Addr) continue;
+
+                uintptr_t ptrLoc = seg.addr + off + i;
+
+                for (uint32_t blkOff : possibleBlocksOffsets) {
+                    if (ptrLoc < blkOff) continue;
+                    uintptr_t pool = ptrLoc - blkOff;
+
+                    // تحقق: CurrentBlock @ +0x38
+                    uint32_t cb = 0;
+                    if (!SafeRead(pool + 0x38, &cb, 4)) continue;
+                    if (cb > 200 || cb == 0) continue;
+
+                    // تحقق: block1 @ pool + blkOff + 8
+                    uint64_t block1 = 0;
+                    if (!SafeRead(pool + blkOff + 8, &block1, 8)) continue;
+                    if (!IsValidHeapPtr(block1)) continue;
+
+                    // block1 يجب يحتوي أسماء صالحة
+                    bool ok = false;
+                    std::string name1 = ReadFNameEntry(block1, &ok);
+                    if (!ok || name1.empty()) continue;
+
+                    PoolCandidate pc;
+                    pc.poolAddr     = pool;
+                    pc.ptrLoc       = ptrLoc;
+                    pc.blocksOffset = blkOff;
+                    out.push_back(pc);
+
+                    LOGF("[Find] Pool candidate @ 0x%lx "
+                         "(ptr @ 0x%lx, blocks_off=0x%x, cb=%u, block1_name=\"%s\")",
+                         pool, ptrLoc, blkOff, cb, name1.c_str());
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+// ============================================================
+// STEP 3: eقراءة أسماء
+// ============================================================
+static std::string ReadFName(uintptr_t pool, uint32_t blocksOff, uint32_t id) {
+    uint32_t blockIdx      = id >> 16;
+    uint32_t offsetInBlock = id & 0xFFFF;
+
+    uint64_t blockPtr = 0;
+    if (!SafeRead(pool + blocksOff + blockIdx * 8, &blockPtr, 8)) return "<?>";
+    if (!IsValidHeapPtr(blockPtr)) return "<?>";
+
+    // stride = 2 (UE5.0.1)
+    uintptr_t entry = blockPtr + offsetInBlock * 2;
+
+    bool ok = false;
+    std::string s = ReadFNameEntry(entry, &ok);
+    return ok ? s : "<?>";
 }
 
 // ============================================================
 // Main
 // ============================================================
 static void Run() {
-    // انتظر libUnreal.so
-    LibInfo info{0,0,0};
+    // انتظر libUnreal
+    LibInfo:
+    uintptr_t base = 0;
     for (int i = 0; i < 60; i++) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        info = GetLibInfo();
-        if (info.base) break;
+        dl_iterate_phdr([](struct dl_phdr_info* ph, size_t, void* d) -> int {
+            auto* out = (uintptr_t*)d;
+            if (!ph->dlpi_name || !*ph->dlpi_name) return 0;
+            if (!strstr(ph->dlpi_name, "libUnreal")) return 0;
+            *out = ph->dlpi_addr;
+            return 1;
+        }, &base);
+        if (base) break;
     }
-    if (!info.base) {
-        LOGF("[ERR] libUnreal not found");
-        return;
-    }
-    g_base = info.base;
+    if (!base) { LOGF("[ERR] libUnreal not found"); return; }
+    g_base = base;
 
     LOGF("========================================");
-    LOGF("FNamePool Scanner — Fortnite 21.30");
+    LOGF("FNamePool Finder — Fortnite 21.30");
     LOGF("libBase = 0x%lx", g_base);
     LOGF("========================================");
 
-    // انتظر شوي عشان اللعبة تحمّل كل شي
-    LOGF("Waiting 15s for game to fully load...");
-    std::this_thread::sleep_for(std::chrono::seconds(15));
+    LOGF("Waiting 20s for game to load...");
+    std::this_thread::sleep_for(std::chrono::seconds(20));
 
-    // ابدأ الـ scan
-    uintptr_t pool = ScanForFNamePool();
+    auto segs = GetAllWritableSegments();
+    LOGF("Writable segments: %zu", segs.size());
+    for (auto& s : segs)
+        LOGF("  addr=0x%lx size=0x%lx flags=0x%x", s.addr, s.size, s.flags);
+    LOGF("");
 
-    if (pool) {
-        LOGF("");
-        LOGF("=== DONE ===");
-        LOGF("Use: g_FNamePool = libBase + 0x%lx;", pool - g_base);
-    } else {
-        LOGF("");
-        LOGF("=== FAILED ===");
-        LOGF("Try:");
-        LOGF("  1. Increase wait time");
-        LOGF("  2. Scan more segments");
-        LOGF("  3. Use different validation");
+    // STEP 1
+    LOGF("STEP 1: Search for block0 signature (\"None\"+\"ByteProperty\")...");
+    auto block0s = FindBlock0Candidates(segs);
+    if (block0s.empty()) {
+        LOGF("!!! No block0 candidates found !!!");
+        return;
     }
+    LOGF("Found %zu block0 candidates.", block0s.size());
+    for (auto& b : block0s)
+        LOGF("  block0 @ 0x%lx", b.addr);
+    LOGF("");
+
+    // STEP 2
+    LOGF("STEP 2: Search for FNamePool (pointer to block0)...");
+    for (auto& b : block0s) {
+        LOGF("  Trying block0 = 0x%lx", b.addr);
+        auto pools = FindPoolFromBlock0(segs, b.addr);
+
+        if (pools.empty()) {
+            LOGF("    No pool pointer found for this block0.");
+            continue;
+        }
+
+        LOGF("");
+        LOGF("##########################################");
+        LOGF("###     *** FNamePool FOUND! ***      ###");
+        LOGF("##########################################");
+
+        for (auto& p : pools) {
+            LOGF("FNamePool    @ 0x%lx", p.poolAddr);
+            LOGF("  Offset     = 0x%lx   <- SAVE THIS!",
+                 p.poolAddr - g_base);
+            LOGF("  Blocks[]   = +0x%x", p.blocksOffset);
+            LOGF("  Pointer at = 0x%lx", p.ptrLoc);
+
+            LOGF("");
+            LOGF("--- First 30 FNames (using blocks_off=0x%x) ---",
+                 p.blocksOffset);
+            for (uint32_t i = 0; i < 30; i++) {
+                LOGF("[%2u] = %s",
+                     i, ReadFName(p.poolAddr, p.blocksOffset, i).c_str());
+            }
+            LOGF("");
+        }
+    }
+
+    LOGF("=== DONE ===");
 }
 
 // ============================================================
@@ -349,7 +408,7 @@ extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     InitLogFile();
     LOGF("========================================");
-    LOGF("FNamePool Scanner %s %s", __DATE__, __TIME__);
+    LOGF("FNamePool Finder %s %s", __DATE__, __TIME__);
     LOGF("PID: %d", getpid());
     LOGF("========================================");
 
