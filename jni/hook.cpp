@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cerrno>
 #include <string>
+#include <vector>
 #include <thread>
 #include <chrono>
 #include <mutex>
@@ -16,15 +17,12 @@
 #include "dobby.h"
 
 #define LOG_TAG "FNamePool"
-#define ADDR_FNamePool_LogStats   0x74915C8
 
-// ==================== Globals ====================
 static FILE* g_logfile = nullptr;
 static std::mutex g_mutex;
 static uintptr_t g_base = 0;
-static uintptr_t g_FNamePool = 0;
 
-// ==================== Logger (نفس الكود الشغال) ====================
+// ==================== Logger ====================
 static void InitLogFile() {
     const char* paths[] = {
         "/storage/emulated/0/Android/data/com.epicgames.fortnite/files/FNamePool.txt",
@@ -34,25 +32,16 @@ static void InitLogFile() {
     };
     for (auto p : paths) {
         FILE* f = fopen(p, "w");
-        if (f) { 
-            g_logfile = f;
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[FILE] opened: %s", p);
-            return;
-        }
-        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "[FILE] failed: %s (errno=%d)", p, errno);
+        if (f) { g_logfile = f; return; }
     }
-    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[FILE] all failed — logcat only");
 }
 
 static void LOGF(const char* fmt, ...) {
     char buf[4096];
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
-    
     if (g_logfile) {
         std::lock_guard<std::mutex> lock(g_mutex);
         fprintf(g_logfile, "%s\n", buf);
@@ -60,7 +49,7 @@ static void LOGF(const char* fmt, ...) {
     }
 }
 
-// ==================== GetLibInfo (نفس كودك الأصلي) ====================
+// ==================== LibInfo ====================
 struct LibInfo { uintptr_t base, text_start, text_end; };
 
 static LibInfo GetLibInfo() {
@@ -74,7 +63,7 @@ static LibInfo GetLibInfo() {
             const auto& p = ph->dlpi_phdr[i];
             if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
             o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end   = o->text_start + p.p_memsz;
+            o->text_end = o->text_start + p.p_memsz;
             break;
         }
         return 1;
@@ -82,30 +71,63 @@ static LibInfo GetLibInfo() {
     return info;
 }
 
-// ==================== FName Resolver ====================
-static std::string ResolveFName(uint32_t nameId) {
-    if (!g_FNamePool) return "<no pool>";
-    
+// ==================== Segment Scanner ====================
+struct Segment {
+    uintptr_t addr;
+    size_t size;
+    int flags;
+};
+
+static std::vector<Segment> GetWritableSegments() {
+    std::vector<Segment> segs;
+    dl_iterate_phdr([](struct dl_phdr_info* ph, size_t, void* data) -> int {
+        auto* out = (std::vector<Segment>*)data;
+        if (!ph->dlpi_name || !*ph->dlpi_name) return 0;
+        if (!strstr(ph->dlpi_name, "libUnreal")) return 0;
+        
+        for (int i = 0; i < ph->dlpi_phnum; i++) {
+            const auto& p = ph->dlpi_phdr[i];
+            if (p.p_type != PT_LOAD) continue;
+            // writable + readable
+            if ((p.p_flags & (PF_W | PF_R)) == (PF_W | PF_R)) {
+                out->push_back({
+                    ph->dlpi_addr + p.p_vaddr,
+                    p.p_memsz,
+                    p.p_flags
+                });
+            }
+        }
+        return 1;
+    }, &segs);
+    return segs;
+}
+
+// ==================== Validator ====================
+static bool IsValidHeapPtr(uint64_t p) {
+    return p >= 0x1000000000ULL && p <= 0x8000000000ULL;
+}
+
+// اقرأ ذاكرة بأمان
+static bool SafeRead(uintptr_t addr, void* buf, size_t n) {
+    struct iovec l = { buf, n };
+    struct iovec r = { (void*)addr, n };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+}
+
+// ==================== FName Reader (لـ التحقق) ====================
+static std::string ReadFNameFromPool(uintptr_t pool, uint32_t nameId) {
     uint32_t blockIdx = nameId >> 16;
     uint32_t offsetInBlock = nameId & 0xFFFF;
     if (blockIdx >= 8192) return "<oob>";
     
     uint64_t blockPtr = 0;
-    {
-        struct iovec l = { &blockPtr, 8 };
-        struct iovec r = { (void*)(g_FNamePool + 0x7C + blockIdx * 8), 8 };
-        if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != 8) return "<rdfail>";
-    }
-    if (!blockPtr) return "<null>";
+    if (!SafeRead(pool + 0x7C + blockIdx * 8, &blockPtr, 8)) return "<rdfail>";
+    if (!IsValidHeapPtr(blockPtr)) return "<null>";
     
     uintptr_t entryPtr = blockPtr + offsetInBlock * 2;
     
     uint16_t header = 0;
-    {
-        struct iovec l = { &header, 2 };
-        struct iovec r = { (void*)entryPtr, 2 };
-        if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != 2) return "<rd>";
-    }
+    if (!SafeRead(entryPtr, &header, 2)) return "<rd>";
     
     uint32_t len = (header >> 6) & 0x3FF;
     bool isWide = (header & 0x8000) != 0;
@@ -116,87 +138,184 @@ static std::string ResolveFName(uint32_t nameId) {
         char16_t wide[512] = {};
         uint32_t nBytes = len * 2;
         if (nBytes > sizeof(wide) - 2) nBytes = sizeof(wide) - 2;
-        struct iovec l = { wide, nBytes };
-        struct iovec r = { (void*)(entryPtr + 2), nBytes };
-        if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != (ssize_t)nBytes) return "<rd>";
+        if (!SafeRead(entryPtr + 2, wide, nBytes)) return "<rd>";
         for (uint32_t i = 0; i < len; i++) buf[i] = (char)(wide[i] & 0x7F);
     } else {
         uint32_t nBytes = len;
         if (nBytes > sizeof(buf) - 1) nBytes = sizeof(buf) - 1;
-        struct iovec l = { buf, nBytes };
-        struct iovec r = { (void*)(entryPtr + 2), nBytes };
-        if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != (ssize_t)nBytes) return "<rd>";
+        if (!SafeRead(entryPtr + 2, buf, nBytes)) return "<rd>";
     }
     return std::string(buf, len);
 }
 
-// ==================== FNamePool Hook ====================
-typedef void (*LogStats_t)(void*, void*);
-static LogStats_t o_LogStats = nullptr;
+// ==================== Validator: هل هذا FNamePool حقيقي؟ ====================
+static bool ValidateFNamePool(uintptr_t candidate) {
+    // 1) CurrentBlock منطقي؟
+    uint32_t cb = 0;
+    if (!SafeRead(candidate + 0x38, &cb, 4)) return false;
+    if (cb > 200) return false;  // realistic bound
+    
+    // 2) البلوك الأول صالح؟
+    uint64_t block0 = 0;
+    if (!SafeRead(candidate + 0x7C, &block0, 8)) return false;
+    if (!IsValidHeapPtr(block0)) return false;
+    
+    // 3) أول 5 entries يجب أن تكون:
+    //    None, ByteProperty, IntProperty, BoolProperty, FloatProperty
+    static const char* expected[] = {
+        "None", "ByteProperty", "IntProperty", "BoolProperty", "FloatProperty"
+    };
+    
+    for (int i = 0; i < 5; i++) {
+        std::string name = ReadFNameFromPool(candidate, i);
+        if (name != expected[i]) return false;
+    }
+    
+    return true;
+}
 
-static void Hook_LogStats(void* a1, void* a2) {
-    static bool once = false;
-    if (!once && a1) {
-        once = true;
-        g_FNamePool = (uintptr_t)a1;
+// ==================== Scanner الرئيسي ====================
+static uintptr_t ScanForFNamePool() {
+    LOGF("");
+    LOGF("========================================");
+    LOGF("Starting memory scan for FNamePool...");
+    LOGF("========================================");
+    
+    auto segs = GetWritableSegments();
+    LOGF("Found %zu writable segments", segs.size());
+    
+    const size_t CHUNK = 0x100000;  // 1MB
+    std::vector<uint8_t> buf(CHUNK);
+    
+    size_t totalScanned = 0;
+    auto startTime = std::chrono::steady_clock::now();
+    
+    for (auto& seg : segs) {
+        LOGF("");
+        LOGF("Segment: addr=0x%lx size=0x%lx flags=0x%x", 
+             seg.addr, seg.size, seg.flags);
         
-        LOGF("========================================");
-        LOGF("FNamePool @ 0x%lx", g_FNamePool);
-        LOGF("libBase   @ 0x%lx", g_base);
-        LOGF("Offset    = 0x%lx  <- SAVE THIS", g_FNamePool - g_base);
-        LOGF("========================================");
-        
-        // اختبر أول 20 FName
-        LOGF("--- First 20 FNames ---");
-        for (uint32_t i = 0; i < 20; i++) {
-            LOGF("[%2u] = %s", i, ResolveFName(i).c_str());
+        for (size_t off = 0; off < seg.size; off += CHUNK) {
+            size_t toRead = std::min(CHUNK, seg.size - off);
+            
+            struct iovec l = { buf.data(), toRead };
+            struct iovec r = { (void*)(seg.addr + off), toRead };
+            ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+            
+            if (got < 0x84) continue;
+            totalScanned += got;
+            
+            // امسح كل 8 بايت
+            for (size_t i = 0; i + 0x84 <= (size_t)got; i += 8) {
+                uintptr_t candidate = seg.addr + off + i;
+                
+                // فحص سريع 1: CurrentBlock @ +0x38
+                uint32_t cb = *(uint32_t*)(buf.data() + i + 0x38);
+                if (cb > 200) continue;
+                
+                // فحص سريع 2: block ptr @ +0x7C
+                uint64_t blockPtr = *(uint64_t*)(buf.data() + i + 0x7C);
+                if (!IsValidHeapPtr(blockPtr)) continue;
+                
+                // فحص سريع 3: أول entry = "None"?
+                uint8_t entry[16];
+                if (!SafeRead(blockPtr, entry, 16)) continue;
+                
+                uint16_t header = *(uint16_t*)entry;
+                uint32_t len = (header >> 6) & 0x3FF;
+                bool isWide = (header & 0x8000) != 0;
+                
+                if (isWide || len != 4) continue;
+                if (entry[2] != 'N' || entry[3] != 'o' || 
+                    entry[4] != 'n' || entry[5] != 'e') continue;
+                
+                // 🎯 مرشح قوي — افحص بعمق
+                LOGF("");
+                LOGF("Candidate @ 0x%lx (cb=%u block0=0x%lx)", 
+                     candidate, cb, blockPtr);
+                
+                if (ValidateFNamePool(candidate)) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - startTime).count();
+                    
+                    LOGF("");
+                    LOGF("##########################################");
+                    LOGF("###  ★★★ FNamePool FOUND! ★★★        ###");
+                    LOGF("##########################################");
+                    LOGF("FNamePool    @ 0x%lx", candidate);
+                    LOGF("libBase      @ 0x%lx", g_base);
+                    LOGF("Offset       = 0x%lx   <- SAVE THIS!", candidate - g_base);
+                    LOGF("CurrentBlock = %u", cb);
+                    LOGF("Scanned      = %.1f MB in %lds", 
+                         totalScanned / (1024.0 * 1024.0), (long)elapsed);
+                    LOGF("##########################################");
+                    LOGF("");
+                    
+                    // اطبع أول 30 entry للتأكد
+                    LOGF("--- First 30 FNames ---");
+                    for (uint32_t j = 0; j < 30; j++) {
+                        LOGF("[%2u] = %s", j, ReadFNameFromPool(candidate, j).c_str());
+                    }
+                    
+                    return candidate;
+                }
+            }
         }
     }
     
-    if (o_LogStats) o_LogStats(a1, a2);
+    LOGF("");
+    LOGF("!!! FNamePool NOT FOUND in writable segments !!!");
+    LOGF("Scanned: %.1f MB", totalScanned / (1024.0 * 1024.0));
+    return 0;
 }
 
 // ==================== Main ====================
 static void Run() {
-    // 1) انتظر libUnreal.so
+    // انتظر libUnreal.so
     LibInfo info{0,0,0};
     for (int i = 0; i < 60; i++) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         info = GetLibInfo();
         if (info.base) break;
     }
-    if (!info.base) { 
-        LOGF("[ERR] libUnreal not found after 60s"); 
-        return; 
+    if (!info.base) {
+        LOGF("[ERR] libUnreal not found");
+        return;
     }
     g_base = info.base;
     
     LOGF("========================================");
-    LOGF("FNamePool Dumper — Fortnite 21.30");
+    LOGF("FNamePool Scanner — Fortnite 21.30");
     LOGF("libBase = 0x%lx", g_base);
     LOGF("========================================");
     
-    // 2) ثبّت hook على FNamePool::LogStats
-    void* target = (void*)(g_base + ADDR_FNamePool_LogStats);
-    int rc = DobbyHook(target, (void*)Hook_LogStats, (void**)&o_LogStats);
+    // انتظر شوي عشان اللعبة تحمّل كل المكتبات
+    LOGF("Waiting 15s for game to fully load...");
+    std::this_thread::sleep_for(std::chrono::seconds(15));
     
-    LOGF("DobbyHook(%p) = %d", target, rc);
-    LOGF("Original ptr   = %p", (void*)o_LogStats);
+    // ابدأ الـ scan
+    uintptr_t pool = ScanForFNamePool();
     
-    if (rc != 0) {
-        LOGF("!!! HOOK FAILED !!!");
-        return;
+    if (pool) {
+        LOGF("");
+        LOGF("=== DONE ===");
+        LOGF("Use: g_FNamePool = libBase + 0x%lx;", pool - g_base);
+    } else {
+        LOGF("");
+        LOGF("=== FAILED ===");
+        LOGF("Try:");
+        LOGF("  1. Increase wait time");
+        LOGF("  2. Scan more segments (including read-only)");
+        LOGF("  3. Use different validation");
     }
-    
-    LOGF("Hook installed. Waiting for LogStats call...");
 }
 
 // ==================== JNI ====================
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
-    InitLogFile();       // ← أول شي
+    InitLogFile();
     LOGF("========================================");
-    LOGF("FNamePool Dumper %s %s", __DATE__, __TIME__);
+    LOGF("FNamePool Scanner %s %s", __DATE__, __TIME__);
     LOGF("PID: %d", getpid());
     LOGF("========================================");
     
