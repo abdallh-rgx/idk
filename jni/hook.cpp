@@ -140,11 +140,12 @@ static void FixControllerAndPossess(void* pc, void* newPawn) {
     LOGF("[FixController] Linked PC (%p) <-> Pawn (%p)", pc, newPawn);
 }
 
-static void* GetPawnClass(void* gm) {
-    void* pawnClass = nullptr;
-    RP((char*)gm + OFF_GM_DefaultPawnClass, &pawnClass);
-    if (!IVP(pawnClass) && SFO) {
-        pawnClass = SFO(nullptr, nullptr, u"/Script/FortniteGame.FortPlayerPawnAthena", false);
+static void* GetAthenaPawnClass() {
+    if (!SFO) return nullptr;
+    // تحميل كلاس Person Athena المباشر الذي تم استخراجه
+    void* pawnClass = SFO(nullptr, nullptr, u"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", false);
+    if (!IVP(pawnClass)) {
+        pawnClass = SFO(nullptr, nullptr, u"/Game/Athena/PlayerPawn_Athena_Generic.PlayerPawn_Athena_Generic_C", false);
     }
     return pawnClass;
 }
@@ -158,7 +159,10 @@ static void DirectSpawn(void* gm, void* pc) {
     auto SpawnAtTransform = (SpawnDefaultPawnAtTransform_t)vft[VFT_IDX_SpawnDefaultPawnAtTransform];
     if (!SpawnAtTransform) return;
 
-    void* pawnClass = GetPawnClass(gm);
+    void* pawnClass = GetAthenaPawnClass();
+    if (IVP(pawnClass)) {
+        *(void**)((char*)gm + OFF_GM_DefaultPawnClass) = pawnClass;
+    }
 
     FTransform sky;
     memset(&sky, 0, sizeof(sky));
@@ -243,7 +247,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v17 - Complete Possession Fix");
+    LOGF(" hook v18 - PlayerPawn_Athena Direct Class");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
