@@ -21,12 +21,16 @@
 
 #define LOG_TAG "hook"
 
+// ⚠️ تنبيه: هذه العناوين خاصة بنسخة اللعبة الحالية، يجب تحديثها مع كل تحديث
 #define ADDR_StaticFindObject            0x762A664
 #define ADDR_PlaylistHandler             0x5519710
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
+// ⚠️ فهرس دالة SpawnDefaultPawnAtTransform في جدول VFT (يجب التأكد منه من الـ SDK Dump)
 #define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
+// ⚠️ فهرس دالة Possess في جدول VFT الخاص بـ APlayerController (يجب التأكد منه من الـ SDK Dump)
+#define VFT_IDX_Possess                     0x1A4 
 
 #define OFF_PC_PlayerState               0x278
 #define OFF_PC_StateName                 0x2A8
@@ -89,7 +93,7 @@ static LibInfo GetLibInfo() {
             const auto& p = ph->dlpi_phdr[i];
             if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
             o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end = o->text_start + p.p_vaddr;
+            o->text_end = o->text_start + p.p_memsz; // تم تصحيح p_vaddr إلى p_memsz
             break;
         }
         return 1;
@@ -110,7 +114,10 @@ static bool IVP(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*, void*);
+// ✅ تم تصحيح التوقيع: دالة SpawnDefaultPawnAtTransform تأخذ 3 معاملات فقط (this, NewPlayer, Transform)
+typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
+// ✅ إضافة توقيع دالة Possess
+typedef void (*Possess_t)(void*, void*);
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
@@ -129,23 +136,35 @@ static void ClearSpectator(void* pc) {
 static void FixControllerAndPossess(void* pc, void* newPawn) {
     if (!IVP(pc) || !IVP(newPawn)) return;
 
+    // 1. مسح حالة Spectator
+    ClearSpectator(pc);
+
+    // 2. ربط المؤشرات يدوياً (كحل احتياطي في حال فشل دالة Possess)
     *(uint32_t*)((char*)pc + OFF_PC_StateName) = 0;
     *(uint32_t*)((char*)pc + OFF_PC_StateName + 0x4) = 0;
-
     *(void**)((char*)pc + OFF_PC_Pawn) = newPawn;
     *(void**)((char*)newPawn + OFF_Pawn_Controller) = pc;
 
-    ClearSpectator(pc);
+    // 3. استدعاء دالة Possess الفعلية لتحديث الكاميرا والمدخلات
+    void** pc_vft = *(void***)pc;
+    if (pc_vft) {
+        auto PossessFunc = (Possess_t)pc_vft[VFT_IDX_Possess];
+        if (PossessFunc) {
+            LOGF("[Possess] Calling APlayerController::Possess...");
+            PossessFunc(pc, newPawn);
+        }
+    }
 
     LOGF("[FixController] Linked PC (%p) <-> Pawn (%p)", pc, newPawn);
 }
 
 static void* GetAthenaPawnClass() {
     if (!SFO) return nullptr;
-    // تحميل كلاس Person Athena المباشر الذي تم استخراجه
+    // تحميل كلاس PlayerPawn_Athena
     void* pawnClass = SFO(nullptr, nullptr, u"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", false);
     if (!IVP(pawnClass)) {
-        pawnClass = SFO(nullptr, nullptr, u"/Game/Athena/PlayerPawn_Athena_Generic.PlayerPawn_Athena_Generic_C", false);
+        // مسار بديل في حال كان البيلد للفصل الثالث (Artemis)
+        pawnClass = SFO(nullptr, nullptr, u"/Game/Artemis/PlayerPawn_Artemis.PlayerPawn_Artemis_C", false);
     }
     return pawnClass;
 }
@@ -157,22 +176,31 @@ static void DirectSpawn(void* gm, void* pc) {
     if (!vft) return;
 
     auto SpawnAtTransform = (SpawnDefaultPawnAtTransform_t)vft[VFT_IDX_SpawnDefaultPawnAtTransform];
-    if (!SpawnAtTransform) return;
+    if (!SpawnAtTransform) {
+        LOGF("[ERR] SpawnDefaultPawnAtTransform is null!");
+        return;
+    }
 
     void* pawnClass = GetAthenaPawnClass();
     if (IVP(pawnClass)) {
         *(void**)((char*)gm + OFF_GM_DefaultPawnClass) = pawnClass;
+        LOGF("[Spawn] DefaultPawnClass set to %p", pawnClass);
+    } else {
+        LOGF("[ERR] Failed to find PlayerPawn_Athena class!");
+        return;
     }
 
     FTransform sky;
     memset(&sky, 0, sizeof(sky));
     sky.qw = 1.0f;
+    // إحداثيات آمنة فوق خريطة Artemis (تجنب الـ KillZ)
     sky.tx = 125000.0f;
     sky.ty = 125000.0f;
-    sky.tz = 4000.0f;
+    sky.tz = 10000.0f; 
     sky.sx = sky.sy = sky.sz = 1.0f;
 
-    void* newPawn = SpawnAtTransform(gm, pc, &sky, pawnClass);
+    // ✅ تم تصحيح الاستدعاء: إزالة pawnClass من المعاملات
+    void* newPawn = SpawnAtTransform(gm, pc, &sky);
     LOGF("[Spawn] Result Pawn = %p", newPawn);
 
     if (IVP(newPawn)) {
@@ -210,11 +238,18 @@ static void Hook_PL(void* gm, void* pc) {
     g_calls++;
     LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========", (unsigned long long)g_calls, gm, pc);
 
+    // 1. حقن قائمة اللعب
     InjectPlaylist(gm);
+    
+    // 2. محاولة إزالة حالة Spectator مبكراً
     ClearSpectator(pc);
 
+    // 3. استدعاء الدالة الأصلية (إذا كانت تعمل)
+    // ⚠️ تحذير: إذا كان السيرفر وهمياً، قد تتسبب هذه الدالة في تعليق اللعبة
+    // إذا حدث Crash، قم بتعليق السطر التالي:
     if (o_PL) o_PL(gm, pc);
 
+    // 4. إجبار الرسبنة اليدوية
     ClearSpectator(pc);
     DirectSpawn(gm, pc);
 
@@ -247,7 +282,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v18 - PlayerPawn_Athena Direct Class");
+    LOGF(" hook v19 - Corrected Spawn & Possess");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
