@@ -21,21 +21,26 @@
 
 #define LOG_TAG "hook"
 
+// --- العناوين الأساسية ---
 #define ADDR_StaticFindObject            0x762A664
 #define ADDR_PlaylistHandler             0x5519710
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
-// VFT Indices for UE5 (Check these if crash happens)
-#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
-#define VFT_IDX_SpawnDefaultPawnFor         0xDE
+// --- عنوان دالة Possess الذي وجدته ---
+#define ADDR_Possess_THUNK_RVA           0x99C4C18
+// #define ADDR_Possess_ORIG_RVA          0x92E2C74
 
+// --- إزاحات الذاكرة ---
 #define OFF_PC_PlayerState               0x278
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
 #define OFF_PS_SpectatorByte             0x27A
 #define OFF_GM_DefaultPawnClass          0x330
+
+// VFT Indices for UE5 (للاحتياط فقط)
+#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
 
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -93,7 +98,7 @@ static LibInfo GetLibInfo() {
             const auto& p = ph->dlpi_phdr[i];
             if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
             o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end = o->text_start + p.p_memsz; // FIXED: p_memsz instead of p_vaddr
+            o->text_end = o->text_start + p.p_memsz;
             break;
         }
         return 1;
@@ -105,6 +110,7 @@ static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
+static void* g_saved_pc = nullptr; // متغير عام لحفظ الـ PlayerController
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
@@ -114,8 +120,8 @@ static bool IVP(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-// FIXED: Signature for SpawnDefaultPawnAtTransform (this, Controller, Transform)
 typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
+typedef void (*Possess_t)(void*, void*); // توقيع دالة Possess
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
@@ -139,19 +145,29 @@ static void DirectSpawn(void* gm, void* pc) {
 
     void* pawnClass = GetPawnClass(gm);
     if (IVP(pawnClass)) {
-        // Force GameMode to use Athena Pawn
         WP((char*)gm + OFF_GM_DefaultPawnClass, pawnClass); 
     }
 
     FTransform sky;
     memset(&sky, 0, sizeof(sky));
     sky.qw = 1.0f;
-    sky.tz = 10000.0f; // Higher Z to avoid terrain clipping
+    sky.tz = 10000.0f; 
     sky.sx = sky.sy = sky.sz = 1.0f;
 
-    // FIXED: Removed pawnClass from arguments, only 3 args: this, pc, transform
     void* newPawn = SpawnAtTransform(gm, pc, &sky);
     LOGF("[Spawn] Result Pawn = %p", newPawn);
+
+    if (IVP(newPawn)) {
+        // استخدام عنوان دالة Possess الذي وجدته
+        auto PossessFunc = (Possess_t)(g_base + ADDR_Possess_THUNK_RVA);
+        if (PossessFunc) {
+            LOGF("[Possess] Calling Possess function at %p...", (void*)PossessFunc);
+            PossessFunc(pc, newPawn);
+            LOGF("[Possess] Success! PC %p now possesses Pawn %p", pc, newPawn);
+        } else {
+            LOGF("[Possess] Failed to resolve Possess function!");
+        }
+    }
 }
 
 static void* FindPlaylist() {
@@ -170,7 +186,6 @@ static bool InjectPlaylist(void* gm) {
     void* gs = nullptr;
     if (!RP((char*)gm + OFF_GM_GameState, &gs) || !gs) return false;
     
-    // Safety check before writing to GS
     WP((char*)gs + OFF_GS_Playlist2298, g_cached_playlist);
     WP((char*)gs + OFF_GS_Playlist2290, g_cached_playlist);
     
@@ -193,33 +208,18 @@ static void ClearSpectator(void* pc) {
 
 typedef void (*PL_t)(void*, void*);
 static PL_t o_PL = nullptr;
-static uint64_t g_calls = 0;
 
 static void Hook_PL(void* gm, void* pc) {
-    g_calls++;
-    LOGF("========== [PostLogin #%llu] GM=%p PC=%p ==========", (unsigned long long)g_calls, gm, pc);
+    LOGF("========== [PostLogin] GM=%p PC=%p ==========", gm, pc);
 
     InjectPlaylist(gm);
     ClearSpectator(pc);
+    g_saved_pc = pc; // حفظ الـ PC للاستخدام لاحقاً
 
     if (o_PL) o_PL(gm, pc);
-
     ClearSpectator(pc);
 
-    // Better delay loop instead of single sleep
-    std::thread([gm, pc]() {
-        for (int i = 0; i < 10; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            ClearSpectator(pc);
-            void* gs = nullptr;
-            if (RP((char*)gm + OFF_GM_GameState, &gs) && IVP(gs)) {
-                DirectSpawn(gm, pc);
-                break;
-            }
-        }
-    }).detach();
-
-    LOGF("[PostLogin] done");
+    LOGF("[PostLogin] done. Waiting for Aircraft Phase to Spawn...");
 }
 
 typedef bool (*SAP_t)(void*, char);
@@ -227,6 +227,13 @@ static SAP_t o_SAP = nullptr;
 
 static bool Hook_SAP(void* gm, char a2) {
     LOGF("[Aircraft] phase=%d", (int)a2);
+    
+    // نقوم بعمل Spawn هنا لأننا في الخيط الرئيسي (Game Thread)
+    if (g_saved_pc) {
+        LOGF("[Aircraft] Triggering DirectSpawn on Game Thread...");
+        DirectSpawn(gm, g_saved_pc);
+    }
+
     return o_SAP ? o_SAP(gm, a2) : false;
 }
 
@@ -248,13 +255,12 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v17 - Direct Spawn VFT Fixed");
+    LOGF(" hook v18 - Direct Spawn + Possess (Game Thread)");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    LOGF(" SFO = %p (RVA=0x%X)", (void*)SFO, ADDR_StaticFindObject);
-
+    
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
