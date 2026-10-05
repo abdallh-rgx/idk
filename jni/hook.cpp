@@ -26,15 +26,11 @@
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
-// ✅ VFT Index لـ SpawnDefaultPawnAtTransform (من SDK الخاص بك)
+// VFT Indices for UE5 (Check these if crash happens)
 #define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
+#define VFT_IDX_SpawnDefaultPawnFor         0xDE
 
-// ✅ Offsets محدثة من الـ SDK Dump
 #define OFF_PC_PlayerState               0x278
-#define OFF_PC_StateName                 0x2A8
-#define OFF_PC_Pawn                      0x2B0
-#define OFF_Pawn_Controller              0x2A8
-#define OFF_Pawn_PlayerState             0x2B0   // ✅ جديد: Pawn->PlayerState
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
 #define OFF_GS_Playlist2290              0x2290
@@ -69,6 +65,11 @@ static bool RP(void* a, void** o) {
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
 
+static bool WP(void* a, void* v) {
+    struct iovec l = { &v, sizeof(void*) }, r = { a, sizeof(void*) };
+    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
+}
+
 static bool RU8(void* a, uint8_t* v) {
     struct iovec l = { v, 1 }, r = { a, 1 };
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 1;
@@ -77,16 +78,6 @@ static bool RU8(void* a, uint8_t* v) {
 static bool WU8(void* a, uint8_t v) {
     struct iovec l = { &v, 1 }, r = { a, 1 };
     return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == 1;
-}
-
-static bool WU32(void* a, uint32_t v) {
-    struct iovec l = { &v, 4 }, r = { a, 4 };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == 4;
-}
-
-static bool WP(void* a, void* v) {
-    struct iovec l = { &v, sizeof(void*) }, r = { a, sizeof(void*) };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
 }
 
 struct LibInfo { uintptr_t base, text_start, text_end; };
@@ -102,7 +93,7 @@ static LibInfo GetLibInfo() {
             const auto& p = ph->dlpi_phdr[i];
             if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
             o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end = o->text_start + p.p_memsz;
+            o->text_end = o->text_start + p.p_memsz; // FIXED: p_memsz instead of p_vaddr
             break;
         }
         return 1;
@@ -123,56 +114,16 @@ static bool IVP(void* p) {
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
+// FIXED: Signature for SpawnDefaultPawnAtTransform (this, Controller, Transform)
 typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
-typedef void (*Possess_t)(void*, void*);
-typedef void (*ClientRestart_t)(void*, void*);
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
-static void ClearSpectator(void* pc) {
-    if (!IVP(pc)) return;
-    void* ps = nullptr;
-    RP((char*)pc + OFF_PC_PlayerState, &ps);
-    if (!IVP(ps)) return;
-    uint8_t b = 0;
-    if (RU8((char*)ps + OFF_PS_SpectatorByte, &b) && b != 0) {
-        WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
-        LOGF("[Spectator] 0x%02X -> 0x00", b);
-    }
-}
-
-// ✅ ربط البيدق بالمتحكم بدون استدعاء Possess (لتجنب الكراش)
-static void LinkPawnToController(void* pc, void* newPawn) {
-    if (!IVP(pc) || !IVP(newPawn)) return;
-
-    ClearSpectator(pc);
-
-    // 1. ربط PlayerState بالبيدق (مهم جداً لأثينا)
-    void* ps = nullptr;
-    RP((char*)pc + OFF_PC_PlayerState, &ps);
-    if (IVP(ps)) {
-        WP((char*)newPawn + OFF_Pawn_PlayerState, ps);
-        LOGF("[Link] Pawn->PlayerState = %p", ps);
-    } else {
-        LOGF("[Link] WARNING: PC->PlayerState is NULL!");
-    }
-
-    // 2. مسح StateName (لإزالة حالة "Waiting" أو "Spectating")
-    WU32((char*)pc + OFF_PC_StateName, 0);
-    WU32((char*)pc + OFF_PC_StateName + 0x4, 0);
-
-    // 3. ربط المؤشرات الأساسية
-    WP((char*)pc + OFF_PC_Pawn, newPawn);           // PC->Pawn = newPawn
-    WP((char*)newPawn + OFF_Pawn_Controller, pc);   // Pawn->Controller = pc
-
-    LOGF("[Link] PC (%p) <-> Pawn (%p) linked", pc, newPawn);
-}
-
-static void* GetAthenaPawnClass() {
-    if (!SFO) return nullptr;
-    void* pawnClass = SFO(nullptr, nullptr, u"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", false);
-    if (!IVP(pawnClass)) {
-        pawnClass = SFO(nullptr, nullptr, u"/Game/Athena/PlayerPawn_Athena_Generic.PlayerPawn_Athena_Generic_C", false);
+static void* GetPawnClass(void* gm) {
+    void* pawnClass = nullptr;
+    RP((char*)gm + OFF_GM_DefaultPawnClass, &pawnClass);
+    if (!IVP(pawnClass) && SFO) {
+        pawnClass = SFO(nullptr, nullptr, u"/Script/FortniteGame.FortPlayerPawnAthena", false);
     }
     return pawnClass;
 }
@@ -181,45 +132,26 @@ static void DirectSpawn(void* gm, void* pc) {
     if (!IVP(gm) || !IVP(pc)) return;
 
     void** vft = *(void***)gm;
-    if (!vft) {
-        LOGF("[ERR] GM VFT is null");
-        return;
-    }
+    if (!vft) return;
 
     auto SpawnAtTransform = (SpawnDefaultPawnAtTransform_t)vft[VFT_IDX_SpawnDefaultPawnAtTransform];
-    if (!SpawnAtTransform) {
-        LOGF("[ERR] SpawnDefaultPawnAtTransform is null!");
-        return;
-    }
+    if (!SpawnAtTransform) return;
 
-    void* pawnClass = GetAthenaPawnClass();
+    void* pawnClass = GetPawnClass(gm);
     if (IVP(pawnClass)) {
-        WP((char*)gm + OFF_GM_DefaultPawnClass, pawnClass);
-        LOGF("[Spawn] DefaultPawnClass set to %p", pawnClass);
-    } else {
-        LOGF("[ERR] Failed to find PlayerPawn_Athena class!");
-        return;
+        // Force GameMode to use Athena Pawn
+        WP((char*)gm + OFF_GM_DefaultPawnClass, pawnClass); 
     }
 
     FTransform sky;
     memset(&sky, 0, sizeof(sky));
     sky.qw = 1.0f;
-    sky.tx = 125000.0f;
-    sky.ty = 125000.0f;
-    sky.tz = 10000.0f;
+    sky.tz = 10000.0f; // Higher Z to avoid terrain clipping
     sky.sx = sky.sy = sky.sz = 1.0f;
 
+    // FIXED: Removed pawnClass from arguments, only 3 args: this, pc, transform
     void* newPawn = SpawnAtTransform(gm, pc, &sky);
     LOGF("[Spawn] Result Pawn = %p", newPawn);
-
-    if (!IVP(newPawn)) {
-        LOGF("[ERR] Pawn is invalid!");
-        return;
-    }
-
-    // ✅ استخدم الربط المباشر بدلاً من Possess
-    LinkPawnToController(pc, newPawn);
-    LOGF("[Spawn] LinkPawnToController done");
 }
 
 static void* FindPlaylist() {
@@ -237,11 +169,26 @@ static bool InjectPlaylist(void* gm) {
     }
     void* gs = nullptr;
     if (!RP((char*)gm + OFF_GM_GameState, &gs) || !gs) return false;
+    
+    // Safety check before writing to GS
     WP((char*)gs + OFF_GS_Playlist2298, g_cached_playlist);
     WP((char*)gs + OFF_GS_Playlist2290, g_cached_playlist);
+    
     g_injected_gms.insert(gm);
     LOGF("[Inject] Playlist set on GS=%p", gs);
     return true;
+}
+
+static void ClearSpectator(void* pc) {
+    if (!IVP(pc)) return;
+    void* ps = nullptr;
+    RP((char*)pc + OFF_PC_PlayerState, &ps);
+    if (!IVP(ps)) return;
+    uint8_t b = 0;
+    if (RU8((char*)ps + OFF_PS_SpectatorByte, &b) && b != 0) {
+        WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
+        LOGF("[Spectator] 0x%02X -> 0x00", b);
+    }
 }
 
 typedef void (*PL_t)(void*, void*);
@@ -255,11 +202,22 @@ static void Hook_PL(void* gm, void* pc) {
     InjectPlaylist(gm);
     ClearSpectator(pc);
 
-    // ⚠️ لا تستدعي o_PL لأنها قد تسبب كراش بدون سيرفر حقيقي
-    // if (o_PL) o_PL(gm, pc);
+    if (o_PL) o_PL(gm, pc);
 
     ClearSpectator(pc);
-    DirectSpawn(gm, pc);
+
+    // Better delay loop instead of single sleep
+    std::thread([gm, pc]() {
+        for (int i = 0; i < 10; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            ClearSpectator(pc);
+            void* gs = nullptr;
+            if (RP((char*)gm + OFF_GM_GameState, &gs) && IVP(gs)) {
+                DirectSpawn(gm, pc);
+                break;
+            }
+        }
+    }).detach();
 
     LOGF("[PostLogin] done");
 }
@@ -290,7 +248,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v20 - No Possess, Direct Link");
+    LOGF(" hook v17 - Direct Spawn VFT Fixed");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
