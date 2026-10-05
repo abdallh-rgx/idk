@@ -19,19 +19,25 @@
 #include <sys/uio.h>
 #include "dobby.h"
 
-#define LOG_TAG "hook"
+#define LOG_TAG "FortHook"
 
-// --- العناوين الأساسية ---
+// ==========================================
+// 1. العناوين والإزاحات (Offsets & RVAs)
+// ==========================================
 #define ADDR_StaticFindObject            0x762A664
 #define ADDR_PlaylistHandler             0x5519710
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
 
-// --- عنوان دالة Possess الذي وجدته ---
+// العناوين الجديدة التي استخرجتها
+#define ADDR_ReadyToStartMatch_THUNK_RVA 0x99E7270
+#define ADDR_StartFlightPath_ORIG_RVA    0x53F0458
 #define ADDR_Possess_THUNK_RVA           0x99C4C18
-// #define ADDR_Possess_ORIG_RVA          0x92E2C74
 
-// --- إزاحات الذاكرة ---
+// VFT Indices
+#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
+
+// Memory Offsets
 #define OFF_PC_PlayerState               0x278
 #define OFF_GM_GameState                 0x2D0
 #define OFF_GS_Playlist2298              0x2298
@@ -39,9 +45,9 @@
 #define OFF_PS_SpectatorByte             0x27A
 #define OFF_GM_DefaultPawnClass          0x330
 
-// VFT Indices for UE5 (للاحتياط فقط)
-#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
-
+// ==========================================
+// 2. أدوات السجل والذاكرة (Logging & Memory)
+// ==========================================
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
 
@@ -106,25 +112,31 @@ static LibInfo GetLibInfo() {
     return info;
 }
 
+// ==========================================
+// 3. المتغيرات العامة والأنواع (Globals & Typedefs)
+// ==========================================
 static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
-static void* g_saved_pc = nullptr; // متغير عام لحفظ الـ PlayerController
+static void* g_saved_pc = nullptr;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
+
+typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
+typedef void (*Possess_t)(void*, void*);
+
+struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
 static bool IVP(void* p) {
     uintptr_t v = (uintptr_t)p;
     return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
 }
 
-typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
-typedef void (*Possess_t)(void*, void*); // توقيع دالة Possess
-
-struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
-
+// ==========================================
+// 4. الدوال الأساسية (Core Logic)
+// ==========================================
 static void* GetPawnClass(void* gm) {
     void* pawnClass = nullptr;
     RP((char*)gm + OFF_GM_DefaultPawnClass, &pawnClass);
@@ -158,14 +170,11 @@ static void DirectSpawn(void* gm, void* pc) {
     LOGF("[Spawn] Result Pawn = %p", newPawn);
 
     if (IVP(newPawn)) {
-        // استخدام عنوان دالة Possess الذي وجدته
         auto PossessFunc = (Possess_t)(g_base + ADDR_Possess_THUNK_RVA);
         if (PossessFunc) {
-            LOGF("[Possess] Calling Possess function at %p...", (void*)PossessFunc);
+            LOGF("[Possess] Calling Possess at %p...", (void*)PossessFunc);
             PossessFunc(pc, newPawn);
             LOGF("[Possess] Success! PC %p now possesses Pawn %p", pc, newPawn);
-        } else {
-            LOGF("[Possess] Failed to resolve Possess function!");
         }
     }
 }
@@ -206,6 +215,18 @@ static void ClearSpectator(void* pc) {
     }
 }
 
+static void ForceStartFlightPath(void* gm) {
+    if (!gm) return;
+    auto StartFlightPathFunc = (void(*)(void*))(g_base + ADDR_StartFlightPath_ORIG_RVA);
+    if (StartFlightPathFunc) {
+        LOGF("[Force] Calling StartFlightPath manually...");
+        StartFlightPathFunc(gm);
+    }
+}
+
+// ==========================================
+// 5. دوال الاختراق (Hooks)
+// ==========================================
 typedef void (*PL_t)(void*, void*);
 static PL_t o_PL = nullptr;
 
@@ -214,12 +235,21 @@ static void Hook_PL(void* gm, void* pc) {
 
     InjectPlaylist(gm);
     ClearSpectator(pc);
-    g_saved_pc = pc; // حفظ الـ PC للاستخدام لاحقاً
+    g_saved_pc = pc;
 
     if (o_PL) o_PL(gm, pc);
     ClearSpectator(pc);
 
     LOGF("[PostLogin] done. Waiting for Aircraft Phase to Spawn...");
+}
+
+typedef bool (*ReadyToStartMatch_t)(void*);
+static ReadyToStartMatch_t o_ReadyToStartMatch = nullptr;
+
+static bool Hook_ReadyToStartMatch(void* gm) {
+    bool originalResult = o_ReadyToStartMatch ? o_ReadyToStartMatch(gm) : false;
+    LOGF("[GameMode] ReadyToStartMatch called. Original: %d. Forcing TRUE!", originalResult);
+    return true; // إجبار اللعبة على تخطي مرحلة الانتظار
 }
 
 typedef bool (*SAP_t)(void*, char);
@@ -228,7 +258,10 @@ static SAP_t o_SAP = nullptr;
 static bool Hook_SAP(void* gm, char a2) {
     LOGF("[Aircraft] phase=%d", (int)a2);
     
-    // نقوم بعمل Spawn هنا لأننا في الخيط الرئيسي (Game Thread)
+    if ((int)a2 == 0 || (int)a2 == 1) { 
+        ForceStartFlightPath(gm);
+    }
+
     if (g_saved_pc) {
         LOGF("[Aircraft] Triggering DirectSpawn on Game Thread...");
         DirectSpawn(gm, g_saved_pc);
@@ -245,6 +278,9 @@ static int Hook_PH(void* a1) {
     return o_PH ? o_PH(a1) : 0;
 }
 
+// ==========================================
+// 6. التشغيل (Initialization)
+// ==========================================
 static void Run() {
     LibInfo i{0,0,0};
     for (int k = 0; k < 60; k++) {
@@ -255,15 +291,17 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" hook v18 - Direct Spawn + Possess (Game Thread)");
+    LOGF(" FORTNITE ANDROID HOOK - MASTER BUILD");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     
+    // تفعيل كل الـ Hooks
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
+    DobbyHook((void*)(g_base + ADDR_ReadyToStartMatch_THUNK_RVA), (void*)Hook_ReadyToStartMatch, (void**)&o_ReadyToStartMatch);
 
     LOGF("[Run] All hooks installed. Waiting for PostLogin...");
 }
