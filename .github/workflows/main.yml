@@ -21,11 +21,22 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      # 1. خطوة الكاش: تخزين الـ NDK لمنع تحميله في كل مرة
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/setup-ndk/
+          key: ${{ runner.os }}-ndk-r27-${{ hashFiles('jni/Android.mk', 'jni/Application.mk') }}
+          restore-keys: |
+            ${{ runner.os }}-ndk-r27-
+
+      # 2. إعداد NDK r27 (سيستخدم الكاش إذا كان موجوداً)
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r26b
+          ndk-version: r27
           add-to-path: true
 
       - name: Print NDK info
@@ -50,5 +61,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: liberbium_hook-arm64
+          name: libhook-arm64
           path: libs/arm64-v8a/libhook.so
