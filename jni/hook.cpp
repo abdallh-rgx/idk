@@ -31,12 +31,10 @@
 #define ADDR_ReadyToStartMatch_THUNK_RVA 0x99E7270
 #define ADDR_StartFlightPath_ORIG_RVA    0x53F0458
 #define ADDR_Possess_THUNK_RVA           0x99C4C18
-
-// 🎯 الكنز الجديد الذي وجدته!
 #define ADDR_ClientRestart_THUNK_RVA     0x9ADFE80 
 
-// VFT Indices
-#define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
+// 🎯 العناوين الجديدة التي أرسلتها
+#define ADDR_SpawnDefaultPawnFor_THUNK_RVA 0x99E790C
 
 // Memory Offsets
 #define OFF_PC_PlayerState               0x278
@@ -47,7 +45,7 @@
 #define OFF_GM_DefaultPawnClass          0x330
 
 // ==========================================
-// 2. أدوات السجل والذاكرة (Logging & Memory)
+// 2. أدوات السجل والذاكرة
 // ==========================================
 static FILE* g_logfile = nullptr;
 static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
@@ -114,22 +112,23 @@ static LibInfo GetLibInfo() {
 }
 
 // ==========================================
-// 3. المتغيرات العامة والأنواع (Globals & Typedefs)
+// 3. المتغيرات العامة والأنواع
 // ==========================================
 static uintptr_t g_base = 0;
 static std::mutex g_inject_mutex;
 static std::set<void*> g_injected_gms;
 static void* g_cached_playlist = nullptr;
 static void* g_saved_pc = nullptr;
+static bool g_bMatchStarted = false;
 
 typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
 static StaticFindObject_t SFO = nullptr;
 
-typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
-typedef void (*Possess_t)(void*, void*);
-typedef void (*ClientRestart_t)(void*, void*); // توقيع دالة ClientRestart
+typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
+static SpawnDefaultPawnFor_t o_SpawnDefaultPawnFor = nullptr;
 
-struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
+typedef void (*Possess_t)(void*, void*);
+typedef void (*ClientRestart_t)(void*, void*);
 
 static bool IVP(void* p) {
     uintptr_t v = (uintptr_t)p;
@@ -137,7 +136,7 @@ static bool IVP(void* p) {
 }
 
 // ==========================================
-// 4. الدوال الأساسية (Core Logic)
+// 4. الدوال الأساسية
 // ==========================================
 static void* GetPawnClass(void* gm) {
     void* pawnClass = nullptr;
@@ -148,47 +147,38 @@ static void* GetPawnClass(void* gm) {
     return pawnClass;
 }
 
-static void DirectSpawn(void* gm, void* pc) {
-    if (!IVP(gm) || !IVP(pc)) return;
-
-    void** vft = *(void***)gm;
-    if (!vft) return;
-
-    auto SpawnAtTransform = (SpawnDefaultPawnAtTransform_t)vft[VFT_IDX_SpawnDefaultPawnAtTransform];
-    if (!SpawnAtTransform) return;
-
+// 🎯 دالة الـ Hook الجديدة: نترك المحرك ينشئ الشخصية، لكننا نصلح الـ Class
+void* Hook_SpawnDefaultPawnFor(void* gm, void* pc, void* startSpot) {
+    LOGF("[Spawn] SpawnDefaultPawnFor called by engine!");
+    
+    // إجبار الـ GameMode على استخدام شخصية أثينا
     void* pawnClass = GetPawnClass(gm);
     if (IVP(pawnClass)) {
         WP((char*)gm + OFF_GM_DefaultPawnClass, pawnClass); 
     }
-
-    FTransform sky;
-    memset(&sky, 0, sizeof(sky));
-    sky.qw = 1.0f;
-    sky.tz = 10000.0f; 
-    sky.sx = sky.sy = sky.sz = 1.0f;
-
-    void* newPawn = SpawnAtTransform(gm, pc, &sky);
-    LOGF("[Spawn] Result Pawn = %p", newPawn);
-
-    if (IVP(newPawn)) {
-        // 1. الامتلاك (Possess)
+    
+    // استدعاء الدالة الأصلية (المحرك سيتولى الباقي)
+    void* newPawn = o_SpawnDefaultPawnFor ? o_SpawnDefaultPawnFor(gm, pc, startSpot) : nullptr;
+    LOGF("[Spawn] Engine spawned Pawn = %p", newPawn);
+    
+    // إذا نجح المحرك في إنشاء الشخصية، نتدخل فقط لضمان الامتلاك وتغيير الحالة
+    if (IVP(newPawn) && IVP(pc)) {
+        // 1. الامتلاك (احتياطي فقط، المحرك عادة يقوم به)
         auto PossessFunc = (Possess_t)(g_base + ADDR_Possess_THUNK_RVA);
         if (PossessFunc) {
             PossessFunc(pc, newPawn);
-            LOGF("[Possess] Success! PC %p now possesses Pawn %p", pc, newPawn);
+            LOGF("[Possess] Manual Possess ensured!");
         }
 
-        // 2. إجبار اللعبة على تغيير الحالة إلى Playing باستخدام العنوان الجديد
+        // 2. إجبار تغيير الحالة إلى Playing
         auto ClientRestartFunc = (ClientRestart_t)(g_base + ADDR_ClientRestart_THUNK_RVA);
         if (ClientRestartFunc) {
-            LOGF("[Restart] Calling ClientRestart to force Playing state...");
             ClientRestartFunc(pc, newPawn);
-            LOGF("[Restart] ClientRestart called successfully! Player should now be in Playing state.");
-        } else {
-            LOGF("[Restart] FAILED to resolve ClientRestart function!");
+            LOGF("[Restart] ClientRestart called to force Playing state!");
         }
     }
+    
+    return newPawn;
 }
 
 static void* FindPlaylist() {
@@ -249,16 +239,21 @@ static void Hook_PL(void* gm, void* pc) {
     g_saved_pc = pc;
     if (o_PL) o_PL(gm, pc);
     ClearSpectator(pc);
-    LOGF("[PostLogin] done. Waiting for Aircraft Phase to Spawn...");
+    LOGF("[PostLogin] done.");
 }
 
 typedef bool (*ReadyToStartMatch_t)(void*);
 static ReadyToStartMatch_t o_ReadyToStartMatch = nullptr;
 
 static bool Hook_ReadyToStartMatch(void* gm) {
-    bool originalResult = o_ReadyToStartMatch ? o_ReadyToStartMatch(gm) : false;
-    LOGF("[GameMode] ReadyToStartMatch called. Original: %d. Forcing TRUE!", originalResult);
-    return true; // إجبار اللعبة على تخطي مرحلة الانتظار
+    // 🎯 إصلاح المشكلة: نعيد true مرة واحدة فقط لمنع الحلقة المفرغة
+    if (g_bMatchStarted) {
+        return o_ReadyToStartMatch ? o_ReadyToStartMatch(gm) : false;
+    }
+    
+    g_bMatchStarted = true;
+    LOGF("[GameMode] ReadyToStartMatch -> FORCING TRUE (ONCE)!");
+    return true; 
 }
 
 typedef bool (*SAP_t)(void*, char);
@@ -271,11 +266,7 @@ static bool Hook_SAP(void* gm, char a2) {
         ForceStartFlightPath(gm);
     }
 
-    if (g_saved_pc) {
-        LOGF("[Aircraft] Triggering DirectSpawn on Game Thread...");
-        DirectSpawn(gm, g_saved_pc);
-    }
-
+    // 🎯 لا نقوم بعمل Spawn يدوي هنا. نترك المحرك يستدعي Hook_SpawnDefaultPawnFor
     return o_SAP ? o_SAP(gm, a2) : false;
 }
 
@@ -300,7 +291,7 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" FORTNITE ANDROID HOOK - FINAL BUILD");
+    LOGF(" FORTNITE ANDROID HOOK - FINAL BUILD V2");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
@@ -310,6 +301,9 @@ static void Run() {
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
     DobbyHook((void*)(g_base + ADDR_ReadyToStartMatch_THUNK_RVA), (void*)Hook_ReadyToStartMatch, (void**)&o_ReadyToStartMatch);
+    
+    // 🎯 تفعيل الـ Hook الجديد
+    DobbyHook((void*)(g_base + ADDR_SpawnDefaultPawnFor_THUNK_RVA), (void*)Hook_SpawnDefaultPawnFor, (void**)&o_SpawnDefaultPawnFor);
 
     LOGF("[Run] All hooks installed. Waiting for PostLogin...");
 }
