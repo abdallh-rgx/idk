@@ -12,7 +12,7 @@
 #include <map>
 #include <algorithm>
 #include <android/log.h>
-#include "Dobby/dobby.h"
+#include "third_party/include/dobby.h"
 
 #define TAG "EraCH3"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
