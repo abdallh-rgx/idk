@@ -15,15 +15,9 @@
 #include <android/log.h>
 #include "../third_party/include/dobby.h"
 
-#define TAG "EraCH3"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-
 #define CURLOPT_SSL_VERIFYPEER 64
 #define CURLOPT_SSL_VERIFYHOST 81
 #define CURLOPT_URL 10002
-#define REDIRECT_SCHEME "http"
-#define REDIRECT_HOST "127.0.0.1:3551"
 
 using int8  = int8_t;
 using int16 = int16_t;
@@ -34,24 +28,48 @@ using uint16 = uint16_t;
 using uint32 = uint32_t;
 using uint64 = uint64_t;
 
+static FILE* g_logFile = nullptr;
+
+static void InitLogFile() {
+    const char* paths[] = {
+        "/storage/emulated/0/Android/data/com.epicgames.fortnite/files/era_log.txt",
+        "/sdcard/Android/data/com.epicgames.fortnite/files/era_log.txt",
+        "/data/local/tmp/era_log.txt",
+        "/sdcard/era_log.txt",
+        nullptr
+    };
+    for (int i = 0; paths[i]; ++i) {
+        g_logFile = fopen(paths[i], "w");
+        if (g_logFile) break;
+    }
+}
+
+#define LOGI(...) do { \
+    __android_log_print(ANDROID_LOG_INFO, "EraCH3", __VA_ARGS__); \
+    if (g_logFile) { fprintf(g_logFile, "[I] "); fprintf(g_logFile, __VA_ARGS__); fprintf(g_logFile, "\n"); fflush(g_logFile); } \
+} while(0)
+
+#define LOGE(...) do { \
+    __android_log_print(ANDROID_LOG_ERROR, "EraCH3", __VA_ARGS__); \
+    if (g_logFile) { fprintf(g_logFile, "[E] "); fprintf(g_logFile, __VA_ARGS__); fprintf(g_logFile, "\n"); fflush(g_logFile); } \
+} while(0)
+
 namespace RVAs {
     constexpr uint64_t ProcessEvent                  = 0x07611B5C;
     constexpr uint64_t GObjects                      = 0x0DCD6E08;
     constexpr uint64_t GNames                        = 0x0DC960C0;
     constexpr uint64_t GEngine                       = 0x0DE34970;
     constexpr uint64_t SpawnActor_Thunk              = 0x3217298;
-    constexpr uint64_t GetEngineVersion              = 0x945F4B4;
     constexpr uint64_t FNameToString                 = 0x74937C0;
     constexpr uint64_t FreeInternal                  = 0x7355370;
     constexpr uint64_t Realloc                       = 0x735E520;
     constexpr uint64_t CopyScriptStruct              = 0x7535848;
-    constexpr uint64_t GetDataTableRowFromName_Thunk = 0x99CD07C;
     constexpr uint64_t GetDataTableRowFromName_ORIG  = 0x9319C70;
     constexpr uint64_t GetDataTableRowNames_ORIG     = 0x9319CD8;
-    constexpr uint64_t UDataTable_FindRowUnchecked   = 0x359CB9C;
     constexpr uint64_t GenericArray_Remove           = 0x944B2DC;
-    constexpr uint64_t UStruct_IsChildOf             = 0x753C14C;
-    constexpr uint64_t GMalloc                       = 0xDC55AC0;
+    constexpr uint64_t FCurl_ProcessRequest          = 0x089F02F0;
+    constexpr uint64_t FCurl_SetUrl                  = 0x089EDCF8;
+    constexpr uint64_t FCurl_GetUrl_Offset           = 0x70;
     constexpr uint64_t curl_easy_setopt              = 0x0B1CA0B8;
 }
 
@@ -133,6 +151,12 @@ struct FString {
         if (!Data) return {};
         return std::wstring(Data, Data + (Count > 0 ? Count - 1 : 0));
     }
+};
+
+struct FUEString {
+    char16_t* data;
+    int32 length;
+    int32 capacity;
 };
 
 struct FVector { float X, Y, Z; };
@@ -342,12 +366,10 @@ public:
             funcCache[key] = func;
         }
         if (IsBadPtr(func)) return T{};
-
         int32 ps = *(int16*)(int64(func) + offsets::ParamsSize);
         int16 ro = *(int16*)(int64(func) + offsets::ReturnValueOffset);
         if (ro == -1) ro = ReturnOffset;
         if (ps <= 0 || ps > 0x10000) return T{};
-
         uint8* params = (uint8*)calloc(1, ps);
         auto offs = func->GetFunctionChildrenOffset();
         int i = 0;
@@ -360,7 +382,6 @@ public:
             i++;
         };
         (fill(args), ...);
-
         PE(this, func, params);
         T r{};
         if (ro > 0 && ro < ps) r = *(T*)(params + ro);
@@ -371,18 +392,14 @@ public:
 
 struct FUObjectItem { UObject* Object; int32 Flags; int32 Cluster; int32 Serial; };
 
-// ============================================================
-// GObjects — FIXED layout per MobileDumper-7
-// base + 0x0DCD6E08 → FChunkedFixedUObjectArray (structure, NOT pointer)
-// ============================================================
 struct GObjects_t {
     uint8 _pad0[0x10];
-    void** Objects;             // 0x10 → array of chunk pointers
+    void** Objects;
     uint8 _pad1[0x8];
-    int32 MaxElements;          // 0x20
-    int32 NumElements;          // 0x24
-    int32 MaxChunks;            // 0x28
-    int32 NumChunks;            // 0x2C
+    int32 MaxElements;
+    int32 NumElements;
+    int32 MaxChunks;
+    int32 NumChunks;
 
     UObject* GetById(uint32 id) {
         if (!Objects) return nullptr;
@@ -470,6 +487,9 @@ static void (*GenericArray_RemoveFn)(void*, void*, int) = nullptr;
 static void* (*orig_ProcessEvent)(UObject*, UObject*, void*) = nullptr;
 static void* (*orig_curl_easy_setopt)(void*, int, void*) = nullptr;
 
+static bool (*orig_FCurl_ProcessRequest)(void*) = nullptr;
+static void (*FCurl_SetUrlFn)(void*, const void*) = nullptr;
+
 static UObject* PlayerController = nullptr;
 static UObject* GameState = nullptr;
 static UObject* GameMode = nullptr;
@@ -551,6 +571,111 @@ static UObject* SpawnActorEasy(UObject* klass, FVector loc, FRotator rot) {
     return SpawnActorFn((void*)World, klass, &loc, &rot, p);
 }
 
+static char* UEString_ToUTF8(const char16_t* data, int32 length, int32 maxBytes) {
+    if (!data || length <= 0) return nullptr;
+    char* out = (char*)malloc(maxBytes);
+    if (!out) return nullptr;
+    int o = 0;
+    for (int32 i = 0; i < length - 1; i++) {
+        char16_t c = data[i];
+        if (c <= 0x7F) out[o++] = (char)c;
+        else if (c <= 0x7FF) {
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[o++] = (char)(0xE0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+        if (o >= maxBytes - 4) break;
+    }
+    out[o] = 0;
+    return out;
+}
+
+static void FillUEString(FUEString* out, const char* utf8) {
+    if (!out) return;
+    int len = (int)strlen(utf8) + 1;
+    out->data = (char16_t*)malloc(len * sizeof(char16_t));
+    out->length = len;
+    out->capacity = len;
+    for (int i = 0; i < len - 1; ++i) out->data[i] = (char16_t)(unsigned char)utf8[i];
+    out->data[len - 1] = 0;
+}
+
+namespace Url {
+    static bool ShouldRedirect(const std::string& host) {
+        std::string s = host;
+        if (s.rfind("http://", 0) == 0) s = s.substr(7);
+        else if (s.rfind("https://", 0) == 0) s = s.substr(8);
+        auto colon = s.find(':');
+        if (colon != std::string::npos) s = s.substr(0, colon);
+        if (s.size() >= 17 && s.compare(s.size() - 17, 17, "ol.epicgames.com") == 0) return true;
+        if (s.size() >= 14 && s.compare(s.size() - 14, 14, "on.epicgames.com") == 0) return true;
+        if (s.size() >= 14 && s.compare(s.size() - 14, 14, "ol.epicgames.net") == 0) return true;
+        if (s.size() >= 17 && s.compare(s.size() - 17, 17, "ak.epicgames.com") == 0) return true;
+        if (s.size() >= 13 && s.compare(s.size() - 13, 13, "epicgames.dev") == 0) return true;
+        if (s.size() >= 22 && s.compare(s.size() - 22, 22, "game-social.epicgames.com") == 0) return true;
+        if (s.size() >= 15 && s.compare(s.size() - 15, 15, ".akamaized.net") == 0) return true;
+        return false;
+    }
+
+    static std::string Rewrite(const std::string& url) {
+        size_t se = url.find("://");
+        if (se == std::string::npos) return url;
+        size_t hs = se + 3;
+        size_t he = url.find_first_of("/?", hs);
+        if (he == std::string::npos) he = url.size();
+        std::string host = url.substr(hs, he - hs);
+        if (!ShouldRedirect(host)) return url;
+        return "http://127.0.0.1:3551" + url.substr(he);
+    }
+}
+
+static bool FCurl_ProcessRequestHook(void* Req) {
+    if (!Req) return orig_FCurl_ProcessRequest(Req);
+    if (!orig_FCurl_ProcessRequest) return false;
+    if (!FCurl_SetUrlFn) return orig_FCurl_ProcessRequest(Req);
+    if (IsBadPtr(Req)) return orig_FCurl_ProcessRequest(Req);
+
+    auto* urlPtr = (FUEString*)((uintptr_t)Req + RVAs::FCurl_GetUrl_Offset);
+    if (IsBadPtr(urlPtr) || !urlPtr->data || urlPtr->length <= 0)
+        return orig_FCurl_ProcessRequest(Req);
+
+    char* og = UEString_ToUTF8(urlPtr->data, urlPtr->length, urlPtr->length * 3 + 16);
+    if (!og) return orig_FCurl_ProcessRequest(Req);
+
+    std::string original(og);
+    free(og);
+
+    std::string rewritten = Url::Rewrite(original);
+    if (rewritten != original) {
+        LOGI("FCurl: %s -> %s", original.c_str(), rewritten.c_str());
+        FUEString newUrl{};
+        FillUEString(&newUrl, rewritten.c_str());
+        FCurl_SetUrlFn(Req, &newUrl);
+        if (newUrl.data) free(newUrl.data);
+    }
+
+    return orig_FCurl_ProcessRequest(Req);
+}
+
+static void* curl_easy_setopt_Hook(void* curl, int option, void* arg) {
+    if (option == CURLOPT_URL && !IsBadPtr(arg)) {
+        std::string orig = (const char*)arg;
+        std::string rw = Url::Rewrite(orig);
+        if (rw != orig) {
+            LOGI("curl_setopt: %s -> %s", orig.c_str(), rw.c_str());
+            return orig_curl_easy_setopt(curl, option, (void*)rw.c_str());
+        }
+        return orig_curl_easy_setopt(curl, option, arg);
+    }
+    if (option == CURLOPT_SSL_VERIFYPEER || option == CURLOPT_SSL_VERIFYHOST) {
+        return orig_curl_easy_setopt(curl, option, (void*)0);
+    }
+    return orig_curl_easy_setopt(curl, option, arg);
+}
+
 namespace Athena {
     void SpawnPawn();
     void ShowSkin();
@@ -594,23 +719,27 @@ void Athena::SpawnPawn() {
 }
 
 void Athena::ShowSkin() {
+    if (!PlayerController || !Pawn) return;
     static UObject* Hero = nullptr;
     if (auto t = &PlayerController->Child<UObject*>("MyPlayerInfo")->Child<UObject*>("AthenaMenuHeroDef"); !IsBadPtr(t)) Hero = *t;
     if (auto t = &PlayerController->Child<UObject*>("MyPlayerInfo")->Child<UObject*>("TempAthenaMenuHeroInstance"); !IsBadPtr(t)) Hero = *t;
     if (!Hero) return;
     static auto charParts = Hero->Child<TArray<UObject*>>("CharacterParts");
     if (CharacterPartsArray.size() == 0) {
-        for (UObject* cp : charParts) CharacterPartsArray.push_back(cp);
+        for (UObject* cp : charParts) if (cp && !IsBadPtr(cp)) CharacterPartsArray.push_back(cp);
     }
     for (UObject* cp : CharacterPartsArray) {
-        if (cp) Pawn->Call("ServerChoosePart", cp->Child<char>("CharacterPartType"), cp);
+        if (cp && !IsBadPtr(cp)) Pawn->Call("ServerChoosePart", cp->Child<char>("CharacterPartType"), cp);
     }
-    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterParts");
-    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterData");
+    auto ps = &PlayerController->Child<UObject*>("PlayerState");
+    if (!IsBadPtr(ps) && *ps) {
+        (*ps)->Call("OnRep_CharacterParts");
+        (*ps)->Call("OnRep_CharacterData");
+    }
 }
 
 void Athena::DestroyLods() {
-    if (CheatManager) CheatManager->Call("DestroyAll", FindObject(L"/Script/FortniteGame.FortHLODSMActor"));
+    if (CheatManager && !IsBadPtr(CheatManager)) CheatManager->Call("DestroyAll", FindObject(L"/Script/FortniteGame.FortHLODSMActor"));
 }
 
 void Athena::DropLoadingScreen() {
@@ -620,9 +749,12 @@ void Athena::DropLoadingScreen() {
     PlayerController->Call("ServerReadyToStartMatch");
     PlayerController->Child<bool>("bHasServerFinishedLoading") = true;
     PlayerController->Child<bool>("bHasClientFinishedLoading") = true;
-    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_SquadId");
-    PlayerController->Child<UObject*>("PlayerState")->Child<char>("TeamIndex") = (char)2;
-    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_TeamIndex");
+    auto ps = &PlayerController->Child<UObject*>("PlayerState");
+    if (!IsBadPtr(ps) && *ps) {
+        (*ps)->Call("OnRep_SquadId");
+        (*ps)->Child<char>("TeamIndex") = (char)2;
+        (*ps)->Call("OnRep_TeamIndex");
+    }
 
     if (auto m = &GameState->Child<FSlateBrush>("MinimapNextCircleBrush"); !IsBadPtr(m)) *m = {};
     if (auto m = &GameState->Child<FSlateBrush>("FullMapNextCircleBrush"); !IsBadPtr(m)) *m = {};
@@ -630,9 +762,11 @@ void Athena::DropLoadingScreen() {
     if (auto m = &GameState->Child<FSlateBrush>("MinimapCircleBrush"); !IsBadPtr(m)) *m = {};
     if (auto m = &GameState->Child<FSlateBrush>("FullMapCircleBrush"); !IsBadPtr(m)) *m = {};
     if (auto m = &GameState->Child<FSlateBrush>("AircraftPathBrush"); !IsBadPtr(m)) m->ObjectResource = FindObject(L"/Game/Athena/HUD/MiniMap/M_BusPath.M_BusPath");
-    if (auto m = &GameState->Child<FSlateBrush>("MinimapBackgroundBrush"); !IsBadPtr(m)) {
-        auto ws = &WorldSettings->Child<FSlateBrush>("AthenaMapImage");
-        m->ObjectResource = IsBadPtr(ws) ? nullptr : ws->ObjectResource;
+    if (WorldSettings) {
+        if (auto m = &GameState->Child<FSlateBrush>("MinimapBackgroundBrush"); !IsBadPtr(m)) {
+            auto ws = &WorldSettings->Child<FSlateBrush>("AthenaMapImage");
+            m->ObjectResource = IsBadPtr(ws) ? nullptr : ws->ObjectResource;
+        }
     }
     if (auto m = &GameState->Child<UObject*>("MinimapMaterial"); !IsBadPtr(m)) {
         UObject* apollo = FindObject(L"/Game/Athena/Apollo/Maps/UI/M_MiniMapApollo.M_MiniMapApollo");
@@ -654,10 +788,11 @@ void Athena::DropLoadingScreen() {
 }
 
 void Athena::InventoryUpdate() {
+    if (!PlayerController) return;
     PlayerController->Call("HandleWorldInventoryLocalUpdate");
-    if (WorldInventory) WorldInventory->Call("HandleInventoryLocalUpdate");
+    if (WorldInventory && !IsBadPtr(WorldInventory)) WorldInventory->Call("HandleInventoryLocalUpdate");
     PlayerController->Call("OnRep_QuickBar");
-    if (Quickbars) {
+    if (Quickbars && !IsBadPtr(Quickbars)) {
         Quickbars->Call("OnRep_SecondaryQuickBar");
         Quickbars->Call("OnRep_PrimaryQuickBar");
     }
@@ -668,13 +803,15 @@ void Athena::InventoryUpdate() {
 void Athena::AddToInventory(UObject* item, int count, char index, int slot) {
     if (IsBadPtr(item) || !WorldInventory || !Quickbars) return;
     UObject* itemInstance = item->Call<UObject*>("CreateTemporaryItemInstanceBP", count, 1);
-    if (!itemInstance) return;
+    if (!itemInstance || IsBadPtr(itemInstance)) return;
     WorldInventory->Child<TArray<UObject*>>("ItemInstances").Add(itemInstance);
 
     UObject* entryStruct = FindObject(L"/Script/FortniteGame.FortItemEntry");
     if (entryStruct) {
         int32 structSize = *(int32*)(int64(entryStruct) + offsets::StructSize);
-        WorldInventory->Child<TArray<char>>("ReplicatedEntries").AddWithSize(structSize, &itemInstance->Child<void*>("ItemEntry"));
+        if (structSize > 0 && structSize < 0x1000) {
+            WorldInventory->Child<TArray<char>>("ReplicatedEntries").AddWithSize(structSize, &itemInstance->Child<void*>("ItemEntry"));
+        }
     }
     itemInstance->Call("SetOwningControllerForTemporaryItem", PlayerController);
     FGuid guid = itemInstance->Call<FGuid>("GetItemGuid");
@@ -687,19 +824,25 @@ void Athena::InitializeInventory() {
     if (auto qb = &PlayerController->Child<UObject*>("ClientQuickBars"); !IsBadPtr(qb)) Quickbars = *qb;
     else {
         Quickbars = SpawnActorEasy(FindObject(L"/Script/FortniteGame.FortQuickBars"), FVector{0, 0, 0}, FRotator{0, 0, 0});
-        PlayerController->Child<UObject*>("QuickBars") = Quickbars;
+        if (Quickbars) PlayerController->Child<UObject*>("QuickBars") = Quickbars;
     }
-    if (Quickbars) Quickbars->Call("SetOwner", PlayerController);
-    if (WorldInventory) WorldInventory->Call("SetOwner", PlayerController);
+    if (Quickbars && !IsBadPtr(Quickbars)) Quickbars->Call("SetOwner", PlayerController);
+    if (WorldInventory && !IsBadPtr(WorldInventory)) WorldInventory->Call("SetOwner", PlayerController);
 
     auto startingItems = GameMode->Child<TArray<FItemAndCount>>("StartingItems");
-    UObject* pickaxeWeapon = PlayerController->Child<UObject*>("Pickaxe")->Child<UObject*>("WeaponDefinition");
+    auto pickaxePtr = &PlayerController->Child<UObject*>("Pickaxe");
+    UObject* pickaxeWeapon = nullptr;
+    if (!IsBadPtr(pickaxePtr) && *pickaxePtr) pickaxeWeapon = (*pickaxePtr)->Child<UObject*>("WeaponDefinition");
     AddToInventory(pickaxeWeapon, 1, 0, 0);
-    if (startingItems.Count > 0) AddToInventory(startingItems[0].Item, 1, 1, 0);
-    if (startingItems.Count > 1) AddToInventory(startingItems[1].Item, 1, 1, 1);
-    if (startingItems.Count > 2) AddToInventory(startingItems[2].Item, 1, 1, 2);
-    if (startingItems.Count > 3) AddToInventory(startingItems[3].Item, 1, 1, 3);
-    if (startingItems.Count > 5) AddToInventory(startingItems[5].Item, 999, 3, 0);
+
+    if (startingItems.Count > 0 && !IsBadPtr(startingItems.Data)) {
+        if (startingItems.Count > 0) AddToInventory(startingItems[0].Item, 1, 1, 0);
+        if (startingItems.Count > 1) AddToInventory(startingItems[1].Item, 1, 1, 1);
+        if (startingItems.Count > 2) AddToInventory(startingItems[2].Item, 1, 1, 2);
+        if (startingItems.Count > 3) AddToInventory(startingItems[3].Item, 1, 1, 3);
+        if (startingItems.Count > 5) AddToInventory(startingItems[5].Item, 999, 3, 0);
+        if (startingItems.Count > 4) EditToolItem = startingItems[4].Item;
+    }
 
     AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AthenaAmmoDataShells.AthenaAmmoDataShells"), 999, 3, 0);
     AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium"), 999, 3, 0);
@@ -708,8 +851,6 @@ void Athena::InitializeInventory() {
     AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AmmoDataRockets.AmmoDataRockets"), 999, 3, 0);
     AddToInventory(FindObject(L"/Game/Athena/Items/Traps/TID_Floor_Player_Launch_Pad_Athena.TID_Floor_Player_Launch_Pad_Athena"), 1, 3, 0);
     AddToInventory(FindObject(L"/Game/Athena/Items/Traps/TID_Floor_Spikes_Athena_R_T03.TID_Floor_Spikes_Athena_R_T03"), 1, 3, 0);
-
-    if (startingItems.Count > 4) EditToolItem = startingItems[4].Item;
 
     if (kismetStringLib && kismetSystemLib) {
         FName infAmmo = kismetStringLib->Call<FName>("Conv_StringToName", FString(L"bInfiniteAmmo"));
@@ -724,7 +865,7 @@ void Athena::OnServerExecuteInventoryItem(FGuid guid) {
     if (!WorldInventory || !Pawn) return;
     auto instances = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
     for (UObject* inst : instances) {
-        if (!inst) continue;
+        if (!inst || IsBadPtr(inst)) continue;
         if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", inst->Call<FGuid>("GetItemGuid"), guid)) {
             UObject* def = inst->Call<UObject*>("GetItemDefinitionBP");
             if (!def) continue;
@@ -740,8 +881,11 @@ void Athena::OnServerExecuteInventoryItem(FGuid guid) {
                     if (head) Pawn->Call("ServerChoosePart", head->Child<char>("CharacterPartType"), head);
                     if (body) Pawn->Call("ServerChoosePart", body->Child<char>("CharacterPartType"), body);
                 }
-                PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterParts");
-                PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterData");
+                auto ps = &PlayerController->Child<UObject*>("PlayerState");
+                if (!IsBadPtr(ps) && *ps) {
+                    (*ps)->Call("OnRep_CharacterParts");
+                    (*ps)->Call("OnRep_CharacterData");
+                }
                 UObject* abilitySet = kismetSystemLib->Call<UObject*>("Conv_SoftObjectReferenceToObject", def->Child<SoftObjectPtr>("AbilitySet"));
                 if (abilitySet) {
                     for (UObject* a : abilitySet->Child<TArray<UObject*>>("GameplayAbilities")) Athena::GrantAbility(a);
@@ -760,7 +904,7 @@ void Athena::OnServerExecuteInventoryWeapon(UObject* weapon) {
     FGuid guid = weapon->Child<FGuid>("ItemEntryGuid");
     auto instances = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
     for (UObject* inst : instances) {
-        if (!inst) continue;
+        if (!inst || IsBadPtr(inst)) continue;
         if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", inst->Call<FGuid>("GetItemGuid"), guid)) {
             Pawn->Call<UObject*>("EquipWeaponDefinition", inst->Call<UObject*>("GetItemDefinitionBP"), inst->Call<FGuid>("GetItemGuid"));
         }
@@ -772,7 +916,7 @@ void Athena::RemoveNetDebugUI() {
     if (!wbLib) return;
     TArray<UObject*> empty{};
     auto arr = wbLib->Call<TArray<UObject*>, 0x8>("GetAllWidgetsOfClass", World, empty, FindObject(L"/Game/Athena/HUD/NetDebugUI.NetDebugUI_C"), false);
-    if (arr.Count > 0 && arr[0]) arr[0]->Call("RemoveFromViewport");
+    if (arr.Count > 0 && arr[0] && !IsBadPtr(arr[0])) arr[0]->Call("RemoveFromViewport");
 }
 
 void Athena::TeleportToSpawnIsland() {
@@ -799,20 +943,12 @@ void Athena::CheatScript(const char* script) {
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
     if (s.find("spawnrift") != std::string::npos) {
         if (!SpawnActorEasy(FindObject(L"/Game/Athena/Items/Consumables/RiftItem/BGA_RiftPortal_Item_Athena.BGA_RiftPortal_Item_Athena_C"), Pawn->Call<FVector>("K2_GetActorLocation"), FRotator{0, 0, 0}))
-            GameMode->Call("Say", FString(L"Rifts unavailable in this version."));
+            GameMode->Call("Say", FString(L"Rifts unavailable."));
     }
     else if (s.find("spawnweapon") != std::string::npos) {
         std::string wn = s.substr(s.find(" ") + 1);
         UObject* def = FindObject(ToWide(wn).c_str(), false, true);
         if (def) SpawnPickup(def, 1, Pawn->Call<FVector>("K2_GetActorLocation"));
-    }
-    else if (s.find("startevent") != std::string::npos) {
-        bool started = false;
-        UObject* cattus = FindObject(L"/Game/Athena/Maps/Athena_POI_Foundations.Athena_POI_Foundations.PersistentLevel.BP_CattusDoggus_Scripting_2");
-        UObject* nightNight = FindObject(L"/Game/Athena/Maps/Athena_POI_Foundations.Athena_POI_Foundations.PersistentLevel.BP_NightNight_Scripting_2");
-        if (cattus) { cattus->Call<bool>("LoadCattusLevel"); cattus->Call("startevent"); started = true; }
-        else if (nightNight) { nightNight->Call<bool>("LoadNightNightLevel"); nightNight->Call("startevent"); started = true; }
-        if (started) GameMode->Call("Say", FString(L"The event started successfully."));
     }
 }
 
@@ -858,8 +994,9 @@ void Athena::ServerHandlePickup(UObject* pickup) {
     }
 
     UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
+    if (!bpcLib || !GameViewport) return;
     UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
-    UObject* invCtx = bpcLib ? bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext")) : nullptr;
+    UObject* invCtx = bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext"));
     if (invCtx) {
         for (int i = 0; i < 6; ++i) {
             if (!invCtx->Call<UObject*>("GetQuickBarSlottedItem", (char)0, i)) {
@@ -884,7 +1021,7 @@ void Athena::ServerHandlePickup(UObject* pickup) {
 void Athena::FixBuildingFoundations() {
     if (!GameStatics) return;
     auto arr = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, FindObject(L"/Script/FortniteGame.BuildingFoundation"), TArray<UObject*>{});
-    for (UObject* b : arr) if (b) b->Child<char>("DynamicFoundationType") = 0;
+    for (UObject* b : arr) if (b && !IsBadPtr(b)) b->Child<char>("DynamicFoundationType") = 0;
 }
 
 void Athena::Fixbus() {
@@ -1020,6 +1157,7 @@ void Athena::GrantDefaultAbilities() {
 }
 
 void Athena::OnAircraftJump() {
+    if (!PlayerController) return;
     FVector loc = PlayerController->Call<FVector>("GetFocalLocation");
     FRotator rot = PlayerController->Call<FRotator>("GetControlRotation");
     rot.Pitch = 0; rot.Roll = 0;
@@ -1030,7 +1168,7 @@ void Athena::OnAircraftJump() {
     ShowSkin();
     bDroppedFromAircraft = true;
     UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
-    if (!bpcLib) return;
+    if (!bpcLib || !GameViewport) return;
     UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
     UObject* invCtx = bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext"));
     if (!invCtx) return;
@@ -1113,7 +1251,8 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         if (it == pkgRows.end()) break;
         std::advance(it, i);
         if (it == pkgRows.end()) break;
-        std::string call = ((FString*)((uintptr_t)it->second + lpcOff))->ToString();
+        std::string call = ((FUEString*)((uintptr_t)it->second + lpcOff))->data ?
+            std::string((char*)((FUEString*)((uintptr_t)it->second + lpcOff))->data) : std::string();
         if (pkgName.find(".Empty") != std::string::npos) continue;
         if (call.find(".Empty") != std::string::npos) { ++i; continue; }
 
@@ -1154,11 +1293,13 @@ void Athena::SpawnFloorLoot() {
     if (!GameStatics) return;
     auto arr = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, FindObject(L"Tiered_Athena_FloorLoot_01_C", false, true), TArray<UObject*>{});
     for (UObject* e : arr) {
+        if (!e || IsBadPtr(e)) continue;
         auto loot = PickLootDrops("Loot_AthenaFloorLoot");
         for (auto& l : loot) SpawnPickup(l.ItemDefinition, l.Count, e->Call<FVector>("K2_GetActorLocation"), false);
     }
     auto arr2 = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, FindObject(L"Tiered_Athena_FloorLoot_Warmup_C", false, true), TArray<UObject*>{});
     for (UObject* e : arr2) {
+        if (!e || IsBadPtr(e)) continue;
         auto loot = PickLootDrops("Loot_AthenaFloorLoot_Warmup");
         for (auto& l : loot) SpawnPickup(l.ItemDefinition, l.Count, e->Call<FVector>("K2_GetActorLocation"), false);
     }
@@ -1214,7 +1355,7 @@ void Athena::Tick() {
         Pawn->Child<char>("Role") = inVeh ? (char)2 : (char)3;
         if (inVeh) {
             UObject* v = Pawn->Call<UObject*>("GetVehicle");
-            if (v) v->Child<char>("Role") = (char)2;
+            if (v && !IsBadPtr(v)) v->Child<char>("Role") = (char)2;
         }
     }
     if (Pawn) {
@@ -1232,7 +1373,7 @@ void Athena::OnExitVehicle() {
     if (!Pawn) return;
     Pawn->Child<char>("Role") = 3;
     UObject* v = Pawn->Call<UObject*>("GetVehicle");
-    if (v) v->Child<char>("Role") = 3;
+    if (v && !IsBadPtr(v)) v->Child<char>("Role") = 3;
 }
 
 void Athena::DropInventoryItem(FGuid guid, int count, bool checkCount) {
@@ -1263,9 +1404,9 @@ void Athena::DropInventoryItem(FGuid guid, int count, bool checkCount) {
             }
             InventoryUpdate();
             SpawnPickup(curDef, count, Pawn->Call<FVector>("K2_GetActorLocation"));
-
+            if (!Quickbars) return;
             UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
-            if (!bpcLib) return;
+            if (!bpcLib || !GameViewport) return;
             UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
             UObject* invCtx = bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext"));
             if (!invCtx) return;
@@ -1280,45 +1421,9 @@ void Athena::DropInventoryItem(FGuid guid, int count, bool checkCount) {
     }
 }
 
-static bool HostShouldRedirect(const std::string& host) {
-    return host.find("ol.epicgames.com") != std::string::npos ||
-           host.find(".akamaized.net") != std::string::npos ||
-           host.find("on.epicgames.com") != std::string::npos ||
-           host.find("epicgames.com") != std::string::npos ||
-           host.find("fortnite.com") != std::string::npos ||
-           host.find("unrealengine.com") != std::string::npos;
-}
-
-static std::string RewriteUrl(const std::string& url) {
-    size_t se = url.find("://");
-    if (se == std::string::npos) return url;
-    size_t hs = se + 3;
-    size_t he = url.find_first_of("/?", hs);
-    if (he == std::string::npos) he = url.size();
-    std::string host = url.substr(hs, he - hs);
-    if (!HostShouldRedirect(host)) return url;
-    return std::string(REDIRECT_SCHEME) + "://" + REDIRECT_HOST + url.substr(he);
-}
-
-static void* curl_easy_setopt_Hook(void* curl, int option, void* arg) {
-    if (option == CURLOPT_URL && !IsBadPtr(arg)) {
-        std::string orig = (const char*)arg;
-        std::string rw = RewriteUrl(orig);
-        if (rw != orig) {
-            LOGI("[curl] %s -> %s", orig.c_str(), rw.c_str());
-            return orig_curl_easy_setopt(curl, option, (void*)rw.c_str());
-        }
-        return orig_curl_easy_setopt(curl, option, arg);
-    }
-    if (option == CURLOPT_SSL_VERIFYPEER || option == CURLOPT_SSL_VERIFYHOST) {
-        return orig_curl_easy_setopt(curl, option, (void*)0);
-    }
-    return orig_curl_easy_setopt(curl, option, arg);
-}
-
 static void InitializeGlobals() {
     if (!gGObjects) { LOGE("InitializeGlobals: gGObjects null"); return; }
-    LOGI("Scanning %d objects...", gGObjects->NumElements);
+    LOGI("Scanning %d objects", gGObjects->NumElements);
     for (int32 i = 0; i < gGObjects->NumElements; ++i) {
         UObject* o = gGObjects->GetById(i);
         if (!o || IsBadPtr(o)) continue;
@@ -1358,7 +1463,7 @@ static void InitializeGlobals() {
 
 static void PlayButton() {
     InitializeGlobals();
-    if (!PlayerController) return;
+    if (!PlayerController) { LOGE("PlayButton: no PC"); return; }
     UObject* func = nullptr;
     UObject* klass = PlayerController->Class;
     while (klass && !func) {
@@ -1369,7 +1474,7 @@ static void PlayButton() {
         }
         klass = *(UObject**)((uintptr_t)klass + offsets::SuperClass);
     }
-    if (!func) return;
+    if (!func) { LOGE("PlayButton: no SwitchLevel"); return; }
     int16 ps = *(int16*)((uintptr_t)func + offsets::ParamsSize);
     uint8* params = (uint8*)calloc(1, ps);
     static std::wstring w = L"Artemis_Terrain";
@@ -1377,33 +1482,50 @@ static void PlayButton() {
     fs->Data = (wchar_t*)w.c_str();
     fs->Count = (int32)w.size() + 1;
     fs->Max = (int32)w.size() + 1;
+    LOGI("PlayButton: SwitchLevel(Artemis_Terrain)");
     orig_ProcessEvent(PlayerController, func, params);
     bPressedPlay = true;
     bInFrontend = false;
 }
 
 static void OnReadyToStartMatch() {
-    LOGI("ReadyToStartMatch");
+    LOGI(">>> ReadyToStartMatch enter");
     bLoadedInMatch = true;
     bInFrontend = false;
     InitializeGlobals();
+    LOGI(">>> PC=%p GS=%p GM=%p W=%p", PlayerController, GameState, GameMode, World);
+    if (!PlayerController) { LOGE("no PC"); return; }
+    if (!GameMode) { LOGE("no GM"); return; }
+
+    LOGI(">>> SpawnPawn");
     Athena::SpawnPawn();
-    Athena::ShowSkin();
-    Athena::DestroyLods();
+    LOGI(">>> Pawn=%p", Pawn);
+
+    if (Pawn) { LOGI(">>> ShowSkin"); Athena::ShowSkin(); }
+    if (CheatManager) { LOGI(">>> DestroyLods"); Athena::DestroyLods(); }
+
+    LOGI(">>> DropLoadingScreen");
     Athena::DropLoadingScreen();
+
+    LOGI(">>> FixBuildingFoundations");
     Athena::FixBuildingFoundations();
-    Athena::InitializeInventory();
-    Athena::GrantDefaultAbilities();
+
+    if (Pawn) { LOGI(">>> InitializeInventory"); Athena::InitializeInventory(); }
+    if (Pawn) { LOGI(">>> GrantDefaultAbilities"); Athena::GrantDefaultAbilities(); }
+
+    LOGI(">>> SpawnBuildPreviews");
     Athena::SpawnBuildPreviews();
+    LOGI(">>> ReadyToStartMatch exit");
 }
 
 static void OnServerLoadingScreenDropped() {
-    LOGI("ServerLoadingScreenDropped");
+    LOGI(">>> ServerLoadingScreenDropped enter");
     if (bInFrontend) { bPressedPlay = false; bLoadedInMatch = false; bDroppedFromAircraft = false; return; }
     Athena::RemoveNetDebugUI();
     Athena::TeleportToSpawnIsland();
     Athena::Fixbus();
     Athena::SpawnFloorLoot();
+    LOGI(">>> ServerLoadingScreenDropped exit");
 }
 
 static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
@@ -1475,21 +1597,14 @@ static void CoreSetup() {
     GenericArray_RemoveFn = (decltype(GenericArray_RemoveFn))(g_base + RVAs::GenericArray_Remove);
     LOGI("func pointers set");
 
-    // ✅ FIXED: no dereference
     gGObjects = (GObjects_t*)(g_base + RVAs::GObjects);
     LOGI("gGObjects = %p", (void*)gGObjects);
-
     if (IsBadPtr(gGObjects)) { LOGE("gGObjects addr bad"); return; }
 
     void* objectsPtr = (void*)gGObjects->Objects;
-    LOGI("Objects = %p, NumElements = %d, NumChunks = %d",
-         objectsPtr, gGObjects->NumElements, gGObjects->NumChunks);
-
-    if (IsBadPtr(objectsPtr)) { LOGE("Objects ptr bad — RVA wrong"); return; }
-    if (gGObjects->NumElements <= 0 || gGObjects->NumElements > 0x2000000) {
-        LOGE("suspicious NumElements = %d", gGObjects->NumElements);
-        return;
-    }
+    LOGI("Objects = %p NumElements = %d NumChunks = %d", objectsPtr, gGObjects->NumElements, gGObjects->NumChunks);
+    if (IsBadPtr(objectsPtr)) { LOGE("Objects ptr bad"); return; }
+    if (gGObjects->NumElements <= 0 || gGObjects->NumElements > 0x2000000) { LOGE("bad NumElements"); return; }
 
     void* h = dlopen("libUnreal.so", RTLD_NOW | RTLD_NOLOAD);
     if (h) {
@@ -1504,17 +1619,34 @@ static void CoreSetup() {
         LOGI("ProcessEvent hooked @ %p", pPE);
     } else LOGE("ProcessEvent hook failed");
 
+    void* pFCurl = (void*)(g_base + RVAs::FCurl_ProcessRequest);
+    FCurl_SetUrlFn = (decltype(FCurl_SetUrlFn))(g_base + RVAs::FCurl_SetUrl);
+    if (DobbyHook(pFCurl, (void*)FCurl_ProcessRequestHook, (void**)&orig_FCurl_ProcessRequest) == 0) {
+        LOGI("FCurl ProcessRequest hooked @ %p", pFCurl);
+    } else LOGE("FCurl hook failed");
+
     void* pCurl = (void*)(g_base + RVAs::curl_easy_setopt);
     if (DobbyHook(pCurl, (void*)curl_easy_setopt_Hook, (void**)&orig_curl_easy_setopt) == 0) {
-        LOGI("curl hooked @ %p", pCurl);
+        LOGI("curl_easy_setopt hooked @ %p", pCurl);
     } else LOGE("curl hook failed");
 
     LOGI("=== CoreSetup done ===");
     InitializeGlobals();
 }
 
+static void* AutoPlayThread(void*) {
+    LOGI("AutoPlay: waiting 15s");
+    sleep(15);
+    if (!bPressedPlay && PlayerController && !bInFrontend) {
+        LOGI("AutoPlay: triggering");
+        PlayButton();
+    }
+    return nullptr;
+}
+
 static void* MainThread(void*) {
     LOGI("EraCH3 starting");
+    InitLogFile();
     if (!Lib::WaitFor("libUnreal.so")) { LOGE("wait timeout"); return nullptr; }
     usleep(300000);
     CoreSetup();
