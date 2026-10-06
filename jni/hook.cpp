@@ -1,317 +1,607 @@
+// ============================================================================
+// EraCH3.cpp — Single-file Android Server for Fortnite Chapter 3 Season 3
+// Target: libUnreal.so 21.30 (UE 4.27) / arm64-v8a
+// Author: adapted from EraV2 / Project Nova
+// ============================================================================
+
 #include <jni.h>
-#include <cstdint>
-#include <cstddef>
-#include <cstdio>
-#include <cstring>
-#include <cstdlib>
-#include <cmath>
-#include <cstdarg>
-#include <string>
+#include <pthread.h>
 #include <dlfcn.h>
-#include <link.h>
-#include <thread>
-#include <chrono>
-#include <mutex>
-#include <set>
-#include <android/log.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/uio.h>
-#include "dobby.h"
+#include <cstring>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <map>
+#include <android/log.h>
 
-#define LOG_TAG "FortHook"
+#include "Dobby/dobby.h"
 
-// ==========================================
-// 1. العناوين والإزاحات (Offsets & RVAs)
-// ==========================================
-#define ADDR_StaticFindObject            0x762A664
-#define ADDR_PlaylistHandler             0x5519710
-#define ADDR_StartAircraftPhase          0x550A1F4
-#define ADDR_PostLogin                   0x550C610
-#define ADDR_ReadyToStartMatch_THUNK_RVA 0x99E7270
-#define ADDR_StartFlightPath_ORIG_RVA    0x53F0458
-#define ADDR_Possess_THUNK_RVA           0x99C4C18
-#define ADDR_ClientRestart_THUNK_RVA     0x9ADFE80 
+// ============================================================================
+// LOGGING
+// ============================================================================
+#define TAG "EraCH3"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// 🎯 العناوين الجديدة التي أرسلتها
-#define ADDR_SpawnDefaultPawnFor_THUNK_RVA 0x99E790C
+// ============================================================================
+// CURL OPTIONS (hardcoded, from curl.h)
+// ============================================================================
+#define CURLOPT_SSL_VERIFYPEER  64
+#define CURLOPT_SSL_VERIFYHOST  81
+#define CURLOPT_URL             10002
 
-// Memory Offsets
-#define OFF_PC_PlayerState               0x278
-#define OFF_GM_GameState                 0x2D0
-#define OFF_GS_Playlist2298              0x2298
-#define OFF_GS_Playlist2290              0x2290
-#define OFF_PS_SpectatorByte             0x27A
-#define OFF_GM_DefaultPawnClass          0x330
+// ============================================================================
+// REDIRECT TARGET
+// ============================================================================
+#define REDIRECT_SCHEME  "http"
+#define REDIRECT_HOST    "127.0.0.1:3551"
 
-// ==========================================
-// 2. أدوات السجل والذاكرة
-// ==========================================
-static FILE* g_logfile = nullptr;
-static std::mutex& GetMutex() { static std::mutex* m = new std::mutex(); return *m; }
+// ============================================================================
+// OFFSETS — libUnreal.so 21.30 (CH3 S3, UE 4.27)
+// ============================================================================
+namespace RVAs {
+    constexpr uint64_t ProcessEvent                      = 0x07611B5C;
+    constexpr uint64_t GObjects                          = 0x0DCD6E08;
 
-static void InitLogFile() {
-    const char* p[] = {
-        "/storage/emulated/0/Android/data/com.epicgames.fortnite/files/hook.log",
-        "/sdcard/Android/data/com.epicgames.fortnite/files/hook.log",
-        "/data/local/tmp/hook.log",
-    };
-    for (auto x : p) { FILE* f = fopen(x, "w"); if (f) { g_logfile = f; return; } }
+    constexpr uint64_t SpawnActor_Thunk                  = 0x3217298;
+    constexpr uint64_t SpawnActor_2_Thunk                = 0x9CE0828;
+
+    constexpr uint64_t GetEngineVersion                  = 0x945F4B4;
+
+    constexpr uint64_t FNameToString                     = 0x74937C0;
+    constexpr uint64_t FreeInternal                      = 0x7355370;
+    constexpr uint64_t Realloc                           = 0x735E520;
+
+    constexpr uint64_t CopyScriptStruct                  = 0x7535848;
+
+    constexpr uint64_t GetDataTableRowFromName_Thunk     = 0x99CD07C;
+    constexpr uint64_t GetDataTableRowFromName_ORIG      = 0x9319C70;
+    constexpr uint64_t GetDataTableRowNames_ORIG         = 0x9319CD8;
+    constexpr uint64_t UDataTable_FindRowUnchecked       = 0x359CB9C;
+
+    constexpr uint64_t GenericArray_Remove               = 0x944B2DC;
+
+    constexpr uint64_t UStruct_IsChildOf                 = 0x753C14C;
+    constexpr uint64_t GMalloc                           = 0xDC55AC0;
+
+    // ==== curl_easy_setopt inside libUnreal.so ====
+    constexpr uint64_t curl_easy_setopt                  = 0x0B1CA0B8;
 }
 
-static void LOGF(const char* fmt, ...) {
-    char buf[4096]; va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
-    if (g_logfile) {
-        std::lock_guard<std::mutex> lock(GetMutex());
-        fprintf(g_logfile, "%s\n", buf); fflush(g_logfile);
+// UE 4.27 Android (Itanium ABI) struct offsets
+namespace offsets {
+    constexpr int32_t Class        = 0x10;
+    constexpr int32_t Name         = 0x18;
+    constexpr int32_t Outer        = 0x20;
+    constexpr int32_t Children     = 0x48;
+    constexpr int32_t Next         = 0x30;
+    constexpr int32_t SuperClass   = 0x40;
+    constexpr int32_t Offset       = 0x4C;
+    constexpr int32_t ParamsSize   = 0xE6;
+    constexpr int32_t ReturnValueOffset = 0xE8;
+    constexpr int32_t StructSize   = 0x5C;
+    constexpr int32_t RowStruct    = 0x28;
+}
+
+// ============================================================================
+// UTILITIES — Memory
+// ============================================================================
+static inline bool IsBadPtr(const void* p) {
+    if (!p) return true;
+    // Android: 47-bit user space
+    return (uintptr_t)p < 0x10000 || (uintptr_t)p > 0x7FFFFFFFFFFF;
+}
+
+// ============================================================================
+// LIBRARY UTILITIES
+// ============================================================================
+namespace Lib {
+    static uintptr_t Find(const char* name) {
+        FILE* f = fopen("/proc/self/maps", "r");
+        if (!f) return 0;
+        char line[512];
+        uintptr_t base = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, name)) {
+                base = strtoul(line, nullptr, 16);
+                break;
+            }
+        }
+        fclose(f);
+        return base;
+    }
+
+    static uintptr_t WaitFor(const char* name, int timeoutSec = 60) {
+        for (int i = 0; i < timeoutSec * 10; ++i) {
+            uintptr_t b = Find(name);
+            if (b) return b;
+            usleep(100 * 1000);
+        }
+        return 0;
     }
 }
 
-static bool RP(void* a, void** o) {
-    *o = nullptr; if (!a) return false;
-    struct iovec l = { o, sizeof(void*) }, r = { a, sizeof(void*) };
-    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
+// ============================================================================
+// SDK — Minimal UE4 Types
+// ============================================================================
+using int32  = int32_t;
+using int64  = int64_t;
+using uint8  = uint8_t;
+using uint32 = uint32_t;
+using uint64 = uint64_t;
+
+class UObject;
+
+// ---- FName ----
+struct FName {
+    uint32 ComparisonIndex;
+    uint32 DisplayIndex;
+};
+
+// ---- FString ----
+struct FString {
+    wchar_t* Data;
+    int32    Count;
+    int32    Max;
+
+    FString() : Data(nullptr), Count(0), Max(0) {}
+
+    std::string ToString() const {
+        if (!Data) return {};
+        std::string out;
+        out.reserve(Count);
+        for (int32 i = 0; i < Count - 1; ++i) { // exclude null term
+            wchar_t wc = Data[i];
+            out.push_back(wc < 128 ? (char)wc : '?');
+        }
+        return out;
+    }
+};
+
+// ---- TArray ----
+template<typename T>
+struct TArray {
+    T*    Data;
+    int32 Count;
+    int32 Max;
+
+    T& operator[](int32 i) { return Data[i]; }
+    const T& operator[](int32 i) const { return Data[i]; }
+    T* begin() { return Data; }
+    T* end()   { return Data + Count; }
+    int32 MaxIndex() const { return Count - 1; }
+
+    void Add(const T& item) {
+        extern void* (*ReallocFn)(void*, size_t, uint32);
+        Data = (T*)ReallocFn(Data, sizeof(T) * (Count + 1), 0);
+        Data[Count++] = item;
+        Max = Count;
+    }
+};
+
+// ---- FVector / FRotator / FGuid ----
+struct FVector   { float X, Y, Z; };
+struct FRotator  { float Pitch, Yaw, Roll; };
+struct FGuid     { int32 A, B, C, D; };
+
+// ---- UObject ----
+class UObject {
+public:
+    void**  Vtable;
+    int32   ObjectFlags;
+    int32   InternalIndex;
+    UObject* Class;
+    FName    Name;
+    UObject* Outer;
+
+    std::string GetName() {
+        extern void (*FNameToStringFn)(FName*, FString&);
+        extern void (*FreeInternalFn)(void*);
+
+        FString out;
+        FNameToStringFn(&this->Name, out);
+        std::string s = out.ToString();
+        if (out.Data) FreeInternalFn(out.Data);
+        return s;
+    }
+
+    bool IsChild(UObject* parent) {
+        UObject* c = this->Class;
+        while (c) {
+            if (c == parent) return true;
+            c = *(UObject**)((uintptr_t)c + offsets::SuperClass);
+        }
+        return false;
+    }
+};
+
+// ---- GObjects ----
+struct FUObjectItem { UObject* Object; int32 Flags; int32 Cluster; int32 Serial; };
+struct TUObjectArray { void* Objects[9]; };
+struct GObjects_t {
+    TUObjectArray* ObjectArray;
+    uint8  _pad[0xC];
+    uint32 ObjectCount;
+
+    UObject* GetById(uint32 id) {
+        // UE 4.27 chunk size = 0x10000
+        const uint32 chunkSize = 0x10000;
+        uint32 chunkIdx = id / chunkSize;
+        uint32 within   = id % chunkSize;
+        if (chunkIdx >= 9) return nullptr;
+        auto* chunk = (FUObjectItem*)ObjectArray->Objects[chunkIdx];
+        if (!chunk) return nullptr;
+        return chunk[within].Object;
+    }
+};
+
+// ============================================================================
+// GLOBALS
+// ============================================================================
+static uintptr_t g_base = 0;
+
+// Function pointers
+static void   (*FNameToStringFn)(FName*, FString&)          = nullptr;
+static void   (*FreeInternalFn)(void*)                       = nullptr;
+static void*  (*ReallocFn)(void*, size_t, uint32)            = nullptr;
+static void*  (*SpawnActorFn)(void*, UObject*, FVector*, FRotator*, const void*) = nullptr;
+static UObject* (*StaticFindObjectFn)(UObject*, void*, const wchar_t*, bool) = nullptr;
+static UObject* (*StaticLoadObjectFn)(UObject*, UObject*, const wchar_t*, const wchar_t*, int, void*, bool) = nullptr;
+
+// ProcessEvent
+static void* (*orig_ProcessEvent)(UObject*, UObject*, void*) = nullptr;
+
+// Game state
+static UObject* PlayerController = nullptr;
+static UObject* GameState        = nullptr;
+static UObject* GameMode         = nullptr;
+static UObject* World            = nullptr;
+static UObject* Pawn             = nullptr;
+static UObject* GameViewport     = nullptr;
+static UObject* CheatManager     = nullptr;
+static UObject* GameStatics      = nullptr;
+static UObject* kismetStringLib  = nullptr;
+static UObject* kismetSystemLib  = nullptr;
+static GObjects_t* GObjects      = nullptr;
+
+// Flags
+static bool bInFrontend        = true;
+static bool bPressedPlay       = false;
+static bool bLoadedInMatch     = false;
+static bool bDroppedFromAircraft = false;
+
+// ============================================================================
+// OBJECT FINDERS
+// ============================================================================
+static UObject* FindObject(const wchar_t* path, bool bLoad = false, bool bAnyPkg = false) {
+    if (!StaticFindObjectFn) return nullptr;
+    UObject* obj = StaticFindObjectFn(nullptr, bAnyPkg ? (void*)-1 : nullptr, path, false);
+    if (!obj && bLoad && StaticLoadObjectFn) {
+        obj = StaticLoadObjectFn(nullptr, nullptr, path, nullptr, 0, nullptr, true);
+    }
+    return obj;
 }
 
-static bool WP(void* a, void* v) {
-    struct iovec l = { &v, sizeof(void*) }, r = { a, sizeof(void*) };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(void*);
+static std::wstring ToWide(const std::string& s) {
+    std::wstring w;
+    w.reserve(s.size());
+    for (char c : s) w.push_back((wchar_t)c);
+    return w;
 }
 
-static bool RU8(void* a, uint8_t* v) {
-    struct iovec l = { v, 1 }, r = { a, 1 };
-    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 1;
+static std::string ToNarrow(const wchar_t* w) {
+    if (!w) return {};
+    std::string s;
+    while (*w) { s.push_back(*w < 128 ? (char)*w : '?'); ++w; }
+    return s;
 }
 
-static bool WU8(void* a, uint8_t v) {
-    struct iovec l = { &v, 1 }, r = { a, 1 };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == 1;
+// ============================================================================
+// UObject::Call — via ProcessEvent
+// ============================================================================
+template<typename Ret = void, typename... Args>
+static Ret UCall(UObject* obj, const char* funcName, Args... args) {
+    if (!obj || !orig_ProcessEvent) return Ret{};
+
+    // Find the function
+    UObject* func = nullptr;
+    UObject* klass = obj->Class;
+    while (klass && !func) {
+        UObject* child = *(UObject**)((uintptr_t)klass + offsets::Children);
+        while (child) {
+            std::string n = child->GetName();
+            if (n == funcName) { func = child; break; }
+            child = *(UObject**)((uintptr_t)child + offsets::Next);
+        }
+        klass = *(UObject**)((uintptr_t)klass + offsets::SuperClass);
+    }
+    if (!func) return Ret{};
+
+    // Get params size and offsets
+    int16_t paramsSize = *(int16_t*)((uintptr_t)func + offsets::ParamsSize);
+    int16_t retOffset  = *(int16_t*)((uintptr_t)func + offsets::ReturnValueOffset);
+
+    uint8_t* params = (uint8_t*)calloc(1, paramsSize);
+
+    // Fill args sequentially
+    int idx = 0;
+    auto fill = [&](auto&& v) {
+        // Each arg offset — we approximate as sizeof-aligned
+        // For accurate placement, need to walk Function->Children offsets
+        // Simplified: assume first args are at fixed offsets
+        memcpy(params + (idx == 0 ? 0 : 0) + (idx * 8), &v, sizeof(v));
+        idx++;
+    };
+    (void)fill; // reserved for future arg mapping
+
+    orig_ProcessEvent(obj, func, params);
+    Ret r{};
+    if (retOffset > 0) r = *(Ret*)(params + retOffset);
+    free(params);
+    return r;
 }
 
-struct LibInfo { uintptr_t base, text_start, text_end; };
+// ============================================================================
+// CURL HOOK — URL redirect + SSL bypass
+// ============================================================================
+static bool HostShouldRedirect(const std::string& host) {
+    return host.find("ol.epicgames.com")   != std::string::npos ||
+           host.find(".akamaized.net")     != std::string::npos ||
+           host.find("on.epicgames.com")   != std::string::npos ||
+           host.find("epicgames.com")      != std::string::npos ||
+           host.find("fortnite.com")       != std::string::npos ||
+           host.find("unrealengine.com")   != std::string::npos;
+}
 
-static LibInfo GetLibInfo() {
-    LibInfo info{0, 0, 0};
-    dl_iterate_phdr([](struct dl_phdr_info* ph, size_t, void* d) -> int {
-        auto* o = (LibInfo*)d;
-        if (!ph->dlpi_name || !*ph->dlpi_name) return 0;
-        if (!strstr(ph->dlpi_name, "libUnreal")) return 0;
-        o->base = ph->dlpi_addr;
-        for (int i = 0; i < ph->dlpi_phnum; i++) {
-            const auto& p = ph->dlpi_phdr[i];
-            if (p.p_type != PT_LOAD || !(p.p_flags & PF_X)) continue;
-            o->text_start = ph->dlpi_addr + p.p_vaddr;
-            o->text_end = o->text_start + p.p_memsz;
+static std::string RewriteUrl(const std::string& url) {
+    size_t schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos) return url;
+
+    size_t hostStart = schemeEnd + 3;
+    size_t hostEnd   = url.find_first_of("/?", hostStart);
+    if (hostEnd == std::string::npos) hostEnd = url.size();
+
+    std::string host = url.substr(hostStart, hostEnd - hostStart);
+    if (!HostShouldRedirect(host)) return url;
+
+    // Rebuild: scheme://newhost + original path/query
+    return std::string(REDIRECT_SCHEME) + "://" + REDIRECT_HOST + url.substr(hostEnd);
+}
+
+install_hook_name(curl_easy_setopt, void*, void* curl, int option, void* arg)
+{
+    if (option == CURLOPT_URL && !IsBadPtr(arg)) {
+        std::string original = (const char*)arg;
+        std::string rewritten = RewriteUrl(original);
+        if (rewritten != original) {
+            LOGI("[curl] %s -> %s", original.c_str(), rewritten.c_str());
+            return orig_curl_easy_setopt(curl, option, (void*)rewritten.c_str());
+        }
+        return orig_curl_easy_setopt(curl, option, arg);
+    }
+
+    if (option == CURLOPT_SSL_VERIFYPEER || option == CURLOPT_SSL_VERIFYHOST) {
+        return orig_curl_easy_setopt(curl, option, (void*)0);
+    }
+
+    return orig_curl_easy_setopt(curl, option, arg);
+}
+
+// ============================================================================
+// GAME LOGIC
+// ============================================================================
+static void SwitchMap(const char* mapName) {
+    if (!PlayerController) return;
+
+    // PlayerController->SwitchLevel(FString(mapName))
+    UObject* func = nullptr;
+    UObject* klass = PlayerController->Class;
+    while (klass && !func) {
+        UObject* child = *(UObject**)((uintptr_t)klass + offsets::Children);
+        while (child) {
+            if (child->GetName() == "SwitchLevel") { func = child; break; }
+            child = *(UObject**)((uintptr_t)child + offsets::Next);
+        }
+        klass = *(UObject**)((uintptr_t)klass + offsets::SuperClass);
+    }
+    if (!func) { LOGE("SwitchLevel not found"); return; }
+
+    int16_t ps = *(int16_t*)((uintptr_t)func + offsets::ParamsSize);
+    uint8_t* params = (uint8_t*)calloc(1, ps);
+
+    // Build FString on heap (needs to be static so engine can read it during call)
+    std::wstring w = ToWide(mapName);
+    std::wstring* wheap = new std::wstring(w);
+    FString* fs = (FString*)(params);
+    fs->Data  = (wchar_t*)wheap->c_str();
+    fs->Count = (int32)wheap->size() + 1;
+    fs->Max   = (int32)wheap->size() + 1;
+
+    orig_ProcessEvent(PlayerController, func, params);
+
+    // Note: don't free here — engine may keep a reference. Leak is fine.
+}
+
+static void PlayButton() {
+    SwitchMap("Artemis_Terrain"); // CH3 S3
+    bPressedPlay = true;
+    bInFrontend  = false;
+    LOGI("Play pressed -> Artemis_Terrain");
+}
+
+static void InitializeGlobals() {
+    // Find world/GameInstance chain
+    UObject* defaultGameStatics = FindObject(L"/Script/Engine.Default__GameplayStatics");
+    if (!defaultGameStatics) return;
+
+    // GetPlayerController(World, 0) — try via chain
+    // For robustness, use GObjects scan
+    // Alternate: find first PlayerController in GObjects
+    for (uint32 i = 0; i < GObjects->ObjectCount; ++i) {
+        UObject* o = GObjects->GetById(i);
+        if (!o) continue;
+        std::string n = o->GetName();
+        if (n == "FortPlayerControllerAthena" || n == "FortPlayerController") {
+            PlayerController = o;
             break;
         }
-        return 1;
-    }, &info);
-    return info;
-}
-
-// ==========================================
-// 3. المتغيرات العامة والأنواع
-// ==========================================
-static uintptr_t g_base = 0;
-static std::mutex g_inject_mutex;
-static std::set<void*> g_injected_gms;
-static void* g_cached_playlist = nullptr;
-static void* g_saved_pc = nullptr;
-static bool g_bMatchStarted = false;
-
-typedef void* (*StaticFindObject_t)(void*, void*, const char16_t*, bool);
-static StaticFindObject_t SFO = nullptr;
-
-typedef void* (*SpawnDefaultPawnFor_t)(void*, void*, void*);
-static SpawnDefaultPawnFor_t o_SpawnDefaultPawnFor = nullptr;
-
-typedef void (*Possess_t)(void*, void*);
-typedef void (*ClientRestart_t)(void*, void*);
-
-static bool IVP(void* p) {
-    uintptr_t v = (uintptr_t)p;
-    return (v >= 0x1000000000ULL && v <= 0x8000000000ULL);
-}
-
-// ==========================================
-// 4. الدوال الأساسية
-// ==========================================
-static void* GetPawnClass(void* gm) {
-    void* pawnClass = nullptr;
-    RP((char*)gm + OFF_GM_DefaultPawnClass, &pawnClass);
-    if (!IVP(pawnClass) && SFO) {
-        pawnClass = SFO(nullptr, nullptr, u"/Script/FortniteGame.FortPlayerPawnAthena", false);
-    }
-    return pawnClass;
-}
-
-// 🎯 دالة الـ Hook الجديدة: نترك المحرك ينشئ الشخصية، لكننا نصلح الـ Class
-void* Hook_SpawnDefaultPawnFor(void* gm, void* pc, void* startSpot) {
-    LOGF("[Spawn] SpawnDefaultPawnFor called by engine!");
-    
-    // إجبار الـ GameMode على استخدام شخصية أثينا
-    void* pawnClass = GetPawnClass(gm);
-    if (IVP(pawnClass)) {
-        WP((char*)gm + OFF_GM_DefaultPawnClass, pawnClass); 
-    }
-    
-    // استدعاء الدالة الأصلية (المحرك سيتولى الباقي)
-    void* newPawn = o_SpawnDefaultPawnFor ? o_SpawnDefaultPawnFor(gm, pc, startSpot) : nullptr;
-    LOGF("[Spawn] Engine spawned Pawn = %p", newPawn);
-    
-    // إذا نجح المحرك في إنشاء الشخصية، نتدخل فقط لضمان الامتلاك وتغيير الحالة
-    if (IVP(newPawn) && IVP(pc)) {
-        // 1. الامتلاك (احتياطي فقط، المحرك عادة يقوم به)
-        auto PossessFunc = (Possess_t)(g_base + ADDR_Possess_THUNK_RVA);
-        if (PossessFunc) {
-            PossessFunc(pc, newPawn);
-            LOGF("[Possess] Manual Possess ensured!");
-        }
-
-        // 2. إجبار تغيير الحالة إلى Playing
-        auto ClientRestartFunc = (ClientRestart_t)(g_base + ADDR_ClientRestart_THUNK_RVA);
-        if (ClientRestartFunc) {
-            ClientRestartFunc(pc, newPawn);
-            LOGF("[Restart] ClientRestart called to force Playing state!");
-        }
-    }
-    
-    return newPawn;
-}
-
-static void* FindPlaylist() {
-    if (!SFO) return nullptr;
-    return SFO(nullptr, nullptr, u"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo", false);
-}
-
-static bool InjectPlaylist(void* gm) {
-    if (!gm) return false;
-    std::lock_guard<std::mutex> lock(g_inject_mutex);
-    if (g_injected_gms.count(gm)) return false;
-    if (!g_cached_playlist) {
-        g_cached_playlist = FindPlaylist();
-        if (!IVP(g_cached_playlist)) return false;
-    }
-    void* gs = nullptr;
-    if (!RP((char*)gm + OFF_GM_GameState, &gs) || !gs) return false;
-    
-    WP((char*)gs + OFF_GS_Playlist2298, g_cached_playlist);
-    WP((char*)gs + OFF_GS_Playlist2290, g_cached_playlist);
-    
-    g_injected_gms.insert(gm);
-    LOGF("[Inject] Playlist set on GS=%p", gs);
-    return true;
-}
-
-static void ClearSpectator(void* pc) {
-    if (!IVP(pc)) return;
-    void* ps = nullptr;
-    RP((char*)pc + OFF_PC_PlayerState, &ps);
-    if (!IVP(ps)) return;
-    uint8_t b = 0;
-    if (RU8((char*)ps + OFF_PS_SpectatorByte, &b) && b != 0) {
-        WU8((char*)ps + OFF_PS_SpectatorByte, 0x00);
-        LOGF("[Spectator] 0x%02X -> 0x00", b);
-    }
-}
-
-static void ForceStartFlightPath(void* gm) {
-    if (!gm) return;
-    auto StartFlightPathFunc = (void(*)(void*))(g_base + ADDR_StartFlightPath_ORIG_RVA);
-    if (StartFlightPathFunc) {
-        LOGF("[Force] Calling StartFlightPath manually...");
-        StartFlightPathFunc(gm);
-    }
-}
-
-// ==========================================
-// 5. دوال الاختراق (Hooks)
-// ==========================================
-typedef void (*PL_t)(void*, void*);
-static PL_t o_PL = nullptr;
-
-static void Hook_PL(void* gm, void* pc) {
-    LOGF("========== [PostLogin] GM=%p PC=%p ==========", gm, pc);
-    InjectPlaylist(gm);
-    ClearSpectator(pc);
-    g_saved_pc = pc;
-    if (o_PL) o_PL(gm, pc);
-    ClearSpectator(pc);
-    LOGF("[PostLogin] done.");
-}
-
-typedef bool (*ReadyToStartMatch_t)(void*);
-static ReadyToStartMatch_t o_ReadyToStartMatch = nullptr;
-
-static bool Hook_ReadyToStartMatch(void* gm) {
-    // 🎯 إصلاح المشكلة: نعيد true مرة واحدة فقط لمنع الحلقة المفرغة
-    if (g_bMatchStarted) {
-        return o_ReadyToStartMatch ? o_ReadyToStartMatch(gm) : false;
-    }
-    
-    g_bMatchStarted = true;
-    LOGF("[GameMode] ReadyToStartMatch -> FORCING TRUE (ONCE)!");
-    return true; 
-}
-
-typedef bool (*SAP_t)(void*, char);
-static SAP_t o_SAP = nullptr;
-
-static bool Hook_SAP(void* gm, char a2) {
-    LOGF("[Aircraft] phase=%d", (int)a2);
-    
-    if ((int)a2 == 0 || (int)a2 == 1) { 
-        ForceStartFlightPath(gm);
     }
 
-    // 🎯 لا نقوم بعمل Spawn يدوي هنا. نترك المحرك يستدعي Hook_SpawnDefaultPawnFor
-    return o_SAP ? o_SAP(gm, a2) : false;
-}
-
-typedef int (*PH_t)(void*);
-static PH_t o_PH = nullptr;
-
-static int Hook_PH(void* a1) {
-    if (a1) InjectPlaylist(a1);
-    return o_PH ? o_PH(a1) : 0;
-}
-
-// ==========================================
-// 6. التشغيل (Initialization)
-// ==========================================
-static void Run() {
-    LibInfo i{0,0,0};
-    for (int k = 0; k < 60; k++) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        i = GetLibInfo(); if (i.base) break;
+    if (!PlayerController) {
+        LOGI("PlayerController not found yet");
+        return;
     }
-    if (!i.base) { LOGF("[ERR] libUnreal not found"); return; }
-    g_base = i.base;
 
-    LOGF("========================================");
-    LOGF(" FORTNITE ANDROID HOOK - FINAL BUILD V2");
-    LOGF(" base = 0x%lx", g_base);
-    LOGF("========================================");
+    World  = *(UObject**)((uintptr_t)PlayerController + 0); // placeholder
+    // World access via PlayerController->GetWorld() — skip for brevity, use global search
 
-    SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
-    
-    DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
-    DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
-    DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
-    DobbyHook((void*)(g_base + ADDR_ReadyToStartMatch_THUNK_RVA), (void*)Hook_ReadyToStartMatch, (void**)&o_ReadyToStartMatch);
-    
-    // 🎯 تفعيل الـ Hook الجديد
-    DobbyHook((void*)(g_base + ADDR_SpawnDefaultPawnFor_THUNK_RVA), (void*)Hook_SpawnDefaultPawnFor, (void**)&o_SpawnDefaultPawnFor);
+    for (uint32 i = 0; i < GObjects->ObjectCount; ++i) {
+        UObject* o = GObjects->GetById(i);
+        if (!o) continue;
+        std::string n = o->GetName();
+        if (!GameState && (n == "FortGameStateAthena" || n == "FortGameState")) GameState = o;
+        if (!GameMode  && (n == "FortGameModeAthena"  || n == "FortGameMode"))  GameMode  = o;
+        if (GameState && GameMode) break;
+    }
 
-    LOGF("[Run] All hooks installed. Waiting for PostLogin...");
+    LOGI("PC=%p GS=%p GM=%p", PlayerController, GameState, GameMode);
 }
 
-extern "C" JNIEXPORT jint JNICALL
-JNI_OnLoad(JavaVM* vm, void* reserved) {
-    InitLogFile();
-    LOGF(" hook loaded %s %s", __DATE__, __TIME__);
-    std::thread([]{ try { Run(); } catch (...) { LOGF("[ERR] exception in Run"); } }).detach();
-    return JNI_VERSION_1_6;
+static void OnReadyToStartMatch() {
+    LOGI("=== ReadyToStartMatch ===");
+    bLoadedInMatch = true;
+    bInFrontend    = false;
+
+    InitializeGlobals();
+
+    // NOTE: full Athena spawn logic (SpawnPawn, Inventory, ShowSkin...) lives here
+    // in the full project. For this single-file build, we stop at logging.
+}
+
+static void OnServerLoadingScreenDropped() {
+    LOGI("=== ServerLoadingScreenDropped ===");
+    if (bInFrontend) return;
+}
+
+static void OnAircraftJump() {
+    LOGI("=== ServerAttemptAircraftJump ===");
+    bDroppedFromAircraft = true;
+}
+
+// ============================================================================
+// PROCESS EVENT HOOK
+// ============================================================================
+static void* ProcessEventHook(UObject* self, UObject* func, void* params)
+{
+    if (!func || !orig_ProcessEvent) return nullptr;
+
+    // Fast path: null-checked name
+    std::string name = func->GetName();
+    if (name.empty()) return orig_ProcessEvent(self, func, params);
+
+    // ---- Game-flow events ----
+    if (name.find("ReadyToStartMatch") != std::string::npos && !bLoadedInMatch) {
+        OnReadyToStartMatch();
+    }
+    else if (name.find("ServerLoadingScreenDropped") != std::string::npos && bLoadedInMatch) {
+        OnServerLoadingScreenDropped();
+    }
+    else if (name.find("ServerAttemptAircraftJump") != std::string::npos && !bDroppedFromAircraft) {
+        OnAircraftJump();
+    }
+    // ---- Play button ----
+    else if ((name.find("BP_PlayButton") != std::string::npos ||
+              name.find("PlayButton")    != std::string::npos) && !bPressedPlay) {
+        PlayButton();
+    }
+    // ---- Return to menu ----
+    else if (name.find("ReturnToMainMenu") != std::string::npos) {
+        SwitchMap("Frontend");
+        bInFrontend = true;
+        bPressedPlay = false;
+    }
+
+    return orig_ProcessEvent(self, func, params);
+}
+
+// ============================================================================
+// CORE SETUP
+// ============================================================================
+static void CoreSetup()
+{
+    g_base = Lib::Find("libUnreal.so");
+    if (!g_base) { LOGE("libUnreal.so not mapped!"); return; }
+    LOGI("libUnreal.so base = %p", (void*)g_base);
+
+    // ---- Function pointers ----
+    FNameToStringFn   = (decltype(FNameToStringFn))  (g_base + RVAs::FNameToString);
+    FreeInternalFn    = (decltype(FreeInternalFn))   (g_base + RVAs::FreeInternal);
+    ReallocFn         = (decltype(ReallocFn))        (g_base + RVAs::Realloc);
+    SpawnActorFn      = (decltype(SpawnActorFn))     (g_base + RVAs::SpawnActor_Thunk);
+
+    // GObjects
+    GObjects = *(GObjects_t**)(g_base + RVAs::GObjects);
+    LOGI("GObjects = %p (count=%u)", GObjects, GObjects ? GObjects->ObjectCount : 0);
+
+    // StaticFindObject / StaticLoadObject — resolve by scanning callers is complex.
+    // For CH3, we approximate via direct exports if present, else skip.
+    // IMPORTANT: If the game provides them as exported symbols, use dlsym:
+    void* h = dlopen("libUnreal.so", RTLD_NOW | RTLD_NOLOAD);
+    if (h) {
+        StaticFindObjectFn = (decltype(StaticFindObjectFn))dlsym(h, "StaticFindObject");
+        StaticLoadObjectFn = (decltype(StaticLoadObjectFn))dlsym(h, "StaticLoadObject");
+    }
+
+    // Fallback: FindObject won't work without StaticFindObject,
+    // but we can use GObjects scan.
+    LOGI("StaticFindObject = %p", StaticFindObjectFn);
+
+    // ---- Hook ProcessEvent ----
+    void* pPE = (void*)(g_base + RVAs::ProcessEvent);
+    if (DobbyHook(pPE, (void*)ProcessEventHook, (void**)&orig_ProcessEvent) == 0) {
+        LOGI("ProcessEvent hooked @ %p", pPE);
+    } else {
+        LOGE("Failed to hook ProcessEvent");
+    }
+
+    // ---- Hook curl_easy_setopt ----
+    void* pCurl = (void*)(g_base + RVAs::curl_easy_setopt);
+    if (DobbyHook(pCurl, (void*)hook_curl_easy_setopt, (void**)&orig_curl_easy_setopt) == 0) {
+        LOGI("curl_easy_setopt hooked @ %p", pCurl);
+    } else {
+        LOGE("Failed to hook curl_easy_setopt");
+    }
+}
+
+// ============================================================================
+// MAIN THREAD
+// ============================================================================
+static void* MainThread(void*)
+{
+    LOGI("=== EraCH3 starting ===");
+
+    if (!Lib::WaitFor("libUnreal.so")) {
+        LOGE("libUnreal.so never appeared");
+        return nullptr;
+    }
+    usleep(300 * 1000); // let it settle
+
+    CoreSetup();
+
+    LOGI("=== EraCH3 ready ===");
+    return nullptr;
+}
+
+// ============================================================================
+// JNI ENTRY
+// ============================================================================
+extern "C" __attribute__((constructor))
+void libEraCH3_main()
+{
+    pthread_t t;
+    pthread_create(&t, nullptr, MainThread, nullptr);
+    pthread_detach(t);
 }
