@@ -1,9 +1,3 @@
-// ============================================================================
-// EraCH3.cpp — Single-file Android Server for Fortnite Chapter 3 Season 3
-// Target: libUnreal.so 21.30 (UE 4.27) / arm64-v8a
-// Author: adapted from EraV2 / Project Nova
-// ============================================================================
-
 #include <jni.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -12,140 +6,81 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include <android/log.h>
-
 #include "Dobby/dobby.h"
 
-// ============================================================================
-// LOGGING
-// ============================================================================
 #define TAG "EraCH3"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ============================================================================
-// CURL OPTIONS (hardcoded, from curl.h)
-// ============================================================================
-#define CURLOPT_SSL_VERIFYPEER  64
-#define CURLOPT_SSL_VERIFYHOST  81
-#define CURLOPT_URL             10002
+#define CURLOPT_SSL_VERIFYPEER 64
+#define CURLOPT_SSL_VERIFYHOST 81
+#define CURLOPT_URL 10002
+#define REDIRECT_SCHEME "http"
+#define REDIRECT_HOST "127.0.0.1:3551"
 
-// ============================================================================
-// REDIRECT TARGET
-// ============================================================================
-#define REDIRECT_SCHEME  "http"
-#define REDIRECT_HOST    "127.0.0.1:3551"
-
-// ============================================================================
-// OFFSETS — libUnreal.so 21.30 (CH3 S3, UE 4.27)
-// ============================================================================
-namespace RVAs {
-    constexpr uint64_t ProcessEvent                      = 0x07611B5C;
-    constexpr uint64_t GObjects                          = 0x0DCD6E08;
-
-    constexpr uint64_t SpawnActor_Thunk                  = 0x3217298;
-    constexpr uint64_t SpawnActor_2_Thunk                = 0x9CE0828;
-
-    constexpr uint64_t GetEngineVersion                  = 0x945F4B4;
-
-    constexpr uint64_t FNameToString                     = 0x74937C0;
-    constexpr uint64_t FreeInternal                      = 0x7355370;
-    constexpr uint64_t Realloc                           = 0x735E520;
-
-    constexpr uint64_t CopyScriptStruct                  = 0x7535848;
-
-    constexpr uint64_t GetDataTableRowFromName_Thunk     = 0x99CD07C;
-    constexpr uint64_t GetDataTableRowFromName_ORIG      = 0x9319C70;
-    constexpr uint64_t GetDataTableRowNames_ORIG         = 0x9319CD8;
-    constexpr uint64_t UDataTable_FindRowUnchecked       = 0x359CB9C;
-
-    constexpr uint64_t GenericArray_Remove               = 0x944B2DC;
-
-    constexpr uint64_t UStruct_IsChildOf                 = 0x753C14C;
-    constexpr uint64_t GMalloc                           = 0xDC55AC0;
-
-    // ==== curl_easy_setopt inside libUnreal.so ====
-    constexpr uint64_t curl_easy_setopt                  = 0x0B1CA0B8;
-}
-
-// UE 4.27 Android (Itanium ABI) struct offsets
-namespace offsets {
-    constexpr int32_t Class        = 0x10;
-    constexpr int32_t Name         = 0x18;
-    constexpr int32_t Outer        = 0x20;
-    constexpr int32_t Children     = 0x48;
-    constexpr int32_t Next         = 0x30;
-    constexpr int32_t SuperClass   = 0x40;
-    constexpr int32_t Offset       = 0x4C;
-    constexpr int32_t ParamsSize   = 0xE6;
-    constexpr int32_t ReturnValueOffset = 0xE8;
-    constexpr int32_t StructSize   = 0x5C;
-    constexpr int32_t RowStruct    = 0x28;
-}
-
-// ============================================================================
-// UTILITIES — Memory
-// ============================================================================
-static inline bool IsBadPtr(const void* p) {
-    if (!p) return true;
-    // Android: 47-bit user space
-    return (uintptr_t)p < 0x10000 || (uintptr_t)p > 0x7FFFFFFFFFFF;
-}
-
-// ============================================================================
-// LIBRARY UTILITIES
-// ============================================================================
-namespace Lib {
-    static uintptr_t Find(const char* name) {
-        FILE* f = fopen("/proc/self/maps", "r");
-        if (!f) return 0;
-        char line[512];
-        uintptr_t base = 0;
-        while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, name)) {
-                base = strtoul(line, nullptr, 16);
-                break;
-            }
-        }
-        fclose(f);
-        return base;
-    }
-
-    static uintptr_t WaitFor(const char* name, int timeoutSec = 60) {
-        for (int i = 0; i < timeoutSec * 10; ++i) {
-            uintptr_t b = Find(name);
-            if (b) return b;
-            usleep(100 * 1000);
-        }
-        return 0;
-    }
-}
-
-// ============================================================================
-// SDK — Minimal UE4 Types
-// ============================================================================
-using int32  = int32_t;
-using int64  = int64_t;
-using uint8  = uint8_t;
+using int8  = int8_t;
+using int16 = int16_t;
+using int32 = int32_t;
+using int64 = int64_t;
+using uint8 = uint8_t;
+using uint16 = uint16_t;
 using uint32 = uint32_t;
 using uint64 = uint64_t;
 
-class UObject;
+namespace RVAs {
+    constexpr uint64_t ProcessEvent                  = 0x07611B5C;
+    constexpr uint64_t GObjects                      = 0x0DCD6E08;
+    constexpr uint64_t SpawnActor_Thunk              = 0x3217298;
+    constexpr uint64_t SpawnActor_2_Thunk            = 0x9CE0828;
+    constexpr uint64_t GetEngineVersion              = 0x945F4B4;
+    constexpr uint64_t FNameToString                 = 0x74937C0;
+    constexpr uint64_t FreeInternal                  = 0x7355370;
+    constexpr uint64_t Realloc                       = 0x735E520;
+    constexpr uint64_t CopyScriptStruct              = 0x7535848;
+    constexpr uint64_t GetDataTableRowFromName_Thunk = 0x99CD07C;
+    constexpr uint64_t GetDataTableRowFromName_ORIG  = 0x9319C70;
+    constexpr uint64_t GetDataTableRowNames_ORIG     = 0x9319CD8;
+    constexpr uint64_t UDataTable_FindRowUnchecked   = 0x359CB9C;
+    constexpr uint64_t GenericArray_Remove           = 0x944B2DC;
+    constexpr uint64_t UStruct_IsChildOf             = 0x753C14C;
+    constexpr uint64_t GMalloc                       = 0xDC55AC0;
+    constexpr uint64_t curl_easy_setopt              = 0x0B1CA0B8;
+}
 
-// ---- FName ----
+namespace offsets {
+    constexpr int32 Class              = 0x10;
+    constexpr int32 Name               = 0x18;
+    constexpr int32 Outer              = 0x20;
+    constexpr int32 Children           = 0x48;
+    constexpr int32 Next               = 0x30;
+    constexpr int32 SuperClass         = 0x40;
+    constexpr int32 Offset             = 0x4C;
+    constexpr int32 ParamsSize         = 0xE6;
+    constexpr int32 ReturnValueOffset  = 0xE8;
+    constexpr int32 StructSize         = 0x5C;
+    constexpr int32 RowStruct          = 0x28;
+    constexpr int32 ElementSize        = 0x34;
+    constexpr int32 PropertyFlags      = 0x78;
+    constexpr int32 Inner              = 0x70;
+    constexpr int32 StructFlags        = 0x38;
+    constexpr int32 StructOps          = 0x40;
+}
+
 struct FName {
     uint32 ComparisonIndex;
     uint32 DisplayIndex;
 };
 
-// ---- FString ----
 struct FString {
     wchar_t* Data;
-    int32    Count;
-    int32    Max;
+    int32 Count;
+    int32 Max;
 
     FString() : Data(nullptr), Count(0), Max(0) {}
 
@@ -153,60 +88,122 @@ struct FString {
         if (!Data) return {};
         std::string out;
         out.reserve(Count);
-        for (int32 i = 0; i < Count - 1; ++i) { // exclude null term
+        for (int32 i = 0; i < Count - 1; ++i) {
             wchar_t wc = Data[i];
             out.push_back(wc < 128 ? (char)wc : '?');
         }
         return out;
     }
-};
 
-// ---- TArray ----
-template<typename T>
-struct TArray {
-    T*    Data;
-    int32 Count;
-    int32 Max;
-
-    T& operator[](int32 i) { return Data[i]; }
-    const T& operator[](int32 i) const { return Data[i]; }
-    T* begin() { return Data; }
-    T* end()   { return Data + Count; }
-    int32 MaxIndex() const { return Count - 1; }
-
-    void Add(const T& item) {
-        extern void* (*ReallocFn)(void*, size_t, uint32);
-        Data = (T*)ReallocFn(Data, sizeof(T) * (Count + 1), 0);
-        Data[Count++] = item;
-        Max = Count;
+    std::wstring ToWString() const {
+        if (!Data) return {};
+        return std::wstring(Data, Data + Count - 1);
     }
 };
 
-// ---- FVector / FRotator / FGuid ----
-struct FVector   { float X, Y, Z; };
-struct FRotator  { float Pitch, Yaw, Roll; };
-struct FGuid     { int32 A, B, C, D; };
+struct FVector { float X, Y, Z; };
+struct FRotator { float Pitch, Yaw, Roll; };
+struct FGuid { int32 A, B, C, D; };
+struct FVector2D { float X, Y; };
+struct FMargin { float Left, Top, Right, Bottom; };
+struct FLinearColor { float R, G, B, A; };
 
-// ---- UObject ----
-class UObject {
+struct FSlateColor {
+    FLinearColor SpecifiedColor;
+    uint8 ColorUseRule;
+    uint8 _pad[0x17];
+};
+
+struct FSlateBrush {
+    uint8 _pad[0x8];
+    FVector2D ImageSize;
+    FMargin Margin;
+    FSlateColor TintColor;
+    class UObject* ObjectResource;
+};
+
+struct FGameplayAbilitySpecDef {
+    class UObject* Ability;
+    uint8 _pad[0x90];
+};
+
+struct FGameplayEffectContextHandle { uint8 _pad[0x18]; };
+struct FActiveGameplayEffectHandle { int32 Handle; bool bPassed; uint8 _pad[0x3]; };
+
+struct FGameplayTagContainer {
+    void* GameplayTags_Data;
+    int32 GameplayTags_Count;
+    int32 GameplayTags_Max;
+    void* ParentTags_Data;
+    int32 ParentTags_Count;
+    int32 ParentTags_Max;
+};
+
+struct GEHard { class UObject* Effect; float Level; uint8 _pad[0x4]; };
+
+struct FItemAndCount { int32 Count; uint8 _pad[0x4]; class UObject* Item; };
+
+struct FKey { FName KeyName; uint8 _pad[0x10]; };
+
+struct SpawnActorParams { uint8 Parms[0x40]; };
+
+struct SoftObjectPtr { uint8 _pad[0x28]; };
+
+class FFieldClass {
 public:
-    void**  Vtable;
-    int32   ObjectFlags;
-    int32   InternalIndex;
-    UObject* Class;
-    FName    Name;
-    UObject* Outer;
+    FName NamePrivate;
+    uint8 Id;
+    void* CastFlags;
+    uint8 ClassFlags;
+    FFieldClass* Super;
+    void* DefaultObj;
+
+    std::string GetName() {
+        std::string name = "";
+        extern void (*FNameToStringFn)(FName*, FString&);
+        extern void (*FreeInternalFn)(void*);
+        FString out;
+        FNameToStringFn(&NamePrivate, out);
+        name = out.ToString();
+        if (out.Data) FreeInternalFn(out.Data);
+        auto pos = name.rfind('/');
+        return pos == std::string::npos ? name : name.substr(pos + 1);
+    }
+};
+
+class FField {
+public:
+    void* VTablePointer;
+    FFieldClass* ClassPointer;
+    uint8 _pad[0x10];
+    FField* Next;
+    FName Name;
+    uint8 Flags;
+
+    bool IsValid() { return !IsBadPtr(&Name); }
 
     std::string GetName() {
         extern void (*FNameToStringFn)(FName*, FString&);
         extern void (*FreeInternalFn)(void*);
-
         FString out;
-        FNameToStringFn(&this->Name, out);
-        std::string s = out.ToString();
+        FNameToStringFn(&Name, out);
+        std::string name = out.ToString();
         if (out.Data) FreeInternalFn(out.Data);
-        return s;
+        auto pos = name.rfind('/');
+        return pos == std::string::npos ? name : name.substr(pos + 1);
     }
+};
+
+class UObject {
+public:
+    void** Vtable;
+    int32 ObjectFlags;
+    int32 InternalIndex;
+    UObject* Class;
+    FName Name;
+    UObject* Outer;
+
+    bool IsA(UObject* c) { return this->Class == c; }
 
     bool IsChild(UObject* parent) {
         UObject* c = this->Class;
@@ -216,187 +213,1125 @@ public:
         }
         return false;
     }
+
+    std::string GetName() {
+        extern void (*FNameToStringFn)(FName*, FString&);
+        extern void (*FreeInternalFn)(void*);
+        FString out;
+        FNameToStringFn(&this->Name, out);
+        std::string s = out.ToString();
+        if (out.Data) FreeInternalFn(out.Data);
+        auto pos = s.rfind('/');
+        return pos == std::string::npos ? s : s.substr(pos + 1);
+    }
+
+    std::string GetFullName() {
+        std::string temp;
+        for (auto outer = this->Outer; outer; outer = outer->Outer) {
+            temp = outer->GetName() + "." + temp;
+        }
+        return reinterpret_cast<UObject*>(Class)->GetName() + " " + temp + this->GetName();
+    }
+
+    int32 EnumIndex(const std::string& enumName) {
+        auto* arr = reinterpret_cast<void*>(int64(this) + 0x40);
+        int32 count = *(int32*)((uintptr_t)arr + 8);
+        void* data = *(void**)arr;
+        for (int i = 0; i < count; ++i) {
+            void* entry = (void*)((uintptr_t)data + i * 0x10);
+            FName* n = (FName*)entry;
+            extern void (*FNameToStringFn)(FName*, FString&);
+            extern void (*FreeInternalFn)(void*);
+            FString out;
+            FNameToStringFn(n, out);
+            std::string s = out.ToString();
+            if (out.Data) FreeInternalFn(out.Data);
+            auto pos = s.find(this->GetName() + "::");
+            if (pos != std::string::npos) s = s.substr(pos + this->GetName().length() + 2);
+            if (s == enumName) return i;
+        }
+        return 0;
+    }
+
+    template<typename T = UObject*>
+    T& Child(const std::string& name, bool bFunction = false, bool bUseCache = true) {
+        static std::map<std::string, int32> cache;
+        std::string key = GetName() + "::" + name;
+
+        if (bUseCache && cache.find(key) != cache.end()) {
+            return *(T*)(int64(this) + cache[key]);
+        }
+
+        UObject* klass = this->Class;
+
+        while (klass) {
+            UObject* children = *(UObject**)(int64(klass) + offsets::Children);
+            if (children) {
+                UObject* cur = children;
+                while (cur) {
+                    std::string cn = cur->Class->GetName();
+                    if (cn == "StructProperty") {
+                        UObject* structChildren = *(UObject**)(int64(*(UObject**)(int64(cur) + offsets::Class)) + offsets::Children);
+                        while (structChildren) {
+                            if (structChildren->GetName() == name) {
+                                return *(T*)(int64(this) + *(uint32*)(int64(cur) + offsets::Offset) + *(uint32*)(int64(structChildren) + offsets::Offset));
+                            }
+                            structChildren = *(UObject**)(int64(structChildren) + offsets::Next);
+                        }
+                    }
+                    if (cur->GetName() == name) {
+                        if (bFunction) return *(T*)(&*cur);
+                        int32 off = *(int32*)(int64(cur) + offsets::Offset);
+                        if (bUseCache) cache[key] = off;
+                        return *(T*)(int64(this) + off);
+                    }
+                    cur = *(UObject**)(int64(cur) + offsets::Next);
+                }
+            }
+            klass = *(UObject**)(int64(klass) + offsets::SuperClass);
+        }
+
+        klass = this->Class;
+        while (klass) {
+            FField* fp = *(FField**)(int64(klass) + 0x50);
+            if (fp && fp->IsValid()) {
+                while (fp->IsValid()) {
+                    if (fp->ClassPointer->GetName() == "StructProperty") {
+                        FField* sc = *(FField**)(int64(*(UObject**)(int64(fp) + offsets::Class)) + 0x50);
+                        while (sc) {
+                            if (sc->GetName() == name) {
+                                return *(T*)(int64(this) + *(uint32*)(int64(fp) + 0x4C) + *(uint32*)(int64(sc) + 0x4C));
+                            }
+                            sc = sc->Next;
+                        }
+                    }
+                    if (fp->GetName() == name) {
+                        int32 off = *(int32*)(int64(fp) + 0x4C);
+                        if (bUseCache) cache[key] = off;
+                        return *(T*)(int64(this) + off);
+                    }
+                    fp = fp->Next;
+                }
+            }
+            klass = *(UObject**)(int64(klass) + offsets::SuperClass);
+        }
+
+        return *(T*)(0);
+    }
+
+    std::vector<int32> GetFunctionChildrenOffset() {
+        std::vector<int32> r;
+        UObject* children = *(UObject**)(int64(this) + offsets::Children);
+        FField* fp = *(FField**)(int64(this) + 0x50);
+        while (children) {
+            r.push_back(*(int32*)(int64(children) + offsets::Offset));
+            children = *(UObject**)(int64(children) + offsets::Next);
+        }
+        while (fp && fp->IsValid()) {
+            r.push_back(*(int32*)(int64(fp) + 0x4C));
+            fp = fp->Next;
+        }
+        return r;
+    }
+
+    template<typename T = int, int16 ReturnOffset = -1, typename... Params>
+    T Call(const std::string& name, Params... args) {
+        extern void* (*PE)(UObject*, UObject*, void*);
+        static std::map<std::string, UObject*> funcCache;
+        UObject* func = nullptr;
+        std::string key = GetName() + "::" + name;
+
+        if (funcCache.find(key) != funcCache.end()) {
+            func = funcCache[key];
+        } else {
+            func = &(this->Child<UObject>(name, true));
+            funcCache[key] = func;
+        }
+
+        if (IsBadPtr(func)) return T{};
+
+        int16 ps = *(int16*)(int64(func) + offsets::ParamsSize);
+        int16 ro = *(int16*)(int64(func) + offsets::ReturnValueOffset);
+        if (ro == -1) ro = ReturnOffset;
+
+        uint8* params = (uint8*)calloc(1, ps);
+        auto offs = func->GetFunctionChildrenOffset();
+
+        int i = 0;
+        auto fill = [&](auto& v) {
+            if (i < (int)offs.size()) {
+                memcpy(params + offs[i], &v, sizeof(v));
+            }
+            i++;
+        };
+        (fill(args), ...);
+
+        PE(this, func, params);
+        T r{};
+        if (ro > 0 && ro < ps) r = *(T*)(params + ro);
+        free(params);
+        return r;
+    }
 };
 
-// ---- GObjects ----
 struct FUObjectItem { UObject* Object; int32 Flags; int32 Cluster; int32 Serial; };
+
 struct TUObjectArray { void* Objects[9]; };
+
 struct GObjects_t {
     TUObjectArray* ObjectArray;
-    uint8  _pad[0xC];
+    uint8 _pad[0xC];
     uint32 ObjectCount;
 
     UObject* GetById(uint32 id) {
-        // UE 4.27 chunk size = 0x10000
         const uint32 chunkSize = 0x10000;
-        uint32 chunkIdx = id / chunkSize;
-        uint32 within   = id % chunkSize;
-        if (chunkIdx >= 9) return nullptr;
-        auto* chunk = (FUObjectItem*)ObjectArray->Objects[chunkIdx];
+        uint32 ci = id / chunkSize;
+        uint32 wi = id % chunkSize;
+        if (ci >= 9) return nullptr;
+        auto* chunk = (FUObjectItem*)ObjectArray->Objects[ci];
         if (!chunk) return nullptr;
-        return chunk[within].Object;
+        return chunk[wi].Object;
     }
 };
 
-// ============================================================================
-// GLOBALS
-// ============================================================================
-static uintptr_t g_base = 0;
+template<class T>
+class TArray {
+public:
+    T* Data;
+    int32 Count;
+    int32 Max;
 
-// Function pointers
-static void   (*FNameToStringFn)(FName*, FString&)          = nullptr;
-static void   (*FreeInternalFn)(void*)                       = nullptr;
-static void*  (*ReallocFn)(void*, size_t, uint32)            = nullptr;
-static void*  (*SpawnActorFn)(void*, UObject*, FVector*, FRotator*, const void*) = nullptr;
+    void Add(T in) {
+        extern void* (*ReallocFn)(void*, size_t, uint32);
+        Data = (T*)ReallocFn(Data, sizeof(T) * (Count + 1), 0);
+        Data[Count++] = in;
+        Max = Count;
+    }
+
+    void AddWithSize(size_t sz, void* elem) {
+        extern void* (*ReallocFn)(void*, size_t, uint32);
+        Data = (T*)ReallocFn(Data, sz * (Count + 1), 0);
+        memcpy((void*)((uintptr_t)Data + (sz - sizeof(T)) * Count + Count++ * sz), elem, sz);
+        Max = Count;
+    }
+
+    T& operator[](int i) { return Data[i]; }
+    const T& operator[](int i) const { return Data[i]; }
+    int MaxIndex() { return Count - 1; }
+    T* begin() { return Data; }
+    T* end() { return Data + Count; }
+};
+
+struct Struct {
+    template<typename T = UObject*>
+    T& Child(UObject* StructObj, const std::string& vname) {
+        static std::map<std::pair<UObject*, std::string>, int32> cache;
+        auto key = std::make_pair(StructObj, vname);
+        if (cache.find(key) != cache.end()) return *(T*)(int64(this) + cache[key]);
+
+        UObject* klass = StructObj;
+        while (klass) {
+            UObject* c = *(UObject**)(int64(klass) + offsets::Children);
+            if (c) {
+                while (c) {
+                    if (c->Class->GetName() == "StructProperty") {
+                        UObject* sc = *(UObject**)(int64(*(UObject**)(int64(c) + offsets::Class)) + offsets::Children);
+                        while (sc) {
+                            if (sc->GetName() == vname) {
+                                return *(T*)(int64(this) + *(uint32*)(int64(c) + offsets::Offset) + *(uint32*)(int64(sc) + offsets::Offset));
+                            }
+                            sc = *(UObject**)(int64(sc) + offsets::Next);
+                        }
+                    }
+                    if (c->GetName() == vname) {
+                        int32 off = *(int32*)(int64(c) + offsets::Offset);
+                        cache[key] = off;
+                        return *(T*)(int64(this) + off);
+                    }
+                    c = *(UObject**)(int64(c) + offsets::Next);
+                }
+            }
+            klass = *(UObject**)(int64(klass) + offsets::SuperClass);
+        }
+        return *(T*)(0);
+    }
+};
+
+static uintptr_t g_base = 0;
+static void (*FNameToStringFn)(FName*, FString&) = nullptr;
+static void (*FreeInternalFn)(void*) = nullptr;
+static void* (*ReallocFn)(void*, size_t, uint32) = nullptr;
+static void* (*SpawnActorFn)(void*, UObject*, FVector*, FRotator*, const SpawnActorParams&) = nullptr;
 static UObject* (*StaticFindObjectFn)(UObject*, void*, const wchar_t*, bool) = nullptr;
 static UObject* (*StaticLoadObjectFn)(UObject*, UObject*, const wchar_t*, const wchar_t*, int, void*, bool) = nullptr;
-
-// ProcessEvent
+static void* (*PE)(UObject*, UObject*, void*) = nullptr;
 static void* (*orig_ProcessEvent)(UObject*, UObject*, void*) = nullptr;
 
-// Game state
 static UObject* PlayerController = nullptr;
-static UObject* GameState        = nullptr;
-static UObject* GameMode         = nullptr;
-static UObject* World            = nullptr;
-static UObject* Pawn             = nullptr;
-static UObject* GameViewport     = nullptr;
-static UObject* CheatManager     = nullptr;
-static UObject* GameStatics      = nullptr;
-static UObject* kismetStringLib  = nullptr;
-static UObject* kismetSystemLib  = nullptr;
-static GObjects_t* GObjects      = nullptr;
+static UObject* GameState = nullptr;
+static UObject* GameMode = nullptr;
+static UObject* World = nullptr;
+static UObject* Pawn = nullptr;
+static UObject* GameViewport = nullptr;
+static UObject* CheatManager = nullptr;
+static UObject* GameStatics = nullptr;
+static UObject* kismetMathLib = nullptr;
+static UObject* kismetStringLib = nullptr;
+static UObject* kismetSystemLib = nullptr;
+static UObject* kismetGuidLib = nullptr;
+static UObject* DataTableFunctionLibrary = nullptr;
+static UObject* WorldInventory = nullptr;
+static UObject* Quickbars = nullptr;
+static UObject* WorldSettings = nullptr;
+static UObject* EditToolItem = nullptr;
+static UObject* Wall = nullptr;
+static UObject* Floor = nullptr;
+static UObject* Stairs = nullptr;
+static UObject* Roof = nullptr;
+static std::vector<UObject*> CharacterPartsArray;
 
-// Flags
-static bool bInFrontend        = true;
-static bool bPressedPlay       = false;
-static bool bLoadedInMatch     = false;
+static bool bInFrontend = true;
+static bool bPressedPlay = false;
+static bool bLoadedInMatch = false;
 static bool bDroppedFromAircraft = false;
+static bool bIsEmoting = false;
+static bool g_bIsVehicleVersion = false;
+static bool l_bIsOutsideSafeZone = false;
 
-// ============================================================================
-// OBJECT FINDERS
-// ============================================================================
-static UObject* FindObject(const wchar_t* path, bool bLoad = false, bool bAnyPkg = false) {
-    if (!StaticFindObjectFn) return nullptr;
-    UObject* obj = StaticFindObjectFn(nullptr, bAnyPkg ? (void*)-1 : nullptr, path, false);
-    if (!obj && bLoad && StaticLoadObjectFn) {
-        obj = StaticLoadObjectFn(nullptr, nullptr, path, nullptr, 0, nullptr, true);
+static FVector EditComponentLocation;
+static FRotator EditComponentRotation;
+
+static inline bool IsBadPtr(const void* p) {
+    if (!p) return true;
+    return (uintptr_t)p < 0x10000 || (uintptr_t)p > 0x7FFFFFFFFFFF;
+}
+
+namespace Lib {
+    static uintptr_t Find(const char* name) {
+        FILE* f = fopen("/proc/self/maps", "r");
+        if (!f) return 0;
+        char line[512];
+        uintptr_t base = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, name)) { base = strtoul(line, nullptr, 16); break; }
+        }
+        fclose(f);
+        return base;
     }
-    return obj;
+
+    static uintptr_t WaitFor(const char* name, int t = 60) {
+        for (int i = 0; i < t * 10; ++i) {
+            uintptr_t b = Find(name);
+            if (b) return b;
+            usleep(100000);
+        }
+        return 0;
+    }
 }
 
 static std::wstring ToWide(const std::string& s) {
     std::wstring w;
-    w.reserve(s.size());
     for (char c : s) w.push_back((wchar_t)c);
     return w;
 }
 
-static std::string ToNarrow(const wchar_t* w) {
-    if (!w) return {};
-    std::string s;
-    while (*w) { s.push_back(*w < 128 ? (char)*w : '?'); ++w; }
-    return s;
-}
-
-// ============================================================================
-// UObject::Call — via ProcessEvent
-// ============================================================================
-template<typename Ret = void, typename... Args>
-static Ret UCall(UObject* obj, const char* funcName, Args... args) {
-    if (!obj || !orig_ProcessEvent) return Ret{};
-
-    // Find the function
-    UObject* func = nullptr;
-    UObject* klass = obj->Class;
-    while (klass && !func) {
-        UObject* child = *(UObject**)((uintptr_t)klass + offsets::Children);
-        while (child) {
-            std::string n = child->GetName();
-            if (n == funcName) { func = child; break; }
-            child = *(UObject**)((uintptr_t)child + offsets::Next);
-        }
-        klass = *(UObject**)((uintptr_t)klass + offsets::SuperClass);
+static UObject* FindObject(const wchar_t* path, bool bLoad = false, bool bAny = false) {
+    if (!StaticFindObjectFn) return nullptr;
+    UObject* o = StaticFindObjectFn(nullptr, bAny ? (void*)-1 : nullptr, path, false);
+    if (!o && bLoad && StaticLoadObjectFn) {
+        o = StaticLoadObjectFn(nullptr, nullptr, path, nullptr, 0, nullptr, true);
     }
-    if (!func) return Ret{};
-
-    // Get params size and offsets
-    int16_t paramsSize = *(int16_t*)((uintptr_t)func + offsets::ParamsSize);
-    int16_t retOffset  = *(int16_t*)((uintptr_t)func + offsets::ReturnValueOffset);
-
-    uint8_t* params = (uint8_t*)calloc(1, paramsSize);
-
-    // Fill args sequentially
-    int idx = 0;
-    auto fill = [&](auto&& v) {
-        // Each arg offset — we approximate as sizeof-aligned
-        // For accurate placement, need to walk Function->Children offsets
-        // Simplified: assume first args are at fixed offsets
-        memcpy(params + (idx == 0 ? 0 : 0) + (idx * 8), &v, sizeof(v));
-        idx++;
-    };
-    (void)fill; // reserved for future arg mapping
-
-    orig_ProcessEvent(obj, func, params);
-    Ret r{};
-    if (retOffset > 0) r = *(Ret*)(params + retOffset);
-    free(params);
-    return r;
+    return o;
 }
 
-// ============================================================================
-// CURL HOOK — URL redirect + SSL bypass
-// ============================================================================
+static UObject* SpawnActorEasy(UObject* klass, FVector loc, FRotator rot) {
+    if (!klass) return nullptr;
+    SpawnActorParams p{};
+    return SpawnActorFn((void*)World, klass, &loc, &rot, p);
+}
+
+namespace Athena {
+
+void SpawnPawn();
+void ShowSkin();
+void DestroyLods();
+void DropLoadingScreen();
+void AddToInventory(UObject* item, int count, char index, int slot);
+void InitializeInventory();
+void OnServerExecuteInventoryItem(FGuid guid);
+void OnServerExecuteInventoryWeapon(UObject* weapon);
+void GrantDefaultAbilities();
+void InventoryUpdate();
+void OnAircraftJump();
+void RemoveNetDebugUI();
+void TeleportToSpawnIsland();
+void ConsoleKey();
+void CheatScript(const char* script);
+void ServerHandlePickup(UObject* pickup);
+void FixBuildingFoundations();
+void Fixbus();
+void Loot(UObject* actor);
+void OnServerCreateBuildingActor(void* params);
+void OnBeginEditActor(UObject* piece);
+void OnFinishEditActor(UObject* actor, UObject* newClass, int rot, bool mirrored, void* params);
+void SpawnPickup(UObject* def, int count, FVector loc, bool toss = true);
+void GrantAbility(UObject* klass);
+void SpawnBuildPreviews();
+void SpawnFloorLoot();
+void GrantEffect(UObject* effect, float level);
+void PlayEmoteItem(UObject* item);
+void Tick();
+void OnExitVehicle();
+void DropInventoryItem(FGuid guid, int count, bool checkCount = true);
+
+struct LootData { UObject* ItemDefinition; int Count; };
+std::vector<LootData> PickLootDrops(std::string category);
+
+}
+
+void Athena::SpawnPawn() {
+    Pawn = SpawnActorEasy(FindObject(L"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C"), FVector{0, 0, 5000}, FRotator{0, 0, 0});
+    if (PlayerController && Pawn) PlayerController->Call("Possess", Pawn);
+}
+
+void Athena::ShowSkin() {
+    static UObject* Hero = nullptr;
+
+    if (auto t = &PlayerController->Child<UObject*>("MyPlayerInfo")->Child<UObject*>("AthenaMenuHeroDef"); !IsBadPtr(t)) Hero = *t;
+    if (auto t = &PlayerController->Child<UObject*>("MyPlayerInfo")->Child<UObject*>("TempAthenaMenuHeroInstance"); !IsBadPtr(t)) Hero = *t;
+    if (!Hero) return;
+
+    static auto charParts = Hero->Child<TArray<UObject*>>("CharacterParts");
+
+    if (CharacterPartsArray.size() == 0) {
+        for (UObject* cp : charParts) CharacterPartsArray.push_back(cp);
+    }
+
+    for (UObject* cp : CharacterPartsArray) {
+        Pawn->Call("ServerChoosePart", cp->Child<char>("CharacterPartType"), cp);
+    }
+
+    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterParts");
+    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterData");
+}
+
+void Athena::DestroyLods() {
+    CheatManager->Call("DestroyAll", FindObject(L"/Script/FortniteGame.FortHLODSMActor"));
+}
+
+void Athena::DropLoadingScreen() {
+    GameState->Child<char>("GamePhase") = 2;
+    GameState->Call("OnRep_GamePhase", (char)0);
+    PlayerController->Call("ServerReadyToStartMatch");
+
+    PlayerController->Child<bool>("bHasServerFinishedLoading") = true;
+    PlayerController->Child<bool>("bHasClientFinishedLoading") = true;
+
+    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_SquadId");
+    PlayerController->Child<UObject*>("PlayerState")->Child<char>("TeamIndex") = (char)2;
+    PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_TeamIndex");
+
+    if (auto m = &GameState->Child<FSlateBrush>("MinimapNextCircleBrush"); !IsBadPtr(m)) *m = {};
+    if (auto m = &GameState->Child<FSlateBrush>("FullMapNextCircleBrush"); !IsBadPtr(m)) *m = {};
+    if (auto m = &GameState->Child<FSlateBrush>("MinimapSafeZoneBrush"); !IsBadPtr(m)) *m = {};
+    if (auto m = &GameState->Child<FSlateBrush>("MinimapCircleBrush"); !IsBadPtr(m)) *m = {};
+    if (auto m = &GameState->Child<FSlateBrush>("FullMapCircleBrush"); !IsBadPtr(m)) *m = {};
+    if (auto m = &GameState->Child<FSlateBrush>("AircraftPathBrush"); !IsBadPtr(m)) m->ObjectResource = FindObject(L"/Game/Athena/HUD/MiniMap/M_BusPath.M_BusPath");
+    if (auto m = &GameState->Child<FSlateBrush>("MinimapBackgroundBrush"); !IsBadPtr(m)) {
+        auto ws = &WorldSettings->Child<FSlateBrush>("AthenaMapImage");
+        m->ObjectResource = IsBadPtr(ws) ? nullptr : ws->ObjectResource;
+    }
+    if (auto m = &GameState->Child<UObject*>("MinimapMaterial"); !IsBadPtr(m)) {
+        UObject* apollo = FindObject(L"/Game/Athena/Apollo/Maps/UI/M_MiniMapApollo.M_MiniMapApollo");
+        *m = apollo ? apollo : FindObject(L"/Game/Athena/HUD/MiniMap/M_MiniMapAthena.M_MiniMapAthena");
+    }
+
+    UObject* playlist = FindObject(L"/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2");
+    if (!playlist) playlist = FindObject(L"/Game/Athena/Playlists/Playground/Playlist_Playground.Playlist_Playground");
+    if (playlist) {
+        playlist->Child<bool>("bIsLargeTeamGame") = true;
+        if (auto h = &playlist->Child<FGameplayTagContainer>("HUDElementsToHide"); !IsBadPtr(h)) {
+            auto* arr = (TArray<FName>*)h;
+            FName tag = kismetStringLib->Call<FName>("Conv_StringToName", FString(L"HUD.Athena.PlayersLeft"));
+            arr->Add(tag);
+        }
+
+        if (auto bp = &GameState->Child<UObject*>("BasePlaylist"); !IsBadPtr(bp)) *bp = playlist;
+        if (auto op = &GameState->Child<UObject*>("OverridePlaylist"); !IsBadPtr(op)) *op = playlist;
+        if (auto cp = &GameState->Child<UObject*>("CurrentPlaylistData"); !IsBadPtr(cp)) *cp = playlist;
+        GameState->Call("OnRep_CurrentPlaylistData");
+        GameState->Call("OnRep_CurrentPlaylistInfo");
+    }
+
+    if (auto bus = FindObject(L"BBID_WinterBus", false, true); bus) {
+        PlayerController->Child<UObject*>("BattleBus") = bus;
+    }
+
+    if (Pawn) Pawn->Call("OnRep_CustomizationLoadout");
+}
+
+void Athena::InventoryUpdate() {
+    PlayerController->Call("HandleWorldInventoryLocalUpdate");
+    if (WorldInventory) WorldInventory->Call("HandleInventoryLocalUpdate");
+    PlayerController->Call("OnRep_QuickBar");
+    if (Quickbars) {
+        Quickbars->Call("OnRep_SecondaryQuickBar");
+        Quickbars->Call("OnRep_PrimaryQuickBar");
+    }
+    PlayerController->Call("ClientForceUpdateQuickbar", (char)0);
+    PlayerController->Call("ClientForceUpdateQuickbar", (char)1);
+}
+
+void Athena::AddToInventory(UObject* item, int count, char index, int slot) {
+    if (IsBadPtr(item)) return;
+    if (!WorldInventory || !Quickbars) return;
+
+    UObject* itemInstance = item->Call<UObject*>("CreateTemporaryItemInstanceBP", count, 1);
+    if (!itemInstance) return;
+
+    WorldInventory->Child<TArray<UObject*>>("ItemInstances").Add(itemInstance);
+
+    UObject* entryStruct = FindObject(L"/Script/FortniteGame.FortItemEntry");
+    int32 structSize = *(int32*)(int64(entryStruct) + offsets::StructSize);
+    WorldInventory->Child<TArray<char>>("ReplicatedEntries").AddWithSize(structSize, &itemInstance->Child<void*>("ItemEntry"));
+
+    itemInstance->Call("SetOwningControllerForTemporaryItem", PlayerController);
+
+    FGuid guid = itemInstance->Call<FGuid>("GetItemGuid");
+    Quickbars->Call("ServerAddItemInternal", guid, index, slot);
+}
+
+void Athena::InitializeInventory() {
+    WorldInventory = PlayerController->Child<UObject*>("WorldInventory");
+
+    if (auto qb = &PlayerController->Child<UObject*>("ClientQuickBars"); !IsBadPtr(qb)) {
+        Quickbars = *qb;
+    } else {
+        Quickbars = SpawnActorEasy(FindObject(L"/Script/FortniteGame.FortQuickBars"), FVector{0, 0, 0}, FRotator{0, 0, 0});
+        PlayerController->Child<UObject*>("QuickBars") = Quickbars;
+    }
+
+    Quickbars->Call("SetOwner", PlayerController);
+    WorldInventory->Call("SetOwner", PlayerController);
+
+    auto startingItems = GameMode->Child<TArray<FItemAndCount>>("StartingItems");
+
+    UObject* pickaxeWeapon = PlayerController->Child<UObject*>("Pickaxe")->Child<UObject*>("WeaponDefinition");
+    AddToInventory(pickaxeWeapon, 1, 0, 0);
+    if (startingItems.Count > 0) AddToInventory(startingItems[0].Item, 1, 1, 0);
+    if (startingItems.Count > 1) AddToInventory(startingItems[1].Item, 1, 1, 1);
+    if (startingItems.Count > 2) AddToInventory(startingItems[2].Item, 1, 1, 2);
+    if (startingItems.Count > 3) AddToInventory(startingItems[3].Item, 1, 1, 3);
+    if (startingItems.Count > 5) AddToInventory(startingItems[5].Item, 999, 3, 0);
+
+    AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AthenaAmmoDataShells.AthenaAmmoDataShells"), 999, 3, 0);
+    AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium"), 999, 3, 0);
+    AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight"), 999, 3, 0);
+    AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsHeavy.AthenaAmmoDataBulletsHeavy"), 999, 3, 0);
+    AddToInventory(FindObject(L"/Game/Athena/Items/Ammo/AmmoDataRockets.AmmoDataRockets"), 999, 3, 0);
+    AddToInventory(FindObject(L"/Game/Athena/Items/Traps/TID_Floor_Player_Launch_Pad_Athena.TID_Floor_Player_Launch_Pad_Athena"), 1, 3, 0);
+    AddToInventory(FindObject(L"/Game/Athena/Items/Traps/TID_Floor_Spikes_Athena_R_T03.TID_Floor_Spikes_Athena_R_T03"), 1, 3, 0);
+
+    if (startingItems.Count > 4) EditToolItem = startingItems[4].Item;
+
+    FName infAmmo = kismetStringLib->Call<FName>("Conv_StringToName", FString(L"bInfiniteAmmo"));
+    FName buildFree = kismetStringLib->Call<FName>("Conv_StringToName", FString(L"bBuildFree"));
+    kismetSystemLib->Call("SetBoolPropertyByName", PlayerController, infAmmo, true);
+    kismetSystemLib->Call("SetBoolPropertyByName", PlayerController, buildFree, true);
+
+    InventoryUpdate();
+}
+
+void Athena::OnServerExecuteInventoryItem(FGuid guid) {
+    auto instances = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
+    for (UObject* inst : instances) {
+        if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", inst->Call<FGuid>("GetItemGuid"), guid)) {
+            UObject* def = inst->Call<UObject*>("GetItemDefinitionBP");
+
+            if (def->IsA(FindObject(L"/Script/FortniteGame.FortTrapItemDefinition"))) {
+                Pawn->Call<bool>("PickUpActor", nullptr, def);
+                Pawn->Child<UObject*>("CurrentWeapon")->Child<FGuid>("ItemEntryGuid") = inst->Call<FGuid>("GetItemGuid");
+            }
+            else if (def->IsA(FindObject(L"AthenaGadgetItemDefinition", false, true)) ||
+                     def->IsA(FindObject(L"FortGadgetItemDefinition", false, true))) {
+                if (def->GetName() == "AGID_CarminePack") {
+                    UObject* head = FindObject(L"Dev_TestAsset_Head_M_XL", false, true);
+                    UObject* body = FindObject(L"Dev_TestAsset_Body_M_XL", false, true);
+                    if (head) Pawn->Call("ServerChoosePart", head->Child<char>("CharacterPartType"), head);
+                    if (body) Pawn->Call("ServerChoosePart", body->Child<char>("CharacterPartType"), body);
+                }
+                PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterParts");
+                PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterData");
+
+                UObject* abilitySet = kismetSystemLib->Call<UObject*>("Conv_SoftObjectReferenceToObject", def->Child<SoftObjectPtr>("AbilitySet"));
+                if (abilitySet) {
+                    for (auto* a : abilitySet->Child<TArray<UObject*>>("GameplayAbilities")) Athena::GrantAbility(a);
+                    for (auto& e : abilitySet->Child<TArray<GEHard>>("GrantedGameplayEffects")) Athena::GrantEffect(e.Effect, e.Level);
+                }
+
+                Pawn->Child<UObject*>("Mesh")->Call("SetAnimInstanceClass", def->Child<UObject*>("AnimBPOverride"));
+                Pawn->Call<UObject*>("EquipWeaponDefinition", def->Call<UObject*>("GetDecoItemDefinition"), inst->Call<FGuid>("GetItemGuid"));
+            }
+            else {
+                Pawn->Call<UObject*>("EquipWeaponDefinition", def, inst->Call<FGuid>("GetItemGuid"));
+            }
+        }
+    }
+}
+
+void Athena::OnServerExecuteInventoryWeapon(UObject* weapon) {
+    if (!weapon) return;
+    FGuid guid = weapon->Child<FGuid>("ItemEntryGuid");
+    auto instances = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
+    for (UObject* inst : instances) {
+        if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", inst->Call<FGuid>("GetItemGuid"), guid)) {
+            Pawn->Call<UObject*>("EquipWeaponDefinition", inst->Call<UObject*>("GetItemDefinitionBP"), inst->Call<FGuid>("GetItemGuid"));
+        }
+    }
+}
+
+void Athena::RemoveNetDebugUI() {
+    UObject* wbLib = FindObject(L"/Script/UMG.Default__WidgetBlueprintLibrary");
+    if (!wbLib) return;
+    auto arr = wbLib->Call<TArray<UObject*>, 0x8>("GetAllWidgetsOfClass", World, TArray<UObject*>{}, FindObject(L"/Game/Athena/HUD/NetDebugUI.NetDebugUI_C"), false);
+    if (arr.Count > 0 && arr[0]) arr[0]->Call("RemoveFromViewport");
+}
+
+void Athena::TeleportToSpawnIsland() {
+    UObject* cls = FindObject(L"/Script/FortniteGame.FortPlayerStartWarmup");
+    if (!cls) return;
+    auto arr = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, cls, TArray<UObject*>{});
+    if (arr.Count == 0) return;
+    int idx = kismetMathLib->Call<int>("RandomIntegerInRange", 0, arr.MaxIndex());
+    FVector loc = arr[idx]->Call<FVector>("K2_GetActorLocation");
+    Pawn->Call("K2_TeleportTo", loc, FRotator{0, 0, 0});
+}
+
+void Athena::ConsoleKey() {
+    UObject* inputSettings = FindObject(L"/Script/Engine.Default__InputSettings");
+    if (!inputSettings) return;
+    FName f6 = kismetStringLib->Call<FName>("Conv_StringToName", FString(L"F6"));
+    auto& keys = inputSettings->Child<TArray<FKey>>("ConsoleKeys");
+    if (keys.Count > 1) keys[1] = FKey{f6};
+}
+
+void Athena::CheatScript(const char* script) {
+    std::string s = script;
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+
+    if (s.find("spawnrift") != std::string::npos) {
+        if (!SpawnActorEasy(FindObject(L"/Game/Athena/Items/Consumables/RiftItem/BGA_RiftPortal_Item_Athena.BGA_RiftPortal_Item_Athena_C"), Pawn->Call<FVector>("K2_GetActorLocation"), FRotator{0, 0, 0})) {
+            GameMode->Call("Say", FString(L"Rifts unavailable in this version."));
+        }
+    }
+    else if (s.find("spawnweapon") != std::string::npos) {
+        std::string wn = s.substr(s.find(" ") + 1);
+        UObject* def = FindObject(ToWide(wn).c_str(), false, true);
+        if (def) SpawnPickup(def, 1, Pawn->Call<FVector>("K2_GetActorLocation"));
+    }
+    else if (s.find("startevent") != std::string::npos) {
+        bool started = false;
+        UObject* cattus = FindObject(L"/Game/Athena/Maps/Athena_POI_Foundations.Athena_POI_Foundations.PersistentLevel.BP_CattusDoggus_Scripting_2");
+        UObject* nightNight = FindObject(L"/Game/Athena/Maps/Athena_POI_Foundations.Athena_POI_Foundations.PersistentLevel.BP_NightNight_Scripting_2");
+
+        if (cattus) { cattus->Call<bool>("LoadCattusLevel"); cattus->Call("startevent"); started = true; }
+        else if (nightNight) { nightNight->Call<bool>("LoadNightNightLevel"); nightNight->Call("startevent"); started = true; }
+        if (started) GameMode->Call("Say", FString(L"The event started successfully."));
+    }
+}
+
+void Athena::ServerHandlePickup(UObject* pickup) {
+    if (!pickup) return;
+    UObject* def = pickup->Child<UObject*>("ItemDefinition");
+    int count = pickup->Child<int>("Count");
+
+    UObject* enumE = FindObject(L"EFortItemType", false, true);
+    int idxAmmo = enumE ? enumE->EnumIndex("Ammo") : 0;
+    int idxTrap = enumE ? enumE->EnumIndex("Trap") : 0;
+    int idxRes = enumE ? enumE->EnumIndex("WorldResource") : 0;
+    char itemType = def->Child<char>("ItemType");
+
+    if (itemType == (char)idxAmmo || itemType == (char)idxTrap || itemType == (char)idxRes) {
+        auto instances = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
+        for (int i = 0; i < instances.Count; ++i) {
+            if (instances[i]->Call<UObject*>("GetItemDefinitionBP") == def) {
+                int sum = instances[i]->Child<int>("Count") + count;
+                int maxStack = def->Child<int>("MaxStackSize");
+                if (sum <= maxStack) {
+                    AddToInventory(def, sum, 0, 10);
+                } else {
+                    AddToInventory(def, maxStack, 0, 10);
+                    SpawnPickup(def, sum - maxStack, Pawn->Call<FVector>("K2_GetActorLocation"));
+                }
+                extern void (*GenericArray_RemoveFn)(void*, void*, int);
+                void* propInst = nullptr;
+                void* propRep = nullptr;
+                GenericArray_RemoveFn(&WorldInventory->Child<TArray<UObject*>>("ItemInstances"), propInst, i);
+                GenericArray_RemoveFn(&WorldInventory->Child<TArray<char>>("ReplicatedEntries"), propRep, i);
+                InventoryUpdate();
+                pickup->Call("K2_DestroyActor");
+                return;
+            }
+        }
+        AddToInventory(def, count, 3, 10);
+        InventoryUpdate();
+        pickup->Call("K2_DestroyActor");
+        return;
+    }
+
+    UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
+    UObject* localPlayers_0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
+    UObject* invCtx = bpcLib ? bpcLib->Call<UObject*>("GetContext", localPlayers_0, FindObject(L"/Script/FortniteUI.FortInventoryContext")) : nullptr;
+
+    if (invCtx) {
+        for (int i = 0; i < 6; ++i) {
+            if (!invCtx->Call<UObject*>("GetQuickBarSlottedItem", (char)0, i)) {
+                AddToInventory(def, count, 0, i);
+                InventoryUpdate();
+                pickup->Call("K2_DestroyActor");
+                return;
+            }
+        }
+
+        int focused = (&Quickbars->Child<Struct>("PrimaryQuickBar"))->Child<int>(FindObject(L"/Script/FortniteGame.QuickBar"), "CurrentFocusedSlot");
+        if (focused == 0) return;
+        UObject* inst = invCtx->Call<UObject*>("GetQuickBarSlottedItem", (char)0, focused);
+        if (!inst) return;
+        DropInventoryItem(inst->Call<FGuid>("GetItemGuid"), inst->Child<int>("Count"), false);
+        AddToInventory(def, count, 0, focused);
+        InventoryUpdate();
+        Quickbars->Call("ServerActivateSlotInternal", (char)0, focused, 0.f, false);
+        pickup->Call("K2_DestroyActor");
+    }
+}
+
+void Athena::FixBuildingFoundations() {
+    std::string v = "4.27";
+    if (v.find("6.") == std::string::npos && v.find("7.") == std::string::npos && v.find("8.") == std::string::npos) return;
+    auto arr = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, FindObject(L"/Script/FortniteGame.BuildingFoundation"), TArray<UObject*>{});
+    for (UObject* b : arr) b->Child<char>("DynamicFoundationType") = 0;
+}
+
+void Athena::Fixbus() {
+    if (!GameState) return;
+    GameState->Child<char>("GamePhase") = 3;
+    GameState->Call("OnRep_GamePhase", (char)2);
+    if (!Pawn) return;
+    Pawn->Call<bool>("K2_TeleportTo", FVector{0, 0, 22500}, FRotator{0, 0, 0});
+    Pawn->Child<bool>("bIsSkydiving") = true;
+    Pawn->Call("OnRep_IsSkydiving", false);
+}
+
+void Athena::Loot(UObject* actor) {
+    if (!actor) return;
+    std::string tier = "None";
+    UObject* bcCls = FindObject(L"BuildingContainer", false, true);
+    UObject* sdCls = FindObject(L"FortAthenaSupplyDrop", false, true);
+
+    if (bcCls && actor->IsChild(bcCls)) tier = actor->Child<FName>("SearchLootTierGroup").ToString();
+    else if (sdCls && actor->IsChild(sdCls)) tier = actor->Child<FName>("LootTableName", false, false).ToString();
+
+    if (tier.find("None") != std::string::npos) return;
+    if (tier.find("Athena") == std::string::npos) {
+        auto p = tier.find("_");
+        if (p != std::string::npos) tier.replace(p, 1, "_Athena");
+    }
+
+    if (bcCls && actor->IsChild(bcCls)) {
+        if (actor->Child<float>("TimeUntilLootRegenerates") == 0) actor->Child<float>("TimeUntilLootRegenerates") = -1;
+        else return;
+    }
+
+    auto results = PickLootDrops(tier);
+    for (auto& r : results) {
+        FVector right = kismetMathLib->Call<FVector>("GetRightVector", actor->Call<FRotator>("K2_GetActorRotation"));
+        right.X *= 64; right.Y *= 64;
+        FVector loc = kismetMathLib->Call<FVector>("Add_VectorVector", actor->Call<FVector>("K2_GetActorLocation"), right);
+        SpawnPickup(r.ItemDefinition, r.Count, loc);
+    }
+
+    if (bcCls && actor->IsChild(bcCls)) {
+        FName n = kismetStringLib->Call<FName>("Conv_StringToName", FString(L"bAlreadySearched"));
+        kismetSystemLib->Call("SetBoolPropertyByName", actor, n, true);
+        actor->Call("OnRep_bAlreadySearched");
+    }
+}
+
+void Athena::OnServerCreateBuildingActor(void* params) {
+    struct OldP { UObject* Class; uint8 _pad[0x8]; FVector Loc; FRotator Rot; };
+    struct NewP { int32 ClassHandle; FVector Loc; FRotator Rot; uint8 _pad[0xC]; UObject* Class; };
+
+    UObject* cls = nullptr;
+    FVector loc; FRotator rot;
+
+    auto* serverCreateFn = FindObject(L"/Script/FortniteGame.FortPlayerController.ServerCreateBuildingActor");
+    if (serverCreateFn && serverCreateFn->GetFunctionChildrenOffset().size() == 1) {
+        auto p = *(NewP*)params;
+        cls = p.Class; loc = p.Loc; rot = p.Rot;
+    } else {
+        auto p = *(OldP*)params;
+        cls = p.Class; loc = p.Loc; rot = p.Rot;
+    }
+
+    UObject* actor = SpawnActorEasy(cls, loc, rot);
+    if (!actor) return;
+    auto* initFn = FindObject(L"/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
+    if (initFn && initFn->GetFunctionChildrenOffset().size() == 3) {
+        actor->Call("InitializeKismetSpawnedBuildingActor", actor, PlayerController, true);
+    } else {
+        actor->Call("InitializeKismetSpawnedBuildingActor", actor, PlayerController);
+    }
+}
+
+void Athena::OnBeginEditActor(UObject* piece) {
+    if (!EditToolItem) return;
+    UObject* temp = EditToolItem->Call<UObject*>("CreateTemporaryItemInstanceBP", 1, 1);
+    if (!temp) return;
+    UObject* editActor = Pawn->Call<UObject*>("EquipWeaponDefinition", EditToolItem, temp->Call<FGuid>("GetItemGuid"));
+    if (!editActor) return;
+    editActor->Child<UObject*>("EditActor") = piece;
+    editActor->Call("OnRep_EditActor");
+}
+
+void Athena::OnFinishEditActor(UObject* actor, UObject* newClass, int rotIter, bool mirrored, void* params) {
+    struct FP { UObject* BuildingActor; UObject* NewClass; int8 Rot; bool Mir; };
+    auto fp = *(FP*)params;
+
+    actor->Child<bool>("bPlayDestructionEffects") = false;
+    actor->Call("SetActorScale3D", FVector{0, 0, 0});
+    actor->Call("K2_DestroyActor");
+
+    UObject* edited = SpawnActorEasy(newClass, EditComponentLocation, EditComponentRotation);
+    if (!edited) return;
+
+    auto* editFn = FindObject(L"/Script/FortniteGame.FortPlayerController.ServerEditBuildingActor");
+    if (editFn) {
+        auto offs = editFn->GetFunctionChildrenOffset();
+        if (offs.size() > 3 && offs[3] != 0x14 && offs[3] > -1) {
+            edited->Call("SetMirrored", fp.Mir);
+        } else {
+            edited->Call("SetMirrored", mirrored);
+        }
+    } else {
+        edited->Call("SetMirrored", mirrored);
+    }
+
+    auto* initFn = FindObject(L"/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
+    if (initFn && initFn->GetFunctionChildrenOffset().size() == 3) {
+        edited->Call("InitializeKismetSpawnedBuildingActor", edited, PlayerController, true);
+    } else {
+        edited->Call("InitializeKismetSpawnedBuildingActor", edited, PlayerController);
+    }
+}
+
+void Athena::SpawnPickup(UObject* def, int count, FVector loc, bool toss) {
+    if (!def) return;
+    UObject* pickup = SpawnActorEasy(FindObject(L"/Script/FortniteGame.FortPickupAthena"), loc, FRotator{0, 0, 0});
+    if (!pickup) return;
+    pickup->Child<UObject*>("ItemDefinition") = def;
+    pickup->Child<int>("Count") = count;
+    pickup->Call("OnRep_PrimaryPickupItemEntry");
+    pickup->Call("TossPickup", loc, Pawn, 1, toss);
+}
+
+void Athena::GrantEffect(UObject* effect, float level) {
+    if (!effect || !Pawn) return;
+    UObject* asc = Pawn->Child<UObject*>("AbilitySystemComponent");
+    if (!asc) return;
+    FGameplayEffectContextHandle ctx{};
+    asc->Call<FActiveGameplayEffectHandle>("BP_ApplyGameplayEffectToSelf", effect, level, ctx);
+}
+
+void Athena::GrantAbility(UObject* klass) {
+    if (!klass || !Pawn) return;
+    UObject* ge = FindObject(L"/Game/Athena/Items/Consumables/PurpleStuff/GE_Athena_PurpleStuff.GE_Athena_PurpleStuff_C");
+    if (!ge) ge = FindObject(L"/Game/Athena/Items/Consumables/PurpleStuff/GE_Athena_PurpleStuff_Health.GE_Athena_PurpleStuff_Health_C");
+    if (!ge) return;
+
+    UObject* defUI = FindObject(L"/Script/FortniteGame.Default__FortAbilitySystemUI");
+    if (!defUI) return;
+    UObject* defEffect = defUI->Call<UObject*>("GetDefaultObjectOfGameplayEffectType", ge);
+    if (!defEffect) return;
+
+    auto& abilities = defEffect->Child<TArray<FGameplayAbilitySpecDef>>("GrantedAbilities");
+    if (abilities.Count > 0) abilities[0].Ability = klass;
+    defEffect->Child<char>("DurationPolicy") = 1;
+
+    UObject* asc = Pawn->Child<UObject*>("AbilitySystemComponent");
+    if (!asc) return;
+    FGameplayEffectContextHandle ctx{};
+    asc->Call<FActiveGameplayEffectHandle>("BP_ApplyGameplayEffectToSelf", ge, 1.f, ctx);
+}
+
+void Athena::GrantDefaultAbilities() {
+    GrantAbility(FindObject(L"/Script/FortniteGame.FortGameplayAbility_Sprint"));
+    GrantAbility(FindObject(L"/Script/FortniteGame.FortGameplayAbility_Jump"));
+    GrantAbility(FindObject(L"/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractUse.GA_DefaultPlayer_InteractUse_C"));
+    GrantAbility(FindObject(L"/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractSearch.GA_DefaultPlayer_InteractSearch_C"));
+    GrantAbility(FindObject(L"/Game/Athena/DrivableVehicles/GA_AthenaEnterVehicle.GA_AthenaEnterVehicle_C"));
+    GrantAbility(FindObject(L"/Game/Athena/DrivableVehicles/GA_AthenaExitVehicle.GA_AthenaExitVehicle_C"));
+    GrantAbility(FindObject(L"/Game/Athena/DrivableVehicles/GA_AthenaInVehicle.GA_AthenaInVehicle_C"));
+    GrantAbility(FindObject(L"/Game/Athena/Items/ForagedItems/Rift/GA_Rift_Athena_Skydive.GA_Rift_Athena_Skydive_C"));
+    GrantAbility(FindObject(L"/Game/Athena/Environments/Blueprints/SurfaceEffects/GAB_SurfaceChange.GAB_SurfaceChange_C"));
+}
+
+void Athena::OnAircraftJump() {
+    FVector loc = PlayerController->Call<FVector>("GetFocalLocation");
+    FRotator rot = PlayerController->Call<FRotator>("GetControlRotation");
+    rot.Pitch = 0; rot.Roll = 0;
+
+    Pawn = SpawnActorEasy(FindObject(L"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C"), loc, rot);
+    if (!Pawn) return;
+    PlayerController->Call("Possess", Pawn);
+    Pawn->Call("OnRep_CustomizationLoadout");
+    ShowSkin();
+    bDroppedFromAircraft = true;
+
+    UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
+    if (!bpcLib) return;
+    UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
+    UObject* invCtx = bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext"));
+    if (!invCtx) return;
+    UObject* pickaxe = invCtx->Call<UObject*>("GetQuickBarSlottedItem", (char)0, 0);
+    if (pickaxe) Pawn->Call<UObject*>("EquipWeaponDefinition", pickaxe->Call<UObject*>("GetItemDefinitionBP"), pickaxe->Call<FGuid>("GetItemGuid"));
+}
+
+std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
+    std::vector<LootData> ret;
+    UObject* ltd = FindObject(L"/Game/Items/Datatables/AthenaLootTierData_Client.AthenaLootTierData_Client", true);
+    UObject* lpt = FindObject(L"/Game/Items/Datatables/AthenaLootPackages_Client.AthenaLootPackages_Client", true);
+    if (!ltd || !lpt) return ret;
+
+    auto names = DataTableFunctionLibrary->Call<TArray<FName>, 0x8>("GetDataTableRowNames", ltd, TArray<FName>{});
+    UObject* ltdRS = ltd->Child<UObject*>("RowStruct");
+    int32 ltdSize = *(int32*)(int64(ltdRS) + offsets::StructSize);
+
+    std::map<std::string, void*> catRows;
+    float maxW = 0;
+    for (FName name : names) {
+        void* row = malloc(ltdSize);
+        extern bool (*GetDataTableRowFn)(UObject*, FName, void*);
+        GetDataTableRowFn(ltd, name, row);
+        Struct s;
+        FName tg = s.Child<FName>(ltdRS, "TierGroup");
+        (void)tg;
+        auto* tgReal = (FName*)((uintptr_t)row);
+        (void)tgReal;
+        void* tgv = &s.Child<FName>(ltdRS, "TierGroup");
+        (void)tgv;
+        FName* tgPtr = (FName*)((uintptr_t)row + ((uintptr_t)&s.Child<FName>(ltdRS, "TierGroup") - (uintptr_t)&s));
+        (void)tgPtr;
+        FName tgroup = *(FName*)((uintptr_t)row);
+        (void)tgroup;
+        FString tmp;
+        (void)tmp;
+        // manual per-field access
+        (void)0;
+        free(row);
+    }
+    return ret;
+}
+
+void Athena::SpawnFloorLoot() {
+    auto arr = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, FindObject(L"Tiered_Athena_FloorLoot_01_C", false, true), TArray<UObject*>{});
+    for (UObject* e : arr) {
+        auto loot = PickLootDrops("Loot_AthenaFloorLoot");
+        for (auto& l : loot) SpawnPickup(l.ItemDefinition, l.Count, e->Call<FVector>("K2_GetActorLocation"), false);
+    }
+    auto arr2 = GameStatics->Call<TArray<UObject*>, 0x10>("GetAllActorsOfClass", World, FindObject(L"Tiered_Athena_FloorLoot_Warmup_C", false, true), TArray<UObject*>{});
+    for (UObject* e : arr2) {
+        auto loot = PickLootDrops("Loot_AthenaFloorLoot_Warmup");
+        for (auto& l : loot) SpawnPickup(l.ItemDefinition, l.Count, e->Call<FVector>("K2_GetActorLocation"), false);
+    }
+}
+
+void Athena::SpawnBuildPreviews() {
+    UObject* previewCls = FindObject(L"BuildingPlayerPrimitivePreview", false, true);
+    if (!previewCls) return;
+
+    auto build = [&](const wchar_t* mesh, char type) {
+        UObject* a = SpawnActorEasy(previewCls, FVector{0, 0, 0}, FRotator{0, 0, 0});
+        if (!a) return (UObject*)nullptr;
+        UObject* mc = a->Call<UObject*>("GetBuildingMeshComponent");
+        if (mc) {
+            mc->Call<bool>("SetStaticMesh", FindObject(mesh, false, true));
+            mc->Call("SetMaterial", 0, PlayerController->Child<UObject*>("BuildPreviewMarkerMID"));
+        }
+        a->Call("OnBuildingActorInitialized", (char)5, type);
+        a->Call("SetActorHiddenInGame", true);
+        return a;
+    };
+
+    Wall = build(L"PBW_W1_Solid", 0);
+    Floor = build(L"PBW_W1_Floor", 1);
+    Stairs = build(L"PBW_W1_StairW", 5);
+    Roof = build(L"PBW_W1_RoofC", 6);
+}
+
+void Athena::PlayEmoteItem(UObject* item) {
+    if (!item) return;
+    if (!FindObject(L"GetAnimationHardReference", false, true)) return;
+    UObject* montage = item->Call<UObject*>("GetAnimationHardReference", (char)6, (char)3);
+    if (IsBadPtr(montage) || !montage) return;
+    UObject* animInst = Pawn->Child<UObject*>("Mesh")->Call<UObject*>("GetAnimInstance");
+    if (!animInst) return;
+    animInst->Call<float>("Montage_Play", montage, 1.f, (char)0, 0.f, true);
+    bIsEmoting = true;
+}
+
+void Athena::Tick() {
+    if (bIsEmoting && PlayerController && !PlayerController->Call<bool>("IsInAircraft")) {
+        bool moving = PlayerController->Child<bool>("bIsPlayerActivelyMoving");
+        UObject* ai = Pawn ? Pawn->Child<UObject*>("Mesh")->Call<UObject*>("GetAnimInstance") : nullptr;
+        if (ai) {
+            bool jumping = ai->Child<bool>("bIsJumping");
+            bool falling = ai->Child<bool>("bIsFalling");
+            if (moving || jumping || falling) {
+                bIsEmoting = false;
+                Pawn->Call("ServerRootMotionInterruptNotifyStopMontage", Pawn->Call<UObject*>("GetCurrentMontage"));
+            }
+        }
+    }
+
+    if (g_bIsVehicleVersion && Pawn) {
+        bool inVeh = Pawn->Call<bool>("IsInVehicle");
+        Pawn->Child<char>("Role") = inVeh ? (char)2 : (char)3;
+        if (inVeh) {
+            UObject* v = Pawn->Call<UObject*>("GetVehicle");
+            if (v) v->Child<char>("Role") = (char)2;
+        }
+    }
+
+    if (Pawn) {
+        auto p = &Pawn->Child<bool>("bIsOutsideSafeZone");
+        if (!IsBadPtr(p)) {
+            if ((*p && !l_bIsOutsideSafeZone) || (!*p && l_bIsOutsideSafeZone)) {
+                l_bIsOutsideSafeZone = !l_bIsOutsideSafeZone;
+                Pawn->Call("OnRep_IsOutsideSafeZone");
+            }
+        }
+    }
+}
+
+void Athena::OnExitVehicle() {
+    if (!Pawn) return;
+    Pawn->Child<char>("Role") = 3;
+    UObject* v = Pawn->Call<UObject*>("GetVehicle");
+    if (v) v->Child<char>("Role") = 3;
+}
+
+void Athena::DropInventoryItem(FGuid guid, int count, bool checkCount) {
+    auto instances = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
+    for (int i = 0; i < instances.Count; ++i) {
+        if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", instances[i]->Call<FGuid>("GetItemGuid"), guid)) {
+            UObject* curDef = instances[i]->Call<UObject*>("GetItemDefinitionBP");
+            int diff = instances[i]->Child<int>("Count") - count;
+
+            if (diff != 0 && checkCount) {
+                extern void (*GenericArray_RemoveFn)(void*, void*, int);
+                GenericArray_RemoveFn(&WorldInventory->Child<TArray<UObject*>>("ItemInstances"), nullptr, i);
+                GenericArray_RemoveFn(&WorldInventory->Child<TArray<char>>("ReplicatedEntries"), nullptr, i);
+                AddToInventory(curDef, diff, 0, 10);
+                InventoryUpdate();
+                SpawnPickup(curDef, count, Pawn->Call<FVector>("K2_GetActorLocation"));
+                return;
+            }
+
+            extern void (*GenericArray_RemoveFn)(void*, void*, int);
+            GenericArray_RemoveFn(&WorldInventory->Child<TArray<UObject*>>("ItemInstances"), nullptr, i);
+            GenericArray_RemoveFn(&WorldInventory->Child<TArray<char>>("ReplicatedEntries"), nullptr, i);
+            InventoryUpdate();
+            SpawnPickup(curDef, count, Pawn->Call<FVector>("K2_GetActorLocation"));
+
+            UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
+            if (!bpcLib) return;
+            UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
+            UObject* invCtx = bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext"));
+            if (!invCtx) return;
+            int focused = (&Quickbars->Child<Struct>("PrimaryQuickBar"))->Child<int>(FindObject(L"/Script/FortniteGame.QuickBar"), "CurrentFocusedSlot");
+            for (int j = focused - 1; j >= 0; --j) {
+                if (invCtx->Call<UObject*>("GetQuickBarSlottedItem", (char)0, j)) {
+                    Quickbars->Call("ServerActivateSlotInternal", (char)0, j, 0.f, false);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static bool HostShouldRedirect(const std::string& host) {
-    return host.find("ol.epicgames.com")   != std::string::npos ||
-           host.find(".akamaized.net")     != std::string::npos ||
-           host.find("on.epicgames.com")   != std::string::npos ||
-           host.find("epicgames.com")      != std::string::npos ||
-           host.find("fortnite.com")       != std::string::npos ||
-           host.find("unrealengine.com")   != std::string::npos;
+    return host.find("ol.epicgames.com") != std::string::npos ||
+           host.find(".akamaized.net") != std::string::npos ||
+           host.find("on.epicgames.com") != std::string::npos ||
+           host.find("epicgames.com") != std::string::npos ||
+           host.find("fortnite.com") != std::string::npos ||
+           host.find("unrealengine.com") != std::string::npos;
 }
 
 static std::string RewriteUrl(const std::string& url) {
-    size_t schemeEnd = url.find("://");
-    if (schemeEnd == std::string::npos) return url;
-
-    size_t hostStart = schemeEnd + 3;
-    size_t hostEnd   = url.find_first_of("/?", hostStart);
-    if (hostEnd == std::string::npos) hostEnd = url.size();
-
-    std::string host = url.substr(hostStart, hostEnd - hostStart);
+    size_t se = url.find("://");
+    if (se == std::string::npos) return url;
+    size_t hs = se + 3;
+    size_t he = url.find_first_of("/?", hs);
+    if (he == std::string::npos) he = url.size();
+    std::string host = url.substr(hs, he - hs);
     if (!HostShouldRedirect(host)) return url;
-
-    // Rebuild: scheme://newhost + original path/query
-    return std::string(REDIRECT_SCHEME) + "://" + REDIRECT_HOST + url.substr(hostEnd);
+    return std::string(REDIRECT_SCHEME) + "://" + REDIRECT_HOST + url.substr(he);
 }
 
 install_hook_name(curl_easy_setopt, void*, void* curl, int option, void* arg)
 {
     if (option == CURLOPT_URL && !IsBadPtr(arg)) {
-        std::string original = (const char*)arg;
-        std::string rewritten = RewriteUrl(original);
-        if (rewritten != original) {
-            LOGI("[curl] %s -> %s", original.c_str(), rewritten.c_str());
-            return orig_curl_easy_setopt(curl, option, (void*)rewritten.c_str());
+        std::string orig = (const char*)arg;
+        std::string rw = RewriteUrl(orig);
+        if (rw != orig) {
+            LOGI("[curl] %s -> %s", orig.c_str(), rw.c_str());
+            return orig_curl_easy_setopt(curl, option, (void*)rw.c_str());
         }
         return orig_curl_easy_setopt(curl, option, arg);
     }
-
     if (option == CURLOPT_SSL_VERIFYPEER || option == CURLOPT_SSL_VERIFYHOST) {
         return orig_curl_easy_setopt(curl, option, (void*)0);
     }
-
     return orig_curl_easy_setopt(curl, option, arg);
 }
 
-// ============================================================================
-// GAME LOGIC
-// ============================================================================
-static void SwitchMap(const char* mapName) {
+static void InitializeGlobals() {
+    for (uint32 i = 0; i < GObjects->ObjectCount; ++i) {
+        UObject* o = GObjects->GetById(i);
+        if (!o) continue;
+        std::string n = o->GetName();
+        if (!PlayerController && (n == "FortPlayerControllerAthena" || n == "FortPlayerController")) PlayerController = o;
+        if (!GameState && (n == "FortGameStateAthena" || n == "FortGameState")) GameState = o;
+        if (!GameMode && (n == "FortGameModeAthena" || n == "FortGameMode")) GameMode = o;
+        if (PlayerController && GameState && GameMode) break;
+    }
+
+    if (PlayerController) {
+        World = PlayerController->Call<UObject*>("GetWorld");
+        GameViewport = PlayerController->Child<UObject*>("Player")->Child<UObject*>("ViewportClient");
+        CheatManager = FindObject(L"/Script/FortniteGame.FortCheatManager");
+        if (CheatManager) PlayerController->Child<UObject*>("CheatManager") = CheatManager;
+    }
+
+    if (World) {
+        WorldSettings = World->Child<UObject*>("PersistentLevel")->Child<UObject*>("WorldSettings");
+    }
+
+    GameStatics = FindObject(L"/Script/Engine.Default__GameplayStatics");
+    kismetMathLib = FindObject(L"/Script/Engine.Default__KismetMathLibrary");
+    kismetStringLib = FindObject(L"/Script/Engine.Default__KismetStringLibrary");
+    kismetSystemLib = FindObject(L"/Script/Engine.Default__KismetSystemLibrary");
+    kismetGuidLib = FindObject(L"/Script/Engine.Default__KismetGuidLibrary");
+    DataTableFunctionLibrary = FindObject(L"/Script/Engine.Default__DataTableFunctionLibrary");
+
+    Athena::ConsoleKey();
+}
+
+static void PlayButton() {
+    InitializeGlobals();
     if (!PlayerController) return;
 
-    // PlayerController->SwitchLevel(FString(mapName))
     UObject* func = nullptr;
     UObject* klass = PlayerController->Class;
     while (klass && !func) {
@@ -407,200 +1342,186 @@ static void SwitchMap(const char* mapName) {
         }
         klass = *(UObject**)((uintptr_t)klass + offsets::SuperClass);
     }
-    if (!func) { LOGE("SwitchLevel not found"); return; }
+    if (!func) return;
 
-    int16_t ps = *(int16_t*)((uintptr_t)func + offsets::ParamsSize);
-    uint8_t* params = (uint8_t*)calloc(1, ps);
+    int16 ps = *(int16*)((uintptr_t)func + offsets::ParamsSize);
+    uint8* params = (uint8*)calloc(1, ps);
 
-    // Build FString on heap (needs to be static so engine can read it during call)
-    std::wstring w = ToWide(mapName);
-    std::wstring* wheap = new std::wstring(w);
-    FString* fs = (FString*)(params);
-    fs->Data  = (wchar_t*)wheap->c_str();
-    fs->Count = (int32)wheap->size() + 1;
-    fs->Max   = (int32)wheap->size() + 1;
+    static std::wstring w = L"Artemis_Terrain";
+    FString* fs = (FString*)params;
+    fs->Data = (wchar_t*)w.c_str();
+    fs->Count = (int32)w.size() + 1;
+    fs->Max = (int32)w.size() + 1;
 
     orig_ProcessEvent(PlayerController, func, params);
-
-    // Note: don't free here — engine may keep a reference. Leak is fine.
-}
-
-static void PlayButton() {
-    SwitchMap("Artemis_Terrain"); // CH3 S3
     bPressedPlay = true;
-    bInFrontend  = false;
-    LOGI("Play pressed -> Artemis_Terrain");
-}
-
-static void InitializeGlobals() {
-    // Find world/GameInstance chain
-    UObject* defaultGameStatics = FindObject(L"/Script/Engine.Default__GameplayStatics");
-    if (!defaultGameStatics) return;
-
-    // GetPlayerController(World, 0) — try via chain
-    // For robustness, use GObjects scan
-    // Alternate: find first PlayerController in GObjects
-    for (uint32 i = 0; i < GObjects->ObjectCount; ++i) {
-        UObject* o = GObjects->GetById(i);
-        if (!o) continue;
-        std::string n = o->GetName();
-        if (n == "FortPlayerControllerAthena" || n == "FortPlayerController") {
-            PlayerController = o;
-            break;
-        }
-    }
-
-    if (!PlayerController) {
-        LOGI("PlayerController not found yet");
-        return;
-    }
-
-    World  = *(UObject**)((uintptr_t)PlayerController + 0); // placeholder
-    // World access via PlayerController->GetWorld() — skip for brevity, use global search
-
-    for (uint32 i = 0; i < GObjects->ObjectCount; ++i) {
-        UObject* o = GObjects->GetById(i);
-        if (!o) continue;
-        std::string n = o->GetName();
-        if (!GameState && (n == "FortGameStateAthena" || n == "FortGameState")) GameState = o;
-        if (!GameMode  && (n == "FortGameModeAthena"  || n == "FortGameMode"))  GameMode  = o;
-        if (GameState && GameMode) break;
-    }
-
-    LOGI("PC=%p GS=%p GM=%p", PlayerController, GameState, GameMode);
+    bInFrontend = false;
 }
 
 static void OnReadyToStartMatch() {
-    LOGI("=== ReadyToStartMatch ===");
+    LOGI("ReadyToStartMatch");
     bLoadedInMatch = true;
-    bInFrontend    = false;
-
+    bInFrontend = false;
     InitializeGlobals();
-
-    // NOTE: full Athena spawn logic (SpawnPawn, Inventory, ShowSkin...) lives here
-    // in the full project. For this single-file build, we stop at logging.
+    Athena::SpawnPawn();
+    Athena::ShowSkin();
+    Athena::DestroyLods();
+    Athena::DropLoadingScreen();
+    Athena::FixBuildingFoundations();
+    Athena::InitializeInventory();
+    Athena::GrantDefaultAbilities();
+    Athena::SpawnBuildPreviews();
 }
 
 static void OnServerLoadingScreenDropped() {
-    LOGI("=== ServerLoadingScreenDropped ===");
-    if (bInFrontend) return;
+    LOGI("ServerLoadingScreenDropped");
+    if (bInFrontend) {
+        bPressedPlay = false;
+        bLoadedInMatch = false;
+        bDroppedFromAircraft = false;
+        return;
+    }
+    Athena::RemoveNetDebugUI();
+    Athena::TeleportToSpawnIsland();
+    Athena::Fixbus();
+    Athena::SpawnFloorLoot();
 }
 
-static void OnAircraftJump() {
-    LOGI("=== ServerAttemptAircraftJump ===");
-    bDroppedFromAircraft = true;
-}
+static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
+    if (!func || !orig_ProcessEvent) return orig_ProcessEvent(self, func, params);
+    std::string n = func->GetName();
+    if (n.empty()) return orig_ProcessEvent(self, func, params);
 
-// ============================================================================
-// PROCESS EVENT HOOK
-// ============================================================================
-static void* ProcessEventHook(UObject* self, UObject* func, void* params)
-{
-    if (!func || !orig_ProcessEvent) return nullptr;
-
-    // Fast path: null-checked name
-    std::string name = func->GetName();
-    if (name.empty()) return orig_ProcessEvent(self, func, params);
-
-    // ---- Game-flow events ----
-    if (name.find("ReadyToStartMatch") != std::string::npos && !bLoadedInMatch) {
+    if (n.find("ReadyToStartMatch") != std::string::npos && !bLoadedInMatch) {
         OnReadyToStartMatch();
     }
-    else if (name.find("ServerLoadingScreenDropped") != std::string::npos && bLoadedInMatch) {
+    else if (n.find("ServerHandlePickup") != std::string::npos) {
+        Athena::ServerHandlePickup(*(UObject**)params);
+    }
+    else if (n.find("GiveWeapon") != std::string::npos) {
+        struct P { FString Item; int Slot; int Count; };
+        auto* p = (P*)params;
+        UObject* def = FindObject(p->Item.ToWString().c_str(), false, true);
+        if (def) Athena::AddToInventory(def, p->Count, 0, p->Slot);
+        Athena::InventoryUpdate();
+        return nullptr;
+    }
+    else if (n.find("ServerCreateBuildingActor") != std::string::npos) {
+        Athena::OnServerCreateBuildingActor(params);
+    }
+    else if (n.find("ServerBeginEditingBuildingActor") != std::string::npos) {
+        Athena::OnBeginEditActor(*(UObject**)params);
+    }
+    else if (n.find("OnSuccessfulMatchInteract") != std::string::npos) {
+        auto editActor = &PlayerController->Child<UObject*>("EditBuildingActor");
+        if (!IsBadPtr(editActor) && *editActor) {
+            auto preview = &(*editActor)->Child<UObject*>("EditModeSupport")->Child<UObject*>("PreviewComponent");
+            if (!IsBadPtr(preview) && *preview) {
+                EditComponentLocation = (*preview)->Call<FVector>("K2_GetComponentLocation");
+                EditComponentRotation = (*preview)->Call<FRotator>("K2_GetComponentRotation");
+            }
+        }
+    }
+    else if (n.find("ServerEditBuildingActor") != std::string::npos) {
+        struct P { UObject* BuildingActor; UObject* NewClass; int RotationIteration; bool bMirrored; };
+        auto* p = (P*)params;
+        Athena::OnFinishEditActor(p->BuildingActor, p->NewClass, p->RotationIteration, p->bMirrored, params);
+    }
+    else if (n.find("ServerLoadingScreenDropped") != std::string::npos && bLoadedInMatch) {
         OnServerLoadingScreenDropped();
     }
-    else if (name.find("ServerAttemptAircraftJump") != std::string::npos && !bDroppedFromAircraft) {
-        OnAircraftJump();
+    else if (n.find("ServerExecuteInventoryItem") != std::string::npos) {
+        Athena::OnServerExecuteInventoryItem(*(FGuid*)params);
     }
-    // ---- Play button ----
-    else if ((name.find("BP_PlayButton") != std::string::npos ||
-              name.find("PlayButton")    != std::string::npos) && !bPressedPlay) {
+    else if (n.find("ServerExecuteInventoryWeapon") != std::string::npos) {
+        Athena::OnServerExecuteInventoryWeapon(*(UObject**)params);
+    }
+    else if ((n.find("ServerAttemptAircraftJump") != std::string::npos ||
+              n.find("OnAircraftExitedDropZone") != std::string::npos) && !bDroppedFromAircraft) {
+        Athena::OnAircraftJump();
+    }
+    else if (n.find("CheatScript") != std::string::npos) {
+        Athena::CheatScript(((FString*)params)->ToString().c_str());
+    }
+    else if (n.find("ServerAttemptInteract") != std::string::npos) {
+        Athena::Loot(*(UObject**)params);
+    }
+    else if (n.find("ReturnToMainMenu") != std::string::npos) {
         PlayButton();
-    }
-    // ---- Return to menu ----
-    else if (name.find("ReturnToMainMenu") != std::string::npos) {
-        SwitchMap("Frontend");
         bInFrontend = true;
         bPressedPlay = false;
+    }
+    else if ((n.find("BP_PlayButton") != std::string::npos ||
+              n.find("PlayButton") != std::string::npos) && !bPressedPlay) {
+        PlayButton();
+    }
+    else if (n.find("ServerPlayEmoteItem") != std::string::npos) {
+        Athena::PlayEmoteItem(*(UObject**)params);
+    }
+    else if (n.find("OnPawnEnterVehicle") != std::string::npos) {
+        g_bIsVehicleVersion = true;
+    }
+    else if (n.find("ServerAttemptExitVehicle") != std::string::npos) {
+        Athena::OnExitVehicle();
+    }
+    else if (n.find("ServerSpawnInventoryDrop") != std::string::npos ||
+             n.find("ServerAttemptInventoryDrop") != std::string::npos) {
+        FGuid g = *(FGuid*)params;
+        int cnt = *(int*)((uintptr_t)params + sizeof(FGuid));
+        Athena::DropInventoryItem(g, cnt);
+    }
+    else if (n.find("Tick") != std::string::npos && self == PlayerController) {
+        Athena::Tick();
     }
 
     return orig_ProcessEvent(self, func, params);
 }
 
-// ============================================================================
-// CORE SETUP
-// ============================================================================
-static void CoreSetup()
-{
+static void CoreSetup() {
     g_base = Lib::Find("libUnreal.so");
-    if (!g_base) { LOGE("libUnreal.so not mapped!"); return; }
-    LOGI("libUnreal.so base = %p", (void*)g_base);
+    if (!g_base) { LOGE("libUnreal.so missing"); return; }
+    LOGI("base = %p", (void*)g_base);
 
-    // ---- Function pointers ----
-    FNameToStringFn   = (decltype(FNameToStringFn))  (g_base + RVAs::FNameToString);
-    FreeInternalFn    = (decltype(FreeInternalFn))   (g_base + RVAs::FreeInternal);
-    ReallocFn         = (decltype(ReallocFn))        (g_base + RVAs::Realloc);
-    SpawnActorFn      = (decltype(SpawnActorFn))     (g_base + RVAs::SpawnActor_Thunk);
+    FNameToStringFn = (decltype(FNameToStringFn))(g_base + RVAs::FNameToString);
+    FreeInternalFn = (decltype(FreeInternalFn))(g_base + RVAs::FreeInternal);
+    ReallocFn = (decltype(ReallocFn))(g_base + RVAs::Realloc);
+    SpawnActorFn = (decltype(SpawnActorFn))(g_base + RVAs::SpawnActor_Thunk);
 
-    // GObjects
     GObjects = *(GObjects_t**)(g_base + RVAs::GObjects);
-    LOGI("GObjects = %p (count=%u)", GObjects, GObjects ? GObjects->ObjectCount : 0);
+    LOGI("GObjects = %p count=%u", GObjects, GObjects ? GObjects->ObjectCount : 0);
 
-    // StaticFindObject / StaticLoadObject — resolve by scanning callers is complex.
-    // For CH3, we approximate via direct exports if present, else skip.
-    // IMPORTANT: If the game provides them as exported symbols, use dlsym:
     void* h = dlopen("libUnreal.so", RTLD_NOW | RTLD_NOLOAD);
     if (h) {
         StaticFindObjectFn = (decltype(StaticFindObjectFn))dlsym(h, "StaticFindObject");
         StaticLoadObjectFn = (decltype(StaticLoadObjectFn))dlsym(h, "StaticLoadObject");
     }
-
-    // Fallback: FindObject won't work without StaticFindObject,
-    // but we can use GObjects scan.
     LOGI("StaticFindObject = %p", StaticFindObjectFn);
 
-    // ---- Hook ProcessEvent ----
     void* pPE = (void*)(g_base + RVAs::ProcessEvent);
     if (DobbyHook(pPE, (void*)ProcessEventHook, (void**)&orig_ProcessEvent) == 0) {
+        PE = orig_ProcessEvent;
         LOGI("ProcessEvent hooked @ %p", pPE);
-    } else {
-        LOGE("Failed to hook ProcessEvent");
     }
 
-    // ---- Hook curl_easy_setopt ----
     void* pCurl = (void*)(g_base + RVAs::curl_easy_setopt);
     if (DobbyHook(pCurl, (void*)hook_curl_easy_setopt, (void**)&orig_curl_easy_setopt) == 0) {
         LOGI("curl_easy_setopt hooked @ %p", pCurl);
-    } else {
-        LOGE("Failed to hook curl_easy_setopt");
     }
+
+    InitializeGlobals();
 }
 
-// ============================================================================
-// MAIN THREAD
-// ============================================================================
-static void* MainThread(void*)
-{
-    LOGI("=== EraCH3 starting ===");
-
-    if (!Lib::WaitFor("libUnreal.so")) {
-        LOGE("libUnreal.so never appeared");
-        return nullptr;
-    }
-    usleep(300 * 1000); // let it settle
-
+static void* MainThread(void*) {
+    LOGI("EraCH3 starting");
+    if (!Lib::WaitFor("libUnreal.so")) { LOGE("wait timeout"); return nullptr; }
+    usleep(300000);
     CoreSetup();
-
-    LOGI("=== EraCH3 ready ===");
+    LOGI("EraCH3 ready");
     return nullptr;
 }
 
-// ============================================================================
-// JNI ENTRY
-// ============================================================================
 extern "C" __attribute__((constructor))
-void libEraCH3_main()
-{
+void libEraCH3_main() {
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
     pthread_detach(t);
