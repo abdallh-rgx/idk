@@ -69,9 +69,6 @@ namespace offsets {
     constexpr int32 StructOps          = 0x40;
 }
 
-// ============================================================
-// IsBadPtr — must come first
-// ============================================================
 static inline bool IsBadPtr(const void* p) {
     if (!p) return true;
     uintptr_t v = (uintptr_t)p;
@@ -84,21 +81,14 @@ static T& Ref0() {
     return inst;
 }
 
-// ============================================================
-// Forward-declared function pointers
-// ============================================================
 static void (*FNameToStringFn)(void*, void*) = nullptr;
 static void (*FreeInternalFn)(void*) = nullptr;
 static void* (*ReallocFn)(void*, size_t, uint32) = nullptr;
 static void* (*PE)(void*, void*, void*) = nullptr;
 
-// ============================================================
-// BASIC STRUCTS
-// ============================================================
 struct FName {
     uint32 ComparisonIndex;
     uint32 DisplayIndex;
-
     std::string ToString() {
         if (!FNameToStringFn) return "";
         struct FS { wchar_t* Data; int32 Count; int32 Max; } out{};
@@ -120,7 +110,6 @@ struct FString {
     wchar_t* Data;
     int32 Count;
     int32 Max;
-
     FString() : Data(nullptr), Count(0), Max(0) {}
     FString(const wchar_t* other) {
         if (!other) { Data = nullptr; Count = 0; Max = 0; return; }
@@ -150,7 +139,6 @@ struct FGuid { int32 A, B, C, D; };
 struct FVector2D { float X, Y; };
 struct FMargin { float Left, Top, Right, Bottom; };
 struct FLinearColor { float R, G, B, A; };
-
 struct FSlateColor { FLinearColor SpecifiedColor; uint8 ColorUseRule; uint8 _pad[0x17]; };
 struct FSlateBrush {
     uint8 _pad[0x8];
@@ -172,9 +160,6 @@ struct FKey { FName KeyName; uint8 _pad[0x10]; };
 struct SpawnActorParams { uint8 Parms[0x40]; };
 struct SoftObjectPtr { uint8 _pad[0x28]; };
 
-// ============================================================
-// FField / UObject
-// ============================================================
 class FFieldClass {
 public:
     FName NamePrivate;
@@ -198,9 +183,7 @@ public:
     FField* Next;
     FName Name;
     uint8 Flags;
-
     bool IsValid() { return !IsBadPtr(&Name); }
-
     std::string GetName() {
         std::string name = Name.ToString();
         auto pos = name.rfind('/');
@@ -218,7 +201,6 @@ public:
     UObject* Outer;
 
     bool IsA(UObject* c) { return this->Class == c; }
-
     bool IsChild(UObject* parent) {
         UObject* c = this->Class;
         while (c && !IsBadPtr(c)) {
@@ -227,13 +209,11 @@ public:
         }
         return false;
     }
-
     std::string GetName() {
         std::string s = Name.ToString();
         auto pos = s.rfind('/');
         return pos == std::string::npos ? s : s.substr(pos + 1);
     }
-
     std::string GetFullName() {
         std::string temp;
         for (auto outer = this->Outer; outer && !IsBadPtr(outer); outer = outer->Outer) {
@@ -242,7 +222,6 @@ public:
         std::string cls = (Class && !IsBadPtr(Class)) ? Class->GetName() : "?";
         return cls + " " + temp + this->GetName();
     }
-
     int32 EnumIndex(const std::string& enumName) {
         void* arr = (void*)(int64(this) + 0x40);
         if (IsBadPtr(arr)) return 0;
@@ -272,14 +251,12 @@ public:
         }
 
         UObject* klass = this->Class;
-
         while (klass && !IsBadPtr(klass)) {
             UObject* children = *(UObject**)(int64(klass) + offsets::Children);
             if (children && !IsBadPtr(children)) {
                 UObject* cur = children;
                 while (cur && !IsBadPtr(cur)) {
                     std::string cn = (cur->Class && !IsBadPtr(cur->Class)) ? cur->Class->GetName() : "";
-
                     if (cn == "StructProperty") {
                         UObject* curClass = *(UObject**)(int64(cur) + offsets::Class);
                         if (curClass && !IsBadPtr(curClass)) {
@@ -336,7 +313,6 @@ public:
             }
             klass = *(UObject**)(int64(klass) + offsets::SuperClass);
         }
-
         return Ref0<T>();
     }
 
@@ -367,10 +343,9 @@ public:
             func = &(this->Child<UObject>(name, true));
             funcCache[key] = func;
         }
-
         if (IsBadPtr(func)) return T{};
 
-        int16 ps = *(int16*)(int64(func) + offsets::ParamsSize);
+        int32 ps = *(int16*)(int64(func) + offsets::ParamsSize);
         int16 ro = *(int16*)(int64(func) + offsets::ReturnValueOffset);
         if (ro == -1) ro = ReturnOffset;
         if (ps <= 0 || ps > 0x10000) return T{};
@@ -404,7 +379,6 @@ struct GObjects_t {
     TUObjectArray* ObjectArray;
     uint8 _pad[0xC];
     uint32 ObjectCount;
-
     UObject* GetById(uint32 id) {
         if (!ObjectArray) return nullptr;
         const uint32 chunkSize = 0x10000;
@@ -423,7 +397,6 @@ public:
     T* Data;
     int32 Count;
     int32 Max;
-
     void Add(T in) {
         Data = (T*)ReallocFn(Data, sizeof(T) * (Count + 1), 0);
         Data[Count++] = in;
@@ -484,11 +457,8 @@ struct Struct {
     }
 };
 
-// ============================================================
-// GLOBALS
-// ============================================================
 static uintptr_t g_base = 0;
-static void* (*SpawnActorFn)(void*, UObject*, FVector*, FRotator*, const SpawnActorParams&) = nullptr;
+static UObject* (*SpawnActorFn)(void*, UObject*, FVector*, FRotator*, const SpawnActorParams&) = nullptr;
 static UObject* (*StaticFindObjectFn)(UObject*, void*, const wchar_t*, bool) = nullptr;
 static UObject* (*StaticLoadObjectFn)(UObject*, UObject*, const wchar_t*, const wchar_t*, int, void*, bool) = nullptr;
 static bool (*GetDataTableRowFn)(UObject*, FName, void*) = nullptr;
@@ -531,9 +501,6 @@ static bool l_bIsOutsideSafeZone = false;
 static FVector EditComponentLocation;
 static FRotator EditComponentRotation;
 
-// ============================================================
-// LIB HELPERS
-// ============================================================
 namespace Lib {
     static uintptr_t Find(const char* name) {
         FILE* f = fopen("/proc/self/maps", "r");
@@ -577,9 +544,6 @@ static UObject* SpawnActorEasy(UObject* klass, FVector loc, FRotator rot) {
     return SpawnActorFn((void*)World, klass, &loc, &rot, p);
 }
 
-// ============================================================
-// ATHENA
-// ============================================================
 namespace Athena {
     void SpawnPawn();
     void ShowSkin();
@@ -627,7 +591,6 @@ void Athena::ShowSkin() {
     if (auto t = &PlayerController->Child<UObject*>("MyPlayerInfo")->Child<UObject*>("AthenaMenuHeroDef"); !IsBadPtr(t)) Hero = *t;
     if (auto t = &PlayerController->Child<UObject*>("MyPlayerInfo")->Child<UObject*>("TempAthenaMenuHeroInstance"); !IsBadPtr(t)) Hero = *t;
     if (!Hero) return;
-
     static auto charParts = Hero->Child<TArray<UObject*>>("CharacterParts");
     if (CharacterPartsArray.size() == 0) {
         for (UObject* cp : charParts) CharacterPartsArray.push_back(cp);
@@ -774,7 +737,6 @@ void Athena::OnServerExecuteInventoryItem(FGuid guid) {
                 }
                 PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterParts");
                 PlayerController->Child<UObject*>("PlayerState")->Call("OnRep_CharacterData");
-
                 UObject* abilitySet = kismetSystemLib->Call<UObject*>("Conv_SoftObjectReferenceToObject", def->Child<SoftObjectPtr>("AbilitySet"));
                 if (abilitySet) {
                     for (UObject* a : abilitySet->Child<TArray<UObject*>>("GameplayAbilities")) Athena::GrantAbility(a);
@@ -877,12 +839,10 @@ void Athena::ServerHandlePickup(UObject* pickup) {
                     SpawnPickup(def, sum - maxStack, Pawn->Call<FVector>("K2_GetActorLocation"));
                 }
                 if (GenericArray_RemoveFn) {
-                    void* instProp = nullptr;
-                    void* repProp = nullptr;
                     TArray<UObject*> instArr = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
                     TArray<char> repArr = WorldInventory->Child<TArray<char>>("ReplicatedEntries");
-                    GenericArray_RemoveFn(&instArr, instProp, i);
-                    GenericArray_RemoveFn(&repArr, repProp, i);
+                    GenericArray_RemoveFn(&instArr, nullptr, i);
+                    GenericArray_RemoveFn(&repArr, nullptr, i);
                 }
                 InventoryUpdate();
                 pickup->Call("K2_DestroyActor");
@@ -949,7 +909,6 @@ void Athena::Loot(UObject* actor) {
         FName n = actor->Child<FName>("LootTableName", false, false);
         tier = n.ToString();
     }
-
     if (tier.find("None") != std::string::npos) return;
     if (tier.find("Athena") == std::string::npos) {
         auto p = tier.find("_");
@@ -1349,9 +1308,6 @@ void Athena::DropInventoryItem(FGuid guid, int count, bool checkCount) {
     }
 }
 
-// ============================================================
-// CURL HOOK
-// ============================================================
 static bool HostShouldRedirect(const std::string& host) {
     return host.find("ol.epicgames.com") != std::string::npos ||
            host.find(".akamaized.net") != std::string::npos ||
@@ -1388,9 +1344,6 @@ static void* curl_easy_setopt_Hook(void* curl, int option, void* arg) {
     return orig_curl_easy_setopt(curl, option, arg);
 }
 
-// ============================================================
-// GLOBAL INIT
-// ============================================================
 static void InitializeGlobals() {
     if (!gGObjects) return;
     for (uint32 i = 0; i < gGObjects->ObjectCount; ++i) {
@@ -1402,7 +1355,6 @@ static void InitializeGlobals() {
         if (!GameMode && (n == "FortGameModeAthena" || n == "FortGameMode")) GameMode = o;
         if (PlayerController && GameState && GameMode) break;
     }
-
     if (PlayerController) {
         World = PlayerController->Call<UObject*>("GetWorld");
         auto playerPtr = &PlayerController->Child<UObject*>("Player");
@@ -1485,9 +1437,6 @@ static void OnServerLoadingScreenDropped() {
     Athena::SpawnFloorLoot();
 }
 
-// ============================================================
-// PROCESS EVENT HOOK
-// ============================================================
 static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
     if (!func || !orig_ProcessEvent) return orig_ProcessEvent(self, func, params);
     std::string n = func->GetName();
@@ -1579,9 +1528,6 @@ static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
     return orig_ProcessEvent(self, func, params);
 }
 
-// ============================================================
-// CORE SETUP
-// ============================================================
 static void CoreSetup() {
     g_base = Lib::Find("libUnreal.so");
     if (!g_base) { LOGE("libUnreal.so missing"); return; }
@@ -1606,7 +1552,7 @@ static void CoreSetup() {
 
     void* pPE = (void*)(g_base + RVAs::ProcessEvent);
     if (DobbyHook(pPE, (void*)ProcessEventHook, (void**)&orig_ProcessEvent) == 0) {
-        PE = (void*)orig_ProcessEvent;
+        PE = reinterpret_cast<void*(*)(void*, void*, void*)>(orig_ProcessEvent);
         LOGI("ProcessEvent hooked @ %p", pPE);
     } else LOGE("ProcessEvent hook failed");
 
