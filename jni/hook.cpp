@@ -28,11 +28,12 @@
 #define ADDR_PlaylistHandler             0x5519710
 #define ADDR_StartAircraftPhase          0x550A1F4
 #define ADDR_PostLogin                   0x550C610
-
-// العناوين الجديدة التي استخرجتها
 #define ADDR_ReadyToStartMatch_THUNK_RVA 0x99E7270
 #define ADDR_StartFlightPath_ORIG_RVA    0x53F0458
 #define ADDR_Possess_THUNK_RVA           0x99C4C18
+
+// 🎯 الكنز الجديد الذي وجدته!
+#define ADDR_ClientRestart_THUNK_RVA     0x9ADFE80 
 
 // VFT Indices
 #define VFT_IDX_SpawnDefaultPawnAtTransform 0xDC
@@ -126,6 +127,7 @@ static StaticFindObject_t SFO = nullptr;
 
 typedef void* (*SpawnDefaultPawnAtTransform_t)(void*, void*, void*);
 typedef void (*Possess_t)(void*, void*);
+typedef void (*ClientRestart_t)(void*, void*); // توقيع دالة ClientRestart
 
 struct FTransform { float qx,qy,qz,qw; float tx,ty,tz,_p1; float sx,sy,sz,_p2; };
 
@@ -170,11 +172,21 @@ static void DirectSpawn(void* gm, void* pc) {
     LOGF("[Spawn] Result Pawn = %p", newPawn);
 
     if (IVP(newPawn)) {
+        // 1. الامتلاك (Possess)
         auto PossessFunc = (Possess_t)(g_base + ADDR_Possess_THUNK_RVA);
         if (PossessFunc) {
-            LOGF("[Possess] Calling Possess at %p...", (void*)PossessFunc);
             PossessFunc(pc, newPawn);
             LOGF("[Possess] Success! PC %p now possesses Pawn %p", pc, newPawn);
+        }
+
+        // 2. إجبار اللعبة على تغيير الحالة إلى Playing باستخدام العنوان الجديد
+        auto ClientRestartFunc = (ClientRestart_t)(g_base + ADDR_ClientRestart_THUNK_RVA);
+        if (ClientRestartFunc) {
+            LOGF("[Restart] Calling ClientRestart to force Playing state...");
+            ClientRestartFunc(pc, newPawn);
+            LOGF("[Restart] ClientRestart called successfully! Player should now be in Playing state.");
+        } else {
+            LOGF("[Restart] FAILED to resolve ClientRestart function!");
         }
     }
 }
@@ -232,14 +244,11 @@ static PL_t o_PL = nullptr;
 
 static void Hook_PL(void* gm, void* pc) {
     LOGF("========== [PostLogin] GM=%p PC=%p ==========", gm, pc);
-
     InjectPlaylist(gm);
     ClearSpectator(pc);
     g_saved_pc = pc;
-
     if (o_PL) o_PL(gm, pc);
     ClearSpectator(pc);
-
     LOGF("[PostLogin] done. Waiting for Aircraft Phase to Spawn...");
 }
 
@@ -291,13 +300,12 @@ static void Run() {
     g_base = i.base;
 
     LOGF("========================================");
-    LOGF(" FORTNITE ANDROID HOOK - MASTER BUILD");
+    LOGF(" FORTNITE ANDROID HOOK - FINAL BUILD");
     LOGF(" base = 0x%lx", g_base);
     LOGF("========================================");
 
     SFO = (StaticFindObject_t)(g_base + ADDR_StaticFindObject);
     
-    // تفعيل كل الـ Hooks
     DobbyHook((void*)(g_base + ADDR_PlaylistHandler), (void*)Hook_PH, (void**)&o_PH);
     DobbyHook((void*)(g_base + ADDR_StartAircraftPhase), (void*)Hook_SAP, (void**)&o_SAP);
     DobbyHook((void*)(g_base + ADDR_PostLogin), (void*)Hook_PL, (void**)&o_PL);
