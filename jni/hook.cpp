@@ -37,6 +37,8 @@ using uint64 = uint64_t;
 namespace RVAs {
     constexpr uint64_t ProcessEvent                  = 0x07611B5C;
     constexpr uint64_t GObjects                      = 0x0DCD6E08;
+    constexpr uint64_t GNames                        = 0x0DC960C0;
+    constexpr uint64_t GEngine                       = 0x0DE34970;
     constexpr uint64_t SpawnActor_Thunk              = 0x3217298;
     constexpr uint64_t GetEngineVersion              = 0x945F4B4;
     constexpr uint64_t FNameToString                 = 0x74937C0;
@@ -58,21 +60,21 @@ namespace offsets {
     constexpr int32 Name               = 0x18;
     constexpr int32 Outer              = 0x20;
     constexpr int32 Children           = 0x48;
-    constexpr int32 Next               = 0x30;
+    constexpr int32 Next               = 0x28;
     constexpr int32 SuperClass         = 0x40;
-    constexpr int32 Offset             = 0x4C;
-    constexpr int32 ParamsSize         = 0xE6;
-    constexpr int32 ReturnValueOffset  = 0xE8;
-    constexpr int32 StructSize         = 0x5C;
+    constexpr int32 Offset             = 0x44;
+    constexpr int32 ParamsSize         = 0xB6;
+    constexpr int32 ReturnValueOffset  = 0xB8;
+    constexpr int32 StructSize         = 0x58;
     constexpr int32 RowStruct          = 0x28;
-    constexpr int32 StructFlags        = 0x38;
-    constexpr int32 StructOps          = 0x40;
 }
 
 static inline bool IsBadPtr(const void* p) {
     if (!p) return true;
     uintptr_t v = (uintptr_t)p;
-    return v < 0x10000 || v > 0x7FFFFFFFFFFF;
+    if (v < 0x10000) return true;
+    if (v > 0x0000FFFFFFFFFFFFULL) return true;
+    return false;
 }
 
 template<typename T>
@@ -244,12 +246,10 @@ public:
     T& Child(const std::string& name, bool bFunction = false, bool bUseCache = true) {
         static std::map<std::string, int32> cache;
         std::string key = GetName() + "::" + name;
-
         if (bUseCache) {
             auto it = cache.find(key);
             if (it != cache.end()) return *(T*)(int64(this) + it->second);
         }
-
         UObject* klass = this->Class;
         while (klass && !IsBadPtr(klass)) {
             UObject* children = *(UObject**)(int64(klass) + offsets::Children);
@@ -282,7 +282,6 @@ public:
             }
             klass = *(UObject**)(int64(klass) + offsets::SuperClass);
         }
-
         klass = this->Class;
         while (klass && !IsBadPtr(klass)) {
             FField* fp = *(FField**)(int64(klass) + 0x50);
@@ -336,7 +335,6 @@ public:
         static std::map<std::string, UObject*> funcCache;
         UObject* func = nullptr;
         std::string key = GetName() + "::" + name;
-
         auto fit = funcCache.find(key);
         if (fit != funcCache.end()) func = fit->second;
         else {
@@ -352,7 +350,6 @@ public:
 
         uint8* params = (uint8*)calloc(1, ps);
         auto offs = func->GetFunctionChildrenOffset();
-
         int i = 0;
         auto fill = [&](auto& v) {
             if (i < (int)offs.size() && offs[i] > 0 && offs[i] < ps) {
@@ -373,19 +370,27 @@ public:
 };
 
 struct FUObjectItem { UObject* Object; int32 Flags; int32 Cluster; int32 Serial; };
-struct TUObjectArray { void* Objects[9]; };
 
+// ============================================================
+// GObjects — FIXED layout per MobileDumper-7
+// base + 0x0DCD6E08 → FChunkedFixedUObjectArray (structure, NOT pointer)
+// ============================================================
 struct GObjects_t {
-    TUObjectArray* ObjectArray;
-    uint8 _pad[0xC];
-    uint32 ObjectCount;
+    uint8 _pad0[0x10];
+    void** Objects;             // 0x10 → array of chunk pointers
+    uint8 _pad1[0x8];
+    int32 MaxElements;          // 0x20
+    int32 NumElements;          // 0x24
+    int32 MaxChunks;            // 0x28
+    int32 NumChunks;            // 0x2C
+
     UObject* GetById(uint32 id) {
-        if (!ObjectArray) return nullptr;
+        if (!Objects) return nullptr;
         const uint32 chunkSize = 0x10000;
         uint32 ci = id / chunkSize;
         uint32 wi = id % chunkSize;
-        if (ci >= 9) return nullptr;
-        auto* chunk = (FUObjectItem*)ObjectArray->Objects[ci];
+        if ((int32)ci >= NumChunks) return nullptr;
+        auto* chunk = (FUObjectItem*)Objects[ci];
         if (!chunk) return nullptr;
         return chunk[wi].Object;
     }
@@ -422,7 +427,6 @@ struct Struct {
         auto key = std::make_pair(StructObj, vname);
         auto it = cache.find(key);
         if (it != cache.end()) return *(T*)(int64(this) + it->second);
-
         UObject* klass = StructObj;
         while (klass && !IsBadPtr(klass)) {
             UObject* c = *(UObject**)(int64(klass) + offsets::Children);
@@ -506,12 +510,15 @@ namespace Lib {
         FILE* f = fopen("/proc/self/maps", "r");
         if (!f) return 0;
         char line[512];
-        uintptr_t base = 0;
+        uintptr_t lowest = UINTPTR_MAX;
         while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, name)) { base = strtoul(line, nullptr, 16); break; }
+            if (strstr(line, name)) {
+                uintptr_t addr = strtoul(line, nullptr, 16);
+                if (addr < lowest) lowest = addr;
+            }
         }
         fclose(f);
-        return base;
+        return (lowest == UINTPTR_MAX) ? 0 : lowest;
     }
     static uintptr_t WaitFor(const char* name, int t = 60) {
         for (int i = 0; i < t * 10; ++i) {
@@ -677,7 +684,6 @@ void Athena::AddToInventory(UObject* item, int count, char index, int slot) {
 void Athena::InitializeInventory() {
     if (!PlayerController || !GameMode) return;
     WorldInventory = PlayerController->Child<UObject*>("WorldInventory");
-
     if (auto qb = &PlayerController->Child<UObject*>("ClientQuickBars"); !IsBadPtr(qb)) Quickbars = *qb;
     else {
         Quickbars = SpawnActorEasy(FindObject(L"/Script/FortniteGame.FortQuickBars"), FVector{0, 0, 0}, FRotator{0, 0, 0});
@@ -722,7 +728,6 @@ void Athena::OnServerExecuteInventoryItem(FGuid guid) {
         if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", inst->Call<FGuid>("GetItemGuid"), guid)) {
             UObject* def = inst->Call<UObject*>("GetItemDefinitionBP");
             if (!def) continue;
-
             if (def->IsA(FindObject(L"/Script/FortniteGame.FortTrapItemDefinition"))) {
                 Pawn->Call<bool>("PickUpActor", nullptr, def);
                 Pawn->Child<UObject*>("CurrentWeapon")->Child<FGuid>("ItemEntryGuid") = inst->Call<FGuid>("GetItemGuid");
@@ -745,9 +750,7 @@ void Athena::OnServerExecuteInventoryItem(FGuid guid) {
                 Pawn->Child<UObject*>("Mesh")->Call("SetAnimInstanceClass", def->Child<UObject*>("AnimBPOverride"));
                 Pawn->Call<UObject*>("EquipWeaponDefinition", def->Call<UObject*>("GetDecoItemDefinition"), inst->Call<FGuid>("GetItemGuid"));
             }
-            else {
-                Pawn->Call<UObject*>("EquipWeaponDefinition", def, inst->Call<FGuid>("GetItemGuid"));
-            }
+            else Pawn->Call<UObject*>("EquipWeaponDefinition", def, inst->Call<FGuid>("GetItemGuid"));
         }
     }
 }
@@ -794,7 +797,6 @@ void Athena::ConsoleKey() {
 void Athena::CheatScript(const char* script) {
     std::string s = script;
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-
     if (s.find("spawnrift") != std::string::npos) {
         if (!SpawnActorEasy(FindObject(L"/Game/Athena/Items/Consumables/RiftItem/BGA_RiftPortal_Item_Athena.BGA_RiftPortal_Item_Athena_C"), Pawn->Call<FVector>("K2_GetActorLocation"), FRotator{0, 0, 0}))
             GameMode->Call("Say", FString(L"Rifts unavailable in this version."));
@@ -858,7 +860,6 @@ void Athena::ServerHandlePickup(UObject* pickup) {
     UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
     UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
     UObject* invCtx = bpcLib ? bpcLib->Call<UObject*>("GetContext", lp0, FindObject(L"/Script/FortniteUI.FortInventoryContext")) : nullptr;
-
     if (invCtx) {
         for (int i = 0; i < 6; ++i) {
             if (!invCtx->Call<UObject*>("GetQuickBarSlottedItem", (char)0, i)) {
@@ -901,24 +902,14 @@ void Athena::Loot(UObject* actor) {
     std::string tier = "None";
     UObject* bcCls = FindObject(L"BuildingContainer", false, true);
     UObject* sdCls = FindObject(L"FortAthenaSupplyDrop", false, true);
-
-    if (bcCls && actor->IsChild(bcCls)) {
-        FName n = actor->Child<FName>("SearchLootTierGroup");
-        tier = n.ToString();
-    } else if (sdCls && actor->IsChild(sdCls)) {
-        FName n = actor->Child<FName>("LootTableName", false, false);
-        tier = n.ToString();
-    }
+    if (bcCls && actor->IsChild(bcCls)) { FName n = actor->Child<FName>("SearchLootTierGroup"); tier = n.ToString(); }
+    else if (sdCls && actor->IsChild(sdCls)) { FName n = actor->Child<FName>("LootTableName", false, false); tier = n.ToString(); }
     if (tier.find("None") != std::string::npos) return;
-    if (tier.find("Athena") == std::string::npos) {
-        auto p = tier.find("_");
-        if (p != std::string::npos) tier.replace(p, 1, "_Athena");
-    }
+    if (tier.find("Athena") == std::string::npos) { auto p = tier.find("_"); if (p != std::string::npos) tier.replace(p, 1, "_Athena"); }
     if (bcCls && actor->IsChild(bcCls)) {
         if (actor->Child<float>("TimeUntilLootRegenerates") == 0) actor->Child<float>("TimeUntilLootRegenerates") = -1;
         else return;
     }
-
     auto results = PickLootDrops(tier);
     for (auto& r : results) {
         FVector right = kismetMathLib->Call<FVector>("GetRightVector", actor->Call<FRotator>("K2_GetActorRotation"));
@@ -936,7 +927,6 @@ void Athena::Loot(UObject* actor) {
 void Athena::OnServerCreateBuildingActor(void* params) {
     struct OldP { UObject* Class; uint8 _pad[0x8]; FVector Loc; FRotator Rot; };
     struct NewP { int32 ClassHandle; FVector Loc; FRotator Rot; uint8 _pad[0xC]; UObject* Class; };
-
     UObject* cls = nullptr; FVector loc{}; FRotator rot{};
     auto* serverCreateFn = FindObject(L"/Script/FortniteGame.FortPlayerController.ServerCreateBuildingActor");
     if (serverCreateFn && serverCreateFn->GetFunctionChildrenOffset().size() == 1) {
@@ -1039,7 +1029,6 @@ void Athena::OnAircraftJump() {
     Pawn->Call("OnRep_CustomizationLoadout");
     ShowSkin();
     bDroppedFromAircraft = true;
-
     UObject* bpcLib = FindObject(L"/Script/BlueprintContext.Default__BlueprintContextLibrary");
     if (!bpcLib) return;
     UObject* lp0 = GameViewport->Child<UObject*>("GameInstance")->Child<TArray<UObject*>>("LocalPlayers")[0];
@@ -1054,14 +1043,11 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     UObject* ltd = FindObject(L"/Game/Items/Datatables/AthenaLootTierData_Client.AthenaLootTierData_Client", true);
     UObject* lpt = FindObject(L"/Game/Items/Datatables/AthenaLootPackages_Client.AthenaLootPackages_Client", true);
     if (!ltd || !lpt || !GetDataTableRowFn || !DataTableFunctionLibrary) return ret;
-
     UObject* ltdRS = ltd->Child<UObject*>("RowStruct");
     UObject* lptRS = lpt->Child<UObject*>("RowStruct");
     if (!ltdRS || !lptRS) return ret;
-
     int32 ltdSize = *(int32*)(int64(ltdRS) + offsets::StructSize);
     int32 lptSize = *(int32*)(int64(lptRS) + offsets::StructSize);
-
     auto ltdNames = DataTableFunctionLibrary->Call<TArray<FName>, 0x8>("GetDataTableRowNames", ltd, TArray<FName>{});
     auto lptNames = DataTableFunctionLibrary->Call<TArray<FName>, 0x8>("GetDataTableRowNames", lpt, TArray<FName>{});
 
@@ -1099,12 +1085,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
             else free(row);
         } else free(row);
     }
-
-    if (catRows.empty() || maxW == 0.f) {
-        for (auto& p : catRows) free(p.second);
-        return ret;
-    }
-
+    if (catRows.empty() || maxW == 0.f) { for (auto& p : catRows) free(p.second); return ret; }
     float rv = kismetMathLib->Call<float>("RandomFloatInRange", 0.f, maxW);
     void* pickedRow = nullptr;
     for (auto& p : catRows) {
@@ -1113,7 +1094,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         rv -= w;
     }
     if (!pickedRow) { for (auto& p : catRows) free(p.second); return ret; }
-
     float numDrops = *(float*)((uintptr_t)pickedRow + ndOff);
     std::string pkgName = ((FName*)((uintptr_t)pickedRow + lpOff))->ToString();
     for (auto& p : catRows) free(p.second);
@@ -1133,7 +1113,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         if (it == pkgRows.end()) break;
         std::advance(it, i);
         if (it == pkgRows.end()) break;
-
         std::string call = ((FString*)((uintptr_t)it->second + lpcOff))->ToString();
         if (pkgName.find(".Empty") != std::string::npos) continue;
         if (call.find(".Empty") != std::string::npos) { ++i; continue; }
@@ -1141,7 +1120,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         std::map<std::string, void*> tempCalls;
         float tempMax = 0;
         bool worldList = strstr(pkgName.c_str(), "WorldList") != nullptr;
-
         if (!worldList) {
             for (FName name : lptNames) {
                 void* row = calloc(1, lptSize);
@@ -1152,7 +1130,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         } else {
             for (auto& p : pkgRows) tempCalls[p.first] = p.second;
         }
-
         for (auto& p : tempCalls) tempMax += *(float*)((uintptr_t)p.second + wOff);
         float trv = kismetMathLib->Call<float>("RandomFloatInRange", 0.f, tempMax);
         for (auto& p : tempCalls) {
@@ -1160,9 +1137,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
             if (trv < w) { finalCalls[p.first] = p.second; break; }
             trv -= w;
         }
-        if (!worldList) {
-            for (auto& p : tempCalls) if (finalCalls.find(p.first) == finalCalls.end()) free(p.second);
-        }
+        if (!worldList) for (auto& p : tempCalls) if (finalCalls.find(p.first) == finalCalls.end()) free(p.second);
     }
 
     for (auto& p : finalCalls) {
@@ -1170,7 +1145,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         UObject* def = kismetSystemLib->Call<UObject*>("Conv_SoftObjectReferenceToObject", *ref);
         if (def) ret.push_back(LootData{def, *(int32*)((uintptr_t)p.second + cntOff)});
     }
-
     for (auto& p : pkgRows) free(p.second);
     for (auto& p : finalCalls) free(p.second);
     return ret;
@@ -1193,7 +1167,6 @@ void Athena::SpawnFloorLoot() {
 void Athena::SpawnBuildPreviews() {
     UObject* previewCls = FindObject(L"BuildingPlayerPrimitivePreview", false, true);
     if (!previewCls || !PlayerController) return;
-
     auto build = [&](const wchar_t* mesh, char type) -> UObject* {
         UObject* a = SpawnActorEasy(previewCls, FVector{0, 0, 0}, FRotator{0, 0, 0});
         if (!a) return nullptr;
@@ -1270,7 +1243,6 @@ void Athena::DropInventoryItem(FGuid guid, int count, bool checkCount) {
         if (kismetGuidLib->Call<bool>("EqualEqual_GuidGuid", instances[i]->Call<FGuid>("GetItemGuid"), guid)) {
             UObject* curDef = instances[i]->Call<UObject*>("GetItemDefinitionBP");
             int diff = instances[i]->Child<int>("Count") - count;
-
             if (diff != 0 && checkCount) {
                 if (GenericArray_RemoveFn) {
                     TArray<UObject*> instArr = WorldInventory->Child<TArray<UObject*>>("ItemInstances");
@@ -1345,16 +1317,19 @@ static void* curl_easy_setopt_Hook(void* curl, int option, void* arg) {
 }
 
 static void InitializeGlobals() {
-    if (!gGObjects) return;
-    for (uint32 i = 0; i < gGObjects->ObjectCount; ++i) {
+    if (!gGObjects) { LOGE("InitializeGlobals: gGObjects null"); return; }
+    LOGI("Scanning %d objects...", gGObjects->NumElements);
+    for (int32 i = 0; i < gGObjects->NumElements; ++i) {
         UObject* o = gGObjects->GetById(i);
-        if (!o) continue;
+        if (!o || IsBadPtr(o)) continue;
         std::string n = o->GetName();
         if (!PlayerController && (n == "FortPlayerControllerAthena" || n == "FortPlayerController")) PlayerController = o;
         if (!GameState && (n == "FortGameStateAthena" || n == "FortGameState")) GameState = o;
         if (!GameMode && (n == "FortGameModeAthena" || n == "FortGameMode")) GameMode = o;
         if (PlayerController && GameState && GameMode) break;
     }
+    LOGI("PC=%p GS=%p GM=%p", PlayerController, GameState, GameMode);
+
     if (PlayerController) {
         World = PlayerController->Call<UObject*>("GetWorld");
         auto playerPtr = &PlayerController->Child<UObject*>("Player");
@@ -1395,7 +1370,6 @@ static void PlayButton() {
         klass = *(UObject**)((uintptr_t)klass + offsets::SuperClass);
     }
     if (!func) return;
-
     int16 ps = *(int16*)((uintptr_t)func + offsets::ParamsSize);
     uint8* params = (uint8*)calloc(1, ps);
     static std::wstring w = L"Artemis_Terrain";
@@ -1425,12 +1399,7 @@ static void OnReadyToStartMatch() {
 
 static void OnServerLoadingScreenDropped() {
     LOGI("ServerLoadingScreenDropped");
-    if (bInFrontend) {
-        bPressedPlay = false;
-        bLoadedInMatch = false;
-        bDroppedFromAircraft = false;
-        return;
-    }
+    if (bInFrontend) { bPressedPlay = false; bLoadedInMatch = false; bDroppedFromAircraft = false; return; }
     Athena::RemoveNetDebugUI();
     Athena::TeleportToSpawnIsland();
     Athena::Fixbus();
@@ -1442,12 +1411,8 @@ static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
     std::string n = func->GetName();
     if (n.empty()) return orig_ProcessEvent(self, func, params);
 
-    if (n.find("ReadyToStartMatch") != std::string::npos && !bLoadedInMatch) {
-        OnReadyToStartMatch();
-    }
-    else if (n.find("ServerHandlePickup") != std::string::npos) {
-        Athena::ServerHandlePickup(*(UObject**)params);
-    }
+    if (n.find("ReadyToStartMatch") != std::string::npos && !bLoadedInMatch) OnReadyToStartMatch();
+    else if (n.find("ServerHandlePickup") != std::string::npos) Athena::ServerHandlePickup(*(UObject**)params);
     else if (n.find("GiveWeapon") != std::string::npos) {
         struct P { FString Item; int Slot; int Count; };
         auto* p = (P*)params;
@@ -1456,12 +1421,8 @@ static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
         Athena::InventoryUpdate();
         return nullptr;
     }
-    else if (n.find("ServerCreateBuildingActor") != std::string::npos) {
-        Athena::OnServerCreateBuildingActor(params);
-    }
-    else if (n.find("ServerBeginEditingBuildingActor") != std::string::npos) {
-        Athena::OnBeginEditActor(*(UObject**)params);
-    }
+    else if (n.find("ServerCreateBuildingActor") != std::string::npos) Athena::OnServerCreateBuildingActor(params);
+    else if (n.find("ServerBeginEditingBuildingActor") != std::string::npos) Athena::OnBeginEditActor(*(UObject**)params);
     else if (n.find("OnSuccessfulMatchInteract") != std::string::npos) {
         if (PlayerController) {
             auto editActor = &PlayerController->Child<UObject*>("EditBuildingActor");
@@ -1479,59 +1440,32 @@ static void* ProcessEventHook(UObject* self, UObject* func, void* params) {
         auto* p = (P*)params;
         Athena::OnFinishEditActor(p->BuildingActor, p->NewClass, p->RotationIteration, p->bMirrored, params);
     }
-    else if (n.find("ServerLoadingScreenDropped") != std::string::npos && bLoadedInMatch) {
-        OnServerLoadingScreenDropped();
-    }
-    else if (n.find("ServerExecuteInventoryItem") != std::string::npos) {
-        Athena::OnServerExecuteInventoryItem(*(FGuid*)params);
-    }
-    else if (n.find("ServerExecuteInventoryWeapon") != std::string::npos) {
-        Athena::OnServerExecuteInventoryWeapon(*(UObject**)params);
-    }
-    else if ((n.find("ServerAttemptAircraftJump") != std::string::npos ||
-              n.find("OnAircraftExitedDropZone") != std::string::npos) && !bDroppedFromAircraft) {
-        Athena::OnAircraftJump();
-    }
-    else if (n.find("CheatScript") != std::string::npos) {
-        Athena::CheatScript(((FString*)params)->ToString().c_str());
-    }
-    else if (n.find("ServerAttemptInteract") != std::string::npos) {
-        Athena::Loot(*(UObject**)params);
-    }
-    else if (n.find("ReturnToMainMenu") != std::string::npos) {
-        PlayButton();
-        bInFrontend = true;
-        bPressedPlay = false;
-    }
-    else if ((n.find("BP_PlayButton") != std::string::npos ||
-              n.find("PlayButton") != std::string::npos) && !bPressedPlay) {
-        PlayButton();
-    }
-    else if (n.find("ServerPlayEmoteItem") != std::string::npos) {
-        Athena::PlayEmoteItem(*(UObject**)params);
-    }
-    else if (n.find("OnPawnEnterVehicle") != std::string::npos) {
-        g_bIsVehicleVersion = true;
-    }
-    else if (n.find("ServerAttemptExitVehicle") != std::string::npos) {
-        Athena::OnExitVehicle();
-    }
-    else if (n.find("ServerSpawnInventoryDrop") != std::string::npos ||
-             n.find("ServerAttemptInventoryDrop") != std::string::npos) {
+    else if (n.find("ServerLoadingScreenDropped") != std::string::npos && bLoadedInMatch) OnServerLoadingScreenDropped();
+    else if (n.find("ServerExecuteInventoryItem") != std::string::npos) Athena::OnServerExecuteInventoryItem(*(FGuid*)params);
+    else if (n.find("ServerExecuteInventoryWeapon") != std::string::npos) Athena::OnServerExecuteInventoryWeapon(*(UObject**)params);
+    else if ((n.find("ServerAttemptAircraftJump") != std::string::npos || n.find("OnAircraftExitedDropZone") != std::string::npos) && !bDroppedFromAircraft) Athena::OnAircraftJump();
+    else if (n.find("CheatScript") != std::string::npos) Athena::CheatScript(((FString*)params)->ToString().c_str());
+    else if (n.find("ServerAttemptInteract") != std::string::npos) Athena::Loot(*(UObject**)params);
+    else if (n.find("ReturnToMainMenu") != std::string::npos) { PlayButton(); bInFrontend = true; bPressedPlay = false; }
+    else if ((n.find("BP_PlayButton") != std::string::npos || n.find("PlayButton") != std::string::npos) && !bPressedPlay) PlayButton();
+    else if (n.find("ServerPlayEmoteItem") != std::string::npos) Athena::PlayEmoteItem(*(UObject**)params);
+    else if (n.find("OnPawnEnterVehicle") != std::string::npos) g_bIsVehicleVersion = true;
+    else if (n.find("ServerAttemptExitVehicle") != std::string::npos) Athena::OnExitVehicle();
+    else if (n.find("ServerSpawnInventoryDrop") != std::string::npos || n.find("ServerAttemptInventoryDrop") != std::string::npos) {
         FGuid g = *(FGuid*)params;
         int cnt = *(int*)((uintptr_t)params + sizeof(FGuid));
         Athena::DropInventoryItem(g, cnt);
     }
-    else if (n.find("Tick") != std::string::npos && self == PlayerController) {
-        Athena::Tick();
-    }
+    else if (n.find("Tick") != std::string::npos && self == PlayerController) Athena::Tick();
+
     return orig_ProcessEvent(self, func, params);
 }
 
 static void CoreSetup() {
+    LOGI("=== CoreSetup enter ===");
     g_base = Lib::Find("libUnreal.so");
-    if (!g_base) { LOGE("libUnreal.so missing"); return; }
-    LOGI("base = %p", (void*)g_base);
+    LOGI("g_base = %p", (void*)g_base);
+    if (!g_base || g_base < 0x1000000 || g_base > 0x8000000000ULL) { LOGE("bad base"); return; }
 
     FNameToStringFn = (decltype(FNameToStringFn))(g_base + RVAs::FNameToString);
     FreeInternalFn = (decltype(FreeInternalFn))(g_base + RVAs::FreeInternal);
@@ -1539,9 +1473,23 @@ static void CoreSetup() {
     SpawnActorFn = (decltype(SpawnActorFn))(g_base + RVAs::SpawnActor_Thunk);
     GetDataTableRowFn = (decltype(GetDataTableRowFn))(g_base + RVAs::GetDataTableRowFromName_ORIG);
     GenericArray_RemoveFn = (decltype(GenericArray_RemoveFn))(g_base + RVAs::GenericArray_Remove);
+    LOGI("func pointers set");
 
-    gGObjects = *(GObjects_t**)(g_base + RVAs::GObjects);
-    LOGI("GObjects = %p count=%u", gGObjects, gGObjects ? gGObjects->ObjectCount : 0);
+    // ✅ FIXED: no dereference
+    gGObjects = (GObjects_t*)(g_base + RVAs::GObjects);
+    LOGI("gGObjects = %p", (void*)gGObjects);
+
+    if (IsBadPtr(gGObjects)) { LOGE("gGObjects addr bad"); return; }
+
+    void* objectsPtr = (void*)gGObjects->Objects;
+    LOGI("Objects = %p, NumElements = %d, NumChunks = %d",
+         objectsPtr, gGObjects->NumElements, gGObjects->NumChunks);
+
+    if (IsBadPtr(objectsPtr)) { LOGE("Objects ptr bad — RVA wrong"); return; }
+    if (gGObjects->NumElements <= 0 || gGObjects->NumElements > 0x2000000) {
+        LOGE("suspicious NumElements = %d", gGObjects->NumElements);
+        return;
+    }
 
     void* h = dlopen("libUnreal.so", RTLD_NOW | RTLD_NOLOAD);
     if (h) {
@@ -1558,9 +1506,10 @@ static void CoreSetup() {
 
     void* pCurl = (void*)(g_base + RVAs::curl_easy_setopt);
     if (DobbyHook(pCurl, (void*)curl_easy_setopt_Hook, (void**)&orig_curl_easy_setopt) == 0) {
-        LOGI("curl_easy_setopt hooked @ %p", pCurl);
+        LOGI("curl hooked @ %p", pCurl);
     } else LOGE("curl hook failed");
 
+    LOGI("=== CoreSetup done ===");
     InitializeGlobals();
 }
 
