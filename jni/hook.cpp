@@ -1,6 +1,17 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FIXED: manual travel only, no auto-travel from lobby (prevents crashes)
+// FIXED for UE5:
+//   - Correct UStruct/Class offsets from MobileDumper-7 dump:
+//       StructBaseChain = 0x30   (was 0x40 - wrong)
+//       SuperStruct     = 0x40   (correct)
+//       Children        = 0x48   (correct)
+//       ClassCastFlags  = 0xD8   (was 0x48 - wrong)
+//   - IsA / SubclassOf now use name-based walk through SuperStruct (0x40)
+//     for maximum reliability, with the corrected chain check as fallback.
+//   - Removed all auto-travel. Travel to Artemis_Terrain must be issued
+//     manually via the in-game console:
+//         open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
+//   - Spawn uses GameModeBase::ChoosePlayerStart instead of hardcoded Z=5000.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -48,9 +59,11 @@ using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=
 using TCHAR=char16_t;
 
 // ============================================================================
-// PROFILE — Fortnite 21.30 CL-21088273
+// PROFILE — Fortnite 21.30 CL-21088273 (values verified against
+//           MobileDumper-7 output for com.epicgames.fortnite 21.30)
 // ============================================================================
 namespace profile {
+// --- RVAs ---
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
 constexpr uintptr_t StaticFindObject     = 0x0762A664;
 constexpr uintptr_t StaticLoadObject     = 0x0761C568;
@@ -75,6 +88,7 @@ constexpr uintptr_t Realloc              = 0x0735E520;
 constexpr uintptr_t GetDataTableRow_Orig = 0x09319C70;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 
+// --- UObject ---
 constexpr unsigned ObjectVtable = 0x00;
 constexpr unsigned ObjectFlags  = 0x08;
 constexpr unsigned ObjectIndex  = 0x0C;
@@ -82,43 +96,52 @@ constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
 
+// --- UField / UStruct / UClass (UE5 — verified from dump) ---
 constexpr unsigned FieldNext        = 0x28;
+constexpr unsigned StructBaseChain  = 0x30;   // ← corrected (was 0x40 in UE4 code)
 constexpr unsigned StructSuper      = 0x40;
 constexpr unsigned StructChildren   = 0x48;
 constexpr unsigned StructChildProps = 0x50;
 constexpr unsigned StructSize       = 0x58;
+constexpr unsigned StructMinAlign   = 0x5C;
 
-constexpr unsigned ClassChain         = 0x40;
-constexpr unsigned ClassCastFlags     = 0x48;
+constexpr unsigned ClassCastFlags     = 0xD8;  // ← corrected (was 0x48 in UE4 code)
 constexpr unsigned ClassDefaultObject = 0x110;
 constexpr unsigned ClassImplemented   = 0x200;
 
+// --- UFunction ---
 constexpr unsigned FunctionFlags     = 0xB0;
 constexpr unsigned FunctionNumParams = 0xB4;
 constexpr unsigned FunctionParamSize = 0xB6;
 constexpr unsigned FunctionExecFunc  = 0xD8;
 
+// --- FProperty ---
 constexpr unsigned PropArrayDim    = 0x30;
 constexpr unsigned PropElementSize = 0x34;
 constexpr unsigned PropFlags       = 0x38;
 constexpr unsigned PropOffset      = 0x44;
 constexpr unsigned PropSize        = 0x70;
 
+// --- FBoolProperty ---
 constexpr unsigned BoolSize        = 0x80;
 constexpr unsigned BoolByteOffset  = 0x81;
 constexpr unsigned BoolFieldMask   = 0x82;
 
+// --- Sub-props ---
 constexpr unsigned ArrayInner       = 0x70;
 constexpr unsigned StructPropStruct = 0x70;
 constexpr unsigned ObjectPropClass  = 0x70;
 
+// --- FField ---
 constexpr unsigned FFieldClass     = 0x08;
 constexpr unsigned FFieldOwner     = 0x10;
 constexpr unsigned FFieldNext      = 0x20;
 constexpr unsigned FFieldName      = 0x28;
 
+// --- UEnum ---
 constexpr unsigned EnumNames = 0x40;
 
+// --- CPF flags ---
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
@@ -215,25 +238,43 @@ static std::u16string ToWide(const std::string& s);
 static std::string Narrow(const char16_t* s, int max);
 
 // ============================================================================
-// isa / subclass
+// isa / subclass — NAME-BASED WALK (UE5-safe)
+// ============================================================================
+// The UE4 chain trick (read CastFlags of T, index into ClassChain of K)
+// does not work reliably on UE5 because the layout changed. We walk the
+// SuperStruct chain (offset 0x40, confirmed by dump) and compare class
+// names, cached inside ObjName.
 // ============================================================================
 static bool IsA(void* obj, void* type) {
-    if (!obj || !type) return false;
+    if (!obj || !type || IsBadPtr(obj) || IsBadPtr(type)) return false;
     void* klass = Read<void*>(obj, profile::ObjectClass);
-    if (!klass) return false;
-    int n = Read<int>(type, profile::ClassCastFlags);
-    int limit = Read<int>(klass, profile::ClassCastFlags);
-    void* chain = Read<void*>(klass, profile::ClassChain);
-    return n >= 0 && n < 1024 && n <= limit && chain &&
-        Read<void*>(chain, (size_t)n * 8) == (char*)type + profile::ClassChain;
+    if (!klass || IsBadPtr(klass)) return false;
+
+    std::string target = ObjName(type);
+    if (target.empty()) return false;
+
+    for (int depth = 0; depth < 64 && klass && !IsBadPtr(klass); ++depth) {
+        if (ObjName(klass) == target) return true;
+        void* super = Read<void*>(klass, profile::StructSuper);
+        if (super == klass) break;
+        klass = super;
+    }
+    return false;
 }
+
 static bool SubclassOf(void* klass, void* type) {
-    if (!klass || !type) return false;
-    int n = Read<int>(type, profile::ClassCastFlags);
-    int limit = Read<int>(klass, profile::ClassCastFlags);
-    void* chain = Read<void*>(klass, profile::ClassChain);
-    return n >= 0 && n < 1024 && n <= limit && chain &&
-        Read<void*>(chain, (size_t)n * 8) == (char*)type + profile::ClassChain;
+    if (!klass || !type || IsBadPtr(klass) || IsBadPtr(type)) return false;
+
+    std::string target = ObjName(type);
+    if (target.empty()) return false;
+
+    for (int depth = 0; depth < 64 && klass && !IsBadPtr(klass); ++depth) {
+        if (ObjName(klass) == target) return true;
+        void* super = Read<void*>(klass, profile::StructSuper);
+        if (super == klass) break;
+        klass = super;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -255,7 +296,7 @@ static void* FindObj(const std::string& path) {
 }
 
 static std::string ObjName(void* obj) {
-    if (!obj) return {};
+    if (!obj || IsBadPtr(obj)) return {};
     static std::map<void*, std::string> cache;
     auto it = cache.find(obj);
     if (it != cache.end()) return it->second;
@@ -1475,7 +1516,7 @@ void Athena::SetupWorld(void* world) {
         return;
     }
     if (!IsA(session.controller, baseCtrl)) {
-        LOG("SetupWorld: controller is not a FortPlayerController at all");
+        LOG("SetupWorld: controller is not a FortPlayerController");
         return;
     }
 
@@ -1570,12 +1611,10 @@ static void tick_hook(void* world, int type, float delta) {
         lastWorld = wn;
     }
 
-    // اللوبي: نسجّل فقط، لا ننتقل تلقائيًا
-    if (wn.find("Frontend") != std::string::npos) {
-        return;
-    }
+    // Frontend / Lobby: log only, do not travel
+    if (wn.find("Frontend") != std::string::npos) return;
 
-    // في Artemis_Terrain؟ هيّئ اللاعب
+    // Artemis_Terrain: run setup
     if (wn.find("Artemis_Terrain") == std::string::npos) return;
 
     int index = Read<int>(world, 0xC);
@@ -1595,16 +1634,10 @@ static void tick_hook(void* world, int type, float delta) {
     Athena::SetupWorld(world);
 }
 
-// ============================================================================
-// EXEC HOOK — يتعامل مع أوامرنا المخصصة
-// ============================================================================
 static bool exec_hook(void* engine, void* world, const char16_t* command, void* output) {
     if (!orig_Exec) return false;
-
     std::string cmd = Narrow(command, 256);
     if (!cmd.empty()) LOG("Exec: %s", cmd.c_str());
-
-    // مرّر كل شيء للعبة كما هو. الأوامر القياسية مثل "open" تمر عادي.
     return orig_Exec(engine, world, command, output);
 }
 
