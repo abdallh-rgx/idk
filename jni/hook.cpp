@@ -1,8 +1,8 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // FULL RELEASE — UE5 LWC (double precision)
-// Includes all fixes: Sprint abilities, Pickaxe fallback, Door handling,
-// Loot containers, ServerHandlePickupInfo, collision registration.
+// Fixed: crash on DropLoadingScreen (ServerReadyToStartMatch removed,
+//        playlist set to DefaultSolo, SpawnBuildPreviews disabled).
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -802,7 +802,7 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: GrantDefaultAbilities");
     GrantDefaultAbilities();
 
-    LOG("SetupWorld: SpawnBuildPreviews");
+    LOG("SetupWorld: SpawnBuildPreviews (skipped)");
     SpawnBuildPreviews();
 
     LOG("SetupWorld: DropLoadingScreen");
@@ -830,17 +830,21 @@ void Athena::FinalizePlayer() {
         pawn, session.pawn,
         ObjName(pawn ? Read<void*>(pawn, profile::ObjectClass) : nullptr).c_str());
 
-    if (!pawn || !pawnCls || !IsA(pawn, pawnCls)) {
-        LOG("Finalize: pawn is not FortPlayerPawnAthena");
-        // On blueprint Athena_PlayerController, the class might be different
-        if (pawn && IsA(pawn, FindObj("/Script/FortniteGame.FortPlayerPawn"))) {
-            LOG("Finalize: but it is FortPlayerPawn, accepting");
+    if (!pawn || !pawnCls) {
+        LOG("Finalize: engine pawn null or class null");
+        return;
+    }
+
+    if (IsA(pawn, pawnCls)) {
+        session.pawn = pawn;
+    } else {
+        void* pawnBase = FindObj("/Script/FortniteGame.FortPlayerPawn");
+        if (pawnBase && IsA(pawn, pawnBase)) {
             session.pawn = pawn;
         } else {
+            LOG("Finalize: pawn class mismatch, skipping");
             return;
         }
-    } else {
-        session.pawn = pawn;
     }
 
     // Verify location
@@ -921,9 +925,6 @@ void Athena::FinalizePlayer() {
         if (rps.ok()) rps.run(session.controller);
     }
 
-    // Re-grant abilities after finalization (in case they were lost)
-    GrantDefaultAbilities();
-
     LOG("Finalize: complete, pawn=%p", session.pawn);
 }
 
@@ -1002,50 +1003,57 @@ void Athena::DestroyLods() {
 }
 
 // ============================================================================
-// DropLoadingScreen
+// DropLoadingScreen — FIXED (no ServerReadyToStartMatch, DefaultSolo playlist)
 // ============================================================================
 void Athena::DropLoadingScreen() {
-    if (!session.state || !session.controller) return;
+    if (!session.state || !session.controller) {
+        LOG("DropLoadingScreen: missing state or controller");
+        return;
+    }
 
+    LOG("DropLoadingScreen: step 1 — set GamePhase");
     void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
-    if (gp && Read<int>(gp, profile::PropElementSize) == 1) {
+    if (gp) {
         uint8_t old = Read<uint8_t>(GetField(session.state, gp));
+        LOG("DropLoadingScreen: GamePhase old=%d", (int)old);
         if (old < 2) {
             uint8_t phase = 2;
             Write<uint8_t>(GetField(session.state, gp), 0, phase);
             Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
-            if (n.ok() && n.set("OldGamePhase", old)) n.run(session.state);
+            if (n.ok()) {
+                n.set("OldGamePhase", old);
+                n.run(session.state);
+            }
         }
     }
+
+    LOG("DropLoadingScreen: step 2 — set load flags");
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
-    Call rsm("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
-    if (rsm.ok()) {
-        rsm.run(session.controller);
-        LOG("ServerReadyToStartMatch sent");
-    }
 
-    const char* brushes[] = {"MinimapNextCircleBrush","FullMapNextCircleBrush",
-        "MinimapSafeZoneBrush","MinimapCircleBrush","FullMapCircleBrush", nullptr};
-    for (int i = 0; brushes[i]; ++i) {
-        std::string path = std::string("/Script/FortniteGame.FortGameStateAthena.").append(brushes[i]);
-        void* p = GetProp(path.c_str());
-        if (p && !IsBadPtr(GetField(session.state, p))) memset(GetField(session.state, p), 0, 8);
+    LOG("DropLoadingScreen: step 3 — set DefaultSolo playlist");
+    void* playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
+    if (!playlist) {
+        playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultDuo.Playlist_DefaultDuo");
     }
-
-    void* playlist = FindObj("/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2");
-    if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playground/Playlist_Playground.Playlist_Playground");
-    if (playlist) {
+    if (!playlist) {
+        LOG("DropLoadingScreen: no default playlist found — skipping");
+    } else {
+        LOG("DropLoadingScreen: playlist set");
         void* bp = GetProp("/Script/FortniteGame.FortGameStateAthena.BasePlaylist");
         void* op = GetProp("/Script/FortniteGame.FortGameStateAthena.OverridePlaylist");
         void* cp = GetProp("/Script/FortniteGame.FortGameStateAthena.CurrentPlaylistData");
         if (bp) Write<void*>(GetField(session.state, bp), 0, playlist);
         if (op) Write<void*>(GetField(session.state, op), 0, playlist);
         if (cp) Write<void*>(GetField(session.state, cp), 0, playlist);
-        Call a("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistData"); if (a.ok()) a.run(session.state);
-        Call b("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistInfo"); if (b.ok()) b.run(session.state);
+
+        Call a("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistData");
+        if (a.ok()) a.run(session.state);
+        Call b("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistInfo");
+        if (b.ok()) b.run(session.state);
     }
-    LOG("Loading screen dropped");
+
+    LOG("DropLoadingScreen: complete");
 }
 
 void Athena::FixBuildingFoundations() {
@@ -1119,7 +1127,6 @@ void Athena::AddToInventory(void* def, int count, int slot) {
         return;
     }
 
-    // 1) Create instance
     void* inst = nullptr;
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
@@ -1132,14 +1139,12 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     }
     if (!inst || IsBadPtr(inst)) { LOG("AddToInventory: inst=null"); return; }
 
-    // 2) Owning controller
     {
         Call c("/Script/FortniteGame.FortItem.SetOwningControllerForTemporaryItem");
         if (c.ok() && c.set("InController", session.controller))
             c.run(inst);
     }
 
-    // 3) Add to arrays
     void* invProp    = GetProp("/Script/FortniteGame.FortInventory.Inventory");
     void* instProp   = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
     void* entryProp  = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
@@ -1155,7 +1160,6 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(entryArr, entryProp, GetField(inst, itemEntryProp));
 
-    // 4) QuickBar
     {
         Call qb("/Script/FortniteGame.FortPlayerController.AddItemToQuickBars");
         if (qb.ok()) {
@@ -1206,7 +1210,6 @@ void Athena::InitializeInventory() {
 
     LOG("Inventory ready: inv=%p qb=%p", session.inventory, session.quickbars);
 
-    // Try StartingItems first
     bool gaveAnything = false;
     void* startingItemsProp = GetProp("/Script/FortniteGame.FortGameModeAthena.StartingItems");
     if (startingItemsProp && session.mode) {
@@ -1222,7 +1225,6 @@ void Athena::InitializeInventory() {
         }
     }
 
-    // Fallback: hardcoded
     if (!gaveAnything) {
         LOG("=== Using hardcoded fallback inventory ===");
 
@@ -1246,7 +1248,6 @@ void Athena::InitializeInventory() {
         }
     }
 
-    // Materials
     struct ResDef { const char* path; };
     ResDef resources[] = {
         {"/Game/Items/ResourcePickups/WoodItemData.WoodItemData"},
@@ -1262,7 +1263,6 @@ void Athena::InitializeInventory() {
         }
     }
 
-    // Ammo
     const char* ammo[] = {
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight",
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium",
@@ -1339,7 +1339,7 @@ void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
 }
 
 // ============================================================================
-// ABILITIES — fixed with EquipFortAbilitySet
+// ABILITIES — EquipFortAbilitySet
 // ============================================================================
 void Athena::GrantDefaultAbilities() {
     if (!session.controller || !session.pawn) {
@@ -1347,11 +1347,9 @@ void Athena::GrantDefaultAbilities() {
         return;
     }
 
-    // PlayerState
     void* ps = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     if (!ps) { LOG("GrantDefaultAbilities: no PlayerState"); return; }
 
-    // Try several GAS paths
     const char* abilitySets[] = {
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_AthenaPlayer.GAS_AthenaPlayer",
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_DefaultPlayer.GAS_DefaultPlayer",
@@ -1366,30 +1364,8 @@ void Athena::GrantDefaultAbilities() {
     }
     if (!abilitySet) { LOG("GrantDefaultAbilities: NO AbilitySet found"); return; }
 
-    // IAbilitySystemInterface
-    void* interfaceClass = FindObj("/Script/GameplayAbilities.AbilitySystemInterface");
-    if (!interfaceClass) interfaceClass = FindObj("/Script/FortniteGame.FortAbilitySystemInterface");
-    if (!interfaceClass) { LOG("GrantDefaultAbilities: no interface class"); return; }
-
-    // Try to fetch interface pointer from PlayerState
-    void* ascInterface = nullptr;
-    {
-        // Raw vtable access to GetInterface
-        void* klass = Read<void*>(ps, profile::ObjectClass);
-        if (klass) {
-            for (int i = 0; i < 500; ++i) {
-                // Not sure of the vtable index; skip and use engine helper below
-                (void)i;
-            }
-        }
-    }
-
-    // Use FortKismetLibrary.EquipFortAbilitySet directly; it accepts an interface
-    // We pass PlayerState as both object and interface pointer; UE will resolve.
-    if (!ascInterface) ascInterface = ps;
-
     struct TScript { void* ObjectPointer; void* InterfacePointer; };
-    TScript iface{ ps, ascInterface };
+    TScript iface{ ps, ps };
 
     Call c("/Script/FortniteGame.FortKismetLibrary.EquipFortAbilitySet");
     if (!c.ok()) { LOG("EquipFortAbilitySet: binding failed"); return; }
@@ -1411,7 +1387,6 @@ void Athena::GrantDefaultAbilities() {
 }
 
 void Athena::GrantAbility(void* klass) {
-    // Legacy path — kept for compatibility but not used
     if (!klass || !session.pawn) return;
     (void)klass;
 }
@@ -1428,7 +1403,7 @@ void Athena::GrantEffect(void* effect, float level) {
 }
 
 // ============================================================================
-// SPAWN PICKUP — fixed signature
+// SPAWN PICKUP
 // ============================================================================
 void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     if (!def) return;
@@ -1602,7 +1577,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
 }
 
 // ============================================================================
-// LOOT INTERACT — fixed with offsets from SDK
+// LOOT INTERACT
 // ============================================================================
 void Athena::Loot(void* actor) {
     if (!actor || IsBadPtr(actor)) return;
@@ -1646,7 +1621,6 @@ void Athena::Loot(void* actor) {
         SpawnPickup(r.Def, r.Count, v);
     }
 
-    // bAlreadySearched @ 0x0FB1 bit 7
     uint8_t* pByte = (uint8_t*)actor + 0x0FB1;
     *pByte |= (1 << 7);
 
@@ -1678,36 +1652,9 @@ void Athena::ServerHandlePickup(void* pickup) {
 // BUILDING
 // ============================================================================
 void Athena::SpawnBuildPreviews() {
-    void* previewCls = FindObj("BuildingPlayerPrimitivePreview");
-    if (!previewCls || !session.controller) return;
-    auto build = [&](const char* meshPath, char type) -> void* {
-        Transform t{};
-        void* actor = SpawnActor(session.world, previewCls, session.controller, t);
-        if (!actor) return nullptr;
-        void* mesh = LoadAsset(meshPath, nullptr);
-        void* mc = nullptr;
-        Call g("/Script/FortniteGame.BuildingActor.GetBuildingMeshComponent");
-        if (g.ok() && g.run(actor)) mc = g.result<void*>();
-        if (mc && mesh) {
-            Call s("/Script/Engine.StaticMeshComponent.SetStaticMesh");
-            if (s.ok() && s.set("NewMesh", mesh)) s.run(mc);
-        }
-        Call init("/Script/FortniteGame.BuildingActor.OnBuildingActorInitialized");
-        if (init.ok()) {
-            init.set("BuildingType", type);
-            init.set("BuildingState", (char)0);
-            init.run(actor);
-        }
-        Call hide("/Script/Engine.Actor.SetActorHiddenInGame");
-        bool h = true;
-        if (hide.ok() && hide.set("bNewHidden", h)) hide.run(actor);
-        return actor;
-    };
-    session.wall   = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_Solid.PBWA_W1_Solid", 0);
-    session.floor  = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_Floor.PBWA_W1_Floor", 1);
-    session.stairs = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_StairW.PBWA_W1_StairW", 5);
-    session.roof   = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_RoofC.PBWA_W1_RoofC", 6);
-    LOG("Build previews: W=%p F=%p S=%p R=%p", session.wall, session.floor, session.stairs, session.roof);
+    // Disabled — was causing crashes on Artemis_Terrain
+    LOG("SpawnBuildPreviews: skipped");
+    return;
 }
 
 void Athena::OnServerCreateBuildingActor(void* params) {
