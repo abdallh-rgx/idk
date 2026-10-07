@@ -1,8 +1,7 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // FULL RELEASE — UE5 LWC (double precision)
-// Fixed: crash on DropLoadingScreen (ServerReadyToStartMatch removed,
-//        playlist set to DefaultSolo, SpawnBuildPreviews disabled).
+// Fixed: waits for console command "open Artemis_Terrain" before initializing.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -145,6 +144,7 @@ template<class T> static void Write(void* p, size_t off, const T& v) {
 static uintptr_t g_base = 0;
 static std::atomic<int> g_status{0};
 static std::atomic<int> g_gameTid{0};
+static std::atomic<bool> g_openRequested{false};
 static thread_local bool g_internal = false;
 struct Guard { bool s = g_internal; Guard() { g_internal = true; } ~Guard() { g_internal = s; } };
 
@@ -623,7 +623,6 @@ static void HandleDoor(void* door, void* /*ignored*/) {
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
 
-    // bDoorOpen @ 0x0FDE bit 5 (from SDK)
     uint8_t* doorOpenByte = (uint8_t*)door + 0x0FDE;
     bool isOpen = ((*doorOpenByte) >> 5) & 1;
 
@@ -691,7 +690,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
 
     SetupCheats();
 
-    // Teleport via ClientSetLocation
     {
         Call cs("/Script/Engine.Controller.ClientSetLocation");
         if (cs.ok()) {
@@ -699,40 +697,29 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
             Rotator rot{0.0, 0.0, 0.0};
             bool ok1 = cs.set("NewLocation", loc);
             bool ok2 = cs.set("NewRotation", rot);
-            LOG("[Init] ClientSetLocation bind: loc=%d rot=%d", (int)ok1, (int)ok2);
             if (ok1 && ok2) {
                 cs.run(controller);
                 LOG("[Init] ClientSetLocation sent");
             } else {
                 cs.dump("ClientSetLocation");
             }
-        } else {
-            LOG("[Init] ClientSetLocation binding failed");
         }
     }
 
-    // Fallback: K2_SetActorLocation
     {
         Call sl("/Script/Engine.Actor.K2_SetActorLocation");
         if (sl.ok()) {
             Vector loc{0.0, 0.0, 3100.0};
             bool bSweep = false;
             bool bTeleport = true;
-            bool ok1 = sl.set("NewLocation", loc);
-            bool ok2 = sl.set("bSweep", bSweep);
-            bool ok3 = sl.set("bTeleport", bTeleport);
-            LOG("[Init] K2_SetActorLocation bind: loc=%d sweep=%d tp=%d",
-                (int)ok1, (int)ok2, (int)ok3);
-            if (ok1) {
-                sl.run(session.pawn);
-                LOG("[Init] K2_SetActorLocation sent");
-            }
-        } else {
-            LOG("[Init] K2_SetActorLocation binding failed");
+            sl.set("NewLocation", loc);
+            sl.set("bSweep", bSweep);
+            sl.set("bTeleport", bTeleport);
+            sl.run(session.pawn);
+            LOG("[Init] K2_SetActorLocation sent");
         }
     }
 
-    // Verify location
     {
         Call chk("/Script/Engine.Actor.K2_GetActorLocation");
         if (chk.ok() && chk.run(session.pawn)) {
@@ -741,7 +728,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         }
     }
 
-    // Skydiving state
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
@@ -815,99 +801,53 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// FinalizePlayer
+// FinalizePlayer — no ClientTravel, no ServerReadyToStartMatch
 // ============================================================================
 void Athena::FinalizePlayer() {
     session.finalized = true;
     LOG("=== FinalizePlayer ===");
 
     void* pc = GetPC(session.world, 0);
-    if (pc != session.controller) { LOG("Finalize: controller changed"); return; }
-
-    void* pawnCls = FindObj("/Script/FortniteGame.FortPlayerPawnAthena");
-    void* pawn = GetPawn(pc);
-    LOG("Finalize: engine pawn=%p old=%p class=%s",
-        pawn, session.pawn,
-        ObjName(pawn ? Read<void*>(pawn, profile::ObjectClass) : nullptr).c_str());
-
-    if (!pawn || !pawnCls) {
-        LOG("Finalize: engine pawn null or class null");
-        return;
+    if (pc != session.controller) {
+        LOG("Finalize: controller changed, keeping old pawn");
     }
 
-    if (IsA(pawn, pawnCls)) {
-        session.pawn = pawn;
-    } else {
+    void* pawn = GetPawn(session.controller);
+    if (pawn && !IsBadPtr(pawn)) {
         void* pawnBase = FindObj("/Script/FortniteGame.FortPlayerPawn");
         if (pawnBase && IsA(pawn, pawnBase)) {
             session.pawn = pawn;
-        } else {
-            LOG("Finalize: pawn class mismatch, skipping");
-            return;
+            LOG("Finalize: using engine pawn %p", pawn);
         }
     }
 
-    // Verify location
-    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
-    if (loc.ok() && loc.run(session.pawn)) {
-        Vector v = loc.result<Vector>();
-        LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
-
-        if (v.Z < 500.0) {
-            LOG("Finalize: Z too low — retry teleport");
-            Vector dest{0.0, 0.0, 3100.0};
-            Rotator rot{0.0, 0.0, 0.0};
-
-            Call cs("/Script/Engine.Controller.ClientSetLocation");
-            if (cs.ok() && cs.set("NewLocation", dest) && cs.set("NewRotation", rot))
-                cs.run(pc);
-
-            Call sl("/Script/Engine.Actor.K2_SetActorLocation");
-            if (sl.ok()) {
-                bool bSweep = false, bTeleport = true;
-                sl.set("NewLocation", dest);
-                sl.set("bSweep", bSweep);
-                sl.set("bTeleport", bTeleport);
-                sl.run(session.pawn);
-            }
-
-            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-            Call sd3("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-            if (sd3.ok()) sd3.run(session.pawn);
-        } else {
-            LOG("Finalize: pawn airborne at Z=%.0f", v.Z);
+    if (session.pawn) {
+        SetBool(session.pawn, "/Script/Engine.Actor.bActorEnableCollision", true);
+        void* root = GetObjField(session.pawn, "/Script/Engine.Actor.RootComponent");
+        if (root) {
+            SetBool(root, "/Script/Engine.PrimitiveComponent.bGenerateOverlapEvents", true);
+            SetBool(root, "/Script/Engine.PrimitiveComponent.bComponentOverlapEvents", true);
         }
-    }
-
-    ShowSkin();
-
-    Call restart("/Script/Engine.PlayerController.ClientRestart");
-    if (restart.ok() && restart.set("NewPawn", session.pawn)) restart.run(pc);
-
-    Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
-    if (cam.ok() && cam.set("NewViewTarget", session.pawn)) cam.run(pc);
-
-    // ===== Collision + Overlap Events =====
-    SetBool(session.pawn, "/Script/Engine.Actor.bActorEnableCollision", true);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bCanBeDamaged", true);
-
-    void* root = GetObjField(session.pawn, "/Script/Engine.Actor.RootComponent");
-    if (root) {
-        SetBool(root, "/Script/Engine.PrimitiveComponent.bGenerateOverlapEvents", true);
-        SetBool(root, "/Script/Engine.PrimitiveComponent.bComponentOverlapEvents", true);
-        SetBool(root, "/Script/Engine.PrimitiveComponent.bTraceComplexOnMove", true);
-    }
-
-    Call ec("/Script/Engine.Actor.SetActorEnableCollision");
-    if (ec.ok()) {
-        bool bEnable = true;
-        if (ec.set("bNewActorEnableCollision", bEnable)) {
-            ec.run(session.pawn);
+        Call ec("/Script/Engine.Actor.SetActorEnableCollision");
+        if (ec.ok()) {
+            bool bEnable = true;
+            if (ec.set("bNewActorEnableCollision", bEnable)) ec.run(session.pawn);
         }
+
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
+        Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+        if (sd.ok()) sd.run(session.pawn);
+
+        Call restart("/Script/Engine.PlayerController.ClientRestart");
+        if (restart.ok() && restart.set("NewPawn", session.pawn))
+            restart.run(session.controller);
+
+        Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+        if (cam.ok() && cam.set("NewViewTarget", session.pawn))
+            cam.run(session.controller);
     }
 
-    // ===== PlayerState — team + OnRep =====
     void* ps = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     if (ps) {
         void* teamProp = GetProp("/Script/FortniteGame.FortPlayerState.TeamIndex");
@@ -1003,7 +943,7 @@ void Athena::DestroyLods() {
 }
 
 // ============================================================================
-// DropLoadingScreen — FIXED (no ServerReadyToStartMatch, DefaultSolo playlist)
+// DropLoadingScreen — no ServerReadyToStartMatch
 // ============================================================================
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) {
@@ -1016,8 +956,8 @@ void Athena::DropLoadingScreen() {
     if (gp) {
         uint8_t old = Read<uint8_t>(GetField(session.state, gp));
         LOG("DropLoadingScreen: GamePhase old=%d", (int)old);
-        if (old < 2) {
-            uint8_t phase = 2;
+        if (old < 3) {
+            uint8_t phase = 3;
             Write<uint8_t>(GetField(session.state, gp), 0, phase);
             Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
             if (n.ok()) {
@@ -1039,7 +979,6 @@ void Athena::DropLoadingScreen() {
     if (!playlist) {
         LOG("DropLoadingScreen: no default playlist found — skipping");
     } else {
-        LOG("DropLoadingScreen: playlist set");
         void* bp = GetProp("/Script/FortniteGame.FortGameStateAthena.BasePlaylist");
         void* op = GetProp("/Script/FortniteGame.FortGameStateAthena.OverridePlaylist");
         void* cp = GetProp("/Script/FortniteGame.FortGameStateAthena.CurrentPlaylistData");
@@ -1051,6 +990,7 @@ void Athena::DropLoadingScreen() {
         if (a.ok()) a.run(session.state);
         Call b("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistInfo");
         if (b.ok()) b.run(session.state);
+        LOG("DropLoadingScreen: playlist set");
     }
 
     LOG("DropLoadingScreen: complete");
@@ -1339,7 +1279,7 @@ void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
 }
 
 // ============================================================================
-// ABILITIES — EquipFortAbilitySet
+// ABILITIES
 // ============================================================================
 void Athena::GrantDefaultAbilities() {
     if (!session.controller || !session.pawn) {
@@ -1652,7 +1592,6 @@ void Athena::ServerHandlePickup(void* pickup) {
 // BUILDING
 // ============================================================================
 void Athena::SpawnBuildPreviews() {
-    // Disabled — was causing crashes on Artemis_Terrain
     LOG("SpawnBuildPreviews: skipped");
     return;
 }
@@ -1974,15 +1913,38 @@ static void tick_hook(void* world, int type, float delta) {
     std::string wn = ObjName(world);
     static std::string lastWorld;
     if (wn != lastWorld) { LOG(">>> WorldTick world: '%s'", wn.c_str()); lastWorld = wn; }
-    if (wn.find("Frontend") != std::string::npos) return;
+
+    // 🔑 لا تفعل أي شيء حتى يكتب المستخدم 'open Artemis_Terrain'
+    if (!g_openRequested.load()) {
+        static double lastWaitLog = 0;
+        double now = Monotonic();
+        if (now - lastWaitLog > 10.0) {
+            lastWaitLog = now;
+            LOG("[Tick] Waiting for 'open Artemis_Terrain' console command...");
+        }
+        return;
+    }
+
+    // استمر في Finalize إذا كنا جاهزين (حتى لو انتقل world إلى Frontend)
+    if (session.attempted && !session.finalized && session.finalize_at > 0) {
+        if (Monotonic() >= session.finalize_at) {
+            LOG("[Tick] Triggering FinalizePlayer (world='%s')", wn.c_str());
+            Athena::FinalizePlayer();
+        }
+    }
+
+    // تجاهل أي world آخر غير Artemis_Terrain
     if (wn.find("Artemis_Terrain") == std::string::npos) return;
+
     int index = Read<int>(world, 0xC);
     if (world != session.world || index != session.world_index) {
-        session = Session{};
-        session.world = world;
-        session.world_index = index;
-        session.observed_at = Monotonic();
-        LOG(">>> Artemis_Terrain detected: %s", wn.c_str());
+        if (!session.attempted) {
+            session = Session{};
+            session.world = world;
+            session.world_index = index;
+            session.observed_at = Monotonic();
+            LOG(">>> Artemis_Terrain detected: %s", wn.c_str());
+        }
     }
     double now = Monotonic();
     if (now - session.observed_at < 5.0) return;
@@ -1993,6 +1955,16 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
     if (!orig_Exec) return false;
     std::string cmd = Narrow(command, 256);
     if (!cmd.empty()) LOG("Exec: %s", cmd.c_str());
+
+    // 🔑 راقب أمر فتح Artemis_Terrain
+    if (cmd.find("open Artemis_Terrain") != std::string::npos ||
+        cmd.find("open artemis_terrain") != std::string::npos) {
+        LOG(">>> [Console] Detected 'open Artemis_Terrain' — user requested entry!");
+        g_openRequested.store(true);
+        // أعد ضبط الجلسة لتُهيَّأ من جديد
+        session = Session{};
+    }
+
     return orig_Exec(engine, world, command, output);
 }
 
@@ -2032,6 +2004,7 @@ static void* Worker(void*) {
     usleep(300000);
     InstallHooks();
     LOG("=== Ready ===");
+    LOG(">>> Type 'open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena' in the console to begin.");
     return nullptr;
 }
 
