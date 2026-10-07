@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// No URL redirect (handled separately). Full implementation.
+// Full implementation with fixed PlayButton detection
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -193,7 +193,6 @@ struct alignas(16) Transform {
 };
 static_assert(sizeof(Transform) == 48, "Transform must be 48 bytes");
 
-// GObjects layout (FChunkedFixedUObjectArray)
 struct FUObjectItem { void* Object; int32 Flags; int32 Cluster; int32 Serial; };
 struct GObjects_t {
     uint8 _pad0[0x10];
@@ -268,13 +267,21 @@ static void* FindObj(const std::string& path) {
     return Fn<void*(*)(void*, void*, const char16_t*, bool)>(profile::StaticFindObject)(
         nullptr, nullptr, w.c_str(), false);
 }
+
+// Cache for ObjName to avoid re-computing for hot UFunctions
 static std::string ObjName(void* obj) {
     if (!obj) return {};
+    static std::map<void*, std::string> cache;
+    auto it = cache.find(obj);
+    if (it != cache.end()) return it->second;
+
     FStringNative s{};
     Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)(
         (char*)obj + profile::ObjectName, &s);
     std::string out = Narrow(s.Data, std::min(std::max(s.Count, 0), 512));
     if (s.Data) Fn<void(*)(void*)>(profile::Free)(s.Data);
+
+    if (cache.size() < 200000) cache[obj] = out;
     return out;
 }
 static std::string ObjNameFromUEString(FUEString* s) {
@@ -346,7 +353,7 @@ class Call {
 public:
     explicit Call(const char* path) {
         m_func = FindObj(path);
-        if (!m_func) { LOG("Call: missing %s", path); return; }
+        if (!m_func) return;
         int total = Read<uint16_t>(m_func, profile::FunctionParamSize);
         if (total < 0 || total > (int)m_data.size()) return;
 
@@ -388,8 +395,7 @@ public:
     }
 };
 
-// Now that Call exists — implement ObjNameFromFName
-static std::string ObjNameFromFNameReal(FName n) {
+static std::string ObjNameFromFName(FName n) {
     void* klib = FindObj("/Script/Engine.Default__KismetStringLibrary");
     if (!klib) return "";
     Call c("/Script/Engine.KismetStringLibrary.Conv_NameToString");
@@ -400,7 +406,6 @@ static std::string ObjNameFromFNameReal(FName n) {
     if (s.Data) Fn<void(*)(void*)>(profile::Free)(s.Data);
     return out;
 }
-static std::string ObjNameFromFName(FName n) { return ObjNameFromFNameReal(n); }
 
 // ============================================================================
 // CORE WRAPPERS
@@ -496,6 +501,7 @@ struct Session {
 static bool g_lobbyDetected = false;
 static double g_lobbyEnteredAt = 0;
 static bool g_travelTriggered = false;
+static std::atomic<bool> g_pendingTravel{false};
 
 static double Monotonic() {
     timespec ts{};
@@ -1000,7 +1006,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     for (int i = 0; i < ltdNames.Count && i < 512; ++i) {
         void* row = calloc(1, ltdSize);
         getRow(ltd, ltdNames.Data[i], row);
-        std::string tname = ObjNameFromFNameReal(*(FName*)((uintptr_t)row + tg));
+        std::string tname = ObjNameFromFName(*(FName*)((uintptr_t)row + tg));
         if (tname == category) {
             float w = *(float*)((uintptr_t)row + wt);
             if (w != 0) { catRows[i] = row; maxW += w; }
@@ -1018,7 +1024,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     }
     if (!pickedRow) { for (auto& p : catRows) free(p.second); return ret; }
     float numDrops = *(float*)((uintptr_t)pickedRow + nd);
-    std::string pkgName = ObjNameFromFNameReal(*(FName*)((uintptr_t)pickedRow + lp));
+    std::string pkgName = ObjNameFromFName(*(FName*)((uintptr_t)pickedRow + lp));
     for (auto& p : catRows) free(p.second);
     catRows.clear();
 
@@ -1026,7 +1032,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     for (int i = 0; i < lptNames.Count && i < 2048; ++i) {
         void* row = calloc(1, lptSize);
         getRow(lpt, lptNames.Data[i], row);
-        std::string pid = ObjNameFromFNameReal(*(FName*)((uintptr_t)row + lpid));
+        std::string pid = ObjNameFromFName(*(FName*)((uintptr_t)row + lpid));
         if (pid == pkgName) pkgRows[i] = row;
         else free(row);
     }
@@ -1045,7 +1051,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         for (int j = 0; j < lptNames.Count && j < 2048; ++j) {
             void* cand = calloc(1, lptSize);
             getRow(lpt, lptNames.Data[j], cand);
-            std::string cid = ObjNameFromFNameReal(*(FName*)((uintptr_t)cand + lpid));
+            std::string cid = ObjNameFromFName(*(FName*)((uintptr_t)cand + lpid));
             if (cid == call) {
                 SoftObjRef soft = *(SoftObjRef*)((uintptr_t)cand + ido);
                 void* klib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
@@ -1078,10 +1084,10 @@ void Athena::Loot(void* actor) {
     void* sdCls = FindObj("FortAthenaSupplyDrop");
     if (bcCls && IsA(actor, bcCls)) {
         void* p = GetProp("/Script/FortniteGame.BuildingContainer.SearchLootTierGroup");
-        if (p) tier = ObjNameFromFNameReal(Read<FName>(GetField(actor, p)));
+        if (p) tier = ObjNameFromFName(Read<FName>(GetField(actor, p)));
     } else if (sdCls && IsA(actor, sdCls)) {
         void* p = GetProp("/Script/FortniteGame.FortAthenaSupplyDrop.LootTableName");
-        if (p) tier = ObjNameFromFNameReal(Read<FName>(GetField(actor, p)));
+        if (p) tier = ObjNameFromFName(Read<FName>(GetField(actor, p)));
     }
     if (tier.find("None") != std::string::npos) return;
     if (tier.find("Athena") == std::string::npos) {
@@ -1490,13 +1496,18 @@ static void pe_hook(void* obj, void* func, void* params) {
         }
     }
 
-    // Detect play button events (before orig_PE)
+    // Detect real Play button CLICK (BndEvt__ prefix, once)
     if (!g_internal && func) {
-        std::string fn = ObjName(func);
-        if (fn == "BP_PlayButton" || fn == "PlayButton" ||
-            fn.find("PlayButton") != std::string::npos) {
-            LOG("[PE] Play button triggered: %s", fn.c_str());
-            if (session.controller) TriggerTravel();
+        static bool playClicked = false;
+        if (!playClicked) {
+            std::string fn = ObjName(func);
+            if (fn.find("BndEvt__") != std::string::npos &&
+                fn.find("PlayButton") != std::string::npos &&
+                fn.find("Clicked") != std::string::npos) {
+                playClicked = true;
+                LOG("[PE] Play button CLICKED: %s", fn.c_str());
+                if (session.controller) TriggerTravel();
+            }
         }
     }
 
@@ -1512,11 +1523,26 @@ static void tick_hook(void* world, int type, float delta) {
     if (g_gameTid.load() != (int)gettid()) return;
     Guard g;
 
+    // Handle pending travel request (from network thread → game thread)
+    if (g_pendingTravel.exchange(false)) {
+        if (session.controller && !g_travelTriggered) {
+            LOG("tick: processing pending travel");
+            TriggerTravel();
+        }
+    }
+
     if (Read<uint8_t>((void*)(g_base + profile::IsSavingPackage))) return;
     if (Fn<bool(*)()>(profile::IsGarbageCollecting)()) return;
 
     int index = Read<int>(world, 0xC);
     std::string wn = ObjName(world);
+
+    // Log every unique world once
+    static std::string lastWorld;
+    if (wn != lastWorld) {
+        LOG(">>> WorldTick world: '%s'", wn.c_str());
+        lastWorld = wn;
+    }
 
     // Lobby detection
     if (wn.find("Frontend") != std::string::npos) {
@@ -1538,14 +1564,7 @@ static void tick_hook(void* world, int type, float delta) {
     }
 
     // Artemis_Terrain (CH3 S3) — map
-    if (wn.find("Artemis_Terrain") == std::string::npos) {
-        static std::string lastWorld;
-        if (wn != lastWorld) {
-            LOG("World not Artemis_Terrain: %s", wn.c_str());
-            lastWorld = wn;
-        }
-        return;
-    }
+    if (wn.find("Artemis_Terrain") == std::string::npos) return;
 
     if (world != session.world || index != session.world_index) {
         g_travelTriggered = false;
