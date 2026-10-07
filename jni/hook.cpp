@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE FIXED BUILD — Full source, no crash
+// COMPLETE FIXED BUILD
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -221,6 +221,7 @@ static std::string Narrow(const char16_t* s, int max);
 static void* GetObjField(void* obj, const char* path);
 static void* LoadAsset(const std::string& path, const char* type_path);
 static void* LoadClass(const char* path, const char* base_path);
+static void* GetPC(void* world, int index);
 
 // ============================================================================
 // TYPE CHECKS
@@ -240,15 +241,7 @@ static bool IsA(void* obj, void* type) {
     if (!obj || !type || IsBadPtr(obj) || IsBadPtr(type)) return false;
     void* klass = Read<void*>(obj, profile::ObjectClass);
     if (!klass || IsBadPtr(klass)) return false;
-    std::string target = ObjName(type);
-    if (target.empty()) return false;
-    for (int depth = 0; depth < 64 && klass && !IsBadPtr(klass); ++depth) {
-        if (ObjName(klass) == target) return true;
-        void* super = Read<void*>(klass, profile::StructSuper);
-        if (super == klass) break;
-        klass = super;
-    }
-    return false;
+    return SubclassOfFast(klass, type);
 }
 
 // ============================================================================
@@ -480,6 +473,11 @@ static void* LoadClass(const char* path, const char* base_path = "/Script/Engine
         profile::StaticLoadClass)(parent, nullptr, s.c_str(), nullptr, 0, nullptr);
 }
 
+static void* GetPC(void* world, int index = 0) {
+    if (!world) return nullptr;
+    return Fn<void*(*)(void*, int)>(profile::GetPlayerController)(world, index);
+}
+
 // ============================================================================
 // SESSION
 // ============================================================================
@@ -651,7 +649,6 @@ static bool ApplyAbilitySet(void* pawn, void* abilitySet) {
     return true;
 }
 
-// SAFE — no reflection in hot loop, only pointer compares
 static std::vector<void*> CollectGameFeatureAbilitySets() {
     std::vector<void*> result;
 
@@ -674,7 +671,6 @@ static std::vector<void*> CollectGameFeatureAbilitySets() {
     void* abilitySetClass = FindObj("/Script/FortniteGame.FortAbilitySet");
     if (!abilitySetClass) { LOG("[Abilities] FortAbilitySet missing"); return result; }
 
-    // PASS 1: find all GameFeatureData objects
     std::vector<void*> gfds;
     gfds.reserve(32);
     for (int32 i = 0; i < num; ++i) {
@@ -686,7 +682,6 @@ static std::vector<void*> CollectGameFeatureAbilitySets() {
     LOG("[Abilities] Found %zu GameFeatureData instances", gfds.size());
     if (gfds.empty()) return result;
 
-    // PASS 2: find all FortAbilitySet objects whose outer is one of the GFDs
     for (int32 i = 0; i < num; ++i) {
         void* obj = go->GetById(i);
         if (!obj || IsBadPtr(obj)) continue;
@@ -745,10 +740,8 @@ void Athena::GrantAllAbilitySets() {
     if (!session.pawn || session.abilities_granted) return;
     LOG("[Abilities] Setting up...");
 
-    // Step 1: Stamina attributes
     if (!session.stamina_initialized) InitStaminaAttributes();
 
-    // Step 2: Core GAS_AthenaPlayer set
     void* coreSet = LoadAsset(
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_AthenaPlayer.GAS_AthenaPlayer",
         "/Script/FortniteGame.FortAbilitySet");
@@ -760,7 +753,6 @@ void Athena::GrantAllAbilitySets() {
         LOG("[Abilities] GAS_AthenaPlayer missing");
     }
 
-    // Step 3: Every GameFeature ability set
     auto featureSets = CollectGameFeatureAbilitySets();
     LOG("[Abilities] Processing %zu feature sets", featureSets.size());
     int applied = 0;
@@ -786,7 +778,6 @@ void Athena::GrantAllAbilitySets() {
     }
     LOG("[Abilities] Feature sets applied: %d/%zu", applied, featureSets.size());
 
-    // Step 4: Tactical Sprint fallback
     const char* tacticalPaths[] = {
         "/Game/Abilities/Player/TacticalSprint/GA_Athena_TacticalSprint.GA_Athena_TacticalSprint_C",
         "/Game/Abilities/Player/TacticalSprint/GA_Player_TacticalSprint.GA_Player_TacticalSprint_C",
@@ -1194,7 +1185,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     Call possess("/Script/Engine.Controller.Possess");
     if (possess.ok() && possess.set("InPawn", session.pawn)) possess.run(controller);
 
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
     SetupCheats();
 
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
@@ -1595,8 +1585,6 @@ void Athena::InitializeInventory() {
     if (!session.inventory) {
         void* klass = FindObj("/Script/FortniteGame.FortInventory");
         Transform t{};
-        session.inventory = (world_placeholder_never_used, nullptr);
-        // spawn inline
         void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
             profile::BeginSpawn)(session.world, klass, &t, 1, session.controller);
         session.inventory = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
@@ -2202,7 +2190,6 @@ static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
 
     if (!g_internal && func && g_gameTid.load() == (int)gettid()) {
-        // JumpFromHudStart FIRST
         if (obj == session.controller && params == nullptr) {
             std::string fn = ObjName(func);
             if (fn == "JumpFromHudStart") {
