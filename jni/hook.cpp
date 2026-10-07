@@ -1277,8 +1277,8 @@ void Athena::RestoreInput() {
         if (look.set("bNewLookInput", disabled)) look.run(session.controller);
     }
 
-    GrantDefaultAbilities();
-    ApplySprintSpeed();
+    // Abilities and sprint speed are restored by RestoreSprint().
+    // Do not grant them again here: repeated AbilitySystem grants can crash.
 }
 
 void Athena::RestoreAircraft() {
@@ -1891,6 +1891,7 @@ void Athena::GrantDefaultAbilities() {
 // ============================================================================
 void Athena::ApplySprintSpeed() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
+    if (session.sprint_applied) return;
     void* cmc = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
     if (!cmc || IsBadPtr(cmc)) return;
     void* prop = GetProp("/Script/Engine.CharacterMovementComponent.MaxWalkSpeed");
