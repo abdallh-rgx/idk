@@ -1,6 +1,11 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FULL VERSION — bugitgo AFTER ServerReadyToStartMatch (game.cpp order)
+// FINAL — UE5 LWC (double precision) structs
+//   Vector = 24 bytes (3 doubles)
+//   Rotator = 24 bytes (3 doubles)
+//   Transform = 96 bytes (with LWC alignment)
+//   Spawn via BeginSpawn with proper Transform
+//   Teleport via ClientSetLocation + K2_SetActorLocation
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -16,6 +21,7 @@
 #include <cmath>
 #include <ctime>
 #include <cstdarg>
+#include <cstddef>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -24,6 +30,9 @@
 #include <algorithm>
 #include <android/log.h>
 
+// ============================================================================
+// LOGGING
+// ============================================================================
 static FILE* g_logFile = nullptr;
 static void InitLog() {
     const char* p[] = {
@@ -44,6 +53,9 @@ using int8=int8_t; using int16=int16_t; using int32=int32_t; using int64=int64_t
 using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=uint64_t;
 using TCHAR=char16_t;
 
+// ============================================================================
+// PROFILE
+// ============================================================================
 namespace profile {
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
 constexpr uintptr_t StaticFindObject     = 0x0762A664;
@@ -106,6 +118,8 @@ constexpr unsigned FFieldOwner     = 0x10;
 constexpr unsigned FFieldNext      = 0x20;
 constexpr unsigned FFieldName      = 0x28;
 
+constexpr unsigned EnumNames = 0x40;
+
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
@@ -114,6 +128,9 @@ constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 
 extern "C" int DobbyHook(void* target, void* replace, void** origin);
 
+// ============================================================================
+// MEMORY HELPERS
+// ============================================================================
 static inline bool IsBadPtr(const void* p) {
     if (!p) return true;
     uintptr_t v = (uintptr_t)p;
@@ -136,6 +153,9 @@ struct Guard { bool s = g_internal; Guard() { g_internal = true; } ~Guard() { g_
 
 template<class F> static F Fn(uintptr_t rva) { return reinterpret_cast<F>(g_base + rva); }
 
+// ============================================================================
+// 🔑 BASIC STRUCTS — UE5 LWC doubles
+// ============================================================================
 struct FStringNative { TCHAR* Data; int32 Count; int32 Max; };
 struct FUEString     { TCHAR* data; int32 length; int32 capacity; };
 struct FName         { uint32 CompIdx; uint32 DispIdx; };
@@ -146,18 +166,30 @@ template<class T> struct TArray {
     const T& operator[](int i) const { return Data[i]; }
     int Num() const { return Count; }
 };
-struct Guid          { uint32 A, B, C, D; };
-struct Vector        { float X, Y, Z; };
-struct Rotator       { float Pitch, Yaw, Roll; };
-struct ItemAndCount  { int32 Count; uint32 _pad; void* Item; };
-struct SoftObjRef    { uint8 _pad[0x28]; };
+
+struct Guid  { uint32 A, B, C, D; };
+
+// 🔑 LWC — doubles
+struct Vector  { double X, Y, Z; };
+struct Rotator { double Pitch, Yaw, Roll; };
+
+struct ItemAndCount { int32 Count; uint32 _pad; void* Item; };
+struct SoftObjRef   { uint8 _pad[0x28]; };
+
+// 🔑 UE5 FTransform (96 bytes with LWC alignment)
+// Layout observed:  Quat(0x20) + Vec(0x18) + pad(0x08) + Vec(0x18) + pad(0x08) = 0x60
 struct alignas(16) Transform {
-    float Rotation[4]{0,0,0,1};
-    float Location[3]{0,0,5000};
-    float Scale[3]{1,1,1};
-    float _pad[2]{};
+    double Rotation[4]{0, 0, 0, 1};   // @ 0x00 (32 bytes, align 16)
+    double Location[3]{0, 0, 0};      // @ 0x20 (24 bytes)
+    uint8_t _padL[8]{};               // @ 0x38 (8 bytes)
+    double Scale[3]{1, 1, 1};         // @ 0x40 (24 bytes)
+    uint8_t _padS[8]{};               // @ 0x58 (8 bytes)
 };
-static_assert(sizeof(Transform) == 48, "Transform must be 48 bytes");
+static_assert(sizeof(Vector)    == 24, "Vector must be 24 bytes (LWC)");
+static_assert(sizeof(Rotator)   == 24, "Rotator must be 24 bytes (LWC)");
+static_assert(sizeof(Transform) == 96, "Transform must be 96 bytes (LWC)");
+static_assert(offsetof(Transform, Location) == 0x20, "Transform.Location offset");
+static_assert(offsetof(Transform, Scale)    == 0x40, "Transform.Scale offset");
 
 struct FUObjectItem { void* Object; int32 Flags; int32 Cluster; int32 Serial; };
 struct GObjects_t {
@@ -179,6 +211,9 @@ struct GObjects_t {
     }
 };
 
+// ============================================================================
+// FORWARD DECLS
+// ============================================================================
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
 static std::string ObjNameFromFName(FName n);
@@ -318,6 +353,9 @@ static void SetBool(void* obj, const char* path, bool enabled) {
     *dst = enabled ? (*dst | mask) : (*dst & ~mask);
 }
 
+// ============================================================================
+// Function pointer typedefs
+// ============================================================================
 using PE_t   = void(*)(void*, void*, void*);
 using Tick_t = void(*)(void*, int, float);
 using Exec_t = bool(*)(void*, void*, const char16_t*, void*);
@@ -325,6 +363,9 @@ static PE_t   orig_PE = nullptr;
 static Tick_t orig_Tick = nullptr;
 static Exec_t orig_Exec = nullptr;
 
+// ============================================================================
+// Call
+// ============================================================================
 class Call {
     void* m_func = nullptr;
     struct Param { std::string name; int offset, size; uint64_t flags; };
@@ -361,6 +402,7 @@ public:
     }
     bool ok() const { return m_valid; }
     void* func() const { return m_func; }
+    const std::vector<Param>& params() const { return m_params; }
     void dump(const char* label) const {
         LOG("[Call %s] valid=%d func=%p params=%zu", label, (int)m_valid, m_func, m_params.size());
         for (auto& p : m_params)
@@ -401,6 +443,9 @@ static std::string ObjNameFromFName(FName n) {
     return out;
 }
 
+// ============================================================================
+// CORE WRAPPERS
+// ============================================================================
 static void* LoadClass(const char* path, const char* base_path = "/Script/Engine.Actor") {
     if (void* r = FindObj(path)) return r;
     auto s = ToWide(path);
@@ -409,7 +454,8 @@ static void* LoadClass(const char* path, const char* base_path = "/Script/Engine
     return Fn<void*(*)(void*, void*, const char16_t*, const char16_t*, uint32_t, void*)>(
         profile::StaticLoadClass)(parent, nullptr, s.c_str(), nullptr, 0, nullptr);
 }
-static void* LoadAsset(const std::string& path, const char* type_path = "/Script/FortniteGame.FortItemDefinition") {
+static void* LoadAsset(const std::string& path,
+                       const char* type_path = "/Script/FortniteGame.FortItemDefinition") {
     if (void* r = FindObj(path)) return r;
     auto s = ToWide(path);
     void* type = FindObj(type_path);
@@ -463,26 +509,9 @@ static void* GetByShortName(const std::string& wanted) {
     return nullptr;
 }
 
-static void RunCommand(void* world, void* pc, const char* cmd) {
-    if (!world || !cmd) return;
-    void* lib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
-    if (!lib) { LOG("RunCommand: no KismetSystemLibrary"); return; }
-
-    auto buf = ToWide(cmd);
-    FStringNative fs{};
-    fs.Data  = buf.data();
-    fs.Count = (int32)buf.size() + 1;
-    fs.Max   = (int32)buf.size() + 1;
-
-    Call c("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
-    if (!c.ok()) { LOG("RunCommand: bind failed for '%s'", cmd); return; }
-    if (!c.set("WorldContextObject", world)) { c.dump("ExecCmd"); return; }
-    if (!c.set("Command", fs))               { c.dump("ExecCmd"); return; }
-    if (pc) c.set("SpecificPlayer", pc);
-    c.run(lib);
-    LOG("RunCommand: %s", cmd);
-}
-
+// ============================================================================
+// SESSION
+// ============================================================================
 struct Session {
     void* world = nullptr;
     int   world_index = -1;
@@ -498,7 +527,6 @@ struct Session {
     bool  attempted = false;
     bool  finalized = false;
     bool  cheats_ready = false;
-    bool  bugitgo_done = false;
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -517,14 +545,15 @@ static double Monotonic() {
     return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
 }
 
+// ============================================================================
+// ATHENA NAMESPACE
+// ============================================================================
 namespace Athena {
     void SetupWorld(void* world);
     void Tick();
     bool TryInitializePlayer(void* world, void* mode, void* controller);
     void SetupCheats();
-    void PostSpawnSetup();       // 🔑 جديدة
     void FinalizePlayer();
-    bool FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out);
     void ShowSkin();
     void DestroyLods();
     void DropLoadingScreen();
@@ -557,31 +586,9 @@ namespace Athena {
     std::vector<LootData> PickLootDrops(std::string category);
 }
 
-bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out) {
-    if (!mode || !controller) return false;
-
-    Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
-    if (!choose.ok() || !choose.set("Player", controller) || !choose.run(mode)) return false;
-    void* start = choose.result<void*>();
-    if (!start || IsBadPtr(start)) return false;
-
-    void* psCls = FindObj("/Script/Engine.PlayerStart");
-    if (!psCls || !IsA(start, psCls)) {
-        LOG("[Spawn] ChoosePlayerStart returned non-PlayerStart: %s", ObjName(start).c_str());
-        return false;
-    }
-
-    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
-    if (!loc.ok() || !loc.run(start)) return false;
-    Vector v = loc.result<Vector>();
-
-    if (!std::isfinite(v.X) || !std::isfinite(v.Y) || !std::isfinite(v.Z)) return false;
-
-    out = v;
-    LOG("[Spawn] %s loc=(%.0f,%.0f,%.0f)", ObjName(start).c_str(), v.X, v.Y, v.Z);
-    return true;
-}
-
+// ============================================================================
+// SetupCheats — creates FortCheatManager if missing
+// ============================================================================
 void Athena::SetupCheats() {
     void* pc = session.controller;
     if (!pc) return;
@@ -610,50 +617,14 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// 🔑 PostSpawnSetup — bugitgo هنا، بعد ServerReadyToStartMatch
+// TryInitializePlayer — spawn + teleport via ClientSetLocation/K2_SetActorLocation
 // ============================================================================
-void Athena::PostSpawnSetup() {
-    if (!session.controller || !session.pawn) return;
-    if (session.bugitgo_done) return;
-
-    LOG("PostSpawn: SetupCheats");
-    SetupCheats();
-
-    // 🔑 bugitgo — الآن بعد ServerReadyToStartMatch
-    LOG("PostSpawn: bugitgo 0 0 3100");
-    RunCommand(session.world, session.controller, "bugitgo 0 0 3100");
-
-    // 🔑 ClientOnPawnSpawned — مهم مثل game.cpp
-    Call spawned("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
-    if (spawned.ok()) {
-        spawned.run(session.controller);
-        LOG("PostSpawn: ClientOnPawnSpawned sent");
-    }
-
-    // GetHUD
-    Call hud("/Script/Engine.PlayerController.GetHUD");
-    if (hud.ok() && hud.run(session.controller)) {
-        void* h = hud.result<void*>();
-        LOG("PostSpawn: HUD=%p class=%s", h,
-            ObjName(h ? Read<void*>(h, profile::ObjectClass) : nullptr).c_str());
-    }
-
-    // تأكد أن البيد فعلاً تحرك
-    Call chk("/Script/Engine.Actor.K2_GetActorLocation");
-    if (chk.ok() && chk.run(session.pawn)) {
-        Vector v = chk.result<Vector>();
-        LOG("PostSpawn: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
-    }
-
-    session.bugitgo_done = true;
-    LOG("PostSpawn: complete");
-}
-
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
                               "/Script/Engine.Pawn");
     if (!pawnCls) { LOG("[Init] PlayerPawn_Athena_C missing"); return false; }
 
+    // (أ) استخدم بيد المحرك إن وُجد
     void* existing = GetPawn(controller);
     if (existing && !IsBadPtr(existing) && IsA(existing, pawnCls)) {
         session.pawn = existing;
@@ -661,18 +632,16 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return true;
     }
 
-    Vector loc{0, 0, 3100};
-    Vector psLoc;
-    if (FindSafeSpawnLocation(world, mode, controller, psLoc)) loc = psLoc;
-
+    // (ب) اسبن البيد — LWC doubles
     Transform t{};
-    t.Location[0] = loc.X;
-    t.Location[1] = loc.Y;
-    t.Location[2] = (loc.Z < 500.0f) ? 500.0f : (loc.Z + 100.0f);
+    t.Location[0] = 0.0;
+    t.Location[1] = 0.0;
+    t.Location[2] = 500.0;
 
     LOG("[Init] Spawning at (%.0f,%.0f,%.0f)", t.Location[0], t.Location[1], t.Location[2]);
     session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
+    LOG("[Init] Spawned: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
 
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
@@ -682,12 +651,65 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         LOG("[Init] Possession did not stick");
         return false;
     }
+    LOG("[Init] Possessed OK");
 
-    // ⚠️ لا bugitgo هنا — ننتظر حتى بعد ServerReadyToStartMatch
-    // فقط نضبط الهبوط الحر
+    SetupCheats();
+
+    // (ج) 🔑 النقل — ClientSetLocation أولاً (RPC مصمم للنقل)
+    {
+        Call cs("/Script/Engine.Controller.ClientSetLocation");
+        if (cs.ok()) {
+            Vector loc{0.0, 0.0, 3100.0};   // 24 bytes
+            Rotator rot{0.0, 0.0, 0.0};      // 24 bytes
+            bool ok1 = cs.set("NewLocation", loc);
+            bool ok2 = cs.set("NewRotation", rot);
+            LOG("[Init] ClientSetLocation bind: loc=%d rot=%d", (int)ok1, (int)ok2);
+            if (ok1 && ok2) {
+                cs.run(controller);
+                LOG("[Init] ClientSetLocation sent");
+            } else {
+                cs.dump("ClientSetLocation");
+            }
+        } else {
+            LOG("[Init] ClientSetLocation binding failed");
+        }
+    }
+
+    // (د) 🔑 احتياطي — K2_SetActorLocation
+    {
+        Call sl("/Script/Engine.Actor.K2_SetActorLocation");
+        if (sl.ok()) {
+            Vector loc{0.0, 0.0, 3100.0};
+            bool bSweep = false;
+            bool bTeleport = true;
+            bool ok1 = sl.set("NewLocation", loc);
+            bool ok2 = sl.set("bSweep", bSweep);
+            bool ok3 = sl.set("bTeleport", bTeleport);
+            LOG("[Init] K2_SetActorLocation bind: loc=%d sweep=%d tp=%d",
+                (int)ok1, (int)ok2, (int)ok3);
+            if (ok1) {
+                sl.run(session.pawn);
+                LOG("[Init] K2_SetActorLocation sent");
+            }
+        } else {
+            LOG("[Init] K2_SetActorLocation binding failed");
+        }
+    }
+
+    // (هـ) تحقق من الموقع الفعلي
+    {
+        Call chk("/Script/Engine.Actor.K2_GetActorLocation");
+        if (chk.ok() && chk.run(session.pawn)) {
+            Vector v = chk.result<Vector>();
+            LOG("[Init] After teleport: (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
+        }
+    }
+
+    // (و) ضبط الهبوط الحر
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
     if (sd.ok()) sd.run(session.pawn);
-
     Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen");
     if (po.ok()) po.run(session.pawn);
 
@@ -695,10 +717,13 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     if (restart.ok() && restart.set("NewPawn", session.pawn))
         restart.run(controller);
 
-    LOG("[Init] Pawn ready: %p (bugitgo deferred)", session.pawn);
+    LOG("[Init] Pawn ready: %p", session.pawn);
     return true;
 }
 
+// ============================================================================
+// SetupWorld
+// ============================================================================
 void Athena::SetupWorld(void* world) {
     session.world = world;
     session.controller = GetPC(world, 0);
@@ -746,13 +771,8 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SpawnBuildPreviews");
     SpawnBuildPreviews();
 
-    // 🔑 ServerReadyToStartMatch هنا — بعدها مباشرة bugitgo
     LOG("SetupWorld: DropLoadingScreen");
     DropLoadingScreen();
-
-    // 🔑 bugitgo الآن — بعد ServerReadyToStartMatch
-    LOG("SetupWorld: PostSpawnSetup (bugitgo)");
-    PostSpawnSetup();
 
     session.finalize_at = Monotonic() + 2.0;
     session.attempted   = true;
@@ -760,6 +780,9 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: initial pass done, finalize in 2s (pawn=%p)", session.pawn);
 }
 
+// ============================================================================
+// FinalizePlayer
+// ============================================================================
 void Athena::FinalizePlayer() {
     session.finalized = true;
     LOG("=== FinalizePlayer ===");
@@ -779,17 +802,32 @@ void Athena::FinalizePlayer() {
     }
     session.pawn = pawn;
 
+    // تحقق من الموقع
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
     if (loc.ok() && loc.run(session.pawn)) {
         Vector v = loc.result<Vector>();
         LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
 
-        // 🔑 إذا البيد عاد للأسفل، bugitgo مرة أخرى
-        if (v.Z < 500.0f) {
-            LOG("Finalize: Z too low, retrying bugitgo");
-            SetupCheats();
-            RunCommand(session.world, pc, "bugitgo 0 0 3100");
+        if (v.Z < 500.0) {
+            LOG("Finalize: Z too low — retry ClientSetLocation");
+            Vector dest{0.0, 0.0, 3100.0};
+            Rotator rot{0.0, 0.0, 0.0};
+
+            Call cs("/Script/Engine.Controller.ClientSetLocation");
+            if (cs.ok() && cs.set("NewLocation", dest) && cs.set("NewRotation", rot))
+                cs.run(pc);
+
+            Call sl("/Script/Engine.Actor.K2_SetActorLocation");
+            if (sl.ok()) {
+                bool bSweep = false, bTeleport = true;
+                sl.set("NewLocation", dest);
+                sl.set("bSweep", bSweep);
+                sl.set("bTeleport", bTeleport);
+                sl.run(session.pawn);
+            }
+
             SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
             Call sd3("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
             if (sd3.ok()) sd3.run(session.pawn);
         } else {
@@ -808,6 +846,9 @@ void Athena::FinalizePlayer() {
     LOG("Finalize: complete, pawn=%p", session.pawn);
 }
 
+// ============================================================================
+// Tick
+// ============================================================================
 void Athena::Tick() {
     if (!session.world) return;
     double now = Monotonic();
@@ -826,6 +867,9 @@ void Athena::Tick() {
     }
 }
 
+// ============================================================================
+// ShowSkin
+// ============================================================================
 void Athena::ShowSkin() {
     if (!session.controller || !session.pawn) return;
     void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
@@ -876,6 +920,9 @@ void Athena::DestroyLods() {
     LOG("DestroyLods: done");
 }
 
+// ============================================================================
+// DropLoadingScreen
+// ============================================================================
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
 
@@ -891,8 +938,6 @@ void Athena::DropLoadingScreen() {
     }
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
-
-    // 🔑 ServerReadyToStartMatch — هذا هو المفتاح
     Call rsm("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
     if (rsm.ok()) {
         rsm.run(session.controller);
@@ -924,14 +969,13 @@ void Athena::DropLoadingScreen() {
 
 void Athena::FixBuildingFoundations() {
     void* cls = FindObj("/Script/FortniteGame.BuildingFoundation");
-    if (!cls || !session.world) { LOG("FixBuildingFoundations: no class/world"); return; }
+    if (!cls || !session.world) return;
     GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
-    if (!go) { LOG("FixBuildingFoundations: no GObjects"); return; }
+    if (!go) return;
     void* p = GetProp("/Script/FortniteGame.BuildingFoundation.DynamicFoundationType");
-    if (!p) { LOG("FixBuildingFoundations: prop missing"); return; }
+    if (!p) return;
     int propOff = Read<int>(p, profile::PropOffset);
-    if (propOff < 0 || propOff > 0x20000) { LOG("FixBuildingFoundations: bad offset"); return; }
-
+    if (propOff < 0 || propOff > 0x20000) return;
     int fixed = 0;
     for (int32 i = 0; i < go->NumElements; ++i) {
         void* o = go->GetById(i);
@@ -953,14 +997,25 @@ void Athena::FixBus() {
         if (n.ok()) { n.set("OldGamePhase", (uint8_t)2); n.run(session.state); }
     }
     if (!session.pawn) return;
-    Call tp("/Script/Engine.Actor.K2_TeleportTo");
-    Vector loc{0, 0, 22500}; Rotator rot{0, 0, 0};
-    if (tp.ok() && tp.set("DestLocation", loc) && tp.set("DestRotation", rot)) tp.run(session.pawn);
+    Vector loc{0.0, 0.0, 22500.0};
+    Rotator rot{0.0, 0.0, 0.0};
+    Call sl("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+    if (sl.ok()) {
+        bool bSweep = false, bTeleport = true;
+        sl.set("NewLocation", loc);
+        sl.set("NewRotation", rot);
+        sl.set("bSweep", bSweep);
+        sl.set("bTeleport", bTeleport);
+        sl.run(session.pawn);
+    }
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
     if (sd.ok()) sd.run(session.pawn);
 }
 
+// ============================================================================
+// INVENTORY
+// ============================================================================
 void Athena::InventoryUpdate() {
     if (session.inventory) {
         Call a("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate"); if (a.ok()) a.run(session.inventory);
@@ -1064,6 +1119,9 @@ void Athena::InitializeInventory() {
     InventoryUpdate();
 }
 
+// ============================================================================
+// WEAPON EQUIP
+// ============================================================================
 static bool EquipWeapon(void* pawn, void* def, Guid guid) {
     if (!pawn || !def) return false;
     Call c("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
@@ -1104,6 +1162,9 @@ void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
     OnServerExecuteInventoryItem(guid);
 }
 
+// ============================================================================
+// ABILITIES
+// ============================================================================
 void Athena::GrantAbility(void* klass) {
     if (!klass || !session.pawn) return;
     void* asc = GetObjField(session.pawn, "/Script/FortniteGame.FortPawn.AbilitySystemComponent");
@@ -1151,6 +1212,9 @@ void Athena::GrantDefaultAbilities() {
     LOG("Granted default abilities");
 }
 
+// ============================================================================
+// SPAWN PICKUP
+// ============================================================================
 void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     if (!def) return;
     void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
@@ -1174,6 +1238,9 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     }
 }
 
+// ============================================================================
+// LOOT TABLES
+// ============================================================================
 std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     std::vector<LootData> ret;
     void* ltd = LoadAsset("/Game/Items/Datatables/AthenaLootTierData_Client.AthenaLootTierData_Client", nullptr);
@@ -1299,6 +1366,9 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     return ret;
 }
 
+// ============================================================================
+// LOOT INTERACT
+// ============================================================================
 void Athena::Loot(void* actor) {
     if (!actor) return;
     std::string tier = "None";
@@ -1347,6 +1417,9 @@ void Athena::ServerHandlePickup(void* pickup) {
     Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(pickup);
 }
 
+// ============================================================================
+// BUILDING
+// ============================================================================
 void Athena::SpawnBuildPreviews() {
     void* previewCls = FindObj("BuildingPlayerPrimitivePreview");
     if (!previewCls || !session.controller) return;
@@ -1383,7 +1456,7 @@ void Athena::SpawnBuildPreviews() {
 void Athena::OnServerCreateBuildingActor(void* params) {
     if (!params) return;
     struct OldP { void* Class; uint8 _p[0x8]; Vector Loc; Rotator Rot; };
-    struct NewP { int32 ClassHandle; Vector Loc; Rotator Rot; uint8 _p[0xC]; void* Class; };
+    struct NewP { int32 ClassHandle; Vector Loc; Rotator Rot; uint8 _p[0x10]; void* Class; };
     void* cls = nullptr; Vector loc{}; Rotator rot{};
     auto* fn = FindObj("/Script/FortniteGame.FortPlayerController.ServerCreateBuildingActor");
     if (fn && Read<uint16_t>(fn, profile::FunctionNumParams) == 1) {
@@ -1428,7 +1501,7 @@ void Athena::OnBeginEditActor(void* piece) {
 void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored, void* params) {
     if (!actor) return;
     SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayDestructionEffects", false);
-    Vector zero{0, 0, 0};
+    Vector zero{0.0, 0.0, 0.0};
     Call s("/Script/Engine.Actor.SetActorScale3D");
     if (s.ok() && s.set("NewScale3D", zero)) s.run(actor);
     Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(actor);
@@ -1446,13 +1519,16 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
     }
 }
 
+// ============================================================================
+// AIRCRAFT / WORLD
+// ============================================================================
 void Athena::OnAircraftJump() {
     if (!session.controller) return;
     Call loc("/Script/Engine.PlayerController.GetFocalLocation");
-    Vector l{0, 0, 20000};
+    Vector l{0.0, 0.0, 20000.0};
     if (loc.ok() && loc.run(session.controller)) l = loc.result<Vector>();
     Call rot("/Script/Engine.PlayerController.GetControlRotation");
-    Rotator r{0, 0, 0};
+    Rotator r{0.0, 0.0, 0.0};
     if (rot.ok() && rot.run(session.controller)) { r = rot.result<Rotator>(); r.Pitch = 0; r.Roll = 0; }
     void* klass = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
     if (!klass) return;
@@ -1484,11 +1560,18 @@ void Athena::TeleportToSpawnIsland() {
     if (starts.empty()) return;
     void* start = starts[rand() % starts.size()];
     Call c("/Script/Engine.Actor.K2_GetActorLocation");
-    Vector loc{0, 0, 1000};
+    Vector loc{0.0, 0.0, 1000.0};
     if (c.ok() && c.run(start)) loc = c.result<Vector>();
-    Call tp("/Script/Engine.Actor.K2_TeleportTo");
-    Rotator rot{0, 0, 0};
-    if (tp.ok() && tp.set("DestLocation", loc) && tp.set("DestRotation", rot)) tp.run(session.pawn);
+    Rotator rot{0.0, 0.0, 0.0};
+    Call sl("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+    if (sl.ok()) {
+        bool bSweep = false, bTeleport = true;
+        sl.set("NewLocation", loc);
+        sl.set("NewRotation", rot);
+        sl.set("bSweep", bSweep);
+        sl.set("bTeleport", bTeleport);
+        sl.run(session.pawn);
+    }
 }
 
 void Athena::RemoveNetDebugUI() {
@@ -1587,13 +1670,16 @@ void Athena::CheatScript(const char* script) {
         if (!def) def = FindObj(wn);
         if (def) {
             Call c("/Script/Engine.Actor.K2_GetActorLocation");
-            Vector v{0, 0, 5000};
+            Vector v{0.0, 0.0, 5000.0};
             if (c.ok() && c.run(session.pawn)) v = c.result<Vector>();
             SpawnPickup(def, 1, v);
         }
     }
 }
 
+// ============================================================================
+// HOOKS
+// ============================================================================
 static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
     if (!g_internal && func && params && session.controller && obj == session.controller &&
@@ -1691,6 +1777,8 @@ static int InspectCb(dl_phdr_info* info, size_t, void*) {
 
 static void* Worker(void*) {
     LOG("=== EraCH3 starting ===");
+    LOG("sizeof(Vector)=%zu sizeof(Rotator)=%zu sizeof(Transform)=%zu",
+        sizeof(Vector), sizeof(Rotator), sizeof(Transform));
     for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
         dl_iterate_phdr(InspectCb, nullptr);
         if (g_status.load() == 0) usleep(100000);
