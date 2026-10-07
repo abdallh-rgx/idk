@@ -1,12 +1,15 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android (CLIENT-ONLY)
 // COMPLETE + PLAYER-VISIBILITY FIX
-//   1. AddToInventory      → direct FGuid injection into QuickBar Slots
-//   2. HandleDoor          → direct bit flip + OnRep_bDoorOpen
-//   3. ApplySprintSpeed    → direct MaxWalkSpeed modification
-//   4. SpawnSafeZoneIndicator → spawn AFortSafeZoneIndicator locally
-//   5. 🔧 FIX: Player visible — SetCharacterBodyVisibilityForPossession +
-//             ServerReadyToStartMatch + ClientOnPawnSpawned + proper spawn
+//   1. AddToInventory       → direct FGuid injection into QuickBar Slots
+//   2. HandleDoor           → direct bit flip + OnRep_bDoorOpen
+//   3. ApplySprintSpeed     → direct MaxWalkSpeed modification
+//   4. SpawnSafeZoneIndicator → spawn FortSafeZoneIndicator locally
+//   5. 🔧 FIX: HeroType @ 0x430 on FortPlayerState (SDK-confirmed)
+//   6. 🔧 FIX: LoadDefaultCosmetics — manual asset loading + ApplyCharacterCosmetics
+//   7. 🔧 FIX: ForcePlayerVisible — SetCharacterBodyVisibilityForPossession(true)
+//   8. 🔧 FIX: ServerReadyToStartMatch + ClientOnPawnSpawned
+//   9. 🔧 FIX: No teleport to (0,0,3100) — respect PlayerStart
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -125,6 +128,10 @@ constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
 constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
+
+// 🔧 FIX: SDK-confirmed offsets
+constexpr unsigned FortPlayerState_HeroType = 0x0430;  // AFortPlayerState::HeroType
+constexpr unsigned FortPlayerController_MyPlayerInfo = 0x2088;
 }
 
 extern "C" int DobbyHook(void* target, void* replace, void** origin);
@@ -526,8 +533,8 @@ struct Session {
     bool  cheats_ready = false;
     bool  safezone_spawned = false;
     bool  sprint_applied = false;
-    bool  ready_called = false;      // 🔧 FIX: track ServerReadyToStartMatch
-    bool  visibility_forced = false; // 🔧 FIX: track body visibility
+    bool  ready_called = false;      // 🔧 FIX: ServerReadyToStartMatch flag
+    bool  visibility_forced = false; // 🔧 FIX: visibility flag
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -556,6 +563,8 @@ namespace Athena {
     void SetupCheats();
     void FinalizePlayer();
     void ShowSkin();
+    void LoadDefaultCosmetics();        // 🔧 FIX: new
+    void ForcePlayerVisible();          // 🔧 FIX: new
     void DestroyLods();
     void DropLoadingScreen();
     void FixBuildingFoundations();
@@ -586,29 +595,184 @@ namespace Athena {
     void OnExitVehicle();
     void CheatScript(const char* script);
 
-    // 🔧 FIX: new helper for visibility
-    void ForcePlayerVisible();
-
     struct LootData { void* Def; int Count; };
     std::vector<LootData> PickLootDrops(std::string category);
 }
 
 // ============================================================================
-// 🔧 FIX: ForcePlayerVisible — the missing piece
+// 🔧 FIX: LoadDefaultCosmetics — manual asset loading (from game.cpp)
+// ============================================================================
+void Athena::LoadDefaultCosmetics() {
+    if (!session.pawn || !session.controller) return;
+    LOG("[Cosmetics] Loading default Athena parts manually...");
+
+    // 1. Load head + body CustomCharacterPart assets
+    const char* partPaths[] = {
+        "/Game/Athena/Heroes/Meshes/Heads/F_Med_Head1_ATH.F_Med_Head1_ATH",
+        "/Game/Athena/Heroes/Meshes/Bodies/CP_001_Athena_Body.CP_001_Athena_Body",
+    };
+    void* loaded[2]{};
+    for (int i = 0; i < 2; ++i) {
+        void* asset = LoadAsset(partPaths[i], "/Script/FortniteGame.CustomCharacterPart");
+        if (!asset) { LOG("[Cosmetics] Missing: %s", partPaths[i]); continue; }
+        void* partCls = FindObj("/Script/FortniteGame.CustomCharacterPart");
+        if (!partCls || !IsA(asset, partCls)) {
+            LOG("[Cosmetics] Wrong class: %s", partPaths[i]);
+            continue;
+        }
+        loaded[i] = asset;
+        Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+        if (choose.ok() && choose.set("Part", (uint8_t)i) && choose.set("ChosenCharacterPart", asset)) {
+            choose.run(session.pawn);
+            LOG("[Cosmetics] Applied part %d: %s", i, ObjName(asset).c_str());
+        } else {
+            choose.dump("ServerChoosePart");
+        }
+    }
+
+    // 2. Set HeroType on PlayerState + OnReps + ApplyCharacterCosmetics
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
+    if (!state || IsBadPtr(state)) { LOG("[Cosmetics] No PlayerState"); return; }
+
+    if (loaded[0] && loaded[1]) {
+        Array partsArr{loaded, 2, 2};
+        Call apply("/Script/FortniteGame.FortKismetLibrary.ApplyCharacterCosmetics");
+        if (apply.ok()
+            && apply.set("WorldContextObject", session.world)
+            && apply.set("CharacterParts", partsArr)
+            && apply.set("PlayerState", state)) {
+            void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+            if (klib) { apply.run(klib); LOG("[Cosmetics] ApplyCharacterCosmetics dispatched"); }
+        } else {
+            apply.dump("ApplyCharacterCosmetics");
+        }
+
+        // HeroType on PlayerState @ 0x430
+        void* hero = LoadAsset("/Game/Athena/Heroes/HID_001_Athena_Commando_F.HID_001_Athena_Commando_F",
+                               "/Script/FortniteGame.FortHeroType");
+        if (!hero)
+            hero = LoadAsset("/Game/Athena/Heroes/HID_001_Athena_Commando_M.HID_001_Athena_Commando_M",
+                             "/Script/FortniteGame.FortHeroType");
+        if (hero) {
+            Write<void*>(state, profile::FortPlayerState_HeroType, hero);
+            LOG("[Cosmetics] HeroType injected @0x430 = %s", ObjName(hero).c_str());
+        } else {
+            LOG("[Cosmetics] Failed to load default HeroType");
+        }
+    }
+
+    // 3. Trigger all necessary OnReps
+    Call r1("/Script/FortniteGame.FortPlayerState.OnRep_HeroType");
+    if (r1.ok()) r1.run(state);
+    Call r2("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts");
+    if (r2.ok()) r2.run(state);
+    Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData");
+    if (r3.ok()) r3.run(state);
+
+    // 4. Refresh visualization on PlayerState
+    Call refresh("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
+    if (refresh.ok() && refresh.set("PlayerState", state)) {
+        void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+        if (klib) refresh.run(klib);
+    }
+
+    // 5. Refresh pawn customization
+    Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CustomizationLoadout");
+    if (cl.ok()) cl.run(session.pawn);
+
+    // 6. Log mesh state
+    void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
+    if (mesh && !IsBadPtr(mesh)) {
+        void* skmProp = GetProp("/Script/Engine.SkinnedMeshComponent.SkeletalMesh");
+        void* skm = skmProp ? Read<void*>(GetField(mesh, skmProp)) : nullptr;
+        LOG("[Cosmetics] Pawn mesh=%p SkeletalMesh=%s", mesh, ObjName(skm).c_str());
+    } else {
+        LOG("[Cosmetics] Pawn has NO MeshComponent");
+    }
+}
+
+// ============================================================================
+// 🔧 FIX: ShowSkin — HeroType @ 0x430 on FortPlayerState
+// ============================================================================
+void Athena::ShowSkin() {
+    if (!session.controller || !session.pawn) return;
+
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
+    if (!state || IsBadPtr(state)) { LOG("ShowSkin: no PlayerState"); return; }
+
+    // 🔧 FIX: HeroType @ 0x430 (SDK-confirmed: AFortPlayerState::HeroType)
+    void* hero = Read<void*>(state, profile::FortPlayerState_HeroType);
+    LOG("ShowSkin: HeroType@0x430=%p (%s)", hero,
+        ObjName(hero ? Read<void*>(hero, profile::ObjectClass) : nullptr).c_str());
+
+    // If null → fall back to manual cosmetics loader
+    if (!hero || IsBadPtr(hero)) {
+        LOG("ShowSkin: HeroType null — falling back to manual loader");
+        LoadDefaultCosmetics();
+        return;
+    }
+
+    // Extract CharacterParts from HeroType
+    session.character_parts.clear();
+    void* cpProp = GetProp("/Script/FortniteGame.FortHeroType.CharacterParts");
+    if (cpProp) {
+        Array parts = Read<Array>(GetField(hero, cpProp));
+        for (int i = 0; i < parts.Count && i < 16; ++i) {
+            void* p = Read<void*>(parts.Data, (size_t)i * 8);
+            if (p && !IsBadPtr(p)) session.character_parts.push_back(p);
+        }
+    }
+    LOG("ShowSkin: %zu character parts from HeroType", session.character_parts.size());
+
+    if (session.character_parts.empty()) {
+        LOG("ShowSkin: HeroType has no parts — manual fallback");
+        LoadDefaultCosmetics();
+        return;
+    }
+
+    // Apply each part
+    for (void* part : session.character_parts) {
+        void* typeProp = GetProp("/Script/FortniteGame.CustomCharacterPart.CharacterPartType");
+        if (!typeProp) continue;
+        char type = Read<char>(GetField(part, typeProp));
+        Call c("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+        if (c.ok() && c.set("Part", (uint8_t)type) && c.set("ChosenCharacterPart", part))
+            c.run(session.pawn);
+    }
+
+    // OnReps
+    Call a("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts"); if (a.ok()) a.run(state);
+    Call b("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData");  if (b.ok()) b.run(state);
+    Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CustomizationLoadout");
+    if (cl.ok()) cl.run(session.pawn);
+
+    // Verify mesh
+    void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
+    if (mesh && !IsBadPtr(mesh)) {
+        void* skmProp = GetProp("/Script/Engine.SkinnedMeshComponent.SkeletalMesh");
+        void* skm = skmProp ? Read<void*>(GetField(mesh, skmProp)) : nullptr;
+        LOG("ShowSkin: Pawn mesh=%p SkeletalMesh=%s", mesh, ObjName(skm).c_str());
+        if (!skm || IsBadPtr(skm)) LoadDefaultCosmetics();
+    } else {
+        LOG("ShowSkin: Pawn has no MeshComponent — manual fallback");
+        LoadDefaultCosmetics();
+    }
+}
+
+// ============================================================================
+// 🔧 FIX: ForcePlayerVisible — the master visibility call
 // ============================================================================
 void Athena::ForcePlayerVisible() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
-
     LOG("[Visibility] Forcing player body visible...");
 
-    // 1. Cancel skydiving / parachute states
+    // 1. Cancel skydiving states
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteAvailable", true);
 
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
     if (sd.ok()) sd.run(session.pawn);
-
     Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen");
     if (po.ok()) po.run(session.pawn);
 
@@ -618,33 +782,26 @@ void Athena::ForcePlayerVisible() {
         bool bShow = true;
         if (body.set("bVisible", bShow)) {
             body.run(session.pawn);
-            bool ret = body.result<bool>();
-            LOG("[Visibility] SetCharacterBodyVisibilityForPossession(TRUE) returned=%d", (int)ret);
+            LOG("[Visibility] SetCharacterBodyVisibilityForPossession(TRUE) sent");
         } else {
             body.dump("SetCharacterBodyVisibilityForPossession");
-            // Try alternative parameter name
-            if (body.set("bNewVisible", bShow)) {
-                body.run(session.pawn);
-                LOG("[Visibility] Used bNewVisible instead");
-            }
         }
     } else {
         LOG("[Visibility] SetCharacterBodyVisibilityForPossession binding FAILED");
     }
 
-    // 3. Also try SetActorHiddenInGame(false) as fallback
+    // 3. SetActorHiddenInGame(false)
     Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
     if (hid.ok()) {
         bool bHidden = false;
         if (hid.set("bNewHidden", bHidden)) hid.run(session.pawn);
     }
 
-    // 4. Ensure collisions/visibility flags
+    // 4. Ensure no hidden flags
     SetBool(session.pawn, "/Script/Engine.Actor.bHidden", false);
-    SetBool(session.pawn, "/Script/Engine.PrimitiveComponent.bOwnerNoSee", false);
-    SetBool(session.pawn, "/Script/Engine.PrimitiveComponent.bOnlyOwnerSee", false);
 
-    // 5. Re-apply cosmetics AFTER visibility is set
+    // 5. Apply cosmetics + skin AFTER visibility is forced
+    LoadDefaultCosmetics();
     ShowSkin();
 
     session.visibility_forced = true;
@@ -679,11 +836,10 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// HandleDoor (client-local)
+// HandleDoor
 // ============================================================================
 void Athena::HandleDoor(void* door) {
     if (!door || IsBadPtr(door)) return;
-
     static void* wallCls = nullptr;
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
@@ -695,12 +851,11 @@ void Athena::HandleDoor(void* door) {
 
     Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
     if (r.ok()) r.run(door);
-
     LOG("Door %s (client)", wasOpen ? "CLOSED" : "OPENED");
 }
 
 // ============================================================================
-// 🔧 FIX: TryInitializePlayer — with proper spawn + no skydiving left on
+// 🔧 FIX: TryInitializePlayer
 // ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
@@ -714,11 +869,9 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return true;
     }
 
-    // 🔧 FIX: Try ChoosePlayerStart first (proper spawn point)
+    // 🔧 FIX: ChoosePlayerStart first
     Transform t{};
-    t.Location[0] = 0.0;
-    t.Location[1] = 0.0;
-    t.Location[2] = 500.0;
+    t.Location[0] = 0.0; t.Location[1] = 0.0; t.Location[2] = 500.0;
     bool haveSpawn = false;
 
     {
@@ -740,19 +893,20 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
             }
         }
     }
-
     if (!haveSpawn) {
-        // Fallback: spawn island coords
-        t.Location[0] = 0.0;
-        t.Location[1] = 0.0;
-        t.Location[2] = 3100.0;
-        LOG("[Init] Using fallback spawn at (0,0,3100)");
+        // fallback: spawn island coords
+        t.Location[0] = 0.0; t.Location[1] = 0.0; t.Location[2] = 3100.0;
+        LOG("[Init] Using fallback spawn (0,0,3100)");
     }
 
     LOG("[Init] Spawning at (%.0f,%.0f,%.0f)", t.Location[0], t.Location[1], t.Location[2]);
     session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
     LOG("[Init] Spawned: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
+
+    // Ensure NOT skydiving at this point
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
     Possess(controller, session.pawn);
     if (GetPawn(controller) != session.pawn) {
@@ -763,9 +917,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
 
     SetupCheats();
 
-    // 🔧 FIX: do NOT leave bIsSkydiving=true. Set it false right after possessing.
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
     if (sd.ok()) sd.run(session.pawn);
     Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen");
@@ -775,7 +926,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     if (restart.ok() && restart.set("NewPawn", session.pawn))
         restart.run(controller);
 
-    // 🔧 FIX: Force visibility immediately
+    // 🔧 FIX: Force visibility now
     ForcePlayerVisible();
 
     LOG("[Init] Pawn ready: %p", session.pawn);
@@ -800,10 +951,7 @@ void Athena::SetupWorld(void* world) {
     void* stateProp = GetProp("/Script/Engine.World.GameState");
     session.mode  = modeProp  ? Read<void*>(GetField(world, modeProp))  : nullptr;
     session.state = stateProp ? Read<void*>(GetField(world, stateProp)) : nullptr;
-    if (!session.mode || !session.state) {
-        LOG("SetupWorld: mode/state missing");
-        return;
-    }
+    if (!session.mode || !session.state) { LOG("SetupWorld: mode/state missing"); return; }
 
     LOG("SetupWorld: PC=%s GM=%s GS=%s",
         ObjName(session.controller).c_str(),
@@ -817,25 +965,18 @@ void Athena::SetupWorld(void* world) {
 
     LOG("SetupWorld: ShowSkin");
     ShowSkin();
-
     LOG("SetupWorld: DestroyLods");
     DestroyLods();
-
     LOG("SetupWorld: InitializeInventory");
     InitializeInventory();
-
     LOG("SetupWorld: GrantDefaultAbilities");
     GrantDefaultAbilities();
-
     LOG("SetupWorld: ApplySprintSpeed");
     ApplySprintSpeed();
-
     LOG("SetupWorld: SpawnSafeZoneIndicator");
     SpawnSafeZoneIndicator();
-
     LOG("SetupWorld: SpawnBuildPreviews");
     SpawnBuildPreviews();
-
     LOG("SetupWorld: DropLoadingScreen");
     DropLoadingScreen();
 
@@ -846,7 +987,7 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// 🔧 FIX: FinalizePlayer — visibility is the LAST thing we do
+// 🔧 FIX: FinalizePlayer — no bad teleport, ready calls, force visible
 // ============================================================================
 void Athena::FinalizePlayer() {
     if (session.finalized) return;
@@ -868,50 +1009,53 @@ void Athena::FinalizePlayer() {
     }
     session.pawn = pawn;
 
-    // 🔧 FIX: ensure the pawn is on solid ground, not skydiving
+    // 🔧 FIX: Only intervene if truly underground. DO NOT teleport to (0,0,3100).
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
     if (loc.ok() && loc.run(session.pawn)) {
         Vector v = loc.result<Vector>();
         LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
 
-        if (v.Z < 500.0) {
-            LOG("Finalize: Z too low — teleporting up");
-            Vector dest{0.0, 0.0, 3100.0};
-            Rotator rot{0.0, 0.0, 0.0};
-            Call cs("/Script/Engine.Controller.ClientSetLocation");
-            if (cs.ok() && cs.set("NewLocation", dest) && cs.set("NewRotation", rot))
-                cs.run(pc);
-            Call sl("/Script/Engine.Actor.K2_SetActorLocation");
-            if (sl.ok()) {
-                bool bSweep = false, bTeleport = true;
-                sl.set("NewLocation", dest);
-                sl.set("bSweep", bSweep);
-                sl.set("bTeleport", bTeleport);
-                sl.run(session.pawn);
+        if (v.Z < -1000.0) {
+            LOG("Finalize: pawn is underground — snapping to PlayerStart");
+            Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
+            if (choose.ok() && choose.set("Player", pc) && choose.run(session.mode)) {
+                void* start = choose.result<void*>();
+                if (start && !IsBadPtr(start)) {
+                    Call sloc("/Script/Engine.Actor.K2_GetActorLocation");
+                    if (sloc.ok() && sloc.run(start)) {
+                        Vector sv = sloc.result<Vector>();
+                        Rotator rot{0.0, 0.0, 0.0};
+                        Call cs("/Script/Engine.Controller.ClientSetLocation");
+                        if (cs.ok() && cs.set("NewLocation", sv) && cs.set("NewRotation", rot))
+                            cs.run(pc);
+                        LOG("Finalize: snapped to PlayerStart (%.0f,%.0f,%.0f)", sv.X, sv.Y, sv.Z);
+                    }
+                }
             }
+        } else {
+            LOG("Finalize: location OK (not teleporting)");
         }
     }
 
-    // 🔧 FIX: ServerReadyToStartMatch + ClientOnPawnSpawned
+    // 🔧 FIX: ServerReadyToStartMatch + ClientOnPawnSpawned (idempotent)
     if (!session.ready_called) {
-        LOG("Finalize: calling ServerReadyToStartMatch");
+        LOG("Finalize: ServerReadyToStartMatch + ClientOnPawnSpawned");
         Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
         if (srt.ok()) srt.run(pc);
-
         Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
         if (cps.ok()) cps.run(pc);
-
         session.ready_called = true;
     }
 
-    // 🔧 FIX: refresh view target
+    // ClientRestart + ViewTarget
     Call restart("/Script/Engine.PlayerController.ClientRestart");
     if (restart.ok() && restart.set("NewPawn", pawn)) restart.run(pc);
 
     Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
     if (cam.ok() && cam.set("NewViewTarget", pawn)) cam.run(pc);
 
-    // 🔧 FIX: THE critical call to make the body appear
+    // 🔧 FIX: THE final visibility call
+    session.visibility_forced = false; // reset so we re-run
     ForcePlayerVisible();
 
     LOG("Finalize: complete, pawn=%p visible=%d", session.pawn, (int)session.visibility_forced);
@@ -932,52 +1076,17 @@ void Athena::Tick() {
     }
     if (session.finalize_at > 0 && !session.finalized && now >= session.finalize_at) {
         FinalizePlayer();
+        return;
     }
-    // 🔧 FIX: after finalized, keep re-asserting visibility occasionally (some servers
-        // reset it after readiness)
+    // 🔧 FIX: Re-assert visibility periodically
     static double lastVisibility = 0;
-    if (session.finalized && now - lastVisibility > 5.0) {
+    if (session.finalized && now - lastVisibility > 8.0) {
         lastVisibility = now;
-        if (!session.visibility_forced) ForcePlayerVisible();
-    }
-}
-
-// ============================================================================
-// ShowSkin
-// ============================================================================
-void Athena::ShowSkin() {
-    if (!session.controller || !session.pawn) return;
-    void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
-    if (!info) { LOG("ShowSkin: no MyPlayerInfo"); return; }
-    void* hero = GetObjField(info, "/Script/FortniteGame.FortAthenaLocalPlayerInfo.AthenaMenuHeroDef");
-    if (!hero) hero = GetObjField(info, "/Script/FortniteGame.FortAthenaLocalPlayerInfo.TempAthenaMenuHeroInstance");
-    if (!hero) { LOG("ShowSkin: no hero def"); return; }
-
-    if (session.character_parts.empty()) {
-        void* cpProp = GetProp("/Script/FortniteGame.FortHeroType.CharacterParts");
-        if (cpProp) {
-            Array parts = Read<Array>(GetField(hero, cpProp));
-            for (int i = 0; i < parts.Count && i < 16; ++i) {
-                void* p = Read<void*>(parts.Data, (size_t)i * 8);
-                if (p && !IsBadPtr(p)) session.character_parts.push_back(p);
-            }
+        if (!session.visibility_forced) {
+            LOG(">>> Tick: visibility not confirmed, retrying");
+            ForcePlayerVisible();
         }
     }
-
-    for (void* part : session.character_parts) {
-        void* typeProp = GetProp("/Script/FortniteGame.CustomCharacterPart.CharacterPartType");
-        if (!typeProp) continue;
-        char type = Read<char>(GetField(part, typeProp));
-        Call c("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
-        if (c.ok() && c.set("CharacterPartType", type) && c.set("ChosenCharacterPart", part)) c.run(session.pawn);
-    }
-    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
-    if (state) {
-        Call a("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts"); if (a.ok()) a.run(state);
-        Call b("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData"); if (b.ok()) b.run(state);
-    }
-    Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CustomizationLoadout"); if (cl.ok()) cl.run(session.pawn);
-    LOG("Skin applied (%zu parts)", session.character_parts.size());
 }
 
 void Athena::DestroyLods() {
@@ -996,7 +1105,7 @@ void Athena::DestroyLods() {
 }
 
 // ============================================================================
-// 🔧 FIX: DropLoadingScreen — now also calls ServerReadyToStartMatch
+// 🔧 FIX: DropLoadingScreen — also calls ServerReadyToStartMatch
 // ============================================================================
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
@@ -1027,7 +1136,7 @@ void Athena::DropLoadingScreen() {
         Call b("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistInfo"); if (b.ok()) b.run(session.state);
     }
 
-    // 🔧 FIX: call ServerReadyToStartMatch here as well
+    // 🔧 FIX: dispatch readiness callbacks here too
     if (!session.ready_called) {
         Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
         if (srt.ok()) srt.run(session.controller);
@@ -1265,7 +1374,6 @@ void Athena::ApplySprintSpeed() {
             session.sprint_applied = true;
         }
     }
-
     void* flyProp = GetProp("/Script/Engine.CharacterMovementComponent.MaxFlySpeed");
     if (flyProp) {
         float* val = (float*)GetField(cmc, flyProp);
@@ -1418,7 +1526,7 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
 }
 
 // ============================================================================
-// LOOT TABLES (unchanged)
+// LOOT TABLES
 // ============================================================================
 std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     std::vector<LootData> ret;
