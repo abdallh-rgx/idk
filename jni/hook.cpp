@@ -1,11 +1,11 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FIXED for UE5:
-//   - UStruct/Class offsets corrected from MobileDumper-7 dump
-//   - IsA / SubclassOf use name-based SuperStruct walk (UE5-safe)
-//   - GetProp walks FField chain (UE5: properties are not UObjects)
-//   - No auto-travel. Use console: open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
-//   - Spawn uses ChoosePlayerStart instead of hardcoded Z=5000
+// FIXED:
+//   - GetPawn = 0x066E8C88 (was K2_GetPawn at 0x06E1B38C — wrong signature)
+//   - ObjName is thread-safe (mutex around cache)
+//   - GetProp walks FField chain (UE5)
+//   - IsA / SubclassOf use name-based SuperStruct walk
+//   - No auto-travel. Use: open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -66,7 +66,7 @@ constexpr uintptr_t WorldTick            = 0x0949685C;
 constexpr uintptr_t EngineExec           = 0x098BB160;
 constexpr uintptr_t IsStandalone         = 0x0945F840;
 constexpr uintptr_t GetPlayerController  = 0x093A1D48;
-constexpr uintptr_t GetPawn              = 0x06E1B38C;
+constexpr uintptr_t GetPawn              = 0x066E8C88;   // ← CORRECTED
 constexpr uintptr_t BeginSpawn           = 0x093A37E4;
 constexpr uintptr_t FinishSpawn          = 0x0939F1B8;
 constexpr uintptr_t Possess              = 0x092E2C74;
@@ -227,10 +227,8 @@ static bool IsA(void* obj, void* type) {
     if (!obj || !type || IsBadPtr(obj) || IsBadPtr(type)) return false;
     void* klass = Read<void*>(obj, profile::ObjectClass);
     if (!klass || IsBadPtr(klass)) return false;
-
     std::string target = ObjName(type);
     if (target.empty()) return false;
-
     for (int depth = 0; depth < 64 && klass && !IsBadPtr(klass); ++depth) {
         if (ObjName(klass) == target) return true;
         void* super = Read<void*>(klass, profile::StructSuper);
@@ -239,13 +237,10 @@ static bool IsA(void* obj, void* type) {
     }
     return false;
 }
-
 static bool SubclassOf(void* klass, void* type) {
     if (!klass || !type || IsBadPtr(klass) || IsBadPtr(type)) return false;
-
     std::string target = ObjName(type);
     if (target.empty()) return false;
-
     for (int depth = 0; depth < 64 && klass && !IsBadPtr(klass); ++depth) {
         if (ObjName(klass) == target) return true;
         void* super = Read<void*>(klass, profile::StructSuper);
@@ -273,11 +268,22 @@ static void* FindObj(const std::string& path) {
         nullptr, nullptr, w.c_str(), false);
 }
 
+// ============================================================================
+// ObjName — THREAD-SAFE cached name lookup
+// ============================================================================
 static std::string ObjName(void* obj) {
     if (!obj || IsBadPtr(obj)) return {};
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
     static std::map<void*, std::string> cache;
+
+    pthread_mutex_lock(&m);
     auto it = cache.find(obj);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) {
+        std::string r = it->second;
+        pthread_mutex_unlock(&m);
+        return r;
+    }
+    pthread_mutex_unlock(&m);
 
     FStringNative s{};
     Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)(
@@ -285,7 +291,9 @@ static std::string ObjName(void* obj) {
     std::string out = Narrow(s.Data, std::min(std::max(s.Count, 0), 512));
     if (s.Data) Fn<void(*)(void*)>(profile::Free)(s.Data);
 
+    pthread_mutex_lock(&m);
     if (cache.size() < 200000) cache[obj] = out;
+    pthread_mutex_unlock(&m);
     return out;
 }
 static std::string ObjNameFromUEString(FUEString* s) {
@@ -296,16 +304,10 @@ static std::string ObjNameFromUEString(FUEString* s) {
 // ============================================================================
 // PROPERTY LOOKUP — UE5 aware
 // ============================================================================
-// In UE5, FProperty is FField-derived, NOT UObject. StaticFindObject cannot
-// find it. We must walk UStruct::ChildProperties (FField chain at 0x50 /
-// FFieldNext 0x20 / FFieldName 0x28), walking up SuperStruct for inheritance,
-// and fall back to the UStruct::Children chain for UFunction / UClass.
-// ============================================================================
 static void* GetProp(const char* path) {
     if (!path) return nullptr;
     std::string s(path);
 
-    // 1) Direct FindObj — works for UFunction and legacy objects
     if (void* direct = FindObj(s)) return direct;
 
     auto pos = s.rfind('.');
@@ -313,15 +315,12 @@ static void* GetProp(const char* path) {
     std::string classPath = s.substr(0, pos);
     std::string propName  = s.substr(pos + 1);
 
-    // 2) Colon variant used by UE for "Class:Prop" style lookup
     if (void* alt = FindObj(classPath + ":" + propName)) return alt;
 
-    // 3) Walk the class hierarchy
     void* klass = FindObj(classPath);
     if (!klass || IsBadPtr(klass)) return nullptr;
 
     for (int depth = 0; depth < 32 && klass && !IsBadPtr(klass); ++depth) {
-        // FField chain (properties in UE5)
         void* f = Read<void*>(klass, profile::StructChildProps);
         for (int i = 0; f && !IsBadPtr(f) && i < 1024; ++i) {
             FStringNative ns{};
@@ -333,7 +332,6 @@ static void* GetProp(const char* path) {
             f = Read<void*>(f, profile::FFieldNext);
         }
 
-        // UField chain (UFunction, UClass, UEnum...)
         void* c = Read<void*>(klass, profile::StructChildren);
         for (int i = 0; c && !IsBadPtr(c) && i < 1024; ++i) {
             FStringNative ns{};
@@ -640,28 +638,30 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
 
     struct Candidate { void* cls; const char* label; };
     Candidate want[] = {
-        { FindObj("/Script/FortniteGame.FortPlayerStartWarmup"), "FortPlayerStartWarmup" },
         { FindObj("/Script/FortniteGame.FortPlayerStart"),       "FortPlayerStart" },
-        { FindObj("/Script/Engine.PlayerStartPIE"),              "PlayerStartPIE" },
+        { FindObj("/Script/FortniteGame.FortPlayerStartWarmup"), "FortPlayerStartWarmup" },
         { FindObj("/Script/Engine.PlayerStart"),                 "PlayerStart" },
     };
 
     for (auto& w : want) {
         if (!w.cls || IsBadPtr(w.cls)) continue;
-        std::vector<void*> found;
-        for (int32 i = 0; i < go->NumElements && found.size() < 16; ++i) {
+        void* best = nullptr;
+        Vector bestLoc{0,0,0};
+        int total = 0;
+        for (int32 i = 0; i < go->NumElements && total < 64; ++i) {
             void* o = go->GetById(i);
             if (!o || IsBadPtr(o)) continue;
-            if (IsA(o, w.cls)) found.push_back(o);
+            if (!IsA(o, w.cls)) continue;
+            ++total;
+            Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+            if (!loc.ok() || !loc.run(o)) continue;
+            Vector v = loc.result<Vector>();
+            if (best == nullptr || v.Z > bestLoc.Z) { best = o; bestLoc = v; }
         }
-        if (found.empty()) continue;
-
-        void* pick = found[0];
-        Call loc("/Script/Engine.Actor.K2_GetActorLocation");
-        if (loc.ok() && loc.run(pick)) {
-            out = loc.result<Vector>();
-            LOG("[Spawn] Manual %s -> %s loc=(%.0f,%.0f,%.0f) (of %zu)",
-                w.label, ObjName(pick).c_str(), out.X, out.Y, out.Z, found.size());
+        if (best) {
+            out = bestLoc;
+            LOG("[Spawn] Manual %s -> %s loc=(%.0f,%.0f,%.0f) (of %d)",
+                w.label, ObjName(best).c_str(), bestLoc.X, bestLoc.Y, bestLoc.Z, total);
             return true;
         }
     }
@@ -684,27 +684,32 @@ void Athena::SpawnPawn() {
     t.Location[1] = loc.Y;
     t.Location[2] = loc.Z + 100.0f;
 
+    LOG("SpawnPawn: spawning at (%.0f,%.0f,%.0f)...", t.Location[0], t.Location[1], t.Location[2]);
     session.pawn = SpawnActor(session.world, klass, session.controller, t);
     if (!session.pawn) { LOG("SpawnPawn: spawn failed"); return; }
 
     LOG("Pawn spawned: %s at (%.0f,%.0f,%.0f)",
         ObjName(session.pawn).c_str(), t.Location[0], t.Location[1], t.Location[2]);
 
+    LOG("SpawnPawn: calling Possess...");
     Possess(session.controller, session.pawn);
+    LOG("SpawnPawn: Possess returned");
 
     void* check = GetPawn(session.controller);
+    LOG("SpawnPawn: GetPawn returned %p (expected %p)", check, session.pawn);
     if (check != session.pawn) {
-        LOG("WARNING: possession did not stick — got %p expected %p", check, session.pawn);
+        LOG("WARNING: possession did not stick");
     }
+    LOG("SpawnPawn: complete");
 }
 
 void Athena::ShowSkin() {
     if (!session.controller || !session.pawn) return;
     void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
-    if (!info) return;
+    if (!info) { LOG("ShowSkin: no MyPlayerInfo"); return; }
     void* hero = GetObjField(info, "/Script/FortniteGame.FortAthenaLocalPlayerInfo.AthenaMenuHeroDef");
     if (!hero) hero = GetObjField(info, "/Script/FortniteGame.FortAthenaLocalPlayerInfo.TempAthenaMenuHeroInstance");
-    if (!hero) return;
+    if (!hero) { LOG("ShowSkin: no hero def"); return; }
 
     if (session.character_parts.empty()) {
         void* cpProp = GetProp("/Script/FortniteGame.FortHeroType.CharacterParts");
@@ -1555,14 +1560,8 @@ void Athena::SetupWorld(void* world) {
         ObjName(session.mode).c_str(),
         ObjName(session.state).c_str());
 
-    if (!session.mode) {
-        LOG("SetupWorld: GameMode is null — waiting");
-        return;
-    }
-    if (!session.state) {
-        LOG("SetupWorld: GameState is null — waiting");
-        return;
-    }
+    if (!session.mode) { LOG("SetupWorld: GameMode is null — waiting"); return; }
+    if (!session.state) { LOG("SetupWorld: GameState is null — waiting"); return; }
 
     void* oldPawn = GetPawn(session.controller);
     void* pawnCls = FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
@@ -1575,13 +1574,33 @@ void Athena::SetupWorld(void* world) {
 
     if (!session.pawn) { LOG("SetupWorld: no pawn — aborting"); return; }
 
+    LOG("SetupWorld: calling ShowSkin");
     ShowSkin();
+    LOG("SetupWorld: ShowSkin done");
+
+    LOG("SetupWorld: calling DestroyLods");
     DestroyLods();
+    LOG("SetupWorld: DestroyLods done");
+
+    LOG("SetupWorld: calling FixBuildingFoundations");
     FixBuildingFoundations();
+    LOG("SetupWorld: FixBuildingFoundations done");
+
+    LOG("SetupWorld: calling InitializeInventory");
     InitializeInventory();
+    LOG("SetupWorld: InitializeInventory done");
+
+    LOG("SetupWorld: calling GrantDefaultAbilities");
     GrantDefaultAbilities();
+    LOG("SetupWorld: GrantDefaultAbilities done");
+
+    LOG("SetupWorld: calling SpawnBuildPreviews");
     SpawnBuildPreviews();
+    LOG("SetupWorld: SpawnBuildPreviews done");
+
+    LOG("SetupWorld: calling DropLoadingScreen");
     DropLoadingScreen();
+    LOG("SetupWorld: DropLoadingScreen done");
 
     session.initialized = true;
     LOG("World setup complete: pawn=%p at %s",
@@ -1627,7 +1646,6 @@ static void pe_hook(void* obj, void* func, void* params) {
             Athena::DropInventoryItem(gg, cnt);
         }
     }
-
     orig_PE(obj, func, params);
 }
 
@@ -1679,7 +1697,6 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
 // ============================================================================
 static void InstallHooks() {
     LOG("=== InstallHooks ===");
-
     LOG("ProcessEvent @ %lx", (unsigned long)(g_base + profile::ProcessEvent));
     if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) != 0 || !orig_PE) {
         LOG("ProcessEvent hook FAILED"); return;
