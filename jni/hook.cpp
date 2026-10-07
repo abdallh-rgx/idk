@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// Full implementation — tick_hook fixed (no early-return blockers)
+// FIXED: spawn uses ChoosePlayerStart instead of hardcoded (0,0,5000)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -51,7 +51,6 @@ using TCHAR=char16_t;
 // PROFILE — Fortnite 21.30 CL-21088273
 // ============================================================================
 namespace profile {
-// --- RVAs ---
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
 constexpr uintptr_t StaticFindObject     = 0x0762A664;
 constexpr uintptr_t StaticLoadObject     = 0x0761C568;
@@ -76,7 +75,6 @@ constexpr uintptr_t Realloc              = 0x0735E520;
 constexpr uintptr_t GetDataTableRow_Orig = 0x09319C70;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 
-// --- UObject ---
 constexpr unsigned ObjectVtable = 0x00;
 constexpr unsigned ObjectFlags  = 0x08;
 constexpr unsigned ObjectIndex  = 0x0C;
@@ -84,61 +82,49 @@ constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
 
-// --- UField / UStruct ---
 constexpr unsigned FieldNext        = 0x28;
 constexpr unsigned StructSuper      = 0x40;
 constexpr unsigned StructChildren   = 0x48;
 constexpr unsigned StructChildProps = 0x50;
 constexpr unsigned StructSize       = 0x58;
 
-// --- UClass ---
 constexpr unsigned ClassChain         = 0x40;
 constexpr unsigned ClassCastFlags     = 0x48;
 constexpr unsigned ClassDefaultObject = 0x110;
 constexpr unsigned ClassImplemented   = 0x200;
 
-// --- UFunction ---
 constexpr unsigned FunctionFlags     = 0xB0;
 constexpr unsigned FunctionNumParams = 0xB4;
 constexpr unsigned FunctionParamSize = 0xB6;
 constexpr unsigned FunctionExecFunc  = 0xD8;
 
-// --- FProperty ---
 constexpr unsigned PropArrayDim    = 0x30;
 constexpr unsigned PropElementSize = 0x34;
 constexpr unsigned PropFlags       = 0x38;
 constexpr unsigned PropOffset      = 0x44;
 constexpr unsigned PropSize        = 0x70;
 
-// FBoolProperty
 constexpr unsigned BoolSize        = 0x80;
 constexpr unsigned BoolByteOffset  = 0x81;
 constexpr unsigned BoolFieldMask   = 0x82;
 
-// Sub-props
 constexpr unsigned ArrayInner       = 0x70;
 constexpr unsigned StructPropStruct = 0x70;
 constexpr unsigned ObjectPropClass  = 0x70;
 
-// --- FField ---
 constexpr unsigned FFieldClass     = 0x08;
 constexpr unsigned FFieldOwner     = 0x10;
 constexpr unsigned FFieldNext      = 0x20;
 constexpr unsigned FFieldName      = 0x28;
 
-// --- UEnum ---
 constexpr unsigned EnumNames = 0x40;
 
-// --- CPF flags ---
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
 constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 }
 
-// ============================================================================
-// DOBBY
-// ============================================================================
 extern "C" int DobbyHook(void* target, void* replace, void** origin);
 
 // ============================================================================
@@ -326,7 +312,7 @@ static Tick_t orig_Tick = nullptr;
 static Exec_t orig_Exec = nullptr;
 
 // ============================================================================
-// Call class — reflection with FField support
+// Call class
 // ============================================================================
 class Call {
     void* m_func = nullptr;
@@ -371,6 +357,16 @@ public:
 
     bool ok() const { return m_valid; }
     void* func() const { return m_func; }
+
+    // مفيد جدًا للتشخيص: يطبع أسماء كل البارامترات
+    void dump(const char* label) const {
+        LOG("[Call %s] valid=%d func=%p params=%zu", label, (int)m_valid,
+            m_func, m_params.size());
+        for (auto& p : m_params)
+            LOG("   param '%s' off=%d size=%d flags=%llx",
+                p.name.c_str(), p.offset, p.size,
+                (unsigned long long)p.flags);
+    }
 
     template<class T> bool set(const char* key, const T& value) {
         for (auto& p : m_params)
@@ -532,9 +528,7 @@ namespace Athena {
     void OnAircraftJump();
     void TeleportToSpawnIsland();
     void RemoveNetDebugUI();
-    void ConsoleKey();
     void SpawnBuildPreviews();
-    void SpawnFloorLoot();
     void ServerHandlePickup(void* pickup);
     void Loot(void* actor);
     void OnServerCreateBuildingActor(void* params);
@@ -544,23 +538,119 @@ namespace Athena {
     void Tick();
     void OnExitVehicle();
     void CheatScript(const char* script);
+    bool FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out, Rotator& outRot);
 
     struct LootData { void* Def; int Count; };
     std::vector<LootData> PickLootDrops(std::string category);
 }
 
 // ============================================================================
-// ATHENA — SPAWN / SKIN
+// ⭐ SPAWN LOCATION — FIXED
 // ============================================================================
+// الترتيب:
+//   1) نطلب من GameMode أن يختار PlayerStart مناسب (نفس ما تفعله اللعبة)
+//   2) إن فشل، نبحث يدويًا عن FortPlayerStartWarmup في GObjects
+//   3) إن فشل، نبحث عن أي PlayerStart
+//   4) كحل أخير فقط، نستخدم (0,0,5000) — مع تحذير واضح
+// ============================================================================
+bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
+                                    Vector& out, Rotator& outRot) {
+    out = Vector{0, 0, 5000};
+    outRot = Rotator{0, 0, 0};
+
+    // 1) ChoosePlayerStart
+    if (mode && controller) {
+        Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
+        if (choose.ok() && choose.set("Player", controller)) {
+            if (choose.run(mode)) {
+                void* start = choose.result<void*>();
+                if (start && !IsBadPtr(start)) {
+                    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+                    if (loc.ok() && loc.run(start)) {
+                        out = loc.result<Vector>();
+                        LOG("[Spawn] ChoosePlayerStart -> %s loc=(%.0f,%.0f,%.0f)",
+                            ObjName(start).c_str(), out.X, out.Y, out.Z);
+                        return true;
+                    }
+                } else {
+                    LOG("[Spawn] ChoosePlayerStart returned null");
+                }
+            } else {
+                LOG("[Spawn] ChoosePlayerStart run failed");
+            }
+        } else {
+            LOG("[Spawn] ChoosePlayerStart binding failed");
+            choose.dump("ChoosePlayerStart");
+        }
+    }
+
+    // 2) البحث اليدوي في GObjects
+    GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
+    if (!go) return false;
+
+    struct Candidate { void* cls; const char* label; };
+    Candidate want[] = {
+        { FindObj("/Script/FortniteGame.FortPlayerStartWarmup"), "FortPlayerStartWarmup" },
+        { FindObj("/Script/FortniteGame.FortPlayerStart"),       "FortPlayerStart" },
+        { FindObj("/Script/Engine.PlayerStartPIE"),              "PlayerStartPIE" },
+        { FindObj("/Script/Engine.PlayerStart"),                 "PlayerStart" },
+    };
+
+    for (auto& w : want) {
+        if (!w.cls || IsBadPtr(w.cls)) continue;
+        std::vector<void*> found;
+        for (int32 i = 0; i < go->NumElements && found.size() < 16; ++i) {
+            void* o = go->GetById(i);
+            if (!o || IsBadPtr(o)) continue;
+            if (IsA(o, w.cls)) found.push_back(o);
+        }
+        if (found.empty()) continue;
+
+        // اختر الأقرب إلى مركز العالم إن وُجد، وإلا الأول
+        void* pick = found[0];
+        Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+        if (loc.ok() && loc.run(pick)) {
+            out = loc.result<Vector>();
+            LOG("[Spawn] Manual %s -> %s loc=(%.0f,%.0f,%.0f) (of %zu)",
+                w.label, ObjName(pick).c_str(), out.X, out.Y, out.Z, found.size());
+            return true;
+        }
+    }
+
+    // 3) فشل كل شيء
+    LOG("[Spawn] WARNING: no PlayerStart found, using fallback (0,0,5000)");
+    return false;
+}
+
 void Athena::SpawnPawn() {
-    void* klass = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
+    void* klass = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
+                            "/Script/Engine.Pawn");
     if (!klass) { LOG("SpawnPawn: class missing"); return; }
+
+    Vector loc{0, 0, 5000};
+    Rotator rot{0, 0, 0};
+    if (!FindSafeSpawnLocation(session.world, session.mode, session.controller, loc, rot)) {
+        // لا نستسلم — نجرّب أي حال
+    }
+
     Transform t{};
-    t.Location[0] = 0; t.Location[1] = 0; t.Location[2] = 5000;
+    t.Location[0] = loc.X;
+    t.Location[1] = loc.Y;
+    t.Location[2] = loc.Z + 100.0f;  // فوق نقطة السpawn قليلًا
+
     session.pawn = SpawnActor(session.world, klass, session.controller, t);
     if (!session.pawn) { LOG("SpawnPawn: spawn failed"); return; }
-    LOG("Pawn spawned: %s", ObjName(session.pawn).c_str());
+
+    LOG("Pawn spawned: %s at (%.0f,%.0f,%.0f)",
+        ObjName(session.pawn).c_str(), t.Location[0], t.Location[1], t.Location[2]);
+
     Possess(session.controller, session.pawn);
+
+    // تأكد من أن الـ possession ثبت
+    void* check = GetPawn(session.controller);
+    if (check != session.pawn) {
+        LOG("WARNING: possession did not stick — got %p expected %p", check, session.pawn);
+    }
 }
 
 void Athena::ShowSkin() {
@@ -1297,10 +1387,6 @@ void Athena::RemoveNetDebugUI() {
     }
 }
 
-void Athena::ConsoleKey() {
-    LOG("ConsoleKey stub");
-}
-
 void Athena::PlayEmoteItem(void* item) {
     if (!item || !session.pawn) return;
     void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
@@ -1392,31 +1478,46 @@ void Athena::CheatScript(const char* script) {
 }
 
 // ============================================================================
-// ATHENA — SETUP WORLD
+// ATHENA — SETUP WORLD (FIXED: accepts any Fort controller, logs real class)
 // ============================================================================
 void Athena::SetupWorld(void* world) {
     session.world = world;
     session.controller = GetPC(world, 0);
-    if (!session.controller) { LOG("No controller yet"); return; }
-    if (!IsA(session.controller, FindObj("/Script/FortniteGame.FortPlayerControllerAthena"))) {
-        LOG("Not FortPlayerControllerAthena"); return;
+    if (!session.controller) { LOG("SetupWorld: no controller yet"); return; }
+
+    // اطبع الكلاس الحقيقي دائمًا — هذا يكشف سبب "Not FortPlayerControllerAthena"
+    void* ctrlClass = Read<void*>(session.controller, profile::ObjectClass);
+    LOG("SetupWorld: controller class = %s", ObjName(ctrlClass).c_str());
+
+    // اقبل أي FortPlayerController (Base) بدل النوع المتخصص
+    void* baseCtrl = FindObj("/Script/FortniteGame.FortPlayerController");
+    if (!baseCtrl) {
+        LOG("SetupWorld: FortPlayerController base not found");
+        return;
     }
-    session.mode = GetWorldField(world, "/Script/Engine.World.AuthorityGameMode");
+    if (!IsA(session.controller, baseCtrl)) {
+        LOG("SetupWorld: controller is not a FortPlayerController at all");
+        return;
+    }
+
+    session.mode  = GetWorldField(world, "/Script/Engine.World.AuthorityGameMode");
     session.state = GetWorldField(world, "/Script/Engine.World.GameState");
 
-    LOG("PC=%s GM=%s GS=%s",
+    LOG("SetupWorld: PC=%s GM=%s GS=%s",
         ObjName(session.controller).c_str(),
         ObjName(session.mode).c_str(),
         ObjName(session.state).c_str());
 
     void* oldPawn = GetPawn(session.controller);
-    if (!oldPawn || !IsA(oldPawn, FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C"))) {
+    void* pawnCls = FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
+    if (!oldPawn || !pawnCls || !IsA(oldPawn, pawnCls)) {
         SpawnPawn();
     } else {
         session.pawn = oldPawn;
+        LOG("SetupWorld: keeping existing pawn %p", oldPawn);
     }
 
-    if (!session.pawn) { LOG("No pawn"); return; }
+    if (!session.pawn) { LOG("SetupWorld: no pawn — aborting"); return; }
 
     ShowSkin();
     DestroyLods();
@@ -1427,11 +1528,12 @@ void Athena::SetupWorld(void* world) {
     DropLoadingScreen();
 
     session.initialized = true;
-    LOG("World setup complete");
+    LOG("World setup complete: pawn=%p at %s",
+        session.pawn, ObjName(session.pawn).c_str());
 }
 
 // ============================================================================
-// TRIGGER TRAVEL — SwitchLevel to Artemis_Terrain
+// TRIGGER TRAVEL
 // ============================================================================
 static void TriggerTravel() {
     if (!session.controller || g_travelTriggered) return;
@@ -1440,18 +1542,26 @@ static void TriggerTravel() {
 
     Call c("/Script/Engine.PlayerController.SwitchLevel");
     if (!c.ok()) { LOG("SwitchLevel binding failed"); return; }
+    c.dump("SwitchLevel");   // ← يساعدك ترى اسم البارامتر الصحيح
 
+    // جرّب عدة أسماء محتملة للبارامتر
     const char16_t name[] = u"Artemis_Terrain";
     FStringNative level{};
     level.Data = (TCHAR*)name;
     level.Count = 16;
     level.Max = 16;
 
-    if (c.set("MapName", level)) {
-        c.run(session.controller);
-        LOG("SwitchLevel dispatched");
-    } else {
-        LOG("SwitchLevel set(MapName) failed");
+    bool ok = false;
+    for (const char* key : {"MapName", "LevelName", "NewLevel", "URL"}) {
+        if (c.set(key, level)) {
+            LOG("SwitchLevel using param '%s'", key);
+            c.run(session.controller);
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) {
+        LOG("SwitchLevel set(MapName) failed — no matching parameter name");
     }
 }
 
@@ -1495,7 +1605,6 @@ static void pe_hook(void* obj, void* func, void* params) {
         }
     }
 
-    // Detect real Play button CLICK (BndEvt__ + Clicked, once)
     if (!g_internal && func) {
         static bool playClicked = false;
         if (!playClicked) {
@@ -1522,7 +1631,6 @@ static void tick_hook(void* world, int type, float delta) {
     if (g_gameTid.load() != (int)gettid()) return;
     Guard g;
 
-    // Handle pending travel
     if (g_pendingTravel.exchange(false)) {
         if (session.controller && !g_travelTriggered) {
             LOG("tick: processing pending travel");
@@ -1530,16 +1638,6 @@ static void tick_hook(void* world, int type, float delta) {
         }
     }
 
-    // Debug: log once what IsSavingPackage/IsGarbageCollecting say
-    static bool debugLogged = false;
-    if (!debugLogged) {
-        uint8_t saving = Read<uint8_t>((void*)(g_base + profile::IsSavingPackage));
-        bool gc = Fn<bool(*)()>(profile::IsGarbageCollecting)();
-        LOG("tick debug: IsSavingPackage=%d IsGarbageCollecting=%d", (int)saving, (int)gc);
-        debugLogged = true;
-    }
-
-    // ⚡ Log world name FIRST — BEFORE any early return
     std::string wn = ObjName(world);
     static std::string lastWorld;
     if (wn != lastWorld) {
@@ -1547,13 +1645,8 @@ static void tick_hook(void* world, int type, float delta) {
         lastWorld = wn;
     }
 
-    // ❌ COMMENTED OUT — were blocking everything
-    // if (Read<uint8_t>((void*)(g_base + profile::IsSavingPackage))) return;
-    // if (Fn<bool(*)()>(profile::IsGarbageCollecting)()) return;
-
     int index = Read<int>(world, 0xC);
 
-    // Lobby detection
     if (wn.find("Frontend") != std::string::npos) {
         if (!g_lobbyDetected) {
             g_lobbyDetected = true;
@@ -1572,7 +1665,6 @@ static void tick_hook(void* world, int type, float delta) {
         return;
     }
 
-    // Artemis_Terrain (CH3 S3)
     if (wn.find("Artemis_Terrain") == std::string::npos) return;
 
     if (world != session.world || index != session.world_index) {
