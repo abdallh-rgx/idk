@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// Full implementation with fixed PlayButton detection
+// Full implementation — tick_hook fixed (no early-return blockers)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -268,7 +268,6 @@ static void* FindObj(const std::string& path) {
         nullptr, nullptr, w.c_str(), false);
 }
 
-// Cache for ObjName to avoid re-computing for hot UFunctions
 static std::string ObjName(void* obj) {
     if (!obj) return {};
     static std::map<void*, std::string> cache;
@@ -1496,7 +1495,7 @@ static void pe_hook(void* obj, void* func, void* params) {
         }
     }
 
-    // Detect real Play button CLICK (BndEvt__ prefix, once)
+    // Detect real Play button CLICK (BndEvt__ + Clicked, once)
     if (!g_internal && func) {
         static bool playClicked = false;
         if (!playClicked) {
@@ -1523,7 +1522,7 @@ static void tick_hook(void* world, int type, float delta) {
     if (g_gameTid.load() != (int)gettid()) return;
     Guard g;
 
-    // Handle pending travel request (from network thread → game thread)
+    // Handle pending travel
     if (g_pendingTravel.exchange(false)) {
         if (session.controller && !g_travelTriggered) {
             LOG("tick: processing pending travel");
@@ -1531,18 +1530,28 @@ static void tick_hook(void* world, int type, float delta) {
         }
     }
 
-    if (Read<uint8_t>((void*)(g_base + profile::IsSavingPackage))) return;
-    if (Fn<bool(*)()>(profile::IsGarbageCollecting)()) return;
+    // Debug: log once what IsSavingPackage/IsGarbageCollecting say
+    static bool debugLogged = false;
+    if (!debugLogged) {
+        uint8_t saving = Read<uint8_t>((void*)(g_base + profile::IsSavingPackage));
+        bool gc = Fn<bool(*)()>(profile::IsGarbageCollecting)();
+        LOG("tick debug: IsSavingPackage=%d IsGarbageCollecting=%d", (int)saving, (int)gc);
+        debugLogged = true;
+    }
 
-    int index = Read<int>(world, 0xC);
+    // ⚡ Log world name FIRST — BEFORE any early return
     std::string wn = ObjName(world);
-
-    // Log every unique world once
     static std::string lastWorld;
     if (wn != lastWorld) {
         LOG(">>> WorldTick world: '%s'", wn.c_str());
         lastWorld = wn;
     }
+
+    // ❌ COMMENTED OUT — were blocking everything
+    // if (Read<uint8_t>((void*)(g_base + profile::IsSavingPackage))) return;
+    // if (Fn<bool(*)()>(profile::IsGarbageCollecting)()) return;
+
+    int index = Read<int>(world, 0xC);
 
     // Lobby detection
     if (wn.find("Frontend") != std::string::npos) {
@@ -1563,7 +1572,7 @@ static void tick_hook(void* world, int type, float delta) {
         return;
     }
 
-    // Artemis_Terrain (CH3 S3) — map
+    // Artemis_Terrain (CH3 S3)
     if (wn.find("Artemis_Terrain") == std::string::npos) return;
 
     if (world != session.world || index != session.world_index) {
