@@ -1,8 +1,7 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // FULL RELEASE — UE5 LWC (double precision)
-// Fixed: replication roles, PlayerState binding, delayed ClientRestart,
-//        Frontend-tick keeps FinalizePlayer alive.
+// Fixed: removed AlivePlayers manipulation (causes GameMode->Tick crash).
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -629,7 +628,7 @@ static void HandleDoor(void* door, void* /*ignored*/) {
 }
 
 // ============================================================================
-// TryInitializePlayer — with Role/RemoteRole/PlayerState binding
+// TryInitializePlayer — NO AlivePlayers manipulation
 // ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
@@ -653,14 +652,14 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
     LOG("[Init] Spawned: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
 
-    // 🔑 Role/RemoteRole BEFORE anything else
+    // Role/RemoteRole
     void* roleProp = GetProp("/Script/Engine.Actor.Role");
     void* rrProp   = GetProp("/Script/Engine.Actor.RemoteRole");
-    if (roleProp) Write<uint8_t>(GetField(session.pawn, roleProp), 0, 3); // ROLE_Authority
-    if (rrProp)   Write<uint8_t>(GetField(session.pawn, rrProp), 0, 2);   // ROLE_AutonomousProxy
+    if (roleProp) Write<uint8_t>(GetField(session.pawn, roleProp), 0, 3);
+    if (rrProp)   Write<uint8_t>(GetField(session.pawn, rrProp), 0, 2);
     LOG("[Init] Roles set");
 
-    // 🔑 Bind PlayerState <-> Pawn
+    // PlayerState <-> Pawn
     void* ps = GetObjField(controller, "/Script/Engine.Controller.PlayerState");
     if (ps) {
         void* psProp = GetProp("/Script/Engine.Pawn.PlayerState");
@@ -682,26 +681,10 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     }
     LOG("[Init] Possessed OK");
 
-    // 🔑 AcknowledgedPawn
     void* ackProp = GetProp("/Script/Engine.PlayerController.AcknowledgedPawn");
     if (ackProp) Write<void*>(GetField(controller, ackProp), 0, session.pawn);
 
-    // 🔑 Add to AlivePlayers
-    void* apProp = GetProp("/Script/FortniteGame.FortGameModeAthena.AlivePlayers");
-    if (apProp && session.mode) {
-        void* arr = GetField(session.mode, apProp);
-        Array current = Read<Array>(arr);
-        bool found = false;
-        for (int i = 0; i < current.Count; ++i) {
-            void* p = Read<void*>(current.Data, (size_t)i * 8);
-            if (p == controller) { found = true; break; }
-        }
-        if (!found) {
-            void* ctrl = controller;
-            Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, apProp, &ctrl);
-            LOG("[Init] Added to AlivePlayers");
-        }
-    }
+    // ❌ NO AddToAlivePlayers here — causes GameMode->Tick to start the match and crash.
 
     SetupCheats();
 
@@ -810,7 +793,7 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// FinalizePlayer — ClientRestart/ViewTarget here, not in TryInitialize
+// FinalizePlayer
 // ============================================================================
 void Athena::FinalizePlayer() {
     if (session.finalized) return;
@@ -827,13 +810,11 @@ void Athena::FinalizePlayer() {
     LOG("Finalize: pawn=%p class=%s", pawn,
         ObjName(Read<void*>(pawn, profile::ObjectClass)).c_str());
 
-    // Role/RemoteRole
     void* roleProp = GetProp("/Script/Engine.Actor.Role");
     void* rrProp   = GetProp("/Script/Engine.Actor.RemoteRole");
     if (roleProp) Write<uint8_t>(GetField(pawn, roleProp), 0, 3);
     if (rrProp)   Write<uint8_t>(GetField(pawn, rrProp), 0, 2);
 
-    // Collision
     SetBool(pawn, "/Script/Engine.Actor.bActorEnableCollision", true);
     void* root = GetObjField(pawn, "/Script/Engine.Actor.RootComponent");
     if (root) {
@@ -846,7 +827,6 @@ void Athena::FinalizePlayer() {
         if (ec.set("bNewActorEnableCollision", bEnable)) ec.run(pawn);
     }
 
-    // Skydiving
     SetBool(pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     SetBool(pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
     void* movementComp = GetObjField(pawn, "/Script/Engine.Character.CharacterMovement");
@@ -855,7 +835,6 @@ void Athena::FinalizePlayer() {
         if (sd.ok()) sd.run(pawn);
     }
 
-    // ClientRestart
     if (session.controller && !IsBadPtr(session.controller)) {
         Call restart("/Script/Engine.PlayerController.ClientRestart");
         if (restart.ok() && restart.set("NewPawn", pawn)) {
@@ -864,7 +843,6 @@ void Athena::FinalizePlayer() {
         }
     }
 
-    // ViewTarget
     if (session.controller && !IsBadPtr(session.controller)) {
         Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
         if (cam.ok() && cam.set("NewViewTarget", pawn)) {
@@ -873,7 +851,6 @@ void Athena::FinalizePlayer() {
         }
     }
 
-    // Team + PlayerState
     void* ps = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     if (ps) {
         void* teamProp = GetProp("/Script/FortniteGame.FortPlayerState.TeamIndex");
