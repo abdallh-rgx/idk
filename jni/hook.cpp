@@ -657,6 +657,15 @@ namespace Athena {
     void PlayEmoteItem(void* item);
     void OnExitVehicle();
     void CheatScript(const char* script);
+    void RestoreHUD();
+    void RestoreInput();
+    void RestoreAircraft();
+    void RestoreVehicleState();
+    void RestoreClientSystems();
+    void ToggleInventoryHUD();
+    void ToggleFullMap();
+    void RestoreSprint();
+    void SpawnSupplyDrop();
 
     struct LootData { void* Def; int Count; };
     std::vector<LootData> PickLootDrops(std::string category);
@@ -1208,6 +1217,224 @@ void Athena::FinalizePlayer() {
 }
 
 // ============================================================================
+// Client restoration layer — keep the real Fortnite client systems alive.
+// ============================================================================
+void Athena::RestoreHUD() {
+    if (!session.controller) return;
+
+    if (session.mode) {
+        Call init("/Script/Engine.GameModeBase.InitializeHUDForPlayer");
+        if (init.ok() && init.set("NewPlayer", session.controller)) {
+            init.run(session.mode);
+            LOG("[HUD] InitializeHUDForPlayer dispatched");
+        }
+    }
+
+    void* hud = GetObjField(session.controller, "/Script/Engine.PlayerController.HUD");
+    if (hud) {
+        Call show("/Script/Engine.HUD.ShowHUD");
+        if (show.ok()) {
+            show.run(hud);
+            LOG("[HUD] ShowHUD dispatched");
+        }
+    }
+
+    Call localInv("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate");
+    if (localInv.ok() && session.inventory) localInv.run(session.inventory);
+
+    Call worldInv("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate");
+    if (worldInv.ok()) worldInv.run(session.controller);
+
+    Call quick("/Script/FortniteGame.FortPlayerController.ClientForceUpdateQuickbar");
+    if (quick.ok()) {
+        uint8_t bar = 0;
+        quick.set("QuickbarToRefresh", bar);
+        quick.run(session.controller);
+    }
+
+    Call sec("/Script/FortniteGame.FortQuickBars.OnRep_SecondaryQuickBar");
+    if (sec.ok() && session.quickbars) sec.run(session.quickbars);
+    Call prim("/Script/FortniteGame.FortQuickBars.OnRep_PrimaryQuickBar");
+    if (prim.ok() && session.quickbars) prim.run(session.quickbars);
+}
+
+void Athena::RestoreInput() {
+    if (!session.controller) return;
+
+    SetBool(session.controller, "/Script/Engine.PlayerController.bShowMouseCursor", false);
+    SetBool(session.controller, "/Script/Engine.PlayerController.bEnableClickEvents", false);
+    SetBool(session.controller, "/Script/Engine.PlayerController.bEnableMouseOverEvents", false);
+
+    Call move("/Script/Engine.Controller.SetIgnoreMoveInput");
+    if (move.ok()) {
+        bool disabled = false;
+        if (move.set("bNewMoveInput", disabled)) move.run(session.controller);
+    }
+
+    Call look("/Script/Engine.Controller.SetIgnoreLookInput");
+    if (look.ok()) {
+        bool disabled = false;
+        if (look.set("bNewLookInput", disabled)) look.run(session.controller);
+    }
+
+    GrantDefaultAbilities();
+    ApplySprintSpeed();
+}
+
+void Athena::RestoreAircraft() {
+    if (!session.controller) return;
+
+    Call get("/Script/FortniteGame.FortPlayerController.GetAircraftComponent");
+    if (!get.ok() || !get.run(session.controller)) return;
+    void* comp = get.result<void*>();
+    if (!comp || IsBadPtr(comp)) return;
+
+    void* aircraft = nullptr;
+    void* aircraftProp = GetProp("/Script/FortniteGame.FortControllerComponent_Aircraft.CurrentAircraft");
+    if (aircraftProp) aircraft = Read<void*>(GetField(comp, aircraftProp));
+
+    if (!aircraft) {
+        void* aircraftCls = FindObj("/Script/FortniteGame.FortAthenaAircraft");
+        GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
+        if (go && aircraftCls) {
+            for (int32 i = 0; i < go->NumElements; ++i) {
+                void* o = go->GetById(i);
+                if (!o || IsBadPtr(o)) continue;
+                if (IsA(o, aircraftCls)) { aircraft = o; break; }
+            }
+        }
+    }
+
+    if (aircraft) {
+        Call enter("/Script/FortniteGame.FortControllerComponent_Aircraft.ClientEnterAircraft");
+        if (enter.ok() && enter.set("InAircraft", aircraft)) {
+            enter.run(comp);
+            LOG("[Bus] ClientEnterAircraft restored");
+        }
+    }
+
+}
+
+void Athena::RestoreVehicleState() {
+    if (!session.pawn) return;
+
+    Call get("/Script/FortniteGame.FortPlayerPawn.GetVehicleActor");
+    if (!get.ok() || !get.run(session.pawn)) return;
+    void* vehicle = get.result<void*>();
+    if (!vehicle || IsBadPtr(vehicle)) return;
+
+    Call entered("/Script/FortniteGame.FortPlayerPawn.OnEnteredVehicle");
+    if (entered.ok()) entered.run(session.pawn);
+
+    Call ack("/Script/FortniteGame.FortPlayerPawn.ClientAcknowledgeVehicleInputState");
+    if (ack.ok()) {
+        float timestamp = (float)Monotonic();
+        if (ack.set("Timestamp", timestamp)) ack.run(session.pawn);
+    }
+}
+
+void Athena::RestoreClientSystems() {
+    if (!session.finalized || !session.controller || !session.pawn) return;
+
+    RestoreHUD();
+    RestoreInput();
+    RestoreAircraft();
+    RestoreVehicleState();
+    RestoreSprint();
+    RemoveNetDebugUI();
+    FixBuildingFoundations();
+    SpawnSafeZoneIndicator();
+    InventoryUpdate();
+}
+
+void Athena::ToggleInventoryHUD() {
+    if (!session.controller) return;
+    Call c("/Script/FortniteGame.FortPlayerController.ToggleInventory");
+    if (c.ok()) {
+        c.run(session.controller);
+        LOG("[HUD] ToggleInventory dispatched");
+    }
+}
+
+void Athena::RestoreSprint() {
+    if (!session.controller || !session.pawn) return;
+
+    void* sprint = FindObj("/Script/FortniteGame.FortGameplayAbility_Sprint");
+    if (sprint) GrantAbility(sprint);
+
+    Call behavior("/Script/FortniteGame.FortPlayerController.SetSprintBehaviorIsOverridden");
+    if (behavior.ok()) {
+        bool overridden = true;
+        bool sprintByDefault = true;
+        if (behavior.set("bNewSprintBehaviorIsOverridden", overridden) &&
+            behavior.set("bNewSprintByDefaultWhenSprintIsOverridden", sprintByDefault))
+            behavior.run(session.controller);
+    }
+
+    Call toggle("/Script/FortniteGame.FortPlayerController.ServerUpdateSprintToggleable");
+    if (toggle.ok()) {
+        bool toggleable = true;
+        if (toggle.set("bShouldBeToggleable", toggleable)) toggle.run(session.controller);
+    }
+
+    ApplySprintSpeed();
+    LOG("[Sprint] Sprint ability/input restored");
+}
+
+void Athena::SpawnSupplyDrop() {
+    if (!session.world || !session.pawn) return;
+
+    void* cls = LoadClass("/Script/FortniteGame.FortAthenaSupplyDrop", "/Script/Engine.Actor");
+    if (!cls) {
+        LOG("[SupplyDrop] FortAthenaSupplyDrop class missing");
+        return;
+    }
+
+    Call getLoc("/Script/Engine.Actor.K2_GetActorLocation");
+    Vector loc{0.0, 0.0, 1000.0};
+    if (getLoc.ok() && getLoc.run(session.pawn)) loc = getLoc.result<Vector>();
+    loc.Z += 2500.0;
+
+    Transform t{};
+    t.Location[0] = loc.X;
+    t.Location[1] = loc.Y;
+    t.Location[2] = loc.Z;
+
+    void* drop = SpawnActor(session.world, cls, session.pawn, t);
+    if (!drop) {
+        LOG("[SupplyDrop] spawn failed");
+        return;
+    }
+
+    Call ground("/Script/FortniteGame.FortAthenaSupplyDrop.FindGroundLocationAt");
+    if (ground.ok() && ground.set("InLocation", loc) && ground.run(drop)) {
+        Vector g = ground.result<Vector>();
+        Call setLoc("/Script/Engine.Actor.K2_SetActorLocation");
+        if (setLoc.ok()) {
+            bool sweep = false;
+            setLoc.set("NewLocation", g);
+            setLoc.set("bSweep", sweep);
+            setLoc.run(drop);
+            loc = g;
+        }
+    }
+
+    Call loot("/Script/FortniteGame.FortAthenaSupplyDrop.OnLootSpawned");
+    if (loot.ok()) loot.run(drop);
+
+    LOG("[SupplyDrop] spawned at %.0f %.0f %.0f", loc.X, loc.Y, loc.Z);
+}
+
+void Athena::ToggleFullMap() {
+    if (!session.controller) return;
+    Call c("/Script/FortniteGame.FortPlayerController.ToggleFullScreenMap");
+    if (c.ok()) {
+        c.run(session.controller);
+        LOG("[Map] ToggleFullScreenMap dispatched");
+    }
+}
+
+// ============================================================================
 // Tick
 // ============================================================================
 void Athena::Tick() {
@@ -1226,6 +1453,11 @@ void Athena::Tick() {
     }
     static double lastVisibility = 0;
     static double lastSpeedReapply = 0;
+    static double lastClientRestore = 0;
+    if (session.finalized && now - lastClientRestore > 5.0) {
+        lastClientRestore = now;
+        RestoreClientSystems();
+    }
     if (session.finalized && now - lastVisibility > 8.0) {
         lastVisibility = now;
         if (!session.visibility_forced) {
@@ -2327,6 +2559,16 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
         normalized.pop_back();
 
     if (!cmd.empty()) LOG("Exec: %s", cmd.c_str());
+
+    if (normalized == "fixclient" || normalized == "fixall") { Athena::RestoreClientSystems(); return true; }
+    if (normalized == "fixhud") { Athena::RestoreHUD(); return true; }
+    if (normalized == "fixinput") { Athena::RestoreInput(); return true; }
+    if (normalized == "fixbus") { Athena::RestoreAircraft(); return true; }
+    if (normalized == "fixvehicle") { Athena::RestoreVehicleState(); return true; }
+    if (normalized == "inventory" || normalized == "toggleinventory") { Athena::ToggleInventoryHUD(); return true; }
+    if (normalized == "map" || normalized == "togglemap") { Athena::ToggleFullMap(); return true; }
+    if (normalized == "sprint" || normalized == "fixsprint") { Athena::RestoreSprint(); return true; }
+    if (normalized == "supplydrop" || normalized == "spawnsupplydrop") { Athena::SpawnSupplyDrop(); return true; }
 
     // Intercept Athena travel
     if (normalized == "open athena_terrain" || normalized.rfind("open athena_terrain", 0) == 0) {
