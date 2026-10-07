@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FULL VERSION — bugitgo spawn strategy (game.cpp style)
+// FULL VERSION — bugitgo + SetupCheats + teleport backup
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -499,7 +499,7 @@ static void* GetByShortName(const std::string& wanted) {
 }
 
 // ============================================================================
-// 🔑 RunCommand — bugitgo & console commands (game.cpp style)
+// RunCommand — console commands
 // ============================================================================
 static void RunCommand(void* world, void* pc, const char* cmd) {
     if (!world || !cmd) return;
@@ -538,6 +538,7 @@ struct Session {
     bool  aircraft_jumped = false;
     bool  attempted = false;
     bool  finalized = false;
+    bool  cheats_ready = false;
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -563,6 +564,7 @@ namespace Athena {
     void SetupWorld(void* world);
     void Tick();
     bool TryInitializePlayer(void* world, void* mode, void* controller);
+    void SetupCheats();
     void FinalizePlayer();
     bool FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out);
     void ShowSkin();
@@ -626,7 +628,37 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Ve
 }
 
 // ============================================================================
-// 🔑 TryInitializePlayer — bugitgo strategy
+// 🔑 SetupCheats — إنشاء CheatManager حتى يعمل bugitgo
+// ============================================================================
+void Athena::SetupCheats() {
+    void* pc = session.controller;
+    if (!pc) return;
+
+    void* p = GetProp("/Script/Engine.PlayerController.CheatManager");
+    void* klass = FindObj("/Script/FortniteGame.FortCheatManager");
+    if (!klass) klass = FindObj("/Script/Engine.CheatManager");
+    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) {
+        LOG("[Cheat] property or class missing");
+        return;
+    }
+
+    void* cheat = Read<void*>(GetField(pc, p));
+    if (!cheat) {
+        cheat = Fn<void*(*)(void*, void*)>(profile::SpawnObject)(klass, pc);
+        if (cheat) Write<void*>(GetField(pc, p), 0, cheat);
+    }
+    LOG("[Cheat] manager=%p class=%s", cheat,
+        ObjName(cheat ? Read<void*>(cheat, profile::ObjectClass) : nullptr).c_str());
+
+    if (cheat) {
+        Call init("/Script/Engine.CheatManager.ReceiveInitCheatManager");
+        if (init.ok()) init.run(cheat);
+        session.cheats_ready = true;
+    }
+}
+
+// ============================================================================
+// TryInitializePlayer
 // ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
@@ -641,7 +673,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return true;
     }
 
-    // (ب) موقع سبون أولي — bugitgo سيصلحه بعد السبون
+    // (ب) موقع سبون أولي
     Vector loc{0, 0, 3100};
     Vector psLoc;
     if (FindSafeSpawnLocation(world, mode, controller, psLoc)) {
@@ -651,7 +683,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     Transform t{};
     t.Location[0] = loc.X;
     t.Location[1] = loc.Y;
-    // إن كان موقع PlayerStart تحت 500م، ارفعه لـ 500 مؤقتاً
     t.Location[2] = (loc.Z < 500.0f) ? 500.0f : (loc.Z + 100.0f);
 
     LOG("[Init] Spawning at (%.0f,%.0f,%.0f) — will bugitgo",
@@ -660,7 +691,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
 
-    // 🔑 فعّل الهبوط الحر قبل Possess (bugitgo لن يفعّله تلقائياً)
+    // 🔑 فعّل الهبوط الحر قبل Possess
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
@@ -670,12 +701,26 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return false;
     }
 
-    // 🔑 الحيلة الأساسية — bugitgo يصفّر fall tracking ويمنع Fall Damage
+    // 🔑 أنشئ CheatManager أولاً حتى يعمل bugitgo
+    SetupCheats();
+
+    // 🔑 bugitgo (سيعمل الآن بعد إنشاء CheatManager)
     {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "bugitgo %d %d 3100",
                  (int)loc.X, (int)loc.Y);
         RunCommand(world, controller, cmd);
+    }
+
+    // 🛡️ شبكة أمان: teleport مباشر إذا فشل bugitgo
+    {
+        Call tp("/Script/Engine.Actor.K2_TeleportTo");
+        Vector dest{loc.X, loc.Y, 3100.0f};
+        Rotator rot{0, 0, 0};
+        if (tp.ok() && tp.set("DestLocation", dest) && tp.set("DestRotation", rot)) {
+            tp.run(session.pawn);
+            LOG("[Init] K2_TeleportTo backup sent to (%.0f,%.0f,3100)", loc.X, loc.Y);
+        }
     }
 
     // أعلِم المحرك بحالة الهبوط
@@ -689,7 +734,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     if (restart.ok() && restart.set("NewPawn", session.pawn))
         restart.run(controller);
 
-    LOG("[Init] Pawn ready: %p (bugitgo applied)", session.pawn);
+    LOG("[Init] Pawn ready: %p (bugitgo+teleport applied)", session.pawn);
     return true;
 }
 
@@ -778,24 +823,34 @@ void Athena::FinalizePlayer() {
 
     session.pawn = pawn;
 
-    // 🔑 أعد تفعيل الهبوط إن كان لا يزال يسقط
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-    Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-    if (sd.ok()) sd.run(session.pawn);
+    // قراءة موقع البيد
+    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+    if (loc.ok() && loc.run(session.pawn)) {
+        Vector v = loc.result<Vector>();
+        LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
 
-    // إن كان على الأرض (Z منخفض)، أوقف الهبوط
-    {
-        Call loc("/Script/Engine.Actor.K2_GetActorLocation");
-        if (loc.ok() && loc.run(session.pawn)) {
-            Vector v = loc.result<Vector>();
-            LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
-            if (v.Z < 200.0f) {
-                SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
-                SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-                Call sd2("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-                if (sd2.ok()) sd2.run(session.pawn);
-                LOG("Finalize: pawn landed, skydiving OFF");
+        // 🛡️ إذا البيد لسا قريب من (0,0,0) أو على الأرض — أعد الـ teleport
+        if (v.Z < 500.0f) {
+            LOG("Finalize: pawn stuck near ground (Z=%.0f), retrying teleport", v.Z);
+            SetupCheats();
+            {
+                char cmd[96];
+                snprintf(cmd, sizeof(cmd), "bugitgo %d %d 3100", (int)v.X, (int)v.Y);
+                RunCommand(session.world, pc, cmd);
             }
+            Call tp2("/Script/Engine.Actor.K2_TeleportTo");
+            Vector dest{v.X, v.Y, 3100.0f};
+            Rotator rot{0, 0, 0};
+            if (tp2.ok() && tp2.set("DestLocation", dest) && tp2.set("DestRotation", rot)) {
+                tp2.run(session.pawn);
+                LOG("Finalize: teleport retry sent");
+            }
+            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
+            Call sd3("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+            if (sd3.ok()) sd3.run(session.pawn);
+        } else {
+            LOG("Finalize: pawn airborne at Z=%.0f", v.Z);
         }
     }
 
@@ -871,7 +926,12 @@ void Athena::ShowSkin() {
 
 void Athena::DestroyLods() {
     void* cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
-    if (!cm) { LOG("DestroyLods: no CheatManager"); return; }
+    if (!cm) {
+        LOG("DestroyLods: no CheatManager, creating...");
+        SetupCheats();
+        cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
+    }
+    if (!cm) { LOG("DestroyLods: still no CheatManager"); return; }
     void* cls = FindObj("/Script/FortniteGame.FortHLODSMActor");
     if (!cls) return;
     Call c("/Script/Engine.CheatManager.DestroyAll");
@@ -924,7 +984,7 @@ void Athena::DropLoadingScreen() {
 }
 
 // ============================================================================
-// FixBuildingFoundations — DISABLED at call site
+// FixBuildingFoundations — DISABLED
 // ============================================================================
 void Athena::FixBuildingFoundations() {
     void* cls = FindObj("/Script/FortniteGame.BuildingFoundation");
