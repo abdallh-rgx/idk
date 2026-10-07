@@ -1,11 +1,16 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FIXED:
-//   - GetPawn = 0x066E8C88 (was K2_GetPawn at 0x06E1B38C — wrong signature)
-//   - ObjName is thread-safe (mutex around cache)
-//   - GetProp walks FField chain (UE5)
-//   - IsA / SubclassOf use name-based SuperStruct walk
-//   - No auto-travel. Use: open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
+// All fixes applied:
+//   - GetPawn: property read (inline in UE5, no RVA)
+//   - Possess: ProcessEvent with "InPawn" param
+//   - EquipWeaponDefinition: "ItemEntry" param
+//   - AddItemToQuickBars: "Slot" param
+//   - BP_ApplyGameplayEffectToSelf: "GameplayEffectClass" param
+//   - ObjName: thread-safe (mutex)
+//   - GetProp: walks FField chain (UE5)
+//   - IsA/SubclassOf: name-based SuperStruct walk
+//   - No auto-travel; use console:
+//     open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -66,10 +71,9 @@ constexpr uintptr_t WorldTick            = 0x0949685C;
 constexpr uintptr_t EngineExec           = 0x098BB160;
 constexpr uintptr_t IsStandalone         = 0x0945F840;
 constexpr uintptr_t GetPlayerController  = 0x093A1D48;
-constexpr uintptr_t GetPawn              = 0x066E8C88;   // ← CORRECTED
+// GetPawn and Possess REMOVED — they are inline / thunked in UE5.
 constexpr uintptr_t BeginSpawn           = 0x093A37E4;
 constexpr uintptr_t FinishSpawn          = 0x0939F1B8;
-constexpr uintptr_t Possess              = 0x092E2C74;
 constexpr uintptr_t SpawnObject          = 0x093A3388;
 constexpr uintptr_t GenericArrayAdd      = 0x0944A668;
 constexpr uintptr_t GenericArrayRemove   = 0x0944B2DC;
@@ -302,7 +306,7 @@ static std::string ObjNameFromUEString(FUEString* s) {
 }
 
 // ============================================================================
-// PROPERTY LOOKUP — UE5 aware
+// PROPERTY LOOKUP — UE5 aware (FField chain)
 // ============================================================================
 static void* GetProp(const char* path) {
     if (!path) return nullptr;
@@ -482,10 +486,39 @@ static void* LoadAsset(const std::string& path, const char* type_path = "/Script
     return Fn<void*(*)(void*, void*, const char16_t*, const char16_t*, uint32_t, void*, bool, void*)>(
         profile::StaticLoadObject)(type, nullptr, s.c_str(), nullptr, 0, nullptr, true, nullptr);
 }
+
+// ============================================================================
+// GetPawn — PROPERTY-BASED (UE5: GetPawn is inline, no callable RVA)
+// ============================================================================
 static void* GetPawn(void* controller) {
     if (!controller) return nullptr;
-    return Fn<void*(*)(void*)>(profile::GetPawn)(controller);
+    static void* pawnProp = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        pawnProp = GetProp("/Script/Engine.Controller.Pawn");
+        resolved = true;
+        LOG("GetPawn: pawnProp=%p", pawnProp);
+    }
+    if (!pawnProp) return nullptr;
+    return Read<void*>(GetField(controller, pawnProp));
 }
+
+// ============================================================================
+// Possess — via ProcessEvent (param name "InPawn" per SDK)
+// ============================================================================
+static void Possess(void* controller, void* pawn) {
+    if (!controller || !pawn) return;
+    Call c("/Script/Engine.Controller.Possess");
+    if (!c.ok()) { LOG("Possess: binding failed"); return; }
+    if (!c.set("InPawn", pawn)) {
+        c.dump("Possess");
+        LOG("Possess: param 'InPawn' missing");
+        return;
+    }
+    if (c.run(controller)) LOG("Possess: dispatched -> %p", pawn);
+    else LOG("Possess: run failed");
+}
+
 static void* GetPC(void* world, int index = 0) {
     if (!world) return nullptr;
     return Fn<void*(*)(void*, int)>(profile::GetPlayerController)(world, index);
@@ -500,9 +533,6 @@ static void* GetObjField(void* obj, const char* path) {
     if (!p || !obj) return nullptr;
     if (Read<int>(p, profile::PropElementSize) != 8) return nullptr;
     return Read<void*>(GetField(obj, p));
-}
-static void Possess(void* controller, void* pawn) {
-    if (controller && pawn) Fn<void(*)(void*, void*)>(profile::Possess)(controller, pawn);
 }
 static void* SpawnObj(void* klass, void* outer) {
     if (!klass) return nullptr;
@@ -890,10 +920,13 @@ void Athena::AddToInventory(void* def, int count, char idx, int slot) {
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(entryArr, entryProp, GetField(inst, itemEntryProp));
 
+    // FIXED: param is "Slot", not "SlotIndex"
     Call qb("/Script/FortniteGame.FortPlayerController.AddItemToQuickBars");
     uint8_t bar = 0;
-    if (qb.ok() && qb.set("ItemDefinition", def) && qb.set("QuickBarType", bar) && qb.set("SlotIndex", (int)slot)) {
+    if (qb.ok() && qb.set("ItemDefinition", def) && qb.set("QuickBarType", bar) && qb.set("Slot", (int)slot)) {
         qb.run(session.controller);
+    } else {
+        if (qb.ok()) qb.dump("AddItemToQuickBars");
     }
     LOG("Inv+ %s x%d slot=%d", ObjName(def).c_str(), count, slot);
 }
@@ -960,10 +993,13 @@ void Athena::InitializeInventory() {
 // ============================================================================
 // ATHENA — WEAPON EQUIP
 // ============================================================================
+// FIXED: param is "ItemEntry", not "ItemEntryGuid"
 static bool EquipWeapon(void* pawn, void* def, Guid guid) {
     if (!pawn || !def) return false;
     Call c("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
-    if (!c.ok() || !c.set("WeaponData", def) || !c.set("ItemEntryGuid", guid)) return false;
+    if (!c.ok()) { LOG("EquipWeapon: binding failed"); return false; }
+    if (!c.set("WeaponData", def)) { c.dump("EquipWeaponDefinition"); return false; }
+    if (!c.set("ItemEntry", guid)) { c.dump("EquipWeaponDefinition"); return false; }
     if (!c.run(pawn)) return false;
     return c.result<void*>() != nullptr;
 }
@@ -1013,7 +1049,7 @@ void Athena::GrantAbility(void* klass) {
     void* defUI = FindObj("/Script/FortniteGame.Default__FortAbilitySystemUI");
     if (!defUI) return;
     Call d("/Script/FortniteGame.FortAbilitySystemUI.GetDefaultObjectOfGameplayEffectType");
-    if (!d.ok() || !d.set("GameplayEffectType", ge) || !d.run(defUI)) return;
+    if (!d.ok() || !d.set("EffectType", ge) || !d.run(defUI)) return;
     void* defEffect = d.result<void*>();
     if (!defEffect) return;
 
@@ -1026,8 +1062,9 @@ void Athena::GrantAbility(void* klass) {
         }
     }
 
+    // FIXED: param is "GameplayEffectClass", not "GameplayEffect"
     Call apply("/Script/GameplayAbilities.AbilitySystemComponent.BP_ApplyGameplayEffectToSelf");
-    if (apply.ok() && apply.set("GameplayEffect", ge) && apply.set("Level", 1.0f)) {
+    if (apply.ok() && apply.set("GameplayEffectClass", ge) && apply.set("Level", 1.0f)) {
         apply.run(asc);
     }
 }
@@ -1037,7 +1074,7 @@ void Athena::GrantEffect(void* effect, float level) {
     void* asc = GetObjField(session.pawn, "/Script/FortniteGame.FortPawn.AbilitySystemComponent");
     if (!asc) return;
     Call c("/Script/GameplayAbilities.AbilitySystemComponent.BP_ApplyGameplayEffectToSelf");
-    if (c.ok() && c.set("GameplayEffect", effect) && c.set("Level", level)) c.run(asc);
+    if (c.ok() && c.set("GameplayEffectClass", effect) && c.set("Level", level)) c.run(asc);
 }
 
 void Athena::GrantDefaultAbilities() {
@@ -1196,7 +1233,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
                 void* klib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
                 if (klib) {
                     Call cvt("/Script/Engine.KismetSystemLibrary.Conv_SoftObjectReferenceToObject");
-                    if (cvt.ok() && cvt.set("InSoftObject", soft) && cvt.run(klib)) {
+                    if (cvt.ok() && cvt.set("SoftObject", soft) && cvt.run(klib)) {
                         void* def = cvt.result<void*>();
                         int ic = *(int*)((uintptr_t)cand + cnt);
                         if (def) ret.push_back({def, ic});
@@ -1338,7 +1375,7 @@ void Athena::OnBeginEditActor(void* piece) {
     Guid guid{};
     if (g.ok() && g.run(inst)) guid = g.result<Guid>();
     Call eq("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
-    if (!eq.ok() || !eq.set("WeaponData", session.edit_tool) || !eq.set("ItemEntryGuid", guid)) return;
+    if (!eq.ok() || !eq.set("WeaponData", session.edit_tool) || !eq.set("ItemEntry", guid)) return;
     if (!eq.run(session.pawn)) return;
     void* editActor = eq.result<void*>();
     if (!editActor) return;
@@ -1563,9 +1600,20 @@ void Athena::SetupWorld(void* world) {
     if (!session.mode) { LOG("SetupWorld: GameMode is null — waiting"); return; }
     if (!session.state) { LOG("SetupWorld: GameState is null — waiting"); return; }
 
-    void* oldPawn = GetPawn(session.controller);
+    LOG("SetupWorld: reading Pawn property...");
+    void* pawnProp = GetProp("/Script/Engine.Controller.Pawn");
+    LOG("SetupWorld: pawnProp=%p", pawnProp);
+    void* oldPawn = pawnProp ? Read<void*>(GetField(session.controller, pawnProp)) : nullptr;
+    LOG("SetupWorld: oldPawn=%p", oldPawn);
+
+    LOG("SetupWorld: finding pawn class...");
     void* pawnCls = FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
-    if (!oldPawn || !pawnCls || !IsA(oldPawn, pawnCls)) {
+    LOG("SetupWorld: pawnCls=%p", pawnCls);
+
+    bool isPawn = oldPawn && pawnCls && IsA(oldPawn, pawnCls);
+    LOG("SetupWorld: isPawn=%d", (int)isPawn);
+
+    if (!isPawn) {
         SpawnPawn();
     } else {
         session.pawn = oldPawn;
