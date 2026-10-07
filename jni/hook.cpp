@@ -1,17 +1,11 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // FIXED for UE5:
-//   - Correct UStruct/Class offsets from MobileDumper-7 dump:
-//       StructBaseChain = 0x30   (was 0x40 - wrong)
-//       SuperStruct     = 0x40   (correct)
-//       Children        = 0x48   (correct)
-//       ClassCastFlags  = 0xD8   (was 0x48 - wrong)
-//   - IsA / SubclassOf now use name-based walk through SuperStruct (0x40)
-//     for maximum reliability, with the corrected chain check as fallback.
-//   - Removed all auto-travel. Travel to Artemis_Terrain must be issued
-//     manually via the in-game console:
-//         open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
-//   - Spawn uses GameModeBase::ChoosePlayerStart instead of hardcoded Z=5000.
+//   - UStruct/Class offsets corrected from MobileDumper-7 dump
+//   - IsA / SubclassOf use name-based SuperStruct walk (UE5-safe)
+//   - GetProp walks FField chain (UE5: properties are not UObjects)
+//   - No auto-travel. Use console: open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
+//   - Spawn uses ChoosePlayerStart instead of hardcoded Z=5000
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -59,11 +53,9 @@ using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=
 using TCHAR=char16_t;
 
 // ============================================================================
-// PROFILE — Fortnite 21.30 CL-21088273 (values verified against
-//           MobileDumper-7 output for com.epicgames.fortnite 21.30)
+// PROFILE — Fortnite 21.30 CL-21088273
 // ============================================================================
 namespace profile {
-// --- RVAs ---
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
 constexpr uintptr_t StaticFindObject     = 0x0762A664;
 constexpr uintptr_t StaticLoadObject     = 0x0761C568;
@@ -88,7 +80,6 @@ constexpr uintptr_t Realloc              = 0x0735E520;
 constexpr uintptr_t GetDataTableRow_Orig = 0x09319C70;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 
-// --- UObject ---
 constexpr unsigned ObjectVtable = 0x00;
 constexpr unsigned ObjectFlags  = 0x08;
 constexpr unsigned ObjectIndex  = 0x0C;
@@ -96,52 +87,44 @@ constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
 
-// --- UField / UStruct / UClass (UE5 — verified from dump) ---
 constexpr unsigned FieldNext        = 0x28;
-constexpr unsigned StructBaseChain  = 0x30;   // ← corrected (was 0x40 in UE4 code)
+constexpr unsigned StructBaseChain  = 0x30;
 constexpr unsigned StructSuper      = 0x40;
 constexpr unsigned StructChildren   = 0x48;
 constexpr unsigned StructChildProps = 0x50;
 constexpr unsigned StructSize       = 0x58;
 constexpr unsigned StructMinAlign   = 0x5C;
 
-constexpr unsigned ClassCastFlags     = 0xD8;  // ← corrected (was 0x48 in UE4 code)
+constexpr unsigned ClassCastFlags     = 0xD8;
 constexpr unsigned ClassDefaultObject = 0x110;
 constexpr unsigned ClassImplemented   = 0x200;
 
-// --- UFunction ---
 constexpr unsigned FunctionFlags     = 0xB0;
 constexpr unsigned FunctionNumParams = 0xB4;
 constexpr unsigned FunctionParamSize = 0xB6;
 constexpr unsigned FunctionExecFunc  = 0xD8;
 
-// --- FProperty ---
 constexpr unsigned PropArrayDim    = 0x30;
 constexpr unsigned PropElementSize = 0x34;
 constexpr unsigned PropFlags       = 0x38;
 constexpr unsigned PropOffset      = 0x44;
 constexpr unsigned PropSize        = 0x70;
 
-// --- FBoolProperty ---
 constexpr unsigned BoolSize        = 0x80;
 constexpr unsigned BoolByteOffset  = 0x81;
 constexpr unsigned BoolFieldMask   = 0x82;
 
-// --- Sub-props ---
 constexpr unsigned ArrayInner       = 0x70;
 constexpr unsigned StructPropStruct = 0x70;
 constexpr unsigned ObjectPropClass  = 0x70;
 
-// --- FField ---
 constexpr unsigned FFieldClass     = 0x08;
 constexpr unsigned FFieldOwner     = 0x10;
 constexpr unsigned FFieldNext      = 0x20;
 constexpr unsigned FFieldName      = 0x28;
 
-// --- UEnum ---
 constexpr unsigned EnumNames = 0x40;
 
-// --- CPF flags ---
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
@@ -240,11 +223,6 @@ static std::string Narrow(const char16_t* s, int max);
 // ============================================================================
 // isa / subclass — NAME-BASED WALK (UE5-safe)
 // ============================================================================
-// The UE4 chain trick (read CastFlags of T, index into ClassChain of K)
-// does not work reliably on UE5 because the layout changed. We walk the
-// SuperStruct chain (offset 0x40, confirmed by dump) and compare class
-// names, cached inside ObjName.
-// ============================================================================
 static bool IsA(void* obj, void* type) {
     if (!obj || !type || IsBadPtr(obj) || IsBadPtr(type)) return false;
     void* klass = Read<void*>(obj, profile::ObjectClass);
@@ -316,17 +294,62 @@ static std::string ObjNameFromUEString(FUEString* s) {
 }
 
 // ============================================================================
-// PROPERTY HELPERS
+// PROPERTY LOOKUP — UE5 aware
+// ============================================================================
+// In UE5, FProperty is FField-derived, NOT UObject. StaticFindObject cannot
+// find it. We must walk UStruct::ChildProperties (FField chain at 0x50 /
+// FFieldNext 0x20 / FFieldName 0x28), walking up SuperStruct for inheritance,
+// and fall back to the UStruct::Children chain for UFunction / UClass.
 // ============================================================================
 static void* GetProp(const char* path) {
-    void* p = FindObj(path);
-    if (!p) {
-        std::string alt(path);
-        auto pos = alt.rfind('.');
-        if (pos != std::string::npos) { alt[pos] = ':'; p = FindObj(alt); }
+    if (!path) return nullptr;
+    std::string s(path);
+
+    // 1) Direct FindObj — works for UFunction and legacy objects
+    if (void* direct = FindObj(s)) return direct;
+
+    auto pos = s.rfind('.');
+    if (pos == std::string::npos) return nullptr;
+    std::string classPath = s.substr(0, pos);
+    std::string propName  = s.substr(pos + 1);
+
+    // 2) Colon variant used by UE for "Class:Prop" style lookup
+    if (void* alt = FindObj(classPath + ":" + propName)) return alt;
+
+    // 3) Walk the class hierarchy
+    void* klass = FindObj(classPath);
+    if (!klass || IsBadPtr(klass)) return nullptr;
+
+    for (int depth = 0; depth < 32 && klass && !IsBadPtr(klass); ++depth) {
+        // FField chain (properties in UE5)
+        void* f = Read<void*>(klass, profile::StructChildProps);
+        for (int i = 0; f && !IsBadPtr(f) && i < 1024; ++i) {
+            FStringNative ns{};
+            Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)(
+                (char*)f + profile::FFieldName, &ns);
+            std::string n = Narrow(ns.Data, 128);
+            if (ns.Data) Fn<void(*)(void*)>(profile::Free)(ns.Data);
+            if (n == propName) return f;
+            f = Read<void*>(f, profile::FFieldNext);
+        }
+
+        // UField chain (UFunction, UClass, UEnum...)
+        void* c = Read<void*>(klass, profile::StructChildren);
+        for (int i = 0; c && !IsBadPtr(c) && i < 1024; ++i) {
+            FStringNative ns{};
+            Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)(
+                (char*)c + profile::ObjectName, &ns);
+            std::string n = Narrow(ns.Data, 128);
+            if (ns.Data) Fn<void(*)(void*)>(profile::Free)(ns.Data);
+            if (n == propName) return c;
+            c = Read<void*>(c, profile::FieldNext);
+        }
+
+        klass = Read<void*>(klass, profile::StructSuper);
     }
-    return p;
+    return nullptr;
 }
+
 static void* GetField(void* obj, void* prop) {
     if (!obj || !prop) return nullptr;
     return (char*)obj + Read<int>(prop, profile::PropOffset);
@@ -873,7 +896,7 @@ void Athena::AddToInventory(void* def, int count, char idx, int slot) {
 void Athena::InitializeInventory() {
     if (!session.controller) return;
     void* invProp = GetProp("/Script/FortniteGame.FortPlayerController.WorldInventory");
-    if (!invProp) return;
+    if (!invProp) { LOG("InitializeInventory: WorldInventory prop missing"); return; }
     session.inventory = Read<void*>(GetField(session.controller, invProp));
     if (!session.inventory) {
         void* klass = FindObj("/Script/FortniteGame.FortInventory");
@@ -1393,310 +1416,4 @@ void Athena::TeleportToSpawnIsland() {
 
 void Athena::RemoveNetDebugUI() {
     void* wb = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
-    if (!wb) return;
-    void* cls = FindObj("/Game/Athena/HUD/NetDebugUI.NetDebugUI_C");
-    if (!cls) return;
-    Call c("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
-    if (!c.ok() || !c.set("WorldContextObject", session.world) || !c.set("WidgetClass", cls)) return;
-    if (!c.run(wb)) return;
-    auto arr = c.result<Array>();
-    for (int i = 0; i < arr.Count; ++i) {
-        void* w = Read<void*>(arr.Data, (size_t)i * 8);
-        if (w) {
-            Call r("/Script/UMG.UserWidget.RemoveFromViewport");
-            if (r.ok()) r.run(w);
-        }
-    }
-}
-
-void Athena::PlayEmoteItem(void* item) {
-    if (!item || !session.pawn) return;
-    void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
-    if (!mesh) return;
-    Call anim("/Script/Engine.SkeletalMeshComponent.GetAnimInstance");
-    if (!anim.ok() || !anim.run(mesh)) return;
-    void* ai = anim.result<void*>();
-    if (!ai) return;
-    Call ref("/Script/FortniteGame.FortMontageItemDefinitionBase.GetAnimationHardReference");
-    void* montage = nullptr;
-    if (ref.ok()) {
-        ref.set("Type", (char)6);
-        ref.set("Animation", (char)3);
-        if (ref.run(item)) montage = ref.result<void*>();
-    }
-    if (!montage) return;
-    Call play("/Script/Engine.AnimInstance.Montage_Play");
-    if (play.ok()) {
-        play.set("MontageToPlay", montage);
-        play.set("InPlayRate", 1.0f);
-        play.set("InStartTime", 0.0f);
-        play.set("bStopAllMontages", true);
-        play.run(ai);
-    }
-}
-
-void Athena::Tick() {
-    if (!session.pawn) return;
-}
-
-void Athena::OnExitVehicle() {
-    if (!session.pawn) return;
-    void* p = GetProp("/Script/Engine.Actor.Role");
-    if (p) Write<char>(GetField(session.pawn, p), 0, 3);
-    Call v("/Script/FortniteGame.FortPlayerPawn.GetVehicle");
-    if (v.ok() && v.run(session.pawn)) {
-        void* veh = v.result<void*>();
-        if (veh) {
-            void* vp = GetProp("/Script/Engine.Actor.Role");
-            if (vp) Write<char>(GetField(veh, vp), 0, 3);
-        }
-    }
-}
-
-void Athena::DropInventoryItem(Guid guid, int count) {
-    if (!session.inventory) return;
-    void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
-    void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
-    void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
-    if (!invProp || !instProp || !entryProp) return;
-    void* list = GetField(session.inventory, invProp);
-    void* instArr = GetField(list, instProp);
-    void* entryArr = GetField(list, entryProp);
-    Array arr = Read<Array>(instArr);
-    for (int i = 0; i < arr.Count; ++i) {
-        void* inst = Read<void*>(arr.Data, (size_t)i * 8);
-        if (!inst) continue;
-        Call g("/Script/FortniteGame.FortItem.GetItemGuid");
-        if (!g.ok() || !g.run(inst)) continue;
-        Guid cand = g.result<Guid>();
-        if (memcmp(&cand, &guid, sizeof(Guid)) == 0) {
-            Fn<void(*)(void*, void*, int)>(profile::GenericArrayRemove)(instArr, instProp, i);
-            Fn<void(*)(void*, void*, int)>(profile::GenericArrayRemove)(entryArr, entryProp, i);
-            InventoryUpdate();
-            return;
-        }
-    }
-}
-
-void Athena::CheatScript(const char* script) {
-    if (!script || !session.pawn) return;
-    std::string s = script;
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    LOG("CheatScript: %s", s.c_str());
-
-    if (s.find("spawnweapon") != std::string::npos) {
-        auto pos = s.find(" ");
-        if (pos == std::string::npos) return;
-        std::string wn = s.substr(pos + 1);
-        void* def = GetByShortName(wn);
-        if (!def) def = FindObj(wn);
-        if (def) {
-            Call c("/Script/Engine.Actor.K2_GetActorLocation");
-            Vector v{0, 0, 5000};
-            if (c.ok() && c.run(session.pawn)) v = c.result<Vector>();
-            SpawnPickup(def, 1, v);
-        }
-    }
-}
-
-// ============================================================================
-// ATHENA — SETUP WORLD
-// ============================================================================
-void Athena::SetupWorld(void* world) {
-    session.world = world;
-    session.controller = GetPC(world, 0);
-    if (!session.controller) { LOG("SetupWorld: no controller yet"); return; }
-
-    void* ctrlClass = Read<void*>(session.controller, profile::ObjectClass);
-    LOG("SetupWorld: controller class = %s", ObjName(ctrlClass).c_str());
-
-    void* baseCtrl = FindObj("/Script/FortniteGame.FortPlayerController");
-    if (!baseCtrl) {
-        LOG("SetupWorld: FortPlayerController base not found");
-        return;
-    }
-    if (!IsA(session.controller, baseCtrl)) {
-        LOG("SetupWorld: controller is not a FortPlayerController");
-        return;
-    }
-
-    session.mode  = GetWorldField(world, "/Script/Engine.World.AuthorityGameMode");
-    session.state = GetWorldField(world, "/Script/Engine.World.GameState");
-
-    LOG("SetupWorld: PC=%s GM=%s GS=%s",
-        ObjName(session.controller).c_str(),
-        ObjName(session.mode).c_str(),
-        ObjName(session.state).c_str());
-
-    void* oldPawn = GetPawn(session.controller);
-    void* pawnCls = FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
-    if (!oldPawn || !pawnCls || !IsA(oldPawn, pawnCls)) {
-        SpawnPawn();
-    } else {
-        session.pawn = oldPawn;
-        LOG("SetupWorld: keeping existing pawn %p", oldPawn);
-    }
-
-    if (!session.pawn) { LOG("SetupWorld: no pawn — aborting"); return; }
-
-    ShowSkin();
-    DestroyLods();
-    FixBuildingFoundations();
-    InitializeInventory();
-    GrantDefaultAbilities();
-    SpawnBuildPreviews();
-    DropLoadingScreen();
-
-    session.initialized = true;
-    LOG("World setup complete: pawn=%p at %s",
-        session.pawn, ObjName(session.pawn).c_str());
-}
-
-// ============================================================================
-// HOOKS
-// ============================================================================
-static void pe_hook(void* obj, void* func, void* params) {
-    if (!orig_PE) return;
-    if (!g_internal && func && params && session.controller && obj == session.controller &&
-        g_gameTid.load() == (int)gettid()) {
-        Guard g;
-        std::string n = ObjName(func);
-        if (n == "ServerExecuteInventoryItem") {
-            if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid)) {
-                Athena::OnServerExecuteInventoryItem(Read<Guid>(params));
-            }
-        } else if (n == "ServerExecuteInventoryWeapon") {
-            Athena::OnServerExecuteInventoryWeapon(Read<void*>(params));
-        } else if (n == "ServerHandlePickup") {
-            Athena::ServerHandlePickup(Read<void*>(params));
-        } else if (n == "ServerAttemptInteract") {
-            Athena::Loot(Read<void*>(params));
-        } else if (n == "ServerAttemptAircraftJump" && !session.aircraft_jumped) {
-            Athena::OnAircraftJump();
-        } else if (n == "ServerCreateBuildingActor") {
-            Athena::OnServerCreateBuildingActor(params);
-        } else if (n == "ServerBeginEditingBuildingActor") {
-            Athena::OnBeginEditActor(Read<void*>(params));
-        } else if (n == "ServerEditBuildingActor") {
-            struct P { void* BA; void* NC; int RI; bool M; };
-            auto* p = (P*)params;
-            Athena::OnFinishEditActor(p->BA, p->NC, p->RI, p->M, params);
-        } else if (n == "ServerPlayEmoteItem") {
-            Athena::PlayEmoteItem(Read<void*>(params));
-        } else if (n == "ServerAttemptExitVehicle") {
-            Athena::OnExitVehicle();
-        } else if (n == "ServerSpawnInventoryDrop" || n == "ServerAttemptInventoryDrop") {
-            Guid gg = Read<Guid>(params);
-            int cnt = Read<int>(params, sizeof(Guid));
-            Athena::DropInventoryItem(gg, cnt);
-        }
-    }
-
-    orig_PE(obj, func, params);
-}
-
-static void tick_hook(void* world, int type, float delta) {
-    if (orig_Tick) orig_Tick(world, type, delta);
-    if (g_internal || !world) return;
-    int expected = 0;
-    if (g_gameTid.compare_exchange_strong(expected, (int)gettid()))
-        LOG("WorldTick first: tid=%d", (int)gettid());
-    if (g_gameTid.load() != (int)gettid()) return;
-    Guard g;
-
-    std::string wn = ObjName(world);
-    static std::string lastWorld;
-    if (wn != lastWorld) {
-        LOG(">>> WorldTick world: '%s'", wn.c_str());
-        lastWorld = wn;
-    }
-
-    // Frontend / Lobby: log only, do not travel
-    if (wn.find("Frontend") != std::string::npos) return;
-
-    // Artemis_Terrain: run setup
-    if (wn.find("Artemis_Terrain") == std::string::npos) return;
-
-    int index = Read<int>(world, 0xC);
-    if (world != session.world || index != session.world_index) {
-        session = Session{};
-        session.world = world;
-        session.world_index = index;
-        session.observed_at = Monotonic();
-        LOG(">>> Artemis_Terrain detected: %s", wn.c_str());
-    }
-
-    double now = Monotonic();
-    if (session.initialized) { Athena::Tick(); return; }
-    if (now - session.observed_at < 3.0) return;
-    if (now - session.retry_at < 1.0) return;
-    session.retry_at = now;
-    Athena::SetupWorld(world);
-}
-
-static bool exec_hook(void* engine, void* world, const char16_t* command, void* output) {
-    if (!orig_Exec) return false;
-    std::string cmd = Narrow(command, 256);
-    if (!cmd.empty()) LOG("Exec: %s", cmd.c_str());
-    return orig_Exec(engine, world, command, output);
-}
-
-// ============================================================================
-// INSTALL HOOKS
-// ============================================================================
-static void InstallHooks() {
-    LOG("=== InstallHooks ===");
-
-    LOG("ProcessEvent @ %lx", (unsigned long)(g_base + profile::ProcessEvent));
-    if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) != 0 || !orig_PE) {
-        LOG("ProcessEvent hook FAILED"); return;
-    }
-    LOG("ProcessEvent hooked");
-
-    LOG("WorldTick @ %lx", (unsigned long)(g_base + profile::WorldTick));
-    if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) != 0 || !orig_Tick)
-        LOG("WorldTick hook FAILED");
-    else LOG("WorldTick hooked");
-
-    LOG("EngineExec @ %lx", (unsigned long)(g_base + profile::EngineExec));
-    if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) != 0 || !orig_Exec)
-        LOG("EngineExec hook FAILED");
-    else LOG("EngineExec hooked");
-}
-
-// ============================================================================
-// LIB DETECTION
-// ============================================================================
-static int InspectCb(dl_phdr_info* info, size_t, void*) {
-    const char* name = strrchr(info->dlpi_name, '/');
-    name = name ? name + 1 : info->dlpi_name;
-    if (strcmp(name, "libUnreal.so")) return 0;
-    g_base = info->dlpi_addr;
-    g_status.store(1);
-    LOG("Found libUnreal.so base=%p", (void*)g_base);
-    return 1;
-}
-
-static void* Worker(void*) {
-    LOG("=== EraCH3 starting ===");
-    for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
-        dl_iterate_phdr(InspectCb, nullptr);
-        if (g_status.load() == 0) usleep(100000);
-    }
-    if (g_status.load() != 1) { LOG("Timeout waiting for libUnreal.so"); return nullptr; }
-    usleep(300000);
-    InstallHooks();
-    LOG("=== Ready ===");
-    return nullptr;
-}
-
-extern "C" __attribute__((constructor))
-void LibMain() {
-    InitLog();
-    pthread_t t;
-    if (pthread_create(&t, nullptr, Worker, nullptr) == 0) pthread_detach(t);
-}
-
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
-    return JNI_VERSION_1_6;
-}
+    if (!
