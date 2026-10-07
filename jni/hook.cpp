@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// Complete single-file implementation
+// No URL redirect (handled separately). Full implementation.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -9,10 +9,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -77,9 +73,6 @@ constexpr uintptr_t IsGarbageCollecting  = 0x0756E138;
 constexpr uintptr_t IsSavingPackage      = 0x0760A59C;
 constexpr uintptr_t GObjects             = 0x0DCD6E08;
 constexpr uintptr_t Realloc              = 0x0735E520;
-constexpr uintptr_t FCurl_ProcessRequest = 0x089F02F0;
-constexpr uintptr_t FCurl_SetUrl         = 0x089EDCF8;
-constexpr uintptr_t FCurl_GetUrlOffset   = 0x70;
 constexpr uintptr_t GetDataTableRow_Orig = 0x09319C70;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 
@@ -180,7 +173,12 @@ struct FStringNative { TCHAR* Data; int32 Count; int32 Max; };
 struct FUEString     { TCHAR* data; int32 length; int32 capacity; };
 struct FName         { uint32 CompIdx; uint32 DispIdx; };
 struct Array         { void* Data; int32 Count; int32 Max; };
-template<class T> struct TArray { T* Data; int32 Count; int32 Max; };
+template<class T> struct TArray {
+    T* Data; int32 Count; int32 Max;
+    T& operator[](int i) { return Data[i]; }
+    const T& operator[](int i) const { return Data[i]; }
+    int Num() const { return Count; }
+};
 struct Guid          { uint32 A, B, C, D; };
 struct Vector        { float X, Y, Z; };
 struct Rotator       { float Pitch, Yaw, Roll; };
@@ -278,12 +276,6 @@ static std::string ObjName(void* obj) {
     std::string out = Narrow(s.Data, std::min(std::max(s.Count, 0), 512));
     if (s.Data) Fn<void(*)(void*)>(profile::Free)(s.Data);
     return out;
-}
-static std::string ObjNameFromFName(FName n) {
-    void* klib = FindObj("/Script/Engine.Default__KismetStringLibrary");
-    if (!klib) return "";
-    CallPlaceholder:
-    return "";  // replaced below (Call not yet declared)
 }
 static std::string ObjNameFromUEString(FUEString* s) {
     if (!s || !s->data || s->length <= 0) return "";
@@ -396,7 +388,7 @@ public:
     }
 };
 
-// Now that Call exists, implement ObjNameFromFName properly
+// Now that Call exists — implement ObjNameFromFName
 static std::string ObjNameFromFNameReal(FName n) {
     void* klib = FindObj("/Script/Engine.Default__KismetStringLibrary");
     if (!klib) return "";
@@ -408,6 +400,7 @@ static std::string ObjNameFromFNameReal(FName n) {
     if (s.Data) Fn<void(*)(void*)>(profile::Free)(s.Data);
     return out;
 }
+static std::string ObjNameFromFName(FName n) { return ObjNameFromFNameReal(n); }
 
 // ============================================================================
 // CORE WRAPPERS
@@ -499,6 +492,10 @@ struct Session {
     void* stairs = nullptr;
     void* roof = nullptr;
 } session;
+
+static bool g_lobbyDetected = false;
+static double g_lobbyEnteredAt = 0;
+static bool g_travelTriggered = false;
 
 static double Monotonic() {
     timespec ts{};
@@ -632,7 +629,6 @@ void Athena::DropLoadingScreen() {
     Call rsm("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
     if (rsm.ok()) rsm.run(session.controller);
 
-    // Hide minimap brushes
     const char* brushes[] = {"MinimapNextCircleBrush","FullMapNextCircleBrush",
         "MinimapSafeZoneBrush","MinimapCircleBrush","FullMapCircleBrush", nullptr};
     for (int i = 0; brushes[i]; ++i) {
@@ -641,7 +637,6 @@ void Athena::DropLoadingScreen() {
         if (p && !IsBadPtr(GetField(session.state, p))) memset(GetField(session.state, p), 0, 8);
     }
 
-    // Playlist
     void* playlist = FindObj("/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2");
     if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playground/Playlist_Playground.Playlist_Playground");
     if (playlist) {
@@ -771,7 +766,6 @@ void Athena::InitializeInventory() {
     }
     if (!session.inventory) { LOG("No inventory"); return; }
 
-    // QuickBars
     void* qbProp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
     if (qbProp) {
         session.quickbars = Read<void*>(GetField(session.controller, qbProp));
@@ -793,7 +787,6 @@ void Athena::InitializeInventory() {
 
     LOG("Inventory ready: inv=%p qb=%p", session.inventory, session.quickbars);
 
-    // Starting items
     void* startingItemsProp = GetProp("/Script/FortniteGame.FortGameModeAthena.StartingItems");
     if (startingItemsProp && session.mode) {
         Array arr = Read<Array>(GetField(session.mode, startingItemsProp));
@@ -806,7 +799,6 @@ void Athena::InitializeInventory() {
             }
         }
     }
-    // Ammo
     const char* ammo[] = {
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight",
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium",
@@ -1003,7 +995,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     using GetRowFn = bool(*)(void*, FName, void*);
     GetRowFn getRow = (GetRowFn)(g_base + profile::GetDataTableRow_Orig);
 
-    // tier selection
     std::map<int, void*> catRows;
     float maxW = 0;
     for (int i = 0; i < ltdNames.Count && i < 512; ++i) {
@@ -1031,7 +1022,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     for (auto& p : catRows) free(p.second);
     catRows.clear();
 
-    // package rows
     std::map<int, void*> pkgRows;
     for (int i = 0; i < lptNames.Count && i < 2048; ++i) {
         void* row = calloc(1, lptSize);
@@ -1041,7 +1031,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
         else free(row);
     }
 
-    // final calls
     int want = (int)numDrops;
     if (want > (int)pkgRows.size()) want = (int)pkgRows.size();
     for (int i = 0; i < want; ++i) {
@@ -1437,91 +1426,28 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// URL REDIRECT
+// TRIGGER TRAVEL — SwitchLevel to Artemis_Terrain
 // ============================================================================
-static bool ShouldRedirectHost(const std::string& host) {
-    const char* d[] = {"ol.epicgames.com","ol.epicgames.net","on.epicgames.com",
-                       "ak.epicgames.com","game-social.epicgames.com",
-                       "epicgames.dev",".akamaized.net",
-                       ".epicgames.com",".epicgames.net", nullptr};
-    for (int i = 0; d[i]; ++i) {
-        size_t dl = strlen(d[i]);
-        if (host.size() >= dl && host.compare(host.size() - dl, dl, d[i]) == 0) return true;
-    }
-    return false;
-}
-static std::string RewriteUrl(const std::string& url) {
-    size_t se = url.find("://");
-    if (se == std::string::npos) return url;
-    size_t hs = se + 3;
-    size_t he = url.find_first_of("/?", hs);
-    if (he == std::string::npos) he = url.size();
-    std::string host = url.substr(hs, he - hs);
-    if (!ShouldRedirectHost(host)) return url;
-    return "http://127.0.0.1:3551" + url.substr(he);
-}
-static char* FUEToUtf8(const TCHAR* data, int32 len) {
-    if (!data || len <= 0) return nullptr;
-    char* o = (char*)malloc((size_t)len * 3 + 1);
-    if (!o) return nullptr;
-    int j = 0;
-    for (int32 i = 0; i < len - 1; ++i) {
-        uint16_t c = data[i];
-        if (c == 0) break;
-        if (c <= 0x7F) o[j++] = (char)c;
-        else if (c <= 0x7FF) { o[j++] = (char)(0xC0 | (c >> 6)); o[j++] = (char)(0x80 | (c & 0x3F)); }
-        else { o[j++] = (char)(0xE0 | (c >> 12)); o[j++] = (char)(0x80 | ((c >> 6) & 0x3F)); o[j++] = (char)(0x80 | (c & 0x3F)); }
-    }
-    o[j] = 0;
-    return o;
-}
-static void FUEFromUtf8(TCHAR* dst, int dstSize, const char* src) {
-    int i = 0;
-    while (*src && i < dstSize - 1) dst[i++] = (TCHAR)(unsigned char)*src++;
-    dst[i] = 0;
-}
+static void TriggerTravel() {
+    if (!session.controller || g_travelTriggered) return;
+    g_travelTriggered = true;
+    LOG(">>> TriggerTravel: SwitchLevel(Artemis_Terrain)");
 
-static bool (*orig_FCurl_ProcessRequest)(void*) = nullptr;
-static void (*FCurl_SetUrlFn)(void*, const void*) = nullptr;
+    Call c("/Script/Engine.PlayerController.SwitchLevel");
+    if (!c.ok()) { LOG("SwitchLevel binding failed"); return; }
 
-static bool FCurl_ProcessRequestHook(void* req) {
-    if (!req || !orig_FCurl_ProcessRequest) return orig_FCurl_ProcessRequest ? orig_FCurl_ProcessRequest(req) : false;
-    if (!FCurl_SetUrlFn || IsBadPtr(req)) return orig_FCurl_ProcessRequest(req);
-    auto* u = (FUEString*)((uintptr_t)req + profile::FCurl_GetUrlOffset);
-    if (!u || IsBadPtr(u) || !u->data || u->length <= 0) return orig_FCurl_ProcessRequest(req);
-    char* og = FUEToUtf8(u->data, u->length);
-    if (!og) return orig_FCurl_ProcessRequest(req);
-    std::string original(og);
-    free(og);
-    std::string rw = RewriteUrl(original);
-    if (rw != original) {
-        LOG("[FCurl] %s -> %s", original.c_str(), rw.c_str());
-        std::vector<TCHAR> buf(rw.size() + 2);
-        FUEFromUtf8(buf.data(), (int)buf.size(), rw.c_str());
-        FUEString ns{};
-        ns.data = buf.data();
-        ns.length = (int32)rw.size() + 1;
-        ns.capacity = ns.length;
-        FCurl_SetUrlFn(req, &ns);
-    }
-    return orig_FCurl_ProcessRequest(req);
-}
+    const char16_t name[] = u"Artemis_Terrain";
+    FStringNative level{};
+    level.Data = (TCHAR*)name;
+    level.Count = 16;
+    level.Max = 16;
 
-// ============================================================================
-// PROLOGUE VERIFY
-// ============================================================================
-static bool VerifyPrologue(const char* label, uintptr_t rva, std::initializer_list<uint32_t> words) {
-    size_t i = 0;
-    for (auto w : words) {
-        uint32_t actual = Read<uint32_t>((void*)(g_base + rva), 4 * i);
-        if (actual != w) {
-            LOG("PROLOGUE MISMATCH %s at +%zu: got %08x expected %08x", label, i * 4, actual, w);
-            return false;
-        }
-        ++i;
+    if (c.set("MapName", level)) {
+        c.run(session.controller);
+        LOG("SwitchLevel dispatched");
+    } else {
+        LOG("SwitchLevel set(MapName) failed");
     }
-    LOG("Prologue OK: %s", label);
-    return true;
 }
 
 // ============================================================================
@@ -1563,6 +1489,17 @@ static void pe_hook(void* obj, void* func, void* params) {
             Athena::DropInventoryItem(gg, cnt);
         }
     }
+
+    // Detect play button events (before orig_PE)
+    if (!g_internal && func) {
+        std::string fn = ObjName(func);
+        if (fn == "BP_PlayButton" || fn == "PlayButton" ||
+            fn.find("PlayButton") != std::string::npos) {
+            LOG("[PE] Play button triggered: %s", fn.c_str());
+            if (session.controller) TriggerTravel();
+        }
+    }
+
     orig_PE(obj, func, params);
 }
 
@@ -1579,15 +1516,47 @@ static void tick_hook(void* world, int type, float delta) {
     if (Fn<bool(*)()>(profile::IsGarbageCollecting)()) return;
 
     int index = Read<int>(world, 0xC);
+    std::string wn = ObjName(world);
+
+    // Lobby detection
+    if (wn.find("Frontend") != std::string::npos) {
+        if (!g_lobbyDetected) {
+            g_lobbyDetected = true;
+            g_lobbyEnteredAt = Monotonic();
+            LOG("Lobby detected — auto-trigger in 8s");
+        }
+        if (!g_travelTriggered && Monotonic() - g_lobbyEnteredAt > 8.0) {
+            session.world = world;
+            session.world_index = index;
+            session.controller = GetPC(world, 0);
+            if (session.controller) {
+                LOG("Auto-TriggerTravel from lobby timeout");
+                TriggerTravel();
+            }
+        }
+        return;
+    }
+
+    // Artemis_Terrain (CH3 S3) — map
+    if (wn.find("Artemis_Terrain") == std::string::npos) {
+        static std::string lastWorld;
+        if (wn != lastWorld) {
+            LOG("World not Artemis_Terrain: %s", wn.c_str());
+            lastWorld = wn;
+        }
+        return;
+    }
+
     if (world != session.world || index != session.world_index) {
-        auto wn = ObjName(world);
-        if (wn.find("Athena_Terrain") == std::string::npos) return;
+        g_travelTriggered = false;
+        g_lobbyDetected = false;
         session = Session{};
         session.world = world;
         session.world_index = index;
         session.observed_at = Monotonic();
-        LOG("World observed: %s", wn.c_str());
+        LOG(">>> Artemis_Terrain detected: %s", wn.c_str());
     }
+
     double now = Monotonic();
     if (session.initialized) { Athena::Tick(); return; }
     if (now - session.observed_at < 3.0) return;
@@ -1608,26 +1577,22 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
 // ============================================================================
 static void InstallHooks() {
     LOG("=== InstallHooks ===");
-    if (!VerifyPrologue("ProcessEvent", profile::ProcessEvent, {0xf81a0ffc, 0xa90167fa, 0xa9025ff8, 0xa90357f6})) return;
+
+    LOG("ProcessEvent @ %lx", (unsigned long)(g_base + profile::ProcessEvent));
     if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) != 0 || !orig_PE) {
-        LOG("ProcessEvent hook failed"); return;
+        LOG("ProcessEvent hook FAILED"); return;
     }
-    LOG("ProcessEvent hooked @ %lx", (unsigned long)(g_base + profile::ProcessEvent));
+    LOG("ProcessEvent hooked");
 
-    if (VerifyPrologue("WorldTick", profile::WorldTick, {0xd10503ff, 0x6d0d23e9, 0xa90e6ffc, 0xa90f67fa})) {
-        if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) == 0)
-            LOG("WorldTick hooked @ %lx", (unsigned long)(g_base + profile::WorldTick));
-    }
+    LOG("WorldTick @ %lx", (unsigned long)(g_base + profile::WorldTick));
+    if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) != 0 || !orig_Tick)
+        LOG("WorldTick hook FAILED");
+    else LOG("WorldTick hooked");
 
-    if (VerifyPrologue("EngineExec", profile::EngineExec, {0xd10243ff, 0xf90023f9, 0xa9055ff8, 0xa90657f6})) {
-        if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) == 0)
-            LOG("EngineExec hooked @ %lx", (unsigned long)(g_base + profile::EngineExec));
-    }
-
-    FCurl_SetUrlFn = (decltype(FCurl_SetUrlFn))(g_base + profile::FCurl_SetUrl);
-    if (DobbyHook((void*)(g_base + profile::FCurl_ProcessRequest), (void*)FCurl_ProcessRequestHook,
-                  (void**)&orig_FCurl_ProcessRequest) == 0)
-        LOG("FCurl hooked @ %lx", (unsigned long)(g_base + profile::FCurl_ProcessRequest));
+    LOG("EngineExec @ %lx", (unsigned long)(g_base + profile::EngineExec));
+    if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) != 0 || !orig_Exec)
+        LOG("EngineExec hook FAILED");
+    else LOG("EngineExec hooked");
 }
 
 // ============================================================================
