@@ -940,7 +940,6 @@ void Athena::DropLoadingScreen() {
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
 
-    // نستخدم DefaultSolo بدل PlaygroundV2 لجعل الـ HUD كامل
     void* playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
     if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playground/Playlist_Playground.Playlist_Playground");
     if (playlist) {
@@ -1027,7 +1026,6 @@ void Athena::InventoryUpdate() {
 void Athena::AddToInventory(void* def, int count, int slot) {
     if (IsBadPtr(def) || !session.inventory || !session.quickbars) return;
 
-    // 1) Create instance
     void* inst = nullptr;
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
@@ -1037,13 +1035,11 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     }
     if (!inst || IsBadPtr(inst)) return;
 
-    // 2) Owning controller
     {
         Call c("/Script/FortniteGame.FortItem.SetOwningControllerForTemporaryItem");
         if (c.ok() && c.set("InController", session.controller)) c.run(inst);
     }
 
-    // 3) Add to Inventory arrays
     void* invProp   = GetProp("/Script/FortniteGame.FortInventory.Inventory");
     void* instProp  = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
     void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
@@ -1059,13 +1055,11 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(entryArr, entryProp, entrySrc);
 
-    // 4) Read FGuid
     Guid itemGuid{0, 0, 0, 0};
     if (itemGuidProp) itemGuid = Read<Guid>(GetField(entrySrc, itemGuidProp));
     LOG("AddToInventory: %s (guid=%08x%08x%08x%08x)", ObjName(def).c_str(),
         itemGuid.A, itemGuid.B, itemGuid.C, itemGuid.D);
 
-    // 5) Inject FGuid into PrimaryQuickBar slot
     void* primBarProp = GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
     if (primBarProp) {
         void* primBar = GetField(session.quickbars, primBarProp);
@@ -1090,13 +1084,11 @@ void Athena::AddToInventory(void* def, int count, int slot) {
         }
     }
 
-    // 6) Trigger OnRep
     Call onrep("/Script/FortniteGame.FortQuickBars.OnRep_PrimaryQuickBar");
     if (onrep.ok()) onrep.run(session.quickbars);
     Call onrepSec("/Script/FortniteGame.FortQuickBars.OnRep_SecondaryQuickBar");
     if (onrepSec.ok()) onrepSec.run(session.quickbars);
 
-    // 7) Force update
     Call hiu("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate");
     if (hiu.ok()) hiu.run(session.inventory);
     Call hwi("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate");
@@ -1135,7 +1127,6 @@ void Athena::InitializeInventory() {
 
     LOG("Inventory ready: inv=%p qb=%p", session.inventory, session.quickbars);
 
-    // Fallback inventory
     struct DefSlot { const char* path; int slot; };
     DefSlot defaults[] = {
         {"/Game/Athena/Items/Weapons/WID_Harvest_Pickaxe_Athena_C_T01.WID_Harvest_Pickaxe_Athena_C_T01", 0},
@@ -1153,7 +1144,6 @@ void Athena::InitializeInventory() {
     void* editTool = LoadAsset("/Game/Items/Weapons/BuildingTools/EditTool.EditTool");
     if (editTool) session.edit_tool = editTool;
 
-    // Ammo in slot 5
     const char* ammo[] = {
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight",
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium",
@@ -1165,7 +1155,6 @@ void Athena::InitializeInventory() {
         if (def) AddToInventory(def, 999, 5);
     }
 
-    // Materials
     struct ResDef { const char* path; int slot; };
     ResDef resources[] = {
         {"/Game/Items/ResourcePickups/WoodItemData.WoodItemData", 10},
@@ -1284,6 +1273,46 @@ void Athena::GrantDefaultAbilities() {
     GrantAbility(FindObj("/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractSearch.GA_DefaultPlayer_InteractSearch_C"));
     GrantAbility(FindObj("/Game/Athena/Items/ForagedItems/Rift/GA_Rift_Athena_Skydive.GA_Rift_Athena_Skydive_C"));
     LOG("Granted default abilities");
+}
+
+// ============================================================================
+// 🔑 MISSING: OnServerExecuteInventoryItem / Weapon
+// ============================================================================
+void Athena::OnServerExecuteInventoryItem(Guid guid) {
+    if (!session.inventory || !session.pawn) return;
+    void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+    void* invProp  = GetProp("/Script/FortniteGame.FortInventory.Inventory");
+    if (!instProp || !invProp) return;
+    void* list = GetField(session.inventory, invProp);
+    Array arr = Read<Array>(GetField(list, instProp));
+    for (int i = 0; i < arr.Count; ++i) {
+        void* inst = Read<void*>(arr.Data, (size_t)i * 8);
+        if (!inst) continue;
+        Call g("/Script/FortniteGame.FortItem.GetItemGuid");
+        if (!g.ok() || !g.run(inst)) continue;
+        Guid cand = g.result<Guid>();
+        if (memcmp(&cand, &guid, sizeof(Guid)) == 0) {
+            Call d("/Script/FortniteGame.FortItem.GetItemDefinitionBP");
+            void* def = (d.ok() && d.run(inst)) ? d.result<void*>() : nullptr;
+            if (def) {
+                Call eq("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
+                if (eq.ok()) {
+                    eq.set("WeaponData", def);
+                    eq.set("ItemEntry", cand);
+                    eq.run(session.pawn);
+                }
+            }
+            return;
+        }
+    }
+}
+
+void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
+    if (!weapon || !session.pawn) return;
+    void* p = GetProp("/Script/FortniteGame.FortWeapon.ItemEntryGuid");
+    if (!p) return;
+    Guid guid = Read<Guid>(GetField(weapon, p));
+    OnServerExecuteInventoryItem(guid);
 }
 
 // ============================================================================
