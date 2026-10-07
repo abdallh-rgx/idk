@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE FINAL BUILD — Full source with native abilities
+// COMPLETE FINAL BUILD — Native ability granting
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -81,6 +81,12 @@ constexpr uintptr_t GObjects             = 0x0DCD6E08;
 constexpr uintptr_t Realloc              = 0x0735E520;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 
+// ⭐ Native ability functions (from user-provided RVAs)
+constexpr uintptr_t GiveAbility_Native         = 0x31761B8;
+constexpr uintptr_t GiveAbility_ActivateOnce   = 0x3176514;
+constexpr uintptr_t ConstructAbilitySpec       = 0x318B224;
+constexpr uintptr_t ClearAbility               = 0x3177508;
+
 constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
@@ -125,12 +131,10 @@ constexpr unsigned BuildingWall_bDoorOpen_Bit        = 5;
 constexpr unsigned PlayerPawn_Athena_Speed_Sprint    = 0x53EC;
 
 constexpr unsigned TacticalSprint_Flags              = 0xC0;
-
 constexpr uint8_t TacticalSprint_Bit_Enabled   = 0x01;
 constexpr uint8_t TacticalSprint_Bit_WantsSprint = 0x02;
 constexpr uint8_t TacticalSprint_Bit_IsSprinting = 0x08;
 
-// ASC / AbilitySpec
 constexpr unsigned ASC_Items_Total           = 0x4E0;
 constexpr unsigned ClassDefaultObject_Offset = 0x110;
 constexpr int SPEC_SIZE             = 0xB8;
@@ -523,33 +527,31 @@ static void* SpawnActor(void* world, void* klass, void* owner, const Transform& 
 }
 
 // ============================================================================
-// NATIVE ABILITY GIVING
+// ⭐ NATIVE ABILITY GIVING
 // ============================================================================
-static void AddToUEArray(void* arrPtr, const void* element, int elementSize) {
-    if (!arrPtr || !element || elementSize <= 0) return;
-    char* arr = (char*)arrPtr;
-    void** data = (void**)arr;
-    int32* count = (int32*)(arr + 8);
-    int32* max = (int32*)(arr + 12);
+static bool VerifyNativePtrs() {
+    uintptr_t giveAddr = g_base + profile::GiveAbility_Native;
+    uintptr_t ctorAddr = g_base + profile::ConstructAbilitySpec;
 
-    if (*count < 0 || *count > 100000 || *max < 0 || *max > 1000000) {
-        LOG("[AddToUEArray] Bad array state c=%d m=%d", *count, *max);
-        return;
-    }
+    uint32_t giveInsn = Read<uint32_t>((void*)giveAddr);
+    uint32_t ctorInsn = Read<uint32_t>((void*)ctorAddr);
 
-    if (*count + 1 > *max) {
-        int32 newMax = (*max == 0) ? 4 : (*max * 2);
-        void* newData = Fn<void*(*)(void*, int64, uint32)>(profile::Realloc)(
-            *data, (int64)(newMax * elementSize), 0);
-        if (!newData) {
-            LOG("[AddToUEArray] Realloc failed");
-            return;
-        }
-        *data = newData;
-        *max = newMax;
+    LOG("[Native] GiveAbility @ %p = 0x%08X", (void*)giveAddr, giveInsn);
+    LOG("[Native] Ctor        @ %p = 0x%08X", (void*)ctorAddr, ctorInsn);
+
+    // ARM64 prologues usually start with STP or SUB SP
+    // Low byte 0x00 or 0xFF = invalid
+    uint8_t b1 = giveInsn & 0xFF;
+    uint8_t b2 = ctorInsn & 0xFF;
+    if (b1 == 0x00 || b1 == 0xFF) {
+        LOG("[Native] ⚠️ GiveAbility RVA looks WRONG");
+        return false;
     }
-    memcpy((char*)*data + (*count) * elementSize, element, elementSize);
-    (*count)++;
+    if (b2 == 0x00 || b2 == 0xFF) {
+        LOG("[Native] ⚠️ Ctor RVA looks WRONG");
+        return false;
+    }
+    return true;
 }
 
 static bool GiveAbilityNative(void* asc, void* abilityClass) {
@@ -557,29 +559,30 @@ static bool GiveAbilityNative(void* asc, void* abilityClass) {
 
     void* cdo = Read<void*>(abilityClass, profile::ClassDefaultObject_Offset);
     if (!cdo || IsBadPtr(cdo)) {
-        LOG("[GiveAbility] No CDO for class");
+        LOG("[GiveAbility] No CDO for %s", ObjName(abilityClass).c_str());
         return false;
     }
-
-    void* itemsArray = (char*)asc + profile::ASC_Items_Total;
 
     alignas(16) uint8_t spec[profile::SPEC_SIZE];
     memset(spec, 0, profile::SPEC_SIZE);
 
-    static int32_t s_nextHandle = 1;
-    int32_t handle = s_nextHandle++;
-    memcpy(spec + profile::SPEC_Handle_Offset, &handle, 4);
-    memcpy(spec + profile::SPEC_Ability_Offset, &cdo, 8);
+    // FGameplayAbilitySpec::FGameplayAbilitySpec(
+    //     UGameplayAbility* InAbility, int32 InLevel, int32 InInputID, UObject* InSourceObject)
+    using CtorFn = void(*)(void* spec, void* ability, int32 level, int32 inputID, void* sourceObj);
+    CtorFn ctor = Fn<CtorFn>(profile::ConstructAbilitySpec);
+    ctor(spec, cdo, 1, -1, nullptr);
 
-    int32_t level = 1;
-    memcpy(spec + profile::SPEC_Level_Offset, &level, 4);
+    // FGameplayAbilitySpecHandle UAbilitySystemComponent::GiveAbility(FGameplayAbilitySpec& Spec)
+    using GiveFn = uint32_t(*)(void* asc, void* spec);
+    GiveFn give = Fn<GiveFn>(profile::GiveAbility_Native);
+    uint32_t handle = give(asc, spec);
 
-    int32_t inputID = -1;
-    memcpy(spec + profile::SPEC_InputID_Offset, &inputID, 4);
+    if (handle == 0 || handle == 0xFFFFFFFF) {
+        LOG("[GiveAbility] ❌ Native rejected %s (h=0x%X)", ObjName(abilityClass).c_str(), handle);
+        return false;
+    }
 
-    AddToUEArray(itemsArray, spec, profile::SPEC_SIZE);
-
-    LOG("[GiveAbility] ✅ %s (handle=%d)", ObjName(abilityClass).c_str(), handle);
+    LOG("[GiveAbility] ✅ %s (handle=0x%X)", ObjName(abilityClass).c_str(), handle);
     return true;
 }
 
@@ -630,6 +633,7 @@ struct Session {
     bool  abilities_granted = false;
     bool  stamina_initialized = false;
     bool  tactical_sprint_setup = false;
+    bool  native_verified = false;
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -877,8 +881,6 @@ void Athena::SetupTacticalSprint() {
             if (add.run(session.controller)) {
                 comp = add.result<void*>();
                 LOG("[TacticalSprint] Component added: %p", comp);
-            } else {
-                add.dump("AddComponentByClass");
             }
         }
     }
@@ -1186,7 +1188,6 @@ void Athena::LoadProfileCosmetics() {
     if (state && !IsBadPtr(state)) {
         if (heroType && !IsBadPtr(heroType)) {
             Write<void*>(state, profile::FortPlayerState_HeroType, heroType);
-            LOG("[Profile] HeroType injected into PlayerState@0x430");
         }
 
         if (!session.character_parts.empty()) {
@@ -1200,8 +1201,6 @@ void Athena::LoadProfileCosmetics() {
                 && apply.set("PlayerState", state)) {
                 void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
                 if (klib) { apply.run(klib); LOG("[Profile] ApplyCharacterCosmetics dispatched"); }
-            } else {
-                apply.dump("ApplyCharacterCosmetics");
             }
         }
 
@@ -1217,9 +1216,6 @@ void Athena::LoadProfileCosmetics() {
             Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
             if (upd.ok() && upd.set("PlayerState", state)) {
                 upd.run(klib);
-                LOG("[Profile] UpdatePlayerCustomCharacterPartsVisualization DISPATCHED");
-            } else {
-                upd.dump("UpdatePlayerCustomCharacterPartsVisualization");
             }
         }
     }
@@ -1260,8 +1256,6 @@ void Athena::LoadDefaultCosmetics() {
             if (std::find(session.character_parts.begin(), session.character_parts.end(), asset) == session.character_parts.end())
                 session.character_parts.push_back(asset);
             LOG("[Cosmetics] Applied part[%d]: %s", i, ObjName(asset).c_str());
-        } else {
-            choose.dump("ServerChoosePart");
         }
     }
 
@@ -1336,11 +1330,7 @@ void Athena::ForcePlayerVisible() {
             body.run(session.pawn);
             bool ret = body.result<bool>();
             LOG("[Visibility] SetCharacterBodyVisibilityForPossession(TRUE) -> %d", (int)ret);
-        } else {
-            body.dump("SetCharacterBodyVisibilityForPossession");
         }
-    } else {
-        LOG("[Visibility] binding failed");
     }
 
     Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
@@ -1458,6 +1448,12 @@ void Athena::SetupWorld(void* world) {
     if (!TryInitializePlayer(world, session.mode, session.controller)) {
         LOG("SetupWorld: prerequisites not ready, will retry");
         return;
+    }
+
+    // ⭐ Verify native ability function pointers
+    if (!session.native_verified) {
+        session.native_verified = true;
+        VerifyNativePtrs();
     }
 
     LOG("SetupWorld: GrantAllAbilitySets");
@@ -1723,7 +1719,7 @@ void Athena::FixBus() {
 }
 
 // ============================================================================
-// InventoryUpdate
+// Inventory
 // ============================================================================
 void Athena::InventoryUpdate() {
     if (session.inventory) {
@@ -1744,9 +1740,6 @@ void Athena::InventoryUpdate() {
     }
 }
 
-// ============================================================================
-// AddToInventory
-// ============================================================================
 void Athena::AddToInventory(void* def, int count, int slot) {
     if (IsBadPtr(def) || !session.inventory || !session.quickbars) return;
 
@@ -1845,9 +1838,6 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     LOG("Inv+ %s x%d slot=%d", ObjName(def).c_str(), count, slot);
 }
 
-// ============================================================================
-// InitializeInventory
-// ============================================================================
 void Athena::InitializeInventory() {
     if (!session.controller) return;
     void* invProp = GetProp("/Script/FortniteGame.FortPlayerController.WorldInventory");
@@ -1924,9 +1914,6 @@ void Athena::InitializeInventory() {
     EquipSlot(0);
 }
 
-// ============================================================================
-// EquipSlot
-// ============================================================================
 void Athena::EquipSlot(int slot) {
     if (slot < 0 || slot >= 6 || !session.slots[slot]) {
         LOG("EquipSlot[%d]: empty", slot);
@@ -1976,7 +1963,7 @@ void Athena::EquipSlot(int slot) {
 }
 
 // ============================================================================
-// SpawnSafeZoneIndicator
+// SafeZone
 // ============================================================================
 void Athena::SpawnSafeZoneIndicator() {
     if (session.safezone_spawned) return;
@@ -2084,7 +2071,7 @@ void Athena::Loot(void* actor) {
     Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched");
     if (r1.ok()) r1.run(actor);
     Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer");
-    if (r2.ok()) { r2.run(actor); LOG("[Loot] BounceContainer dispatched"); }
+    if (r2.ok()) r2.run(actor);
 
     LOG("[Loot] chest opened: %p", actor);
 }
@@ -2279,7 +2266,7 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
 }
 
 // ============================================================================
-// Misc functions
+// Misc
 // ============================================================================
 void Athena::TeleportToSpawnIsland() {
     if (!session.pawn) return;
@@ -2409,16 +2396,9 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     void* wood = LoadAsset("/Game/Items/ResourcePickups/WoodItemData.WoodItemData");
     void* stone = LoadAsset("/Game/Items/ResourcePickups/StoneItemData.StoneItemData");
     void* metal = LoadAsset("/Game/Items/ResourcePickups/MetalItemData.MetalItemData");
-    void* ammoM = LoadAsset("/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium");
-    void* ammoS = LoadAsset("/Game/Athena/Items/Ammo/AthenaAmmoDataShells.AthenaAmmoDataShells");
-    void* gun = LoadAsset("/Game/Athena/Items/Weapons/WID_Assault_Auto_Athena_C_Ore_T03.WID_Assault_Auto_Athena_C_Ore_T03");
-
     if (wood) ret.push_back({wood, 50});
     if (stone) ret.push_back({stone, 50});
     if (metal) ret.push_back({metal, 50});
-    if (ammoM) ret.push_back({ammoM, 60});
-    if (ammoS) ret.push_back({ammoS, 30});
-    if (gun) ret.push_back({gun, 1});
     return ret;
 }
 
