@@ -1008,7 +1008,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     float maxW = 0;
     for (int i = 0; i < ltdNames.Count && i < 512; ++i) {
         void* row = calloc(1, ltdSize);
-        getRow(ltd, ltdNames[i], row);
+        getRow(ltd, ltdNames.Data[i], row);
         std::string tname = ObjNameFromFNameReal(*(FName*)((uintptr_t)row + tg));
         if (tname == category) {
             float w = *(float*)((uintptr_t)row + wt);
@@ -1035,7 +1035,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     std::map<int, void*> pkgRows;
     for (int i = 0; i < lptNames.Count && i < 2048; ++i) {
         void* row = calloc(1, lptSize);
-        getRow(lpt, lptNames[i], row);
+        getRow(lpt, lptNames.Data[i], row);
         std::string pid = ObjNameFromFNameReal(*(FName*)((uintptr_t)row + lpid));
         if (pid == pkgName) pkgRows[i] = row;
         else free(row);
@@ -1055,7 +1055,7 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
 
         for (int j = 0; j < lptNames.Count && j < 2048; ++j) {
             void* cand = calloc(1, lptSize);
-            getRow(lpt, lptNames[j], cand);
+            getRow(lpt, lptNames.Data[j], cand);
             std::string cid = ObjNameFromFNameReal(*(FName*)((uintptr_t)cand + lpid));
             if (cid == call) {
                 SoftObjRef soft = *(SoftObjRef*)((uintptr_t)cand + ido);
