@@ -916,6 +916,7 @@ void Athena::DestroyLods() {
 // DropLoadingScreen — no ServerReadyToStartMatch
 // ============================================================================
 void Athena::DropLoadingScreen() {
+void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
 
     LOG("DropLoadingScreen: step 1");
@@ -923,22 +924,26 @@ void Athena::DropLoadingScreen() {
     if (gp) {
         uint8_t old = Read<uint8_t>(GetField(session.state, gp));
         LOG("DropLoadingScreen: GamePhase old=%d", (int)old);
-        if (old < 3) {
-            uint8_t phase = 3;
+        // 🔑 اكتب فقط بدون OnRep لتجنب الكراش
+        if (old < 2) {
+            uint8_t phase = 2; // Warmup
             Write<uint8_t>(GetField(session.state, gp), 0, phase);
             Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
             if (n.ok()) {
                 n.set("OldGamePhase", old);
                 n.run(session.state);
+                LOG("DropLoadingScreen: GamePhase set to 2 via OnRep");
             }
+        } else {
+            LOG("DropLoadingScreen: GamePhase already set, skipping OnRep");
         }
     }
 
-    LOG("DropLoadingScreen: step 2");
+    LOG("DropLoadingScreen: step 2 — load flags");
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
 
-    LOG("DropLoadingScreen: step 3");
+    LOG("DropLoadingScreen: step 3 — playlist");
     void* playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
     if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultDuo.Playlist_DefaultDuo");
     if (playlist) {
