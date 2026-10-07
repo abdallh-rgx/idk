@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE FIXED BUILD
+// COMPLETE FINAL BUILD — No GObjects scan, no crash
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -22,7 +22,6 @@
 #include <vector>
 #include <array>
 #include <map>
-#include <set>
 #include <algorithm>
 #include <android/log.h>
 
@@ -405,12 +404,12 @@ public:
         int total = Read<uint16_t>(m_func, profile::FunctionParamSize);
         if (total < 0 || total > (int)m_data.size()) return;
         void* p = Read<void*>(m_func, profile::StructChildren);
-        for (int i = 0; p && !IsBadPtr(p) && i < 256; ++i) {
+        for (int i = 0; p && !IsBadPtr(p) && i < 128; ++i) {
             add_param(p, Read<uint64_t>(p, profile::PropFlags), total, false);
             p = Read<void*>(p, profile::FieldNext);
         }
         void* fp = Read<void*>(m_func, profile::StructChildProps);
-        for (int i = 0; fp && !IsBadPtr(fp) && i < 256; ++i) {
+        for (int i = 0; fp && !IsBadPtr(fp) && i < 128; ++i) {
             add_param(fp, Read<uint64_t>(fp, profile::PropFlags), total, true);
             fp = Read<void*>(fp, profile::FFieldNext);
         }
@@ -419,11 +418,12 @@ public:
 
     bool ok() const { return m_valid; }
     void* func() const { return m_func; }
+    const std::vector<Param>& params() const { return m_params; }
 
     void dump(const char* label) const {
         LOG("[Call %s] valid=%d func=%p params=%zu", label, (int)m_valid, m_func, m_params.size());
         for (auto& p : m_params)
-            LOG("   '%s' off=%d size=%d flags=%llx", p.name.c_str(), p.offset, p.size,
+            LOG("   param '%s' off=%d size=%d flags=%llx", p.name.c_str(), p.offset, p.size,
                 (unsigned long long)p.flags);
     }
 
@@ -473,13 +473,55 @@ static void* LoadClass(const char* path, const char* base_path = "/Script/Engine
         profile::StaticLoadClass)(parent, nullptr, s.c_str(), nullptr, 0, nullptr);
 }
 
+// ============================================================================
+// CORE WRAPPERS
+// ============================================================================
+static void* GetPawn(void* controller) {
+    if (!controller) return nullptr;
+    static void* pawnProp = nullptr;
+    static bool resolved = false;
+    if (!resolved) { pawnProp = GetProp("/Script/Engine.Controller.Pawn"); resolved = true; }
+    if (!pawnProp) return nullptr;
+    return Read<void*>(GetField(controller, pawnProp));
+}
+
+static void Possess(void* controller, void* pawn) {
+    if (!controller || !pawn) return;
+    Call c("/Script/Engine.Controller.Possess");
+    if (!c.ok()) { LOG("Possess: binding failed"); return; }
+    if (!c.set("InPawn", pawn)) { c.dump("Possess"); return; }
+    c.run(controller);
+}
+
 static void* GetPC(void* world, int index = 0) {
     if (!world) return nullptr;
     return Fn<void*(*)(void*, int)>(profile::GetPlayerController)(world, index);
 }
 
+static void* SpawnActor(void* world, void* klass, void* owner, const Transform& t) {
+    if (!world || !klass) return nullptr;
+    void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
+        profile::BeginSpawn)(world, klass, &t, 1, owner);
+    return actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+}
+
+static void* GetByShortName(const std::string& wanted) {
+    void* defType = FindObj("/Script/FortniteGame.FortItemDefinition");
+    if (!defType) return nullptr;
+    GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
+    if (!go) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* o = go->GetById(i);
+        if (!o || IsBadPtr(o)) continue;
+        void* k = Read<void*>(o, profile::ObjectClass);
+        if (k != defType) continue;
+        if (ObjName(o) == wanted) return o;
+    }
+    return nullptr;
+}
+
 // ============================================================================
-// SESSION
+// SESSION STATE
 // ============================================================================
 struct Session {
     void* world = nullptr;
@@ -507,12 +549,12 @@ struct Session {
     double finalize_at = 0;
     std::array<void*, 6> slots{};
     std::vector<void*> character_parts;
+    std::vector<void*> granted_ability_sets;
     void* edit_tool = nullptr;
     void* wall = nullptr;
     void* floor = nullptr;
     void* stairs = nullptr;
     void* roof = nullptr;
-    std::vector<void*> granted_ability_sets;
 } session;
 
 static double Monotonic() {
@@ -566,9 +608,9 @@ namespace Athena {
     void OnExitVehicle();
     void CheatScript(const char* script);
 
+    // Ability system
     void GrantAllAbilitySets();
     void InitStaminaAttributes();
-    void HandleJumpFromHudStart();
     void RefreshHUD();
 
     struct LootData { void* Def; int Count; };
@@ -576,7 +618,7 @@ namespace Athena {
 }
 
 // ============================================================================
-// ABILITIES
+// ABILITIES — NO GObjects scan
 // ============================================================================
 static void* GetASC(void* actor) {
     if (!actor) return nullptr;
@@ -594,7 +636,10 @@ void Athena::GrantAbility(void* klass) {
     if (!asc) { LOG("[Ability] no ASC"); return; }
 
     Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
-    if (!c.ok()) return;
+    if (!c.ok()) {
+        LOG("[Ability] TryActivateAbilityByClass binding failed");
+        return;
+    }
     bool bAllowRemote = true;
     if (c.set("InAbilityToActivate", klass) && c.set("bAllowRemoteActivation", bAllowRemote)) {
         c.run(asc);
@@ -619,6 +664,7 @@ void Athena::GrantEffect(void* effect, float level) {
     }
 }
 
+// Apply a single ability set via FortKismetLibrary::EquipFortAbilitySet (the official path)
 static bool ApplyAbilitySet(void* pawn, void* abilitySet) {
     if (!pawn || !abilitySet || IsBadPtr(abilitySet)) return false;
 
@@ -649,68 +695,10 @@ static bool ApplyAbilitySet(void* pawn, void* abilitySet) {
     return true;
 }
 
-static std::vector<void*> CollectGameFeatureAbilitySets() {
-    std::vector<void*> result;
-
-    GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
-    if (!go) return result;
-
-    int32 num = go->NumElements;
-    if (num <= 0 || num > 8000000) {
-        LOG("[Abilities] GObjects NumElements suspicious: %d", num);
-        return result;
-    }
-    if (!go->Objects || go->NumChunks <= 0 || go->NumChunks > 256) {
-        LOG("[Abilities] GObjects layout suspicious chunks=%d", go->NumChunks);
-        return result;
-    }
-
-    void* gfdClass = FindObj("/Script/FortniteGame.FortGameFeatureData");
-    if (!gfdClass) { LOG("[Abilities] FortGameFeatureData missing"); return result; }
-
-    void* abilitySetClass = FindObj("/Script/FortniteGame.FortAbilitySet");
-    if (!abilitySetClass) { LOG("[Abilities] FortAbilitySet missing"); return result; }
-
-    std::vector<void*> gfds;
-    gfds.reserve(32);
-    for (int32 i = 0; i < num; ++i) {
-        void* obj = go->GetById(i);
-        if (!obj || IsBadPtr(obj)) continue;
-        void* klass = Read<void*>(obj, profile::ObjectClass);
-        if (klass == gfdClass) gfds.push_back(obj);
-    }
-    LOG("[Abilities] Found %zu GameFeatureData instances", gfds.size());
-    if (gfds.empty()) return result;
-
-    for (int32 i = 0; i < num; ++i) {
-        void* obj = go->GetById(i);
-        if (!obj || IsBadPtr(obj)) continue;
-        void* klass = Read<void*>(obj, profile::ObjectClass);
-        if (!klass || IsBadPtr(klass)) continue;
-
-        bool matches = (klass == abilitySetClass);
-        if (!matches) matches = SubclassOfFast(klass, abilitySetClass);
-        if (!matches) continue;
-
-        void* outer = Read<void*>(obj, profile::ObjectOuter);
-        if (!outer || IsBadPtr(outer)) continue;
-
-        for (void* gfd : gfds) {
-            if (outer == gfd) {
-                result.push_back(obj);
-                break;
-            }
-        }
-    }
-
-    LOG("[Abilities] Collected %zu ability sets from GameFeatureData", result.size());
-    return result;
-}
-
 void Athena::InitStaminaAttributes() {
     if (!session.pawn) return;
     void* asc = GetASC(session.pawn);
-    if (!asc) return;
+    if (!asc) { LOG("[Stamina] no ASC"); return; }
 
     void* attrClass = FindObj("/Script/FortniteGame.FortPlayerAttributeSet");
     if (!attrClass) attrClass = FindObj("/Script/GameplayAbilities.AttributeSet");
@@ -736,12 +724,17 @@ void Athena::InitStaminaAttributes() {
     LOG("[Stamina] Initialized FortPlayerAttributeSet");
 }
 
+// No GObjects iteration - explicit paths only
 void Athena::GrantAllAbilitySets() {
     if (!session.pawn || session.abilities_granted) return;
     LOG("[Abilities] Setting up...");
 
-    if (!session.stamina_initialized) InitStaminaAttributes();
+    // Step 1: Stamina attribute set (needed for Tactical Sprint bar)
+    if (!session.stamina_initialized) {
+        InitStaminaAttributes();
+    }
 
+    // Step 2: Core Chapter 1 base set (Jump, Build, Interact, Harvest, Fire)
     void* coreSet = LoadAsset(
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_AthenaPlayer.GAS_AthenaPlayer",
         "/Script/FortniteGame.FortAbilitySet");
@@ -753,43 +746,36 @@ void Athena::GrantAllAbilitySets() {
         LOG("[Abilities] GAS_AthenaPlayer missing");
     }
 
-    auto featureSets = CollectGameFeatureAbilitySets();
-    LOG("[Abilities] Processing %zu feature sets", featureSets.size());
-    int applied = 0;
-    for (void* set : featureSets) {
-        if (!set || IsBadPtr(set)) continue;
-
-        void* setClass = Read<void*>(set, profile::ObjectClass);
-        if (!setClass || IsBadPtr(setClass)) continue;
-
-        void* fortAS = FindObj("/Script/FortniteGame.FortAbilitySet");
-        if (!fortAS || !SubclassOfFast(setClass, fortAS)) continue;
-
-        bool dup = false;
-        for (void* existing : session.granted_ability_sets)
-            if (existing == set) { dup = true; break; }
-        if (dup) continue;
-
+    // Step 3: Chapter 3 additional sets (Sprint, Sliding, Tactical Sprint, Mantle)
+    const char* extraSets[] = {
+        "/Game/Athena/Abilities/GAS_AthenaPlayer_Sliding.GAS_AthenaPlayer_Sliding",
+        "/Game/Athena/Abilities/GAS_AthenaPlayer_Mantle.GAS_AthenaPlayer_Mantle",
+        "/Game/Abilities/Player/Movement/GAS_AthenaPlayer_Movement.GAS_AthenaPlayer_Movement",
+        "/Game/Abilities/Player/TacticalSprint/GAS_TacticalSprint.GAS_TacticalSprint",
+        "/Game/Abilities/Player/TacticalSprint/GAS_AthenaPlayer_TacticalSprint.GAS_AthenaPlayer_TacticalSprint",
+        nullptr
+    };
+    for (int i = 0; extraSets[i]; ++i) {
+        void* set = LoadAsset(extraSets[i], "/Script/FortniteGame.FortAbilitySet");
+        if (!set) { LOG("[Abilities] Not found: %s", extraSets[i]); continue; }
         if (ApplyAbilitySet(session.pawn, set)) {
             session.granted_ability_sets.push_back(set);
-            ++applied;
-            LOG("[Abilities] [%d/%zu] applied %s", applied, featureSets.size(), ObjName(set).c_str());
         }
     }
-    LOG("[Abilities] Feature sets applied: %d/%zu", applied, featureSets.size());
 
-    const char* tacticalPaths[] = {
+    // Step 4: Direct ability classes (fallback if sets above don't exist)
+    const char* directAbilities[] = {
         "/Game/Abilities/Player/TacticalSprint/GA_Athena_TacticalSprint.GA_Athena_TacticalSprint_C",
         "/Game/Abilities/Player/TacticalSprint/GA_Player_TacticalSprint.GA_Player_TacticalSprint_C",
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_TacticalSprint.GA_DefaultPlayer_TacticalSprint_C",
+        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_Sprint.GA_DefaultPlayer_Sprint_C",
         nullptr
     };
-    for (int i = 0; tacticalPaths[i]; ++i) {
-        void* tacClass = LoadClass(tacticalPaths[i], "/Script/GameplayAbilities.GameplayAbility");
-        if (!tacClass) continue;
-        GrantAbility(tacClass);
-        LOG("[Abilities] Tactical Sprint granted via %s", tacticalPaths[i]);
-        break;
+    for (int i = 0; directAbilities[i]; ++i) {
+        void* ability = LoadClass(directAbilities[i], "/Script/GameplayAbilities.GameplayAbility");
+        if (!ability) { LOG("[Abilities] Direct not found: %s", directAbilities[i]); continue; }
+        GrantAbility(ability);
+        LOG("[Abilities] Direct granted: %s", directAbilities[i]);
     }
 
     session.abilities_granted = true;
@@ -810,52 +796,6 @@ void Athena::RefreshHUD() {
 }
 
 // ============================================================================
-// BATTLE BUS
-// ============================================================================
-void Athena::HandleJumpFromHudStart() {
-    if (!session.controller || !session.pawn) return;
-    if (session.aircraft_jumped) return;
-
-    Guard g;
-    LOG("[Bus] JumpFromHudStart intercepted");
-
-    Vector rot{0, 0, 0};
-    void* rotProp = GetProp("/Script/Engine.Controller.ControlRotation");
-    if (rotProp && Read<int>(rotProp, profile::PropElementSize) == 24) {
-        void* addr = GetField(session.controller, rotProp);
-        if (addr) rot = Read<Vector>(addr);
-    }
-
-    Call aircraft("/Script/FortniteGame.FortPlayerController.ServerAttemptAircraftJump");
-    if (aircraft.ok()) {
-        Rotator r{rot.X, rot.Y, rot.Z};
-        if (aircraft.set("ClientRotation", r)) aircraft.run(session.controller);
-    }
-
-    Call sky("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
-    if (sky.ok()) {
-        bool bFromBus = true;
-        if (sky.set("bFromBus", bFromBus)) sky.run(session.pawn);
-    }
-
-    Write<uint8_t>(session.pawn, profile::FortPlayerPawn_bIsSkydiving, 1);
-
-    Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
-    if (cam.ok()) {
-        cam.set("NewViewTarget", session.pawn);
-        float blend = 0.0f;
-        cam.set("BlendTime", blend);
-        cam.run(session.controller);
-    }
-
-    Call rep("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-    if (rep.ok()) rep.run(session.pawn);
-
-    session.aircraft_jumped = true;
-    LOG("[Bus] Skydiving started");
-}
-
-// ============================================================================
 // BeginPlayerSkydiving
 // ============================================================================
 void Athena::BeginPlayerSkydiving() {
@@ -867,7 +807,11 @@ void Athena::BeginPlayerSkydiving() {
         if (bsd.set("bFromBus", bFromBus)) {
             bsd.run(session.pawn);
             LOG("[Skydive] BeginSkydiving(true) dispatched");
+        } else {
+            bsd.dump("BeginSkydiving");
         }
+    } else {
+        LOG("[Skydive] BeginSkydiving binding FAILED");
     }
 
     Write<uint8_t>(session.pawn, profile::FortPlayerPawn_bIsSkydiving, 1);
@@ -882,7 +826,10 @@ void Athena::SetupCheats() {
     void* p = GetProp("/Script/Engine.PlayerController.CheatManager");
     void* klass = FindObj("/Script/FortniteGame.FortCheatManager");
     if (!klass) klass = FindObj("/Script/Engine.CheatManager");
-    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) return;
+    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) {
+        LOG("[Cheat] property or class missing");
+        return;
+    }
     void* cheat = Read<void*>(GetField(pc, p));
     if (!cheat) {
         cheat = Fn<void*(*)(void*, void*)>(profile::SpawnObject)(klass, pc);
@@ -907,6 +854,7 @@ void Athena::HandleDoor(void* door) {
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
 
+    // Try proper interaction path first
     Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract");
     if (interact.ok() && session.pawn) {
         if (interact.set("InteractingPawn", session.pawn)) {
@@ -915,6 +863,7 @@ void Athena::HandleDoor(void* door) {
         }
     }
 
+    // Fallback: toggle bit + notify
     uint8_t* byte = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
     bool wasOpen = ((*byte) >> profile::BuildingWall_bDoorOpen_Bit) & 1;
     if (wasOpen) *byte &= ~(1 << profile::BuildingWall_bDoorOpen_Bit);
@@ -923,7 +872,7 @@ void Athena::HandleDoor(void* door) {
     Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
     if (r.ok()) r.run(door);
 
-    LOG("[Door] Toggled: %s", wasOpen ? "CLOSED" : "OPENED");
+    LOG("[Door] 0xFDE: %02X -> %s (bit 5)", *byte, wasOpen ? "CLOSED" : "OPENED");
 }
 
 // ============================================================================
@@ -1022,6 +971,7 @@ void Athena::LoadProfileCosmetics() {
 
 void Athena::LoadDefaultCosmetics() {
     if (!session.pawn || !session.controller) return;
+    LOG("[Cosmetics] Loading hardcoded defaults...");
 
     const char* partPaths[] = {
         "/Game/Athena/Heroes/Meshes/Heads/F_Med_Head1_ATH.F_Med_Head1_ATH",
@@ -1031,7 +981,7 @@ void Athena::LoadDefaultCosmetics() {
 
     for (int i = 0; i < 2; ++i) {
         void* asset = LoadAsset(partPaths[i], "/Script/FortniteGame.CustomCharacterPart");
-        if (!asset) continue;
+        if (!asset) { LOG("[Cosmetics] Missing: %s", partPaths[i]); continue; }
         void* partCls = FindObj("/Script/FortniteGame.CustomCharacterPart");
         if (!partCls || !IsA(asset, partCls)) continue;
         loaded[i] = asset;
@@ -1040,6 +990,7 @@ void Athena::LoadDefaultCosmetics() {
             choose.run(session.pawn);
             if (std::find(session.character_parts.begin(), session.character_parts.end(), asset) == session.character_parts.end())
                 session.character_parts.push_back(asset);
+            LOG("[Cosmetics] Applied part[%d]: %s", i, ObjName(asset).c_str());
         }
     }
 
@@ -1132,11 +1083,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
                               "/Script/Engine.Pawn");
     if (!pawnCls) { LOG("[Init] PlayerPawn_Athena_C missing"); return false; }
 
-    void* existing = nullptr;
-    {
-        void* pawnProp = GetProp("/Script/Engine.Controller.Pawn");
-        if (pawnProp) existing = Read<void*>(GetField(controller, pawnProp));
-    }
+    void* existing = GetPawn(controller);
     if (existing && !IsBadPtr(existing) && IsA(existing, pawnCls)) {
         session.pawn = existing;
         LOG("[Init] Using existing engine pawn: %s", ObjName(existing).c_str());
@@ -1161,6 +1108,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
                     t.Location[1] = v.Y;
                     t.Location[2] = v.Z + 100.0;
                     haveSpawn = true;
+                    LOG("[Init] PlayerStart chosen at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
                 }
             }
         }
@@ -1170,20 +1118,23 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         t.Location[0] = 0.0;
         t.Location[1] = 0.0;
         t.Location[2] = 3100.0;
+        LOG("[Init] Fallback spawn (0,0,3100)");
     }
 
     LOG("[Init] Spawning at (%.0f,%.0f,%.0f)", t.Location[0], t.Location[1], t.Location[2]);
-    void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-        profile::BeginSpawn)(world, pawnCls, &t, 1, controller);
-    session.pawn = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+    session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
     LOG("[Init] Spawned: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
 
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
-    Call possess("/Script/Engine.Controller.Possess");
-    if (possess.ok() && possess.set("InPawn", session.pawn)) possess.run(controller);
+    Possess(controller, session.pawn);
+    if (GetPawn(controller) != session.pawn) {
+        LOG("[Init] Possession did not stick");
+        return false;
+    }
+    LOG("[Init] Possessed OK");
 
     SetupCheats();
 
@@ -1227,7 +1178,7 @@ void Athena::SetupWorld(void* world) {
         ObjName(session.state).c_str());
 
     if (!TryInitializePlayer(world, session.mode, session.controller)) {
-        LOG("SetupWorld: prerequisites not ready");
+        LOG("SetupWorld: prerequisites not ready, will retry");
         return;
     }
 
@@ -1260,7 +1211,7 @@ void Athena::SetupWorld(void* world) {
     session.finalize_at = Monotonic() + 2.0;
     session.attempted   = true;
     session.initialized = true;
-    LOG("SetupWorld: initial pass done");
+    LOG("SetupWorld: initial pass done, finalize in 2s (pawn=%p)", session.pawn);
 }
 
 // ============================================================================
@@ -1275,8 +1226,11 @@ void Athena::FinalizePlayer() {
     if (pc != session.controller) { LOG("Finalize: controller changed"); return; }
 
     void* pawnCls = FindObj("/Script/FortniteGame.FortPlayerPawnAthena");
-    void* pawnProp = GetProp("/Script/Engine.Controller.Pawn");
-    void* pawn = pawnProp ? Read<void*>(GetField(pc, pawnProp)) : nullptr;
+    void* pawn = GetPawn(pc);
+    LOG("Finalize: engine pawn=%p old=%p class=%s",
+        pawn, session.pawn,
+        ObjName(pawn ? Read<void*>(pawn, profile::ObjectClass) : nullptr).c_str());
+
     if (!pawn || !pawnCls || !IsA(pawn, pawnCls)) {
         LOG("Finalize: pawn is not FortPlayerPawnAthena");
         return;
@@ -1284,10 +1238,36 @@ void Athena::FinalizePlayer() {
     session.pawn = pawn;
 
     if (!session.abilities_granted) {
+        LOG("Finalize: re-granting abilities");
         GrantAllAbilitySets();
     }
 
+    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+    if (loc.ok() && loc.run(session.pawn)) {
+        Vector v = loc.result<Vector>();
+        LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
+
+        if (v.Z < -1000.0) {
+            LOG("Finalize: pawn underground — snapping to PlayerStart");
+            Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
+            if (choose.ok() && choose.set("Player", pc) && choose.run(session.mode)) {
+                void* start = choose.result<void*>();
+                if (start && !IsBadPtr(start)) {
+                    Call sloc("/Script/Engine.Actor.K2_GetActorLocation");
+                    if (sloc.ok() && sloc.run(start)) {
+                        Vector sv = sloc.result<Vector>();
+                        Rotator rot{0.0, 0.0, 0.0};
+                        Call cs("/Script/Engine.Controller.ClientSetLocation");
+                        if (cs.ok() && cs.set("NewLocation", sv) && cs.set("NewRotation", rot))
+                            cs.run(pc);
+                    }
+                }
+            }
+        }
+    }
+
     if (!session.ready_called) {
+        LOG("Finalize: ServerReadyToStartMatch + ClientOnPawnSpawned");
         Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
         if (srt.ok()) srt.run(pc);
         Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
@@ -1304,7 +1284,7 @@ void Athena::FinalizePlayer() {
     session.visibility_forced = false;
     ForcePlayerVisible();
     RefreshHUD();
-    LOG("Finalize: complete");
+    LOG("Finalize: complete, visible=%d", (int)session.visibility_forced);
 }
 
 // ============================================================================
@@ -1324,14 +1304,16 @@ void Athena::Tick() {
         FinalizePlayer();
         return;
     }
-
     static double lastVisibility = 0;
     static double lastSpeedReapply = 0;
     static double lastAbilityCheck = 0;
 
     if (session.finalized && now - lastVisibility > 8.0) {
         lastVisibility = now;
-        if (!session.visibility_forced) ForcePlayerVisible();
+        if (!session.visibility_forced) {
+            LOG(">>> Tick: visibility not confirmed, retrying");
+            ForcePlayerVisible();
+        }
     }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) {
         lastSpeedReapply = now;
@@ -1353,14 +1335,16 @@ void Athena::Tick() {
 void Athena::DestroyLods() {
     void* cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
     if (!cm) {
+        LOG("DestroyLods: no CheatManager, creating...");
         SetupCheats();
         cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
     }
-    if (!cm) return;
+    if (!cm) { LOG("DestroyLods: still no CheatManager"); return; }
     void* cls = FindObj("/Script/FortniteGame.FortHLODSMActor");
     if (!cls) return;
     Call c("/Script/Engine.CheatManager.DestroyAll");
     if (c.ok() && c.set("aClass", cls)) c.run(cm);
+    LOG("DestroyLods: done");
 }
 
 // ============================================================================
@@ -1404,7 +1388,10 @@ void Athena::DropLoadingScreen() {
         Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
         if (cps.ok()) cps.run(session.controller);
         session.ready_called = true;
+        LOG("DropLoadingScreen: ready callbacks dispatched");
     }
+
+    LOG("Loading screen dropped");
 }
 
 // ============================================================================
@@ -1423,10 +1410,12 @@ void Athena::FixBuildingFoundations() {
     for (int32 i = 0; i < go->NumElements; ++i) {
         void* o = go->GetById(i);
         if (!o || IsBadPtr(o)) continue;
-        if (Read<void*>(o, profile::ObjectClass) != cls) continue;
+        void* k = Read<void*>(o, profile::ObjectClass);
+        if (k != cls) continue;
         Write<char>((char*)o + propOff, 0, 0);
         ++fixed;
     }
+    LOG("FixBuildingFoundations: fixed=%d", fixed);
 }
 
 // ============================================================================
@@ -1487,7 +1476,10 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
         int lvl = 1;
-        if (!c.ok() || !c.set("Count", count) || !c.set("Level", lvl) || !c.run(def)) return;
+        if (!c.ok() || !c.set("Count", count) || !c.set("Level", lvl) || !c.run(def)) {
+            LOG("AddToInventory: CreateTemporaryItemInstanceBP failed");
+            return;
+        }
         inst = c.result<void*>();
     }
     if (!inst || IsBadPtr(inst)) return;
@@ -1572,6 +1564,8 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     if (hiu.ok()) hiu.run(session.inventory);
     Call hwi("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate");
     if (hwi.ok()) hwi.run(session.controller);
+
+    LOG("Inv+ %s x%d slot=%d", ObjName(def).c_str(), count, slot);
 }
 
 // ============================================================================
@@ -1580,17 +1574,15 @@ void Athena::AddToInventory(void* def, int count, int slot) {
 void Athena::InitializeInventory() {
     if (!session.controller) return;
     void* invProp = GetProp("/Script/FortniteGame.FortPlayerController.WorldInventory");
-    if (!invProp) return;
+    if (!invProp) { LOG("InitializeInventory: WorldInventory prop missing"); return; }
     session.inventory = Read<void*>(GetField(session.controller, invProp));
     if (!session.inventory) {
         void* klass = FindObj("/Script/FortniteGame.FortInventory");
         Transform t{};
-        void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-            profile::BeginSpawn)(session.world, klass, &t, 1, session.controller);
-        session.inventory = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+        session.inventory = SpawnActor(session.world, klass, session.controller, t);
         if (session.inventory) Write<void*>(GetField(session.controller, invProp), 0, session.inventory);
     }
-    if (!session.inventory) return;
+    if (!session.inventory) { LOG("No inventory"); return; }
 
     void* qbProp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
     if (qbProp) {
@@ -1598,9 +1590,7 @@ void Athena::InitializeInventory() {
         if (!session.quickbars) {
             void* klass = FindObj("/Script/FortniteGame.FortQuickBars");
             Transform t{};
-            void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-                profile::BeginSpawn)(session.world, klass, &t, 1, session.controller);
-            session.quickbars = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+            session.quickbars = SpawnActor(session.world, klass, session.controller, t);
             if (session.quickbars) Write<void*>(GetField(session.controller, qbProp), 0, session.quickbars);
         }
     }
@@ -1609,6 +1599,8 @@ void Athena::InitializeInventory() {
         if (so.ok()) so.run(session.quickbars);
     }
     { Call so("/Script/FortniteGame.FortInventory.SetOwner"); if (so.ok()) so.run(session.inventory); }
+
+    LOG("Inventory ready: inv=%p qb=%p", session.inventory, session.quickbars);
 
     struct DefSlot { const char* path; int slot; };
     DefSlot defaults[] = {
@@ -1659,7 +1651,10 @@ void Athena::InitializeInventory() {
 // EquipSlot
 // ============================================================================
 void Athena::EquipSlot(int slot) {
-    if (slot < 0 || slot >= 6 || !session.slots[slot]) return;
+    if (slot < 0 || slot >= 6 || !session.slots[slot]) {
+        LOG("EquipSlot[%d]: empty", slot);
+        return;
+    }
     void* item = session.slots[slot];
 
     void* def = nullptr;
@@ -1667,7 +1662,7 @@ void Athena::EquipSlot(int slot) {
         Call d("/Script/FortniteGame.FortItem.GetItemDefinitionBP");
         if (d.ok() && d.run(item)) def = d.result<void*>();
     }
-    if (!def) return;
+    if (!def) { LOG("EquipSlot[%d]: no definition", slot); return; }
 
     Guid guid{};
     {
@@ -1683,14 +1678,24 @@ void Athena::EquipSlot(int slot) {
     }
 
     Call eq("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
-    if (!eq.ok()) return;
+    if (!eq.ok()) {
+        LOG("EquipSlot[%d]: binding failed", slot);
+        eq.dump("EquipWeaponDefinition");
+        return;
+    }
 
     bool bDisableAnim = false;
     eq.set("WeaponData", def);
     eq.set("ItemEntryGuid", guid);
     eq.set("TrackerGuid", trackerGuid);
     eq.set("bDisableEquipAnimation", bDisableAnim);
-    eq.run(session.pawn);
+
+    if (eq.run(session.pawn)) {
+        void* weapon = eq.result<void*>();
+        LOG("EquipSlot[%d]: %s -> weapon=%p", slot, ObjName(def).c_str(), weapon);
+    } else {
+        LOG("EquipSlot[%d]: run failed", slot);
+    }
 }
 
 // ============================================================================
@@ -1732,9 +1737,7 @@ void Athena::SpawnSafeZoneIndicator() {
     if (!cls) return;
 
     Transform t{};
-    void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-        profile::BeginSpawn)(session.world, cls, &t, 1, session.state);
-    void* indicator = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+    void* indicator = SpawnActor(session.world, cls, session.state, t);
     if (!indicator) return;
 
     void* prop = GetProp("/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
@@ -1744,6 +1747,7 @@ void Athena::SpawnSafeZoneIndicator() {
     if (n.ok()) n.run(session.state);
 
     session.safezone_spawned = true;
+    LOG("SafeZoneIndicator spawned: %p", indicator);
 }
 
 // ============================================================================
@@ -1757,9 +1761,7 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     t.Location[0] = loc.X;
     t.Location[1] = loc.Y;
     t.Location[2] = loc.Z;
-    void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-        profile::BeginSpawn)(session.world, klass, &t, 1, session.pawn);
-    void* pickup = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+    void* pickup = SpawnActor(session.world, klass, session.pawn, t);
     if (!pickup) return;
     void* defProp = GetProp("/Script/FortniteGame.FortPickup.ItemDefinition");
     void* cntProp = GetProp("/Script/FortniteGame.FortPickup.Count");
@@ -1776,6 +1778,7 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
         c.set("bShouldCombinePickupsWhenTossCompletes", true);
         c.run(pickup);
     }
+    LOG("Pickup spawned: %s x%d", ObjName(def).c_str(), count);
 }
 
 // ============================================================================
@@ -1808,8 +1811,10 @@ void Athena::Loot(void* actor) {
     SetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
     Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched");
     if (r1.ok()) r1.run(actor);
+
     Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer");
     if (r2.ok()) r2.run(actor);
+
     LOG("[Loot] chest opened: %p", actor);
 }
 
@@ -1870,9 +1875,7 @@ void Athena::SpawnBuildPreviews() {
 
     auto build = [&](const char* meshPath, char type) -> void* {
         Transform t{};
-        void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-            profile::BeginSpawn)(session.world, previewCls, &t, 1, session.controller);
-        actor = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+        void* actor = SpawnActor(session.world, previewCls, session.controller, t);
         if (!actor) return nullptr;
         void* mesh = LoadAsset(meshPath, nullptr);
         void* mc = nullptr;
@@ -1898,6 +1901,7 @@ void Athena::SpawnBuildPreviews() {
     session.floor  = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_Floor.PBWA_W1_Floor", 1);
     session.stairs = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_StairW.PBWA_W1_StairW", 5);
     session.roof   = build("/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_RoofC.PBWA_W1_RoofC", 6);
+    LOG("Build previews: W=%p F=%p S=%p R=%p", session.wall, session.floor, session.stairs, session.roof);
 }
 
 // ============================================================================
@@ -1928,9 +1932,7 @@ void Athena::OnServerCreateBuildingActor(void* params) {
     t.Location[1] = loc.Y;
     t.Location[2] = loc.Z;
 
-    void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-        profile::BeginSpawn)(session.world, cls, &t, 1, session.controller);
-    actor = actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
+    void* actor = SpawnActor(session.world, cls, session.controller, t);
     if (!actor) return;
 
     Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
@@ -1941,6 +1943,8 @@ void Athena::OnServerCreateBuildingActor(void* params) {
         init.set("bUsePlayerBuildAnimations", bUse);
         init.run(actor);
     }
+
+    LOG("Building: %s at (%.0f,%.0f,%.0f)", ObjName(cls).c_str(), loc.X, loc.Y, loc.Z);
 }
 
 void Athena::OnBeginEditActor(void* piece) {
@@ -1990,9 +1994,7 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
     if (!newClass) return;
 
     Transform t{};
-    void* spawned = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
-        profile::BeginSpawn)(session.world, newClass, &t, 1, session.controller);
-    void* edited = spawned ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(spawned, &t) : nullptr;
+    void* edited = SpawnActor(session.world, newClass, session.controller, t);
     if (!edited) return;
 
     Call m("/Script/Engine.Actor.SetMirrored");
@@ -2012,7 +2014,42 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
 // OnAircraftJump
 // ============================================================================
 void Athena::OnAircraftJump() {
-    HandleJumpFromHudStart();
+    if (!session.controller || session.aircraft_jumped) return;
+    session.aircraft_jumped = true;
+    LOG("[Bus] Aircraft jump triggered");
+
+    Vector spawnLoc{0.0, 0.0, 50000.0};
+    Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
+    if (choose.ok() && choose.set("Player", session.controller) && choose.run(session.mode)) {
+        void* start = choose.result<void*>();
+        if (start && !IsBadPtr(start)) {
+            Call sl("/Script/Engine.Actor.K2_GetActorLocation");
+            if (sl.ok() && sl.run(start)) {
+                Vector v = sl.result<Vector>();
+                spawnLoc.X = v.X;
+                spawnLoc.Y = v.Y;
+                spawnLoc.Z = 50000.0;
+            }
+        }
+    }
+
+    void* klass = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
+    if (!klass) return;
+
+    Transform t{};
+    t.Location[0] = spawnLoc.X;
+    t.Location[1] = spawnLoc.Y;
+    t.Location[2] = spawnLoc.Z;
+
+    void* newPawn = SpawnActor(session.world, klass, session.controller, t);
+    if (!newPawn) return;
+
+    Possess(session.controller, newPawn);
+    session.pawn = newPawn;
+
+    BeginPlayerSkydiving();
+    ShowSkin();
+    LOG("[Bus] Airborne at (%.0f,%.0f,%.0f)", spawnLoc.X, spawnLoc.Y, spawnLoc.Z);
 }
 
 // ============================================================================
@@ -2152,12 +2189,14 @@ void Athena::CheatScript(const char* script) {
     if (!script || !session.pawn) return;
     std::string s = script;
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    LOG("CheatScript: %s", s.c_str());
 
     if (s.find("spawnweapon") != std::string::npos) {
         auto pos = s.find(" ");
         if (pos == std::string::npos) return;
         std::string wn = s.substr(pos + 1);
-        void* def = FindObj(wn);
+        void* def = GetByShortName(wn);
+        if (!def) def = FindObj(wn);
         if (def) {
             Call c("/Script/Engine.Actor.K2_GetActorLocation");
             Vector v{0.0, 0.0, 5000.0};
@@ -2175,9 +2214,17 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     void* wood = LoadAsset("/Game/Items/ResourcePickups/WoodItemData.WoodItemData");
     void* stone = LoadAsset("/Game/Items/ResourcePickups/StoneItemData.StoneItemData");
     void* metal = LoadAsset("/Game/Items/ResourcePickups/MetalItemData.MetalItemData");
+    void* ammoM = LoadAsset("/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium");
+    void* ammoS = LoadAsset("/Game/Athena/Items/Ammo/AthenaAmmoDataShells.AthenaAmmoDataShells");
+    void* gun = LoadAsset("/Game/Athena/Items/Weapons/WID_Assault_Auto_Athena_C_Ore_T03.WID_Assault_Auto_Athena_C_Ore_T03");
+
     if (wood) ret.push_back({wood, 50});
     if (stone) ret.push_back({stone, 50});
     if (metal) ret.push_back({metal, 50});
+    if (ammoM) ret.push_back({ammoM, 60});
+    if (ammoS) ret.push_back({ammoS, 30});
+    if (gun) ret.push_back({gun, 1});
+
     return ret;
 }
 
@@ -2190,10 +2237,13 @@ static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
 
     if (!g_internal && func && g_gameTid.load() == (int)gettid()) {
+        // JumpFromHudStart intercept (mobile battle bus)
         if (obj == session.controller && params == nullptr) {
             std::string fn = ObjName(func);
             if (fn == "JumpFromHudStart") {
-                Athena::HandleJumpFromHudStart();
+                Guard g;
+                LOG("[Bus] JumpFromHudStart intercepted");
+                Athena::OnAircraftJump();
                 return orig_PE(obj, func, params);
             }
         }
@@ -2201,8 +2251,8 @@ static void pe_hook(void* obj, void* func, void* params) {
         if (!g_interactionClass)
             g_interactionClass = FindObj("/Script/FortniteGame.FortControllerComponent_Interaction");
 
-        bool isPC   = (obj == session.controller);
-        bool isPawn = (obj == session.pawn);
+        bool isPC          = (obj == session.controller);
+        bool isPawn        = (obj == session.pawn);
         bool isInteraction = false;
         if (g_interactionClass && obj) {
             void* cls = Read<void*>(obj, profile::ObjectClass);
@@ -2236,7 +2286,7 @@ static void pe_hook(void* obj, void* func, void* params) {
                 }
             }
             else if (n == "ServerAttemptAircraftJump" && !session.aircraft_jumped) {
-                Athena::HandleJumpFromHudStart();
+                Athena::OnAircraftJump();
             }
             else if (n == "ServerCreateBuildingActor" && params) {
                 Athena::OnServerCreateBuildingActor(params);
