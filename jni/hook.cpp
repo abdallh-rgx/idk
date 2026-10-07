@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FIXED: spawn uses ChoosePlayerStart instead of hardcoded (0,0,5000)
+// FIXED: manual travel only, no auto-travel from lobby (prevents crashes)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -358,7 +358,6 @@ public:
     bool ok() const { return m_valid; }
     void* func() const { return m_func; }
 
-    // مفيد جدًا للتشخيص: يطبع أسماء كل البارامترات
     void dump(const char* label) const {
         LOG("[Call %s] valid=%d func=%p params=%zu", label, (int)m_valid,
             m_func, m_params.size());
@@ -493,11 +492,6 @@ struct Session {
     void* roof = nullptr;
 } session;
 
-static bool g_lobbyDetected = false;
-static double g_lobbyEnteredAt = 0;
-static bool g_travelTriggered = false;
-static std::atomic<bool> g_pendingTravel{false};
-
 static double Monotonic() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -545,20 +539,13 @@ namespace Athena {
 }
 
 // ============================================================================
-// ⭐ SPAWN LOCATION — FIXED
-// ============================================================================
-// الترتيب:
-//   1) نطلب من GameMode أن يختار PlayerStart مناسب (نفس ما تفعله اللعبة)
-//   2) إن فشل، نبحث يدويًا عن FortPlayerStartWarmup في GObjects
-//   3) إن فشل، نبحث عن أي PlayerStart
-//   4) كحل أخير فقط، نستخدم (0,0,5000) — مع تحذير واضح
+// SPAWN LOCATION
 // ============================================================================
 bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
                                     Vector& out, Rotator& outRot) {
     out = Vector{0, 0, 5000};
     outRot = Rotator{0, 0, 0};
 
-    // 1) ChoosePlayerStart
     if (mode && controller) {
         Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
         if (choose.ok() && choose.set("Player", controller)) {
@@ -584,7 +571,6 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
         }
     }
 
-    // 2) البحث اليدوي في GObjects
     GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
     if (!go) return false;
 
@@ -606,7 +592,6 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
         }
         if (found.empty()) continue;
 
-        // اختر الأقرب إلى مركز العالم إن وُجد، وإلا الأول
         void* pick = found[0];
         Call loc("/Script/Engine.Actor.K2_GetActorLocation");
         if (loc.ok() && loc.run(pick)) {
@@ -617,7 +602,6 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
         }
     }
 
-    // 3) فشل كل شيء
     LOG("[Spawn] WARNING: no PlayerStart found, using fallback (0,0,5000)");
     return false;
 }
@@ -629,14 +613,12 @@ void Athena::SpawnPawn() {
 
     Vector loc{0, 0, 5000};
     Rotator rot{0, 0, 0};
-    if (!FindSafeSpawnLocation(session.world, session.mode, session.controller, loc, rot)) {
-        // لا نستسلم — نجرّب أي حال
-    }
+    FindSafeSpawnLocation(session.world, session.mode, session.controller, loc, rot);
 
     Transform t{};
     t.Location[0] = loc.X;
     t.Location[1] = loc.Y;
-    t.Location[2] = loc.Z + 100.0f;  // فوق نقطة السpawn قليلًا
+    t.Location[2] = loc.Z + 100.0f;
 
     session.pawn = SpawnActor(session.world, klass, session.controller, t);
     if (!session.pawn) { LOG("SpawnPawn: spawn failed"); return; }
@@ -646,7 +628,6 @@ void Athena::SpawnPawn() {
 
     Possess(session.controller, session.pawn);
 
-    // تأكد من أن الـ possession ثبت
     void* check = GetPawn(session.controller);
     if (check != session.pawn) {
         LOG("WARNING: possession did not stick — got %p expected %p", check, session.pawn);
@@ -1478,18 +1459,16 @@ void Athena::CheatScript(const char* script) {
 }
 
 // ============================================================================
-// ATHENA — SETUP WORLD (FIXED: accepts any Fort controller, logs real class)
+// ATHENA — SETUP WORLD
 // ============================================================================
 void Athena::SetupWorld(void* world) {
     session.world = world;
     session.controller = GetPC(world, 0);
     if (!session.controller) { LOG("SetupWorld: no controller yet"); return; }
 
-    // اطبع الكلاس الحقيقي دائمًا — هذا يكشف سبب "Not FortPlayerControllerAthena"
     void* ctrlClass = Read<void*>(session.controller, profile::ObjectClass);
     LOG("SetupWorld: controller class = %s", ObjName(ctrlClass).c_str());
 
-    // اقبل أي FortPlayerController (Base) بدل النوع المتخصص
     void* baseCtrl = FindObj("/Script/FortniteGame.FortPlayerController");
     if (!baseCtrl) {
         LOG("SetupWorld: FortPlayerController base not found");
@@ -1533,39 +1512,6 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// TRIGGER TRAVEL
-// ============================================================================
-static void TriggerTravel() {
-    if (!session.controller || g_travelTriggered) return;
-    g_travelTriggered = true;
-    LOG(">>> TriggerTravel: SwitchLevel(Artemis_Terrain)");
-
-    Call c("/Script/Engine.PlayerController.SwitchLevel");
-    if (!c.ok()) { LOG("SwitchLevel binding failed"); return; }
-    c.dump("SwitchLevel");   // ← يساعدك ترى اسم البارامتر الصحيح
-
-    // جرّب عدة أسماء محتملة للبارامتر
-    const char16_t name[] = u"Artemis_Terrain";
-    FStringNative level{};
-    level.Data = (TCHAR*)name;
-    level.Count = 16;
-    level.Max = 16;
-
-    bool ok = false;
-    for (const char* key : {"MapName", "LevelName", "NewLevel", "URL"}) {
-        if (c.set(key, level)) {
-            LOG("SwitchLevel using param '%s'", key);
-            c.run(session.controller);
-            ok = true;
-            break;
-        }
-    }
-    if (!ok) {
-        LOG("SwitchLevel set(MapName) failed — no matching parameter name");
-    }
-}
-
-// ============================================================================
 // HOOKS
 // ============================================================================
 static void pe_hook(void* obj, void* func, void* params) {
@@ -1605,20 +1551,6 @@ static void pe_hook(void* obj, void* func, void* params) {
         }
     }
 
-    if (!g_internal && func) {
-        static bool playClicked = false;
-        if (!playClicked) {
-            std::string fn = ObjName(func);
-            if (fn.find("BndEvt__") != std::string::npos &&
-                fn.find("PlayButton") != std::string::npos &&
-                fn.find("Clicked") != std::string::npos) {
-                playClicked = true;
-                LOG("[PE] Play button CLICKED: %s", fn.c_str());
-                if (session.controller) TriggerTravel();
-            }
-        }
-    }
-
     orig_PE(obj, func, params);
 }
 
@@ -1631,13 +1563,6 @@ static void tick_hook(void* world, int type, float delta) {
     if (g_gameTid.load() != (int)gettid()) return;
     Guard g;
 
-    if (g_pendingTravel.exchange(false)) {
-        if (session.controller && !g_travelTriggered) {
-            LOG("tick: processing pending travel");
-            TriggerTravel();
-        }
-    }
-
     std::string wn = ObjName(world);
     static std::string lastWorld;
     if (wn != lastWorld) {
@@ -1645,31 +1570,16 @@ static void tick_hook(void* world, int type, float delta) {
         lastWorld = wn;
     }
 
-    int index = Read<int>(world, 0xC);
-
+    // اللوبي: نسجّل فقط، لا ننتقل تلقائيًا
     if (wn.find("Frontend") != std::string::npos) {
-        if (!g_lobbyDetected) {
-            g_lobbyDetected = true;
-            g_lobbyEnteredAt = Monotonic();
-            LOG("Lobby detected — auto-trigger in 8s");
-        }
-        if (!g_travelTriggered && Monotonic() - g_lobbyEnteredAt > 8.0) {
-            session.world = world;
-            session.world_index = index;
-            session.controller = GetPC(world, 0);
-            if (session.controller) {
-                LOG("Auto-TriggerTravel from lobby timeout");
-                TriggerTravel();
-            }
-        }
         return;
     }
 
+    // في Artemis_Terrain؟ هيّئ اللاعب
     if (wn.find("Artemis_Terrain") == std::string::npos) return;
 
+    int index = Read<int>(world, 0xC);
     if (world != session.world || index != session.world_index) {
-        g_travelTriggered = false;
-        g_lobbyDetected = false;
         session = Session{};
         session.world = world;
         session.world_index = index;
@@ -1685,10 +1595,16 @@ static void tick_hook(void* world, int type, float delta) {
     Athena::SetupWorld(world);
 }
 
+// ============================================================================
+// EXEC HOOK — يتعامل مع أوامرنا المخصصة
+// ============================================================================
 static bool exec_hook(void* engine, void* world, const char16_t* command, void* output) {
     if (!orig_Exec) return false;
+
     std::string cmd = Narrow(command, 256);
     if (!cmd.empty()) LOG("Exec: %s", cmd.c_str());
+
+    // مرّر كل شيء للعبة كما هو. الأوامر القياسية مثل "open" تمر عادي.
     return orig_Exec(engine, world, command, output);
 }
 
