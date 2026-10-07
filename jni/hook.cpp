@@ -1,10 +1,12 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android (CLIENT-ONLY)
-// COMPLETE — original + 4 client-only fixes:
-//   1. AddToInventory  → direct FGuid injection into QuickBar Slots
-//   2. HandleDoor      → direct bit flip + OnRep_bDoorOpen
-//   3. ApplySprintSpeed → direct MaxWalkSpeed modification
+// COMPLETE + PLAYER-VISIBILITY FIX
+//   1. AddToInventory      → direct FGuid injection into QuickBar Slots
+//   2. HandleDoor          → direct bit flip + OnRep_bDoorOpen
+//   3. ApplySprintSpeed    → direct MaxWalkSpeed modification
 //   4. SpawnSafeZoneIndicator → spawn AFortSafeZoneIndicator locally
+//   5. 🔧 FIX: Player visible — SetCharacterBodyVisibilityForPossession +
+//             ServerReadyToStartMatch + ClientOnPawnSpawned + proper spawn
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -524,6 +526,8 @@ struct Session {
     bool  cheats_ready = false;
     bool  safezone_spawned = false;
     bool  sprint_applied = false;
+    bool  ready_called = false;      // 🔧 FIX: track ServerReadyToStartMatch
+    bool  visibility_forced = false; // 🔧 FIX: track body visibility
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -582,8 +586,69 @@ namespace Athena {
     void OnExitVehicle();
     void CheatScript(const char* script);
 
+    // 🔧 FIX: new helper for visibility
+    void ForcePlayerVisible();
+
     struct LootData { void* Def; int Count; };
     std::vector<LootData> PickLootDrops(std::string category);
+}
+
+// ============================================================================
+// 🔧 FIX: ForcePlayerVisible — the missing piece
+// ============================================================================
+void Athena::ForcePlayerVisible() {
+    if (!session.pawn || IsBadPtr(session.pawn)) return;
+
+    LOG("[Visibility] Forcing player body visible...");
+
+    // 1. Cancel skydiving / parachute states
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteAvailable", true);
+
+    Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+    if (sd.ok()) sd.run(session.pawn);
+
+    Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen");
+    if (po.ok()) po.run(session.pawn);
+
+    // 2. SetCharacterBodyVisibilityForPossession — the KEY call
+    Call body("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
+    if (body.ok()) {
+        bool bShow = true;
+        if (body.set("bVisible", bShow)) {
+            body.run(session.pawn);
+            bool ret = body.result<bool>();
+            LOG("[Visibility] SetCharacterBodyVisibilityForPossession(TRUE) returned=%d", (int)ret);
+        } else {
+            body.dump("SetCharacterBodyVisibilityForPossession");
+            // Try alternative parameter name
+            if (body.set("bNewVisible", bShow)) {
+                body.run(session.pawn);
+                LOG("[Visibility] Used bNewVisible instead");
+            }
+        }
+    } else {
+        LOG("[Visibility] SetCharacterBodyVisibilityForPossession binding FAILED");
+    }
+
+    // 3. Also try SetActorHiddenInGame(false) as fallback
+    Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+    if (hid.ok()) {
+        bool bHidden = false;
+        if (hid.set("bNewHidden", bHidden)) hid.run(session.pawn);
+    }
+
+    // 4. Ensure collisions/visibility flags
+    SetBool(session.pawn, "/Script/Engine.Actor.bHidden", false);
+    SetBool(session.pawn, "/Script/Engine.PrimitiveComponent.bOwnerNoSee", false);
+    SetBool(session.pawn, "/Script/Engine.PrimitiveComponent.bOnlyOwnerSee", false);
+
+    // 5. Re-apply cosmetics AFTER visibility is set
+    ShowSkin();
+
+    session.visibility_forced = true;
+    LOG("[Visibility] Done.");
 }
 
 // ============================================================================
@@ -614,7 +679,7 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// 🔑 FIX #2: HandleDoor (client-local)
+// HandleDoor (client-local)
 // ============================================================================
 void Athena::HandleDoor(void* door) {
     if (!door || IsBadPtr(door)) return;
@@ -623,7 +688,6 @@ void Athena::HandleDoor(void* door) {
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
 
-    // bDoorOpen @ 0x0FDE bit 5
     uint8_t* byte = (uint8_t*)door + 0x0FDE;
     bool wasOpen = ((*byte) >> 5) & 1;
     if (wasOpen) *byte &= ~(1 << 5);
@@ -636,7 +700,7 @@ void Athena::HandleDoor(void* door) {
 }
 
 // ============================================================================
-// TryInitializePlayer
+// 🔧 FIX: TryInitializePlayer — with proper spawn + no skydiving left on
 // ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
@@ -650,18 +714,45 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return true;
     }
 
+    // 🔧 FIX: Try ChoosePlayerStart first (proper spawn point)
     Transform t{};
     t.Location[0] = 0.0;
     t.Location[1] = 0.0;
     t.Location[2] = 500.0;
+    bool haveSpawn = false;
+
+    {
+        Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
+        if (choose.ok() && choose.set("Player", controller) && choose.run(mode)) {
+            void* start = choose.result<void*>();
+            if (start && !IsBadPtr(start)) {
+                Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+                if (loc.ok() && loc.run(start)) {
+                    Vector v = loc.result<Vector>();
+                    if (std::isfinite(v.X) && std::isfinite(v.Y) && std::isfinite(v.Z)) {
+                        t.Location[0] = v.X;
+                        t.Location[1] = v.Y;
+                        t.Location[2] = v.Z + 100.0;
+                        haveSpawn = true;
+                        LOG("[Init] PlayerStart chosen at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!haveSpawn) {
+        // Fallback: spawn island coords
+        t.Location[0] = 0.0;
+        t.Location[1] = 0.0;
+        t.Location[2] = 3100.0;
+        LOG("[Init] Using fallback spawn at (0,0,3100)");
+    }
 
     LOG("[Init] Spawning at (%.0f,%.0f,%.0f)", t.Location[0], t.Location[1], t.Location[2]);
     session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
     LOG("[Init] Spawned: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
-
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
     Possess(controller, session.pawn);
     if (GetPawn(controller) != session.pawn) {
@@ -672,42 +763,8 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
 
     SetupCheats();
 
-    {
-        Call cs("/Script/Engine.Controller.ClientSetLocation");
-        if (cs.ok()) {
-            Vector loc{0.0, 0.0, 3100.0};
-            Rotator rot{0.0, 0.0, 0.0};
-            bool ok1 = cs.set("NewLocation", loc);
-            bool ok2 = cs.set("NewRotation", rot);
-            if (ok1 && ok2) {
-                cs.run(controller);
-                LOG("[Init] ClientSetLocation sent");
-            }
-        }
-    }
-
-    {
-        Call sl("/Script/Engine.Actor.K2_SetActorLocation");
-        if (sl.ok()) {
-            Vector loc{0.0, 0.0, 3100.0};
-            bool bSweep = false, bTeleport = true;
-            sl.set("NewLocation", loc);
-            sl.set("bSweep", bSweep);
-            sl.set("bTeleport", bTeleport);
-            sl.run(session.pawn);
-            LOG("[Init] K2_SetActorLocation sent");
-        }
-    }
-
-    {
-        Call chk("/Script/Engine.Actor.K2_GetActorLocation");
-        if (chk.ok() && chk.run(session.pawn)) {
-            Vector v = chk.result<Vector>();
-            LOG("[Init] After teleport: (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
-        }
-    }
-
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+    // 🔧 FIX: do NOT leave bIsSkydiving=true. Set it false right after possessing.
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
     if (sd.ok()) sd.run(session.pawn);
@@ -717,6 +774,9 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     Call restart("/Script/Engine.PlayerController.ClientRestart");
     if (restart.ok() && restart.set("NewPawn", session.pawn))
         restart.run(controller);
+
+    // 🔧 FIX: Force visibility immediately
+    ForcePlayerVisible();
 
     LOG("[Init] Pawn ready: %p", session.pawn);
     return true;
@@ -761,8 +821,6 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: DestroyLods");
     DestroyLods();
 
-    LOG("SetupWorld: SKIPPING FixBuildingFoundations (crash)");
-
     LOG("SetupWorld: InitializeInventory");
     InitializeInventory();
 
@@ -788,7 +846,7 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// FinalizePlayer
+// 🔧 FIX: FinalizePlayer — visibility is the LAST thing we do
 // ============================================================================
 void Athena::FinalizePlayer() {
     if (session.finalized) return;
@@ -810,13 +868,14 @@ void Athena::FinalizePlayer() {
     }
     session.pawn = pawn;
 
+    // 🔧 FIX: ensure the pawn is on solid ground, not skydiving
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
     if (loc.ok() && loc.run(session.pawn)) {
         Vector v = loc.result<Vector>();
         LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
 
         if (v.Z < 500.0) {
-            LOG("Finalize: Z too low — retry ClientSetLocation");
+            LOG("Finalize: Z too low — teleporting up");
             Vector dest{0.0, 0.0, 3100.0};
             Rotator rot{0.0, 0.0, 0.0};
             Call cs("/Script/Engine.Controller.ClientSetLocation");
@@ -830,24 +889,32 @@ void Athena::FinalizePlayer() {
                 sl.set("bTeleport", bTeleport);
                 sl.run(session.pawn);
             }
-            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-            Call sd3("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-            if (sd3.ok()) sd3.run(session.pawn);
-        } else {
-            LOG("Finalize: pawn airborne at Z=%.0f", v.Z);
         }
     }
 
-    ShowSkin();
+    // 🔧 FIX: ServerReadyToStartMatch + ClientOnPawnSpawned
+    if (!session.ready_called) {
+        LOG("Finalize: calling ServerReadyToStartMatch");
+        Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
+        if (srt.ok()) srt.run(pc);
 
+        Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
+        if (cps.ok()) cps.run(pc);
+
+        session.ready_called = true;
+    }
+
+    // 🔧 FIX: refresh view target
     Call restart("/Script/Engine.PlayerController.ClientRestart");
     if (restart.ok() && restart.set("NewPawn", pawn)) restart.run(pc);
 
     Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
     if (cam.ok() && cam.set("NewViewTarget", pawn)) cam.run(pc);
 
-    LOG("Finalize: complete, pawn=%p", session.pawn);
+    // 🔧 FIX: THE critical call to make the body appear
+    ForcePlayerVisible();
+
+    LOG("Finalize: complete, pawn=%p visible=%d", session.pawn, (int)session.visibility_forced);
 }
 
 // ============================================================================
@@ -865,6 +932,13 @@ void Athena::Tick() {
     }
     if (session.finalize_at > 0 && !session.finalized && now >= session.finalize_at) {
         FinalizePlayer();
+    }
+    // 🔧 FIX: after finalized, keep re-asserting visibility occasionally (some servers
+        // reset it after readiness)
+    static double lastVisibility = 0;
+    if (session.finalized && now - lastVisibility > 5.0) {
+        lastVisibility = now;
+        if (!session.visibility_forced) ForcePlayerVisible();
     }
 }
 
@@ -922,7 +996,7 @@ void Athena::DestroyLods() {
 }
 
 // ============================================================================
-// DropLoadingScreen
+// 🔧 FIX: DropLoadingScreen — now also calls ServerReadyToStartMatch
 // ============================================================================
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
@@ -952,6 +1026,17 @@ void Athena::DropLoadingScreen() {
         Call a("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistData"); if (a.ok()) a.run(session.state);
         Call b("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistInfo"); if (b.ok()) b.run(session.state);
     }
+
+    // 🔧 FIX: call ServerReadyToStartMatch here as well
+    if (!session.ready_called) {
+        Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
+        if (srt.ok()) srt.run(session.controller);
+        Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
+        if (cps.ok()) cps.run(session.controller);
+        session.ready_called = true;
+        LOG("DropLoadingScreen: ServerReadyToStartMatch + ClientOnPawnSpawned dispatched");
+    }
+
     LOG("Loading screen dropped");
 }
 
@@ -1020,9 +1105,6 @@ void Athena::InventoryUpdate() {
     }
 }
 
-// ============================================================================
-// 🔑 FIX #1: AddToInventory — direct QuickBar injection
-// ============================================================================
 void Athena::AddToInventory(void* def, int count, int slot) {
     if (IsBadPtr(def) || !session.inventory || !session.quickbars) return;
 
@@ -1169,9 +1251,6 @@ void Athena::InitializeInventory() {
     InventoryUpdate();
 }
 
-// ============================================================================
-// 🔑 FIX #3: ApplySprintSpeed
-// ============================================================================
 void Athena::ApplySprintSpeed() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
     void* cmc = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
@@ -1194,9 +1273,6 @@ void Athena::ApplySprintSpeed() {
     }
 }
 
-// ============================================================================
-// 🔑 FIX #4: SpawnSafeZoneIndicator
-// ============================================================================
 void Athena::SpawnSafeZoneIndicator() {
     if (session.safezone_spawned) return;
     if (!session.state || !session.world) return;
@@ -1276,7 +1352,7 @@ void Athena::GrantDefaultAbilities() {
 }
 
 // ============================================================================
-// 🔑 MISSING: OnServerExecuteInventoryItem / Weapon
+// OnServerExecuteInventoryItem / Weapon
 // ============================================================================
 void Athena::OnServerExecuteInventoryItem(Guid guid) {
     if (!session.inventory || !session.pawn) return;
@@ -1342,7 +1418,7 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
 }
 
 // ============================================================================
-// LOOT TABLES
+// LOOT TABLES (unchanged)
 // ============================================================================
 std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     std::vector<LootData> ret;
