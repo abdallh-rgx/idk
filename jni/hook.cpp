@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FULL VERSION — bugitgo + SetupCheats + teleport backup
+// FULL VERSION — bugitgo AFTER ServerReadyToStartMatch (game.cpp order)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -24,9 +24,6 @@
 #include <algorithm>
 #include <android/log.h>
 
-// ============================================================================
-// LOGGING
-// ============================================================================
 static FILE* g_logFile = nullptr;
 static void InitLog() {
     const char* p[] = {
@@ -47,9 +44,6 @@ using int8=int8_t; using int16=int16_t; using int32=int32_t; using int64=int64_t
 using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=uint64_t;
 using TCHAR=char16_t;
 
-// ============================================================================
-// PROFILE
-// ============================================================================
 namespace profile {
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
 constexpr uintptr_t StaticFindObject     = 0x0762A664;
@@ -112,8 +106,6 @@ constexpr unsigned FFieldOwner     = 0x10;
 constexpr unsigned FFieldNext      = 0x20;
 constexpr unsigned FFieldName      = 0x28;
 
-constexpr unsigned EnumNames = 0x40;
-
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
@@ -122,9 +114,6 @@ constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 
 extern "C" int DobbyHook(void* target, void* replace, void** origin);
 
-// ============================================================================
-// MEMORY HELPERS
-// ============================================================================
 static inline bool IsBadPtr(const void* p) {
     if (!p) return true;
     uintptr_t v = (uintptr_t)p;
@@ -147,9 +136,6 @@ struct Guard { bool s = g_internal; Guard() { g_internal = true; } ~Guard() { g_
 
 template<class F> static F Fn(uintptr_t rva) { return reinterpret_cast<F>(g_base + rva); }
 
-// ============================================================================
-// BASIC STRUCTS
-// ============================================================================
 struct FStringNative { TCHAR* Data; int32 Count; int32 Max; };
 struct FUEString     { TCHAR* data; int32 length; int32 capacity; };
 struct FName         { uint32 CompIdx; uint32 DispIdx; };
@@ -193,9 +179,6 @@ struct GObjects_t {
     }
 };
 
-// ============================================================================
-// FORWARD DECLS
-// ============================================================================
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
 static std::string ObjNameFromFName(FName n);
@@ -208,9 +191,6 @@ static void SetBool(void* obj, const char* path, bool enabled);
 static std::u16string ToWide(const std::string& s);
 static std::string Narrow(const char16_t* s, int max);
 
-// ============================================================================
-// isa / subclass
-// ============================================================================
 static bool IsA(void* obj, void* type) {
     if (!obj || !type || IsBadPtr(obj) || IsBadPtr(type)) return false;
     void* klass = Read<void*>(obj, profile::ObjectClass);
@@ -238,9 +218,6 @@ static bool SubclassOf(void* klass, void* type) {
     return false;
 }
 
-// ============================================================================
-// STRING / FName
-// ============================================================================
 static std::u16string ToWide(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 static std::string Narrow(const char16_t* s, int max) {
     std::string out;
@@ -296,9 +273,6 @@ static std::string ObjNameFromUEString(FUEString* s) {
     return Narrow(s->data, s->length > 512 ? 512 : s->length);
 }
 
-// ============================================================================
-// PROPERTY
-// ============================================================================
 static void* GetProp(const char* path) {
     if (!path) return nullptr;
     std::string s(path);
@@ -344,9 +318,6 @@ static void SetBool(void* obj, const char* path, bool enabled) {
     *dst = enabled ? (*dst | mask) : (*dst & ~mask);
 }
 
-// ============================================================================
-// Function pointer typedefs
-// ============================================================================
 using PE_t   = void(*)(void*, void*, void*);
 using Tick_t = void(*)(void*, int, float);
 using Exec_t = bool(*)(void*, void*, const char16_t*, void*);
@@ -354,9 +325,6 @@ static PE_t   orig_PE = nullptr;
 static Tick_t orig_Tick = nullptr;
 static Exec_t orig_Exec = nullptr;
 
-// ============================================================================
-// Call
-// ============================================================================
 class Call {
     void* m_func = nullptr;
     struct Param { std::string name; int offset, size; uint64_t flags; };
@@ -433,9 +401,6 @@ static std::string ObjNameFromFName(FName n) {
     return out;
 }
 
-// ============================================================================
-// CORE WRAPPERS
-// ============================================================================
 static void* LoadClass(const char* path, const char* base_path = "/Script/Engine.Actor") {
     if (void* r = FindObj(path)) return r;
     auto s = ToWide(path);
@@ -498,9 +463,6 @@ static void* GetByShortName(const std::string& wanted) {
     return nullptr;
 }
 
-// ============================================================================
-// RunCommand — console commands
-// ============================================================================
 static void RunCommand(void* world, void* pc, const char* cmd) {
     if (!world || !cmd) return;
     void* lib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
@@ -521,9 +483,6 @@ static void RunCommand(void* world, void* pc, const char* cmd) {
     LOG("RunCommand: %s", cmd);
 }
 
-// ============================================================================
-// SESSION
-// ============================================================================
 struct Session {
     void* world = nullptr;
     int   world_index = -1;
@@ -539,6 +498,7 @@ struct Session {
     bool  attempted = false;
     bool  finalized = false;
     bool  cheats_ready = false;
+    bool  bugitgo_done = false;
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -557,14 +517,12 @@ static double Monotonic() {
     return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
 }
 
-// ============================================================================
-// ATHENA NAMESPACE
-// ============================================================================
 namespace Athena {
     void SetupWorld(void* world);
     void Tick();
     bool TryInitializePlayer(void* world, void* mode, void* controller);
     void SetupCheats();
+    void PostSpawnSetup();       // 🔑 جديدة
     void FinalizePlayer();
     bool FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out);
     void ShowSkin();
@@ -599,9 +557,6 @@ namespace Athena {
     std::vector<LootData> PickLootDrops(std::string category);
 }
 
-// ============================================================================
-// SPAWN LOCATION
-// ============================================================================
 bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out) {
     if (!mode || !controller) return false;
 
@@ -627,9 +582,6 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Ve
     return true;
 }
 
-// ============================================================================
-// 🔑 SetupCheats — إنشاء CheatManager حتى يعمل bugitgo
-// ============================================================================
 void Athena::SetupCheats() {
     void* pc = session.controller;
     if (!pc) return;
@@ -658,14 +610,50 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// TryInitializePlayer
+// 🔑 PostSpawnSetup — bugitgo هنا، بعد ServerReadyToStartMatch
 // ============================================================================
+void Athena::PostSpawnSetup() {
+    if (!session.controller || !session.pawn) return;
+    if (session.bugitgo_done) return;
+
+    LOG("PostSpawn: SetupCheats");
+    SetupCheats();
+
+    // 🔑 bugitgo — الآن بعد ServerReadyToStartMatch
+    LOG("PostSpawn: bugitgo 0 0 3100");
+    RunCommand(session.world, session.controller, "bugitgo 0 0 3100");
+
+    // 🔑 ClientOnPawnSpawned — مهم مثل game.cpp
+    Call spawned("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
+    if (spawned.ok()) {
+        spawned.run(session.controller);
+        LOG("PostSpawn: ClientOnPawnSpawned sent");
+    }
+
+    // GetHUD
+    Call hud("/Script/Engine.PlayerController.GetHUD");
+    if (hud.ok() && hud.run(session.controller)) {
+        void* h = hud.result<void*>();
+        LOG("PostSpawn: HUD=%p class=%s", h,
+            ObjName(h ? Read<void*>(h, profile::ObjectClass) : nullptr).c_str());
+    }
+
+    // تأكد أن البيد فعلاً تحرك
+    Call chk("/Script/Engine.Actor.K2_GetActorLocation");
+    if (chk.ok() && chk.run(session.pawn)) {
+        Vector v = chk.result<Vector>();
+        LOG("PostSpawn: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
+    }
+
+    session.bugitgo_done = true;
+    LOG("PostSpawn: complete");
+}
+
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
                               "/Script/Engine.Pawn");
     if (!pawnCls) { LOG("[Init] PlayerPawn_Athena_C missing"); return false; }
 
-    // (أ) اقرأ بيد المحرك أول
     void* existing = GetPawn(controller);
     if (existing && !IsBadPtr(existing) && IsA(existing, pawnCls)) {
         session.pawn = existing;
@@ -673,25 +661,19 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return true;
     }
 
-    // (ب) موقع سبون أولي
     Vector loc{0, 0, 3100};
     Vector psLoc;
-    if (FindSafeSpawnLocation(world, mode, controller, psLoc)) {
-        loc = psLoc;
-    }
+    if (FindSafeSpawnLocation(world, mode, controller, psLoc)) loc = psLoc;
 
     Transform t{};
     t.Location[0] = loc.X;
     t.Location[1] = loc.Y;
     t.Location[2] = (loc.Z < 500.0f) ? 500.0f : (loc.Z + 100.0f);
 
-    LOG("[Init] Spawning at (%.0f,%.0f,%.0f) — will bugitgo",
-        t.Location[0], t.Location[1], t.Location[2]);
-
+    LOG("[Init] Spawning at (%.0f,%.0f,%.0f)", t.Location[0], t.Location[1], t.Location[2]);
     session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
 
-    // 🔑 فعّل الهبوط الحر قبل Possess
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
@@ -701,29 +683,8 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return false;
     }
 
-    // 🔑 أنشئ CheatManager أولاً حتى يعمل bugitgo
-    SetupCheats();
-
-    // 🔑 bugitgo (سيعمل الآن بعد إنشاء CheatManager)
-    {
-        char cmd[96];
-        snprintf(cmd, sizeof(cmd), "bugitgo %d %d 3100",
-                 (int)loc.X, (int)loc.Y);
-        RunCommand(world, controller, cmd);
-    }
-
-    // 🛡️ شبكة أمان: teleport مباشر إذا فشل bugitgo
-    {
-        Call tp("/Script/Engine.Actor.K2_TeleportTo");
-        Vector dest{loc.X, loc.Y, 3100.0f};
-        Rotator rot{0, 0, 0};
-        if (tp.ok() && tp.set("DestLocation", dest) && tp.set("DestRotation", rot)) {
-            tp.run(session.pawn);
-            LOG("[Init] K2_TeleportTo backup sent to (%.0f,%.0f,3100)", loc.X, loc.Y);
-        }
-    }
-
-    // أعلِم المحرك بحالة الهبوط
+    // ⚠️ لا bugitgo هنا — ننتظر حتى بعد ServerReadyToStartMatch
+    // فقط نضبط الهبوط الحر
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
     if (sd.ok()) sd.run(session.pawn);
 
@@ -734,13 +695,10 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     if (restart.ok() && restart.set("NewPawn", session.pawn))
         restart.run(controller);
 
-    LOG("[Init] Pawn ready: %p (bugitgo+teleport applied)", session.pawn);
+    LOG("[Init] Pawn ready: %p (bugitgo deferred)", session.pawn);
     return true;
 }
 
-// ============================================================================
-// SetupWorld
-// ============================================================================
 void Athena::SetupWorld(void* world) {
     session.world = world;
     session.controller = GetPC(world, 0);
@@ -788,8 +746,13 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SpawnBuildPreviews");
     SpawnBuildPreviews();
 
+    // 🔑 ServerReadyToStartMatch هنا — بعدها مباشرة bugitgo
     LOG("SetupWorld: DropLoadingScreen");
     DropLoadingScreen();
+
+    // 🔑 bugitgo الآن — بعد ServerReadyToStartMatch
+    LOG("SetupWorld: PostSpawnSetup (bugitgo)");
+    PostSpawnSetup();
 
     session.finalize_at = Monotonic() + 2.0;
     session.attempted   = true;
@@ -797,18 +760,12 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: initial pass done, finalize in 2s (pawn=%p)", session.pawn);
 }
 
-// ============================================================================
-// FinalizePlayer
-// ============================================================================
 void Athena::FinalizePlayer() {
     session.finalized = true;
     LOG("=== FinalizePlayer ===");
 
     void* pc = GetPC(session.world, 0);
-    if (pc != session.controller) {
-        LOG("Finalize: controller changed, abort");
-        return;
-    }
+    if (pc != session.controller) { LOG("Finalize: controller changed"); return; }
 
     void* pawnCls = FindObj("/Script/FortniteGame.FortPlayerPawnAthena");
     void* pawn = GetPawn(pc);
@@ -817,36 +774,22 @@ void Athena::FinalizePlayer() {
         ObjName(pawn ? Read<void*>(pawn, profile::ObjectClass) : nullptr).c_str());
 
     if (!pawn || !pawnCls || !IsA(pawn, pawnCls)) {
-        LOG("Finalize: active pawn is not FortPlayerPawnAthena");
+        LOG("Finalize: pawn is not FortPlayerPawnAthena");
         return;
     }
-
     session.pawn = pawn;
 
-    // قراءة موقع البيد
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
     if (loc.ok() && loc.run(session.pawn)) {
         Vector v = loc.result<Vector>();
         LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
 
-        // 🛡️ إذا البيد لسا قريب من (0,0,0) أو على الأرض — أعد الـ teleport
+        // 🔑 إذا البيد عاد للأسفل، bugitgo مرة أخرى
         if (v.Z < 500.0f) {
-            LOG("Finalize: pawn stuck near ground (Z=%.0f), retrying teleport", v.Z);
+            LOG("Finalize: Z too low, retrying bugitgo");
             SetupCheats();
-            {
-                char cmd[96];
-                snprintf(cmd, sizeof(cmd), "bugitgo %d %d 3100", (int)v.X, (int)v.Y);
-                RunCommand(session.world, pc, cmd);
-            }
-            Call tp2("/Script/Engine.Actor.K2_TeleportTo");
-            Vector dest{v.X, v.Y, 3100.0f};
-            Rotator rot{0, 0, 0};
-            if (tp2.ok() && tp2.set("DestLocation", dest) && tp2.set("DestRotation", rot)) {
-                tp2.run(session.pawn);
-                LOG("Finalize: teleport retry sent");
-            }
+            RunCommand(session.world, pc, "bugitgo 0 0 3100");
             SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
             Call sd3("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
             if (sd3.ok()) sd3.run(session.pawn);
         } else {
@@ -865,9 +808,6 @@ void Athena::FinalizePlayer() {
     LOG("Finalize: complete, pawn=%p", session.pawn);
 }
 
-// ============================================================================
-// Tick
-// ============================================================================
 void Athena::Tick() {
     if (!session.world) return;
     double now = Monotonic();
@@ -886,9 +826,6 @@ void Athena::Tick() {
     }
 }
 
-// ============================================================================
-// ShowSkin
-// ============================================================================
 void Athena::ShowSkin() {
     if (!session.controller || !session.pawn) return;
     void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
@@ -939,9 +876,6 @@ void Athena::DestroyLods() {
     LOG("DestroyLods: done");
 }
 
-// ============================================================================
-// DropLoadingScreen
-// ============================================================================
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
 
@@ -957,8 +891,13 @@ void Athena::DropLoadingScreen() {
     }
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
+
+    // 🔑 ServerReadyToStartMatch — هذا هو المفتاح
     Call rsm("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
-    if (rsm.ok()) rsm.run(session.controller);
+    if (rsm.ok()) {
+        rsm.run(session.controller);
+        LOG("ServerReadyToStartMatch sent");
+    }
 
     const char* brushes[] = {"MinimapNextCircleBrush","FullMapNextCircleBrush",
         "MinimapSafeZoneBrush","MinimapCircleBrush","FullMapCircleBrush", nullptr};
@@ -983,9 +922,6 @@ void Athena::DropLoadingScreen() {
     LOG("Loading screen dropped");
 }
 
-// ============================================================================
-// FixBuildingFoundations — DISABLED
-// ============================================================================
 void Athena::FixBuildingFoundations() {
     void* cls = FindObj("/Script/FortniteGame.BuildingFoundation");
     if (!cls || !session.world) { LOG("FixBuildingFoundations: no class/world"); return; }
@@ -1025,9 +961,6 @@ void Athena::FixBus() {
     if (sd.ok()) sd.run(session.pawn);
 }
 
-// ============================================================================
-// INVENTORY
-// ============================================================================
 void Athena::InventoryUpdate() {
     if (session.inventory) {
         Call a("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate"); if (a.ok()) a.run(session.inventory);
@@ -1131,9 +1064,6 @@ void Athena::InitializeInventory() {
     InventoryUpdate();
 }
 
-// ============================================================================
-// WEAPON EQUIP
-// ============================================================================
 static bool EquipWeapon(void* pawn, void* def, Guid guid) {
     if (!pawn || !def) return false;
     Call c("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
@@ -1174,9 +1104,6 @@ void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
     OnServerExecuteInventoryItem(guid);
 }
 
-// ============================================================================
-// ABILITIES
-// ============================================================================
 void Athena::GrantAbility(void* klass) {
     if (!klass || !session.pawn) return;
     void* asc = GetObjField(session.pawn, "/Script/FortniteGame.FortPawn.AbilitySystemComponent");
@@ -1224,9 +1151,6 @@ void Athena::GrantDefaultAbilities() {
     LOG("Granted default abilities");
 }
 
-// ============================================================================
-// SPAWN PICKUP
-// ============================================================================
 void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     if (!def) return;
     void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
@@ -1250,9 +1174,6 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     }
 }
 
-// ============================================================================
-// LOOT TABLES
-// ============================================================================
 std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     std::vector<LootData> ret;
     void* ltd = LoadAsset("/Game/Items/Datatables/AthenaLootTierData_Client.AthenaLootTierData_Client", nullptr);
@@ -1378,9 +1299,6 @@ std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
     return ret;
 }
 
-// ============================================================================
-// LOOT INTERACT
-// ============================================================================
 void Athena::Loot(void* actor) {
     if (!actor) return;
     std::string tier = "None";
@@ -1429,9 +1347,6 @@ void Athena::ServerHandlePickup(void* pickup) {
     Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(pickup);
 }
 
-// ============================================================================
-// BUILDING
-// ============================================================================
 void Athena::SpawnBuildPreviews() {
     void* previewCls = FindObj("BuildingPlayerPrimitivePreview");
     if (!previewCls || !session.controller) return;
@@ -1531,9 +1446,6 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
     }
 }
 
-// ============================================================================
-// AIRCRAFT / WORLD
-// ============================================================================
 void Athena::OnAircraftJump() {
     if (!session.controller) return;
     Call loc("/Script/Engine.PlayerController.GetFocalLocation");
@@ -1682,9 +1594,6 @@ void Athena::CheatScript(const char* script) {
     }
 }
 
-// ============================================================================
-// HOOKS
-// ============================================================================
 static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
     if (!g_internal && func && params && session.controller && obj == session.controller &&
