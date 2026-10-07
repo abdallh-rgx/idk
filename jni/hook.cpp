@@ -1,6 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
-// FULL VERSION — with game.cpp-style spawn logic
+// FULL VERSION — bugitgo spawn strategy (game.cpp style)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -499,7 +499,30 @@ static void* GetByShortName(const std::string& wanted) {
 }
 
 // ============================================================================
-// SESSION — 🔑 MODIFIED (added attempted / finalized / finalize_at)
+// 🔑 RunCommand — bugitgo & console commands (game.cpp style)
+// ============================================================================
+static void RunCommand(void* world, void* pc, const char* cmd) {
+    if (!world || !cmd) return;
+    void* lib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
+    if (!lib) { LOG("RunCommand: no KismetSystemLibrary"); return; }
+
+    auto buf = ToWide(cmd);
+    FStringNative fs{};
+    fs.Data  = buf.data();
+    fs.Count = (int32)buf.size() + 1;
+    fs.Max   = (int32)buf.size() + 1;
+
+    Call c("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
+    if (!c.ok()) { LOG("RunCommand: bind failed for '%s'", cmd); return; }
+    if (!c.set("WorldContextObject", world)) { c.dump("ExecCmd"); return; }
+    if (!c.set("Command", fs))               { c.dump("ExecCmd"); return; }
+    if (pc) c.set("SpecificPlayer", pc);
+    c.run(lib);
+    LOG("RunCommand: %s", cmd);
+}
+
+// ============================================================================
+// SESSION
 // ============================================================================
 struct Session {
     void* world = nullptr;
@@ -513,7 +536,6 @@ struct Session {
     bool  initialized = false;
     bool  inventory_ready = false;
     bool  aircraft_jumped = false;
-    // 🔑 new fields (game.cpp style)
     bool  attempted = false;
     bool  finalized = false;
     double observed_at = 0;
@@ -576,24 +598,16 @@ namespace Athena {
 }
 
 // ============================================================================
-// SPAWN LOCATION — 🔑 MODIFIED (strict, game.cpp style)
+// SPAWN LOCATION
 // ============================================================================
 bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Vector& out) {
     if (!mode || !controller) return false;
 
-    // ---- ChoosePlayerStart ----
     Call choose("/Script/Engine.GameModeBase.ChoosePlayerStart");
-    if (!choose.ok() || !choose.set("Player", controller) || !choose.run(mode)) {
-        LOG("[Spawn] ChoosePlayerStart bind/call failed");
-        return false;
-    }
+    if (!choose.ok() || !choose.set("Player", controller) || !choose.run(mode)) return false;
     void* start = choose.result<void*>();
-    if (!start || IsBadPtr(start)) {
-        LOG("[Spawn] ChoosePlayerStart returned null");
-        return false;
-    }
+    if (!start || IsBadPtr(start)) return false;
 
-    // 🔑 require actual PlayerStart
     void* psCls = FindObj("/Script/Engine.PlayerStart");
     if (!psCls || !IsA(start, psCls)) {
         LOG("[Spawn] ChoosePlayerStart returned non-PlayerStart: %s", ObjName(start).c_str());
@@ -601,18 +615,10 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Ve
     }
 
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
-    if (!loc.ok() || !loc.run(start)) {
-        LOG("[Spawn] K2_GetActorLocation failed on %s", ObjName(start).c_str());
-        return false;
-    }
+    if (!loc.ok() || !loc.run(start)) return false;
     Vector v = loc.result<Vector>();
 
-    // 🔑 only reject non-finite — accept any Z (game.cpp does exactly this)
-    if (!std::isfinite(v.X) || !std::isfinite(v.Y) || !std::isfinite(v.Z)) {
-        LOG("[Spawn] Non-finite location from %s (%.0f,%.0f,%.0f)",
-            ObjName(start).c_str(), v.X, v.Y, v.Z);
-        return false;
-    }
+    if (!std::isfinite(v.X) || !std::isfinite(v.Y) || !std::isfinite(v.Z)) return false;
 
     out = v;
     LOG("[Spawn] %s loc=(%.0f,%.0f,%.0f)", ObjName(start).c_str(), v.X, v.Y, v.Z);
@@ -620,14 +626,14 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller, Ve
 }
 
 // ============================================================================
-// TryInitializePlayer — 🔑 NEW (replaces direct SpawnPawn call)
+// 🔑 TryInitializePlayer — bugitgo strategy
 // ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
-    // (أ) اقرأ بيد المحرك أول — قد يكون سبناه المحرك بالفعل
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
                               "/Script/Engine.Pawn");
     if (!pawnCls) { LOG("[Init] PlayerPawn_Athena_C missing"); return false; }
 
+    // (أ) اقرأ بيد المحرك أول
     void* existing = GetPawn(controller);
     if (existing && !IsBadPtr(existing) && IsA(existing, pawnCls)) {
         session.pawn = existing;
@@ -635,45 +641,60 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return true;
     }
 
-    // (ب) موقع صارم
-    Vector loc;
-    if (!FindSafeSpawnLocation(world, mode, controller, loc)) {
-        LOG("[Init] Waiting for valid PlayerStart...");
-        return false;   // ← لا تعلّم attempted
+    // (ب) موقع سبون أولي — bugitgo سيصلحه بعد السبون
+    Vector loc{0, 0, 3100};
+    Vector psLoc;
+    if (FindSafeSpawnLocation(world, mode, controller, psLoc)) {
+        loc = psLoc;
     }
 
-    // (ج) اسبن البيد — 🔑 +100 فقط (ليس +5000)
     Transform t{};
     t.Location[0] = loc.X;
     t.Location[1] = loc.Y;
-    t.Location[2] = loc.Z + 100.0f;
+    // إن كان موقع PlayerStart تحت 500م، ارفعه لـ 500 مؤقتاً
+    t.Location[2] = (loc.Z < 500.0f) ? 500.0f : (loc.Z + 100.0f);
 
-    LOG("[Init] Spawning pawn at (%.0f,%.0f,%.0f)...",
+    LOG("[Init] Spawning at (%.0f,%.0f,%.0f) — will bugitgo",
         t.Location[0], t.Location[1], t.Location[2]);
 
     session.pawn = SpawnActor(world, pawnCls, controller, t);
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
 
-    Possess(controller, session.pawn);
-    LOG("[Init] Possess returned");
+    // 🔑 فعّل الهبوط الحر قبل Possess (bugitgo لن يفعّله تلقائياً)
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
-    // تحقق من أن الاستحواذ نجح
+    Possess(controller, session.pawn);
     if (GetPawn(controller) != session.pawn) {
-        LOG("[Init] Possession did not stick (GetPawn=%p)", GetPawn(controller));
+        LOG("[Init] Possession did not stick");
         return false;
     }
 
-    // 🔑 ClientRestart (game.cpp does this after possession)
+    // 🔑 الحيلة الأساسية — bugitgo يصفّر fall tracking ويمنع Fall Damage
+    {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "bugitgo %d %d 3100",
+                 (int)loc.X, (int)loc.Y);
+        RunCommand(world, controller, cmd);
+    }
+
+    // أعلِم المحرك بحالة الهبوط
+    Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+    if (sd.ok()) sd.run(session.pawn);
+
+    Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen");
+    if (po.ok()) po.run(session.pawn);
+
     Call restart("/Script/Engine.PlayerController.ClientRestart");
     if (restart.ok() && restart.set("NewPawn", session.pawn))
         restart.run(controller);
 
-    LOG("[Init] Pawn ready: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
+    LOG("[Init] Pawn ready: %p (bugitgo applied)", session.pawn);
     return true;
 }
 
 // ============================================================================
-// SetupWorld — 🔑 MODIFIED (retryable, no initialized=true unless success)
+// SetupWorld
 // ============================================================================
 void Athena::SetupWorld(void* world) {
     session.world = world;
@@ -700,13 +721,11 @@ void Athena::SetupWorld(void* world) {
         ObjName(session.mode).c_str(),
         ObjName(session.state).c_str());
 
-    // 🔑 المرحلة الحاسمة — قد تفشل، وفي هذه الحالة نرجع بدون attempted
     if (!TryInitializePlayer(world, session.mode, session.controller)) {
         LOG("SetupWorld: prerequisites not ready, will retry");
         return;
     }
 
-    // ---- بعد نجاح السبون ----
     LOG("SetupWorld: ShowSkin");
     ShowSkin();
 
@@ -714,7 +733,6 @@ void Athena::SetupWorld(void* world) {
     DestroyLods();
 
     LOG("SetupWorld: SKIPPING FixBuildingFoundations (crash)");
-    // FixBuildingFoundations();
 
     LOG("SetupWorld: InitializeInventory");
     InitializeInventory();
@@ -728,7 +746,6 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: DropLoadingScreen");
     DropLoadingScreen();
 
-    // 🔑 المرحلة الثانية
     session.finalize_at = Monotonic() + 2.0;
     session.attempted   = true;
     session.initialized = true;
@@ -736,7 +753,7 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// FinalizePlayer — 🔑 NEW (re-read GetPawn from engine after 2s)
+// FinalizePlayer
 // ============================================================================
 void Athena::FinalizePlayer() {
     session.finalized = true;
@@ -759,13 +776,31 @@ void Athena::FinalizePlayer() {
         return;
     }
 
-    // ✅ استخدم بيد المحرك (قد يختلف عن اللي سبناه)
     session.pawn = pawn;
 
-    // كوزماتكس بعد الاستقرار
+    // 🔑 أعد تفعيل الهبوط إن كان لا يزال يسقط
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+    Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+    if (sd.ok()) sd.run(session.pawn);
+
+    // إن كان على الأرض (Z منخفض)، أوقف الهبوط
+    {
+        Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+        if (loc.ok() && loc.run(session.pawn)) {
+            Vector v = loc.result<Vector>();
+            LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
+            if (v.Z < 200.0f) {
+                SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
+                SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
+                Call sd2("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+                if (sd2.ok()) sd2.run(session.pawn);
+                LOG("Finalize: pawn landed, skydiving OFF");
+            }
+        }
+    }
+
     ShowSkin();
 
-    // ClientRestart + view target
     Call restart("/Script/Engine.PlayerController.ClientRestart");
     if (restart.ok() && restart.set("NewPawn", pawn)) restart.run(pc);
 
@@ -776,13 +811,12 @@ void Athena::FinalizePlayer() {
 }
 
 // ============================================================================
-// Tick — 🔑 MODIFIED (retry + finalize)
+// Tick
 // ============================================================================
 void Athena::Tick() {
     if (!session.world) return;
     double now = Monotonic();
 
-    // ---- المرحلة 1: إعادة محاولة SetupWorld ----
     if (!session.attempted) {
         if (now - session.retry_at < 1.0) return;
         session.retry_at = now;
@@ -791,7 +825,6 @@ void Athena::Tick() {
         return;
     }
 
-    // ---- المرحلة 2: finalize بعد ثانيتين ----
     if (session.finalize_at > 0 && !session.finalized && now >= session.finalize_at) {
         FinalizePlayer();
         return;
@@ -1630,7 +1663,6 @@ static void pe_hook(void* obj, void* func, void* params) {
     orig_PE(obj, func, params);
 }
 
-// 🔑 MODIFIED tick_hook
 static void tick_hook(void* world, int type, float delta) {
     if (orig_Tick) orig_Tick(world, type, delta);
     if (g_internal || !world) return;
@@ -1653,8 +1685,8 @@ static void tick_hook(void* world, int type, float delta) {
         LOG(">>> Artemis_Terrain detected: %s", wn.c_str());
     }
     double now = Monotonic();
-    if (now - session.observed_at < 5.0) return;   // 5s warmup grace
-    Athena::Tick();                                // ← now handles retry + finalize
+    if (now - session.observed_at < 5.0) return;
+    Athena::Tick();
 }
 
 static bool exec_hook(void* engine, void* world, const char16_t* command, void* output) {
