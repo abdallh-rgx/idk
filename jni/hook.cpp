@@ -1,7 +1,9 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // FULL RELEASE — UE5 LWC (double precision)
-// Fixed: removed AlivePlayers manipulation (causes GameMode->Tick crash).
+// Uses original simple TryInitializePlayer + ServerReadyToStartMatch.
+// Includes all fixes: EquipFortAbilitySet, fallback inventory, door handling,
+// loot containers, ServerHandlePickupInfo, tracker GUID support.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -451,7 +453,7 @@ static void* GetPawn(void* controller) {
 static void Possess(void* controller, void* pawn) {
     if (!controller || !pawn) return;
     Call c("/Script/Engine.Controller.Possess");
-    if (!c.ok()) return;
+    if (!c.ok()) { LOG("Possess: binding failed"); return; }
     if (!c.set("InPawn", pawn)) { c.dump("Possess"); return; }
     c.run(controller);
 }
@@ -573,7 +575,10 @@ void Athena::SetupCheats() {
     void* p = GetProp("/Script/Engine.PlayerController.CheatManager");
     void* klass = FindObj("/Script/FortniteGame.FortCheatManager");
     if (!klass) klass = FindObj("/Script/Engine.CheatManager");
-    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) return;
+    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) {
+        LOG("[Cheat] property or class missing");
+        return;
+    }
 
     void* cheat = Read<void*>(GetField(pc, p));
     if (!cheat) {
@@ -605,7 +610,7 @@ static void HandleDoor(void* door, void* /*ignored*/) {
     bool isOpen = ((*doorOpenByte) >> 5) & 1;
 
     void* klib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
-    if (!klib) return;
+    if (!klib) { LOG("HandleDoor: no klib"); return; }
 
     if (isOpen) {
         Call c("/Script/FortniteGame.FortKismetLibrary.CloseActor");
@@ -614,6 +619,8 @@ static void HandleDoor(void* door, void* /*ignored*/) {
             && c.set("OptionalControllerInstigator", session.controller)) {
             c.run(klib);
             LOG("Door CLOSED");
+        } else {
+            c.dump("CloseActor");
         }
     } else {
         Call c("/Script/FortniteGame.FortKismetLibrary.OpenActor");
@@ -623,12 +630,14 @@ static void HandleDoor(void* door, void* /*ignored*/) {
             && c.set("bRequestFastOpen", false)) {
             c.run(klib);
             LOG("Door OPENED");
+        } else {
+            c.dump("OpenActor");
         }
     }
 }
 
 // ============================================================================
-// TryInitializePlayer — NO AlivePlayers manipulation
+// TryInitializePlayer — original simple version
 // ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C",
@@ -652,25 +661,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     if (!session.pawn) { LOG("[Init] Spawn failed"); return false; }
     LOG("[Init] Spawned: %p (%s)", session.pawn, ObjName(session.pawn).c_str());
 
-    // Role/RemoteRole
-    void* roleProp = GetProp("/Script/Engine.Actor.Role");
-    void* rrProp   = GetProp("/Script/Engine.Actor.RemoteRole");
-    if (roleProp) Write<uint8_t>(GetField(session.pawn, roleProp), 0, 3);
-    if (rrProp)   Write<uint8_t>(GetField(session.pawn, rrProp), 0, 2);
-    LOG("[Init] Roles set");
-
-    // PlayerState <-> Pawn
-    void* ps = GetObjField(controller, "/Script/Engine.Controller.PlayerState");
-    if (ps) {
-        void* psProp = GetProp("/Script/Engine.Pawn.PlayerState");
-        if (psProp) {
-            Write<void*>(GetField(session.pawn, psProp), 0, ps);
-            LOG("[Init] Pawn->PlayerState = %p", ps);
-        }
-        void* myPawnProp = GetProp("/Script/Engine.PlayerState.MyPawn");
-        if (myPawnProp) Write<void*>(GetField(ps, myPawnProp), 0, session.pawn);
-    }
-
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
 
@@ -680,11 +670,6 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         return false;
     }
     LOG("[Init] Possessed OK");
-
-    void* ackProp = GetProp("/Script/Engine.PlayerController.AcknowledgedPawn");
-    if (ackProp) Write<void*>(GetField(controller, ackProp), 0, session.pawn);
-
-    // ❌ NO AddToAlivePlayers here — causes GameMode->Tick to start the match and crash.
 
     SetupCheats();
 
@@ -721,15 +706,16 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         }
     }
 
-    void* movementComp = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
-    LOG("[Init] CharacterMovement = %p", movementComp);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
+    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
+    Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
+    if (sd.ok()) sd.run(session.pawn);
+    Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen");
+    if (po.ok()) po.run(session.pawn);
 
-    if (movementComp) {
-        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-        Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-        if (sd.ok()) sd.run(session.pawn);
-    }
+    Call restart("/Script/Engine.PlayerController.ClientRestart");
+    if (restart.ok() && restart.set("NewPawn", session.pawn))
+        restart.run(controller);
 
     LOG("[Init] Pawn ready: %p", session.pawn);
     return true;
@@ -780,7 +766,7 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: GrantDefaultAbilities");
     GrantDefaultAbilities();
 
-    LOG("SetupWorld: SpawnBuildPreviews (skipped)");
+    LOG("SetupWorld: SpawnBuildPreviews");
     SpawnBuildPreviews();
 
     LOG("SetupWorld: DropLoadingScreen");
@@ -793,83 +779,41 @@ void Athena::SetupWorld(void* world) {
 }
 
 // ============================================================================
-// FinalizePlayer
+// FinalizePlayer — original simple version
 // ============================================================================
 void Athena::FinalizePlayer() {
     if (session.finalized) return;
     session.finalized = true;
     LOG("=== FinalizePlayer ===");
 
-    void* pawn = session.pawn;
-    if (!pawn || IsBadPtr(pawn)) pawn = GetPawn(session.controller);
-    if (!pawn || IsBadPtr(pawn)) {
-        LOG("Finalize: no pawn");
+    void* pc = GetPC(session.world, 0);
+    if (pc != session.controller) { LOG("Finalize: controller changed"); return; }
+
+    void* pawnCls = FindObj("/Script/FortniteGame.FortPlayerPawnAthena");
+    void* pawn = GetPawn(pc);
+
+    if (!pawn || !pawnCls || !IsA(pawn, pawnCls)) {
+        LOG("Finalize: pawn is not FortPlayerPawnAthena");
         return;
     }
     session.pawn = pawn;
-    LOG("Finalize: pawn=%p class=%s", pawn,
-        ObjName(Read<void*>(pawn, profile::ObjectClass)).c_str());
+    LOG("Finalize: pawn=%p", pawn);
 
-    void* roleProp = GetProp("/Script/Engine.Actor.Role");
-    void* rrProp   = GetProp("/Script/Engine.Actor.RemoteRole");
-    if (roleProp) Write<uint8_t>(GetField(pawn, roleProp), 0, 3);
-    if (rrProp)   Write<uint8_t>(GetField(pawn, rrProp), 0, 2);
-
-    SetBool(pawn, "/Script/Engine.Actor.bActorEnableCollision", true);
-    void* root = GetObjField(pawn, "/Script/Engine.Actor.RootComponent");
-    if (root) {
-        SetBool(root, "/Script/Engine.PrimitiveComponent.bGenerateOverlapEvents", true);
-        SetBool(root, "/Script/Engine.PrimitiveComponent.bComponentOverlapEvents", true);
-    }
-    Call ec("/Script/Engine.Actor.SetActorEnableCollision");
-    if (ec.ok()) {
-        bool bEnable = true;
-        if (ec.set("bNewActorEnableCollision", bEnable)) ec.run(pawn);
+    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+    if (loc.ok() && loc.run(session.pawn)) {
+        Vector v = loc.result<Vector>();
+        LOG("Finalize: pawn at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
     }
 
-    SetBool(pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-    SetBool(pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-    void* movementComp = GetObjField(pawn, "/Script/Engine.Character.CharacterMovement");
-    if (movementComp) {
-        Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-        if (sd.ok()) sd.run(pawn);
-    }
+    ShowSkin();
 
-    if (session.controller && !IsBadPtr(session.controller)) {
-        Call restart("/Script/Engine.PlayerController.ClientRestart");
-        if (restart.ok() && restart.set("NewPawn", pawn)) {
-            restart.run(session.controller);
-            LOG("Finalize: ClientRestart sent");
-        }
-    }
+    Call restart("/Script/Engine.PlayerController.ClientRestart");
+    if (restart.ok() && restart.set("NewPawn", pawn)) restart.run(pc);
 
-    if (session.controller && !IsBadPtr(session.controller)) {
-        Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
-        if (cam.ok() && cam.set("NewViewTarget", pawn)) {
-            cam.run(session.controller);
-            LOG("Finalize: ViewTarget set");
-        }
-    }
+    Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+    if (cam.ok() && cam.set("NewViewTarget", pawn)) cam.run(pc);
 
-    void* ps = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
-    if (ps) {
-        void* teamProp = GetProp("/Script/FortniteGame.FortPlayerState.TeamIndex");
-        if (teamProp) {
-            uint8_t team = 3;
-            Write<uint8_t>(GetField(ps, teamProp), 0, team);
-            Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_TeamIndex");
-            if (r.ok()) {
-                uint8_t old = 0;
-                r.set("OldVal", old);
-                r.run(ps);
-            }
-        }
-        Call rps("/Script/Engine.PlayerController.OnRep_PlayerState");
-        if (rps.ok()) rps.run(session.controller);
-        LOG("Finalize: PlayerState synced");
-    }
-
-    LOG("Finalize: complete");
+    LOG("Finalize: complete, pawn=%p", session.pawn);
 }
 
 // ============================================================================
@@ -946,7 +890,7 @@ void Athena::DestroyLods() {
 }
 
 // ============================================================================
-// DropLoadingScreen
+// DropLoadingScreen — with ServerReadyToStartMatch + PlaygroundV2
 // ============================================================================
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
@@ -963,10 +907,7 @@ void Athena::DropLoadingScreen() {
             if (n.ok()) {
                 n.set("OldGamePhase", old);
                 n.run(session.state);
-                LOG("DropLoadingScreen: GamePhase set to 2 via OnRep");
             }
-        } else {
-            LOG("DropLoadingScreen: GamePhase already >= 2, skipping OnRep");
         }
     }
 
@@ -974,9 +915,19 @@ void Athena::DropLoadingScreen() {
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
 
-    LOG("DropLoadingScreen: step 3");
-    void* playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
-    if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultDuo.Playlist_DefaultDuo");
+    LOG("DropLoadingScreen: step 3 — ServerReadyToStartMatch");
+    Call rsm("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
+    if (rsm.ok()) {
+        rsm.run(session.controller);
+        LOG("ServerReadyToStartMatch sent");
+    } else {
+        LOG("ServerReadyToStartMatch binding failed");
+    }
+
+    LOG("DropLoadingScreen: step 4 — playlist");
+    void* playlist = FindObj("/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2");
+    if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playground/Playlist_Playground.Playlist_Playground");
+    if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
     if (playlist) {
         void* bp = GetProp("/Script/FortniteGame.FortGameStateAthena.BasePlaylist");
         void* op = GetProp("/Script/FortniteGame.FortGameStateAthena.OverridePlaylist");
@@ -991,7 +942,7 @@ void Athena::DropLoadingScreen() {
         LOG("DropLoadingScreen: playlist set");
     }
 
-    LOG("DropLoadingScreen: complete");
+    LOG("Loading screen dropped");
 }
 
 void Athena::FixBuildingFoundations() {
@@ -1322,7 +1273,7 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
     if (!def) return;
     void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
     if (!klass) klass = FindObj("/Script/FortniteGame.FortPickup");
-    if (!klass) return;
+    if (!klass) { LOG("SpawnPickup: no class"); return; }
 
     Transform t{};
     t.Location[0] = loc.X;
@@ -1494,7 +1445,7 @@ void Athena::Loot(void* actor) {
 
     static void* tierProp = nullptr;
     if (!tierProp) tierProp = GetProp("/Script/FortniteGame.BuildingContainer.SearchLootTierGroup");
-    if (!tierProp) return;
+    if (!tierProp) { LOG("Loot: no tier prop"); return; }
 
     FName tierFName = Read<FName>(GetField(actor, tierProp));
     std::string tier = ObjNameFromFName(tierFName);
@@ -1509,6 +1460,7 @@ void Athena::Loot(void* actor) {
         else
             tier = "Loot_AthenaTreasure";
     }
+    LOG("Loot: resolved tier = '%s'", tier.c_str());
 
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
     Vector v{0, 0, 0};
@@ -1523,7 +1475,9 @@ void Athena::Loot(void* actor) {
 
     auto results = PickLootDrops(tier);
     LOG("Loot: %zu drops", results.size());
-    for (auto& r : results) SpawnPickup(r.Def, r.Count, v);
+    for (auto& r : results) {
+        SpawnPickup(r.Def, r.Count, v);
+    }
 
     uint8_t* pByte = (uint8_t*)actor + 0x0FB1;
     *pByte |= (1 << 7);
@@ -1541,7 +1495,7 @@ void Athena::ServerHandlePickup(void* pickup) {
     void* def = defProp ? Read<void*>(GetField(pickup, defProp)) : nullptr;
     int count = cntProp ? Read<int>(GetField(pickup, cntProp)) : 1;
 
-    if (!def || IsBadPtr(def)) return;
+    if (!def || IsBadPtr(def)) { LOG("ServerHandlePickup: no def"); return; }
 
     LOG("Pickup: %s x%d", ObjName(def).c_str(), count);
 
@@ -1873,11 +1827,8 @@ static void tick_hook(void* world, int type, float delta) {
     if (g_gameTid.load() != (int)gettid()) return;
     Guard g;
     std::string wn = ObjName(world);
-
     static std::string lastWorld;
     if (wn != lastWorld) { LOG(">>> WorldTick world: '%s'", wn.c_str()); lastWorld = wn; }
-
-    // Frontend: still finalize if we started
     if (wn.find("Frontend") != std::string::npos) {
         if (session.attempted && !session.finalized && session.finalize_at > 0) {
             double now = Monotonic();
@@ -1888,9 +1839,7 @@ static void tick_hook(void* world, int type, float delta) {
         }
         return;
     }
-
     if (wn.find("Artemis_Terrain") == std::string::npos) return;
-
     int index = Read<int>(world, 0xC);
     if (world != session.world || index != session.world_index) {
         session = Session{};
