@@ -1,8 +1,7 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // FULL RELEASE — UE5 LWC (double precision)
-// Restored: auto-detect Artemis_Terrain (like original working version).
-// Console watcher kept for debugging only.
+// Fixed: DropLoadingScreen crash (GamePhase set to 2, not 3, no OnRep on 3).
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -452,7 +451,7 @@ static void* GetPawn(void* controller) {
 static void Possess(void* controller, void* pawn) {
     if (!controller || !pawn) return;
     Call c("/Script/Engine.Controller.Possess");
-    if (!c.ok()) { LOG("Possess: binding failed"); return; }
+    if (!c.ok()) return;
     if (!c.set("InPawn", pawn)) { c.dump("Possess"); return; }
     c.run(controller);
 }
@@ -574,10 +573,7 @@ void Athena::SetupCheats() {
     void* p = GetProp("/Script/Engine.PlayerController.CheatManager");
     void* klass = FindObj("/Script/FortniteGame.FortCheatManager");
     if (!klass) klass = FindObj("/Script/Engine.CheatManager");
-    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) {
-        LOG("[Cheat] property or class missing");
-        return;
-    }
+    if (!p || !klass || Read<int>(p, profile::PropElementSize) != 8) return;
 
     void* cheat = Read<void*>(GetField(pc, p));
     if (!cheat) {
@@ -609,7 +605,7 @@ static void HandleDoor(void* door, void* /*ignored*/) {
     bool isOpen = ((*doorOpenByte) >> 5) & 1;
 
     void* klib = FindObj("/Script/Engine.Default__KismetSystemLibrary");
-    if (!klib) { LOG("HandleDoor: no klib"); return; }
+    if (!klib) return;
 
     if (isOpen) {
         Call c("/Script/FortniteGame.FortKismetLibrary.CloseActor");
@@ -673,9 +669,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         if (cs.ok()) {
             Vector loc{0.0, 0.0, 3100.0};
             Rotator rot{0.0, 0.0, 0.0};
-            bool ok1 = cs.set("NewLocation", loc);
-            bool ok2 = cs.set("NewRotation", rot);
-            if (ok1 && ok2) {
+            if (cs.set("NewLocation", loc) && cs.set("NewRotation", rot)) {
                 cs.run(controller);
                 LOG("[Init] ClientSetLocation sent");
             }
@@ -686,8 +680,7 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
         Call sl("/Script/Engine.Actor.K2_SetActorLocation");
         if (sl.ok()) {
             Vector loc{0.0, 0.0, 3100.0};
-            bool bSweep = false;
-            bool bTeleport = true;
+            bool bSweep = false, bTeleport = true;
             sl.set("NewLocation", loc);
             sl.set("bSweep", bSweep);
             sl.set("bTeleport", bTeleport);
@@ -904,7 +897,7 @@ void Athena::DestroyLods() {
         SetupCheats();
         cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
     }
-    if (!cm) { LOG("DestroyLods: still no CheatManager"); return; }
+    if (!cm) return;
     void* cls = FindObj("/Script/FortniteGame.FortHLODSMActor");
     if (!cls) return;
     Call c("/Script/Engine.CheatManager.DestroyAll");
@@ -913,9 +906,8 @@ void Athena::DestroyLods() {
 }
 
 // ============================================================================
-// DropLoadingScreen — no ServerReadyToStartMatch
+// DropLoadingScreen — FIXED: only set GamePhase to 2, no crash
 // ============================================================================
-void Athena::DropLoadingScreen() {
 void Athena::DropLoadingScreen() {
     if (!session.state || !session.controller) return;
 
@@ -924,9 +916,9 @@ void Athena::DropLoadingScreen() {
     if (gp) {
         uint8_t old = Read<uint8_t>(GetField(session.state, gp));
         LOG("DropLoadingScreen: GamePhase old=%d", (int)old);
-        // 🔑 اكتب فقط بدون OnRep لتجنب الكراش
+        // 🔑 Set to Warmup (2) only — DO NOT set to Aircraft (3) — crashes!
         if (old < 2) {
-            uint8_t phase = 2; // Warmup
+            uint8_t phase = 2;
             Write<uint8_t>(GetField(session.state, gp), 0, phase);
             Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
             if (n.ok()) {
@@ -935,15 +927,15 @@ void Athena::DropLoadingScreen() {
                 LOG("DropLoadingScreen: GamePhase set to 2 via OnRep");
             }
         } else {
-            LOG("DropLoadingScreen: GamePhase already set, skipping OnRep");
+            LOG("DropLoadingScreen: GamePhase already >= 2, skipping OnRep");
         }
     }
 
-    LOG("DropLoadingScreen: step 2 — load flags");
+    LOG("DropLoadingScreen: step 2");
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasServerFinishedLoading", true);
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bHasClientFinishedLoading", true);
 
-    LOG("DropLoadingScreen: step 3 — playlist");
+    LOG("DropLoadingScreen: step 3");
     void* playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
     if (!playlist) playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultDuo.Playlist_DefaultDuo");
     if (playlist) {
@@ -1035,10 +1027,7 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
         int lvl = 1;
-        if (!c.ok()) return;
-        if (!c.set("Count", count)) return;
-        if (!c.set("Level", lvl)) return;
-        if (!c.run(def)) return;
+        if (!c.ok() || !c.set("Count", count) || !c.set("Level", lvl) || !c.run(def)) return;
         inst = c.result<void*>();
     }
     if (!inst || IsBadPtr(inst)) return;
@@ -1466,7 +1455,7 @@ void Athena::Loot(void* actor) {
 
     static void* tierProp = nullptr;
     if (!tierProp) tierProp = GetProp("/Script/FortniteGame.BuildingContainer.SearchLootTierGroup");
-    if (!tierProp) { LOG("Loot: no tier prop"); return; }
+    if (!tierProp) return;
 
     FName tierFName = Read<FName>(GetField(actor, tierProp));
     std::string tier = ObjNameFromFName(tierFName);
@@ -1836,9 +1825,6 @@ static void pe_hook(void* obj, void* func, void* params) {
     orig_PE(obj, func, params);
 }
 
-// ============================================================================
-// tick_hook — نفس المنطق الأصلي: يكتشف Artemis_Terrain ويبدأ
-// ============================================================================
 static void tick_hook(void* world, int type, float delta) {
     if (orig_Tick) orig_Tick(world, type, delta);
     if (g_internal || !world) return;
@@ -1865,9 +1851,6 @@ static void tick_hook(void* world, int type, float delta) {
     Athena::Tick();
 }
 
-// ============================================================================
-// exec_hook — للتصحيح فقط
-// ============================================================================
 static bool exec_hook(void* engine, void* world, const char16_t* command, void* output) {
     if (!orig_Exec) return false;
     std::string cmd = Narrow(command, 256);
