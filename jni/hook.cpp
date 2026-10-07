@@ -1,16 +1,18 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android server
 // All fixes applied:
-//   - GetPawn: property read (inline in UE5, no RVA)
-//   - Possess: ProcessEvent with "InPawn" param
-//   - EquipWeaponDefinition: "ItemEntry" param
-//   - AddItemToQuickBars: "Slot" param
-//   - BP_ApplyGameplayEffectToSelf: "GameplayEffectClass" param
-//   - ObjName: thread-safe (mutex)
+//   - GetPawn: property read (inline in UE5)
+//   - Possess: ProcessEvent with "InPawn"
+//   - EquipWeaponDefinition: "ItemEntry"
+//   - AddItemToQuickBars: "Slot"
+//   - BP_ApplyGameplayEffectToSelf: "GameplayEffectClass"
+//   - GetDefaultObjectOfGameplayEffectType: "EffectType"
+//   - Conv_SoftObjectReferenceToObject: "SoftObject"
+//   - ObjName: thread-safe + FName sanity check
 //   - GetProp: walks FField chain (UE5)
 //   - IsA/SubclassOf: name-based SuperStruct walk
-//   - No auto-travel; use console:
-//     open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
+//   - FixBuildingFoundations: exact class match (no IsA walk) + progress logs
+//   - No auto-travel. Use: open Artemis_Terrain?game=/Script/FortniteGame.FortGameModeAthena
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -71,7 +73,7 @@ constexpr uintptr_t WorldTick            = 0x0949685C;
 constexpr uintptr_t EngineExec           = 0x098BB160;
 constexpr uintptr_t IsStandalone         = 0x0945F840;
 constexpr uintptr_t GetPlayerController  = 0x093A1D48;
-// GetPawn and Possess REMOVED — they are inline / thunked in UE5.
+// GetPawn and Possess REMOVED — inline / thunked in UE5
 constexpr uintptr_t BeginSpawn           = 0x093A37E4;
 constexpr uintptr_t FinishSpawn          = 0x0939F1B8;
 constexpr uintptr_t SpawnObject          = 0x093A3388;
@@ -273,10 +275,19 @@ static void* FindObj(const std::string& path) {
 }
 
 // ============================================================================
-// ObjName — THREAD-SAFE cached name lookup
+// ObjName — THREAD-SAFE cached name lookup with FName sanity check
 // ============================================================================
 static std::string ObjName(void* obj) {
     if (!obj || IsBadPtr(obj)) return {};
+
+    // FName sanity check before touching NameAppendString
+    {
+        uint32 compIdx = Read<uint32>(obj, profile::ObjectName + 0);
+        uint32 dispIdx = Read<uint32>(obj, profile::ObjectName + 4);
+        if (compIdx == 0xFFFFFFFF || compIdx > 0x8000000) return {};
+        if (dispIdx == 0xFFFFFFFF || dispIdx > 0x8000000) return {};
+    }
+
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
     static std::map<void*, std::string> cache;
 
@@ -487,9 +498,7 @@ static void* LoadAsset(const std::string& path, const char* type_path = "/Script
         profile::StaticLoadObject)(type, nullptr, s.c_str(), nullptr, 0, nullptr, true, nullptr);
 }
 
-// ============================================================================
-// GetPawn — PROPERTY-BASED (UE5: GetPawn is inline, no callable RVA)
-// ============================================================================
+// GetPawn — property-based (UE5: inline)
 static void* GetPawn(void* controller) {
     if (!controller) return nullptr;
     static void* pawnProp = nullptr;
@@ -503,9 +512,7 @@ static void* GetPawn(void* controller) {
     return Read<void*>(GetField(controller, pawnProp));
 }
 
-// ============================================================================
-// Possess — via ProcessEvent (param name "InPawn" per SDK)
-// ============================================================================
+// Possess — via ProcessEvent (param "InPawn")
 static void Possess(void* controller, void* pawn) {
     if (!controller || !pawn) return;
     Call c("/Script/Engine.Controller.Possess");
@@ -681,7 +688,8 @@ bool Athena::FindSafeSpawnLocation(void* world, void* mode, void* controller,
         for (int32 i = 0; i < go->NumElements && total < 64; ++i) {
             void* o = go->GetById(i);
             if (!o || IsBadPtr(o)) continue;
-            if (!IsA(o, w.cls)) continue;
+            void* k = Read<void*>(o, profile::ObjectClass);
+            if (k != w.cls) continue;
             ++total;
             Call loc("/Script/Engine.Actor.K2_GetActorLocation");
             if (!loc.ok() || !loc.run(o)) continue;
@@ -727,9 +735,7 @@ void Athena::SpawnPawn() {
 
     void* check = GetPawn(session.controller);
     LOG("SpawnPawn: GetPawn returned %p (expected %p)", check, session.pawn);
-    if (check != session.pawn) {
-        LOG("WARNING: possession did not stick");
-    }
+    if (check != session.pawn) LOG("WARNING: possession did not stick");
     LOG("SpawnPawn: complete");
 }
 
@@ -776,11 +782,12 @@ void Athena::ShowSkin() {
 
 void Athena::DestroyLods() {
     void* cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
-    if (!cm) return;
+    if (!cm) { LOG("DestroyLods: no CheatManager"); return; }
     void* cls = FindObj("/Script/FortniteGame.FortHLODSMActor");
-    if (!cls) return;
+    if (!cls) { LOG("DestroyLods: no class"); return; }
     Call c("/Script/Engine.CheatManager.DestroyAll");
     if (c.ok() && c.set("aClass", cls)) c.run(cm);
+    LOG("DestroyLods: done");
 }
 
 // ============================================================================
@@ -829,19 +836,39 @@ void Athena::DropLoadingScreen() {
     LOG("Loading screen dropped");
 }
 
+// ============================================================================
+// FixBuildingFoundations — SAFE VERSION (exact class match, no IsA walk)
+// ============================================================================
 void Athena::FixBuildingFoundations() {
     void* cls = FindObj("/Script/FortniteGame.BuildingFoundation");
-    if (!cls || !session.world) return;
+    if (!cls || !session.world) { LOG("FixBuildingFoundations: no class/world"); return; }
+
     GObjects_t* go = *(GObjects_t**)(g_base + profile::GObjects);
-    if (!go) return;
+    if (!go) { LOG("FixBuildingFoundations: no GObjects"); return; }
+
     void* p = GetProp("/Script/FortniteGame.BuildingFoundation.DynamicFoundationType");
-    if (!p) return;
+    if (!p) { LOG("FixBuildingFoundations: prop missing"); return; }
+
+    int propOff = Read<int>(p, profile::PropOffset);
+    if (propOff < 0 || propOff > 0x20000) {
+        LOG("FixBuildingFoundations: bad offset 0x%x", propOff);
+        return;
+    }
+
+    LOG("FixBuildingFoundations: start (class=%s off=0x%x total=%d)",
+        ObjName(cls).c_str(), propOff, go->NumElements);
+
+    int fixed = 0;
     for (int32 i = 0; i < go->NumElements; ++i) {
+        if ((i & 0x3FFF) == 0) LOG("FixBuildingFoundations: %d / %d", i, go->NumElements);
         void* o = go->GetById(i);
         if (!o || IsBadPtr(o)) continue;
-        if (!IsA(o, cls)) continue;
-        Write<char>(GetField(o, p), 0, 0);
+        void* k = Read<void*>(o, profile::ObjectClass);
+        if (k != cls) continue;   // exact class pointer match — O(1), no walk
+        Write<char>((char*)o + propOff, 0, 0);
+        ++fixed;
     }
+    LOG("FixBuildingFoundations: done, fixed=%d", fixed);
 }
 
 void Athena::FixBus() {
@@ -920,7 +947,6 @@ void Athena::AddToInventory(void* def, int count, char idx, int slot) {
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(entryArr, entryProp, GetField(inst, itemEntryProp));
 
-    // FIXED: param is "Slot", not "SlotIndex"
     Call qb("/Script/FortniteGame.FortPlayerController.AddItemToQuickBars");
     uint8_t bar = 0;
     if (qb.ok() && qb.set("ItemDefinition", def) && qb.set("QuickBarType", bar) && qb.set("Slot", (int)slot)) {
@@ -993,7 +1019,6 @@ void Athena::InitializeInventory() {
 // ============================================================================
 // ATHENA — WEAPON EQUIP
 // ============================================================================
-// FIXED: param is "ItemEntry", not "ItemEntryGuid"
 static bool EquipWeapon(void* pawn, void* def, Guid guid) {
     if (!pawn || !def) return false;
     Call c("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
@@ -1062,7 +1087,6 @@ void Athena::GrantAbility(void* klass) {
         }
     }
 
-    // FIXED: param is "GameplayEffectClass", not "GameplayEffect"
     Call apply("/Script/GameplayAbilities.AbilitySystemComponent.BP_ApplyGameplayEffectToSelf");
     if (apply.ok() && apply.set("GameplayEffectClass", ge) && apply.set("Level", 1.0f)) {
         apply.run(asc);
@@ -1444,7 +1468,10 @@ void Athena::TeleportToSpawnIsland() {
     std::vector<void*> starts;
     for (int32 i = 0; i < go->NumElements; ++i) {
         void* o = go->GetById(i);
-        if (o && !IsBadPtr(o) && IsA(o, cls)) starts.push_back(o);
+        if (o && !IsBadPtr(o)) {
+            void* k = Read<void*>(o, profile::ObjectClass);
+            if (k == cls) starts.push_back(o);
+        }
     }
     if (starts.empty()) return;
     void* start = starts[rand() % starts.size()];
@@ -1576,10 +1603,7 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: controller class = %s", ObjName(ctrlClass).c_str());
 
     void* baseCtrl = FindObj("/Script/FortniteGame.FortPlayerController");
-    if (!baseCtrl) {
-        LOG("SetupWorld: FortPlayerController base not found");
-        return;
-    }
+    if (!baseCtrl) { LOG("SetupWorld: FortPlayerController base not found"); return; }
     if (!IsA(session.controller, baseCtrl)) {
         LOG("SetupWorld: controller is not a FortPlayerController");
         return;
@@ -1613,12 +1637,8 @@ void Athena::SetupWorld(void* world) {
     bool isPawn = oldPawn && pawnCls && IsA(oldPawn, pawnCls);
     LOG("SetupWorld: isPawn=%d", (int)isPawn);
 
-    if (!isPawn) {
-        SpawnPawn();
-    } else {
-        session.pawn = oldPawn;
-        LOG("SetupWorld: keeping existing pawn %p", oldPawn);
-    }
+    if (!isPawn) SpawnPawn();
+    else { session.pawn = oldPawn; LOG("SetupWorld: keeping existing pawn %p", oldPawn); }
 
     if (!session.pawn) { LOG("SetupWorld: no pawn — aborting"); return; }
 
