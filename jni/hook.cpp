@@ -1368,7 +1368,7 @@ void Athena::SetupLocalVehicles() {
     
     Call spawnVeh("/Script/FortniteGame.FortCheatManager.SpawnVehicle");
     if (spawnVeh.ok()) {
-        FString vehicleName{}; // Empty = spawn default/random vehicle
+        FStringNative vehicleName{}; // Empty = spawn default/random vehicle
         spawnVeh.set("VehicleName", vehicleName);
         spawnVeh.set("ForcedMaterialVariantIndex", 0);
         spawnVeh.set("GroundHeightOffset", 100.0f);
