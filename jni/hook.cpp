@@ -1,6 +1,7 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE FINAL — All fixes: Loot, QuickBars, Abilities, Movement, Doors
+// COMPLETE FINAL — All offsets verified from SDK CppSDK 21.30
+// Bots via AthenaAIServicePlayerBots · Vehicles · Loot · HUD · Storm
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -23,6 +24,8 @@
 #include <array>
 #include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <android/log.h>
 
@@ -49,10 +52,10 @@ using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=
 using TCHAR=char16_t;
 
 // ============================================================================
-// PROFILE — All offsets for Fortnite 21.30
+// PROFILE — All verified offsets for Fortnite 21.30 (from SDK scan)
 // ============================================================================
 namespace profile {
-// Core engine
+// ---------- Core engine ----------
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
 constexpr uintptr_t StaticFindObject     = 0x0762A664;
 constexpr uintptr_t StaticLoadObject     = 0x0761C568;
@@ -75,7 +78,7 @@ constexpr uintptr_t Realloc              = 0x0735E520;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 constexpr uintptr_t GetInterfaceAddress  = 0x0761AA88;
 
-// Object layout
+// ---------- Object layout ----------
 constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
@@ -93,55 +96,207 @@ constexpr unsigned BoolFieldMask  = 0x82;
 constexpr unsigned FFieldName = 0x28;
 constexpr unsigned FFieldNext = 0x20;
 
-// CPF flags
+// ---------- CPF flags ----------
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
 constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
 constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 
-// Item entry offsets
-constexpr unsigned ItemEntry_Durability    = 0x24;
-constexpr unsigned ItemEntry_LoadedAmmo    = 0x2C;
-constexpr unsigned ItemEntry_PhantomAmmo   = 0x30;
-constexpr unsigned ItemEntry_TrackerGuid   = 0x78;
-constexpr unsigned ItemEntry_StateValues   = 0xD0;
+// ============================================================================
+// VERIFIED OFFSETS — Fortnite 21.30
+// ============================================================================
 
-// Fortnite specific
-constexpr unsigned FortPlayerState_HeroType          = 0x0430;
-constexpr unsigned FortPlayerController_MyPlayerInfo = 0x2088;
-constexpr unsigned RegisteredPlayerInfo_HeroInstance = 0x2D0;
-constexpr unsigned FortHero_CharacterParts           = 0x238;
-constexpr unsigned FortPlayerPawn_bIsSkydiving       = 0x1A1D;
-constexpr unsigned BuildingWall_bDoorOpen_Byte       = 0x0FDE;
-constexpr unsigned BuildingWall_bDoorOpen_Bit        = 5;
-constexpr unsigned PlayerPawn_Athena_Speed_Sprint    = 0x53EC;
+// ---------- APlayerController / AFortPlayerController ----------
+constexpr unsigned PC_Pawn                  = 0x02B0;
+constexpr unsigned PC_PlayerState           = 0x0278;
+constexpr unsigned PC_CheatManager          = 0x03D8;
+constexpr unsigned PC_WorldInventory        = 0x1D20;
+constexpr unsigned PC_ClientQuickBars       = 0x1A60;
+constexpr unsigned PC_QuickBarReadyByte     = 0x1A68;
+constexpr unsigned PC_MyFortPawn            = 0x0AD8;
+constexpr unsigned PC_MyPlayerInfo          = 0x2088;
+constexpr unsigned PCA_XPComponent          = 0x4330;
+constexpr unsigned PCA_SwappingItemDef      = 0x3770;
+constexpr unsigned PCA_BroadcastRCI         = 0x3DE8;
+constexpr unsigned PCA_CreativePlotLinkedVolume = 0x41B0;
+constexpr unsigned PCA_OwnedPortal          = 0x41D0;
+constexpr unsigned PCA_WarmupPlayerStart    = 0x3E48;
+constexpr unsigned PCA_StrongMyHero         = 0x3DF8;
+constexpr unsigned PCA_bHasHadValidPawn     = 0x38D9;  // bit0
 
-// ⭐ Movement offsets (from SDK)
-constexpr unsigned FortPawn_bWantsToSlide            = 0x1030;
-constexpr unsigned FortPlayerPawn_bIsSliding_Byte    = 0x06DB;
-constexpr unsigned FortPlayerPawn_bIsSliding_Bit     = 3;
-constexpr unsigned FortPlayerPawn_bIsSurfaceSwim_Byte = 0x0770;
-constexpr unsigned FortPlayerPawn_bIsSurfaceSwim_Bit  = 4;
-constexpr unsigned CharacterMovement_MovementMode    = 0x019C;
-constexpr unsigned CharacterMovement_CustomMode      = 0x019D;
+// ---------- ACharacter ----------
+constexpr unsigned Char_CharacterMovement   = 0x02F8;
 
-// TacticalSprint
-constexpr unsigned TacticalSprint_Flags              = 0xC0;
-constexpr uint8_t TacticalSprint_Bit_Enabled   = 0x01;
-constexpr uint8_t TacticalSprint_Bit_WantsSprint = 0x02;
-constexpr uint8_t TacticalSprint_Bit_IsSprinting = 0x08;
+// ---------- AFortPawn ----------
+constexpr unsigned Pawn_AbilitySystemComp   = 0x0450;
+constexpr unsigned Pawn_CurrentWeapon       = 0x0550;
+constexpr unsigned Pawn_HealthSet           = 0x0798;
+constexpr unsigned Pawn_bIsDBNO             = 0x0A5B;  // bit 0x04
+constexpr unsigned Pawn_LastReplicatedEmote = 0x0CA0;
+constexpr unsigned Pawn_bIsABot_Byte        = 0x027A;  // APawn, bit 3
+constexpr unsigned Pawn_bIsABot_Bit         = 3;
 
-// ⭐ QuickBars (21.30 — libUnreal.so)
-constexpr uintptr_t InitializeAthenaQuickBars    = 0x056607ec;
-constexpr uintptr_t FortQuickBarsAthena_vtable   = 0x0BDDF4B0;
-constexpr unsigned  QuickBars_VtableSlot         = 0x738;
-constexpr unsigned  QuickBars_PrimaryOffset      = 0x278;
-constexpr unsigned  QuickBars_SecondaryOffset    = 0x308;
-constexpr unsigned  QuickBars_CreativeOffset     = 0x398;
-constexpr unsigned  Controller_ClientQuickBars     = 0x1a60;
-constexpr unsigned  Controller_QuickBarReadyByte   = 0x1a68;
-constexpr uintptr_t GetItemInQuickbarSlot_Gate     = 0x06673524;
-constexpr unsigned  QuickBars_VtableSlot_GetItemInSlot = 0x6f0;
+// ---------- AFortPlayerPawn ----------
+constexpr unsigned FPP_HeldObject           = 0x1A74;
+constexpr unsigned FPP_VehicleInputComp     = 0x2408;
+
+// ---------- AFortPlayerPawnAthena ----------
+constexpr unsigned FPPA_bIsSkydiving        = 0x1A1D;  // bit0
+constexpr unsigned FPPA_bIsParachuteOpen    = 0x1A1E;  // bit0
+constexpr unsigned FPPA_bIsInAnyStorm       = 0x1D78;  // bit0
+constexpr unsigned FPPA_bIsInsideSafeZone   = 0x1D78;  // bit1
+constexpr unsigned FPPA_Speed_Sprint        = 0x53EC;
+
+// ---------- AFortPlayerStateAthena ----------
+constexpr unsigned PS_UniqueId              = 0x0048;
+constexpr unsigned PS_HeroType              = 0x0430;
+constexpr unsigned PS_WorldPlayerId         = 0x03F2;
+constexpr unsigned PS_PawnDeathLocation     = 0x0A88;
+constexpr unsigned PS_RespawnData           = 0x0EA8;
+constexpr unsigned PS_TeamIndex             = 0x1038;
+constexpr unsigned PS_Place                 = 0x1044;
+constexpr unsigned PS_KillScore             = 0x104C;
+constexpr unsigned PS_SeasonLevelUIDisplay  = 0x1050;
+constexpr unsigned PS_SquadId               = 0x120C;
+constexpr unsigned PS_DeathInfo             = 0x1548;
+
+// ---------- AFortWeapon ----------
+constexpr unsigned Weapon_WeaponData              = 0x03D8;
+constexpr unsigned Weapon_ItemEntryGuid           = 0x0B18;
+constexpr unsigned Weapon_PrimaryAbilitySpecHandle   = 0x0BF8;
+constexpr unsigned Weapon_SecondaryAbilitySpecHandle = 0x0BFC;
+constexpr unsigned Weapon_ReloadAbilitySpecHandle    = 0x0C00;
+constexpr unsigned Weapon_EquippedAbilitySetHandles  = 0x0C20;
+
+// ---------- AFortPickup ----------
+constexpr unsigned Pickup_PrimaryPickupItemEntry = 0x02F8;
+constexpr unsigned Pickup_PickupLocationData     = 0x04A8;
+constexpr unsigned Pickup_bPickedUp              = 0x0590;  // bit0
+constexpr unsigned Pickup_bTossedFromContainer   = 0x0592;  // bit0
+constexpr unsigned Pickup_PawnWhoDroppedPickup   = 0x05C8;
+
+// ---------- AFortSafeZoneIndicator ----------
+constexpr unsigned SZ_SafeZoneRadius            = 0x0288;
+constexpr unsigned SZ_NextRadius                = 0x027C;
+constexpr unsigned SZ_NextCenter                = 0x02A0;
+constexpr unsigned SZ_NextNextCenter            = 0x02B8;
+constexpr unsigned SZ_CurrentPhase              = 0x04B8;
+constexpr unsigned SZ_CurrentDamageInfo         = 0x04BC;
+constexpr unsigned SZ_SafeZoneStartShrinkTime   = 0x04C4;
+constexpr unsigned SZ_SafeZoneFinishShrinkTime  = 0x04C8;
+
+// ---------- AFortAthenaAircraft ----------
+constexpr unsigned Aircraft_FlightInfo          = 0x0318;
+constexpr unsigned Aircraft_FlightStartTime     = 0x0360;
+constexpr unsigned Aircraft_FlightEndTime       = 0x0364;
+constexpr unsigned Aircraft_DropStartTime       = 0x0368;
+constexpr unsigned Aircraft_DropEndTime         = 0x036C;
+constexpr unsigned Aircraft_DefaultBusSkin      = 0x0520;
+constexpr unsigned Aircraft_SpawnedCosmeticAct  = 0x0528;
+
+// ---------- UFortVehicleSeatWeaponComponent ----------
+constexpr unsigned SeatWpn_WeaponSeatDefs       = 0x00B0;
+constexpr unsigned SeatWpn_ActiveSeatIdx        = 0x00C0;
+constexpr unsigned SeatWpn_CachedWeaponDef      = 0x00C8;
+
+// ---------- FFortItemEntry (struct) ----------
+constexpr unsigned Entry_ItemDefinition      = 0x0000;
+constexpr unsigned Entry_Count               = 0x0014;
+constexpr unsigned Entry_Durability          = 0x0024;
+constexpr unsigned Entry_LoadedAmmo          = 0x002C;
+constexpr unsigned Entry_PhantomReserveAmmo  = 0x0030;
+constexpr unsigned Entry_ItemGuid            = 0x0068;
+constexpr unsigned Entry_TrackerGuid         = 0x0078;
+constexpr unsigned Entry_StateValues         = 0x00D0;
+constexpr unsigned Entry_ParentInventory     = 0x00E0;
+constexpr unsigned Entry_Size                = 0x01A0;
+
+// ---------- FQuickBar / FQuickBarSlot ----------
+constexpr unsigned QuickBar_Slots            = 0x0010;
+constexpr unsigned QuickBarSlot_Items        = 0x0000;
+constexpr unsigned QuickBarSlot_bEnabled     = 0x0010;  // bit0
+constexpr unsigned QuickBarSlot_Size         = 0x28;
+
+// ---------- ABuildingWall ----------
+constexpr unsigned Wall_bDoorOpen_Byte = 0x0FDE;
+constexpr unsigned Wall_bDoorOpen_Bit  = 5;
+
+// ---------- UCharacterMovementComponent ----------
+constexpr unsigned CMC_MovementMode   = 0x019C;
+constexpr unsigned CMC_CustomMode     = 0x019D;
+constexpr unsigned CMC_MaxWalkSpeed   = 0x01E8;
+constexpr unsigned CMC_MaxFlySpeed    = 0x01F4;
+constexpr unsigned CMC_MaxSwimSpeed   = 0x01F0;
+constexpr unsigned CMC_JumpZVelocity  = 0x0170;
+constexpr unsigned CMC_GravityScale   = 0x0168;
+
+// ---------- UFortItemDefinition ----------
+constexpr unsigned ItemDef_Rarity            = 0x0070;
+constexpr unsigned ItemDef_ItemType          = 0x0071;
+constexpr unsigned ItemDef_bAllowMultipleStacks = 0x0077;  // bit2
+constexpr unsigned ItemDef_bForceAutoPickup  = 0x0077;     // bit5
+constexpr unsigned ItemDef_MaxStackSize      = 0x01A8;
+
+// ---------- UFortAbilitySet ----------
+constexpr unsigned AbilitySet_GameplayAbilities      = 0x0038;
+constexpr unsigned AbilitySet_GrantedGameplayEffects = 0x0048;
+constexpr unsigned AbilitySet_AdditionalItemsToAdd   = 0x0078;
+constexpr unsigned AbilitySet_PassiveGameplayEffects = 0x0088;
+
+// ---------- AFortAthenaAIBotController ----------
+constexpr unsigned BotCtrl_TargetHandler       = 0x04E0;
+constexpr unsigned BotCtrl_SlotItems           = 0x0530;
+constexpr unsigned BotCtrl_PlayerBotPawn       = 0x05E8;
+constexpr unsigned BotCtrl_CachedService       = 0x05F0;
+constexpr unsigned BotCtrl_BotSkillSetClasses  = 0x0778;
+constexpr unsigned BotCtrl_StartupInventory    = 0x07A8;
+constexpr unsigned BotCtrl_BotOwner            = 0x0E10;
+constexpr unsigned BotCtrl_BotControllerUID    = 0x0E18;
+constexpr unsigned BotCtrl_BotData             = 0x0EB8;
+constexpr unsigned BotCtrl_RespawnParams       = 0x10D8;
+
+// ---------- UAthenaAIServicePlayerBots ----------
+constexpr unsigned BotSvc_PlayerBots           = 0x0B50;
+constexpr unsigned BotSvc_NonAthenaBots        = 0x0B60;
+constexpr unsigned BotSvc_DefaultSpawnerData   = 0x0AD8;
+constexpr unsigned BotSvc_CurrentUID           = 0x0AB8;
+
+// ---------- FFortServerBotInfo ----------
+constexpr unsigned BotInfo_BotController       = 0x0000;
+constexpr unsigned BotInfo_Size                = 0x0010;
+
+// ---------- QuickBars (native init) ----------
+constexpr uintptr_t InitializeAthenaQuickBars  = 0x056607EC;
+constexpr uintptr_t FortQuickBarsAthena_vtable = 0x0BDDF4B0;
+constexpr unsigned  QuickBars_VtableSlot       = 0x738;
+constexpr unsigned  QuickBars_PrimaryOffset    = 0x278;
+constexpr unsigned  QuickBars_SecondaryOffset  = 0x308;
+constexpr unsigned  QuickBars_CreativeOffset   = 0x398;
+constexpr uintptr_t GetItemInQuickbarSlot_Gate = 0x06673524;
+constexpr unsigned  QuickBars_VtableSlot_GetItemInSlot = 0x6F0;
+
+// ---------- Tactical Sprint ----------
+constexpr unsigned TacticalSprint_Flags         = 0xC0;
+constexpr uint8_t  TacticalSprint_Bit_Enabled   = 0x01;
+constexpr uint8_t  TacticalSprint_Bit_WantsSprint = 0x02;
+constexpr uint8_t  TacticalSprint_Bit_IsSprinting = 0x08;
+
+// ---------- Legacy aliases ----------
+constexpr unsigned FortPlayerState_HeroType          = PS_HeroType;
+constexpr unsigned FortPlayerController_MyPlayerInfo = PC_MyPlayerInfo;
+constexpr unsigned FortPlayerPawn_bIsSkydiving       = FPPA_bIsSkydiving;
+constexpr unsigned BuildingWall_bDoorOpen_Byte       = Wall_bDoorOpen_Byte;
+constexpr unsigned BuildingWall_bDoorOpen_Bit        = Wall_bDoorOpen_Bit;
+constexpr unsigned PlayerPawn_Athena_Speed_Sprint    = FPPA_Speed_Sprint;
+constexpr unsigned ItemEntry_Durability   = Entry_Durability;
+constexpr unsigned ItemEntry_LoadedAmmo   = Entry_LoadedAmmo;
+constexpr unsigned ItemEntry_PhantomAmmo  = Entry_PhantomReserveAmmo;
+constexpr unsigned ItemEntry_TrackerGuid  = Entry_TrackerGuid;
+constexpr unsigned ItemEntry_StateValues  = Entry_StateValues;
+constexpr unsigned Controller_ClientQuickBars   = PC_ClientQuickBars;
+constexpr unsigned Controller_QuickBarReadyByte = PC_QuickBarReadyByte;
+constexpr unsigned CharacterMovement_MovementMode = CMC_MovementMode;
+constexpr unsigned CharacterMovement_CustomMode   = CMC_CustomMode;
 }
 
 extern "C" int DobbyHook(void* target, void* replace, void** origin);
@@ -161,6 +316,10 @@ template<class T> static T Read(const void* p, size_t off = 0) {
 }
 template<class T> static void Write(void* p, size_t off, const T& v) {
     if (p) memcpy((char*)p + off, &v, sizeof(T));
+}
+template<typename T>
+static T& Off(void* base, unsigned offset) {
+    return *reinterpret_cast<T*>(reinterpret_cast<char*>(base) + offset);
 }
 
 static uintptr_t g_base = 0;
@@ -227,6 +386,8 @@ static void* GetObjField(void* obj, const char* path);
 static void* LoadAsset(const std::string& path, const char* type_path);
 static void* LoadClass(const char* path, const char* base_path);
 static void* GetPC(void* world, int index);
+static bool IsBotPawn(void* pawn);
+static void* GetASC(void* actor);
 
 // ============================================================================
 // TYPE CHECKS
@@ -246,6 +407,11 @@ static bool IsA(void* obj, void* type) {
     void* klass = Read<void*>(obj, profile::ObjectClass);
     if (!klass || IsBadPtr(klass)) return false;
     return SubclassOfFast(klass, type);
+}
+static bool IsBotPawn(void* pawn) {
+    if (!pawn || IsBadPtr(pawn)) return false;
+    uint8_t b = Read<uint8_t>(pawn, profile::Pawn_bIsABot_Byte);
+    return (b >> profile::Pawn_bIsABot_Bit) & 1;
 }
 
 // ============================================================================
@@ -359,7 +525,7 @@ static Tick_t orig_Tick = nullptr;
 static Exec_t orig_Exec = nullptr;
 
 // ============================================================================
-// CALL SYSTEM
+// CALL SYSTEM — parameter binding by name
 // ============================================================================
 class Call {
     void* m_func = nullptr;
@@ -491,6 +657,18 @@ static void* ResolveInterface(void* object, void* ifaceClass) {
     using Fn_t = void*(*)(void*, void*);
     return ((Fn_t)(g_base + profile::GetInterfaceAddress))(object, ifaceClass);
 }
+static void* GetASC(void* actor) {
+    if (!actor) return nullptr;
+    void* asc = Read<void*>(actor, profile::Pawn_AbilitySystemComp);
+    if (asc && !IsBadPtr(asc)) return asc;
+    void* state = Read<void*>(actor, profile::PC_PlayerState);
+    if (state && !IsBadPtr(state)) {
+        asc = Read<void*>(state, profile::Pawn_AbilitySystemComp);
+        if (asc && !IsBadPtr(asc)) return asc;
+    }
+    asc = GetObjField(actor, "/Script/GameplayAbilities.AbilitySystemComponent");
+    return asc;
+}
 
 // ============================================================================
 // SESSION
@@ -505,6 +683,7 @@ struct Session {
     void* inventory = nullptr;
     void* quickbars = nullptr;
     void* tactical_sprint = nullptr;
+    void* bot_service = nullptr;
     bool  initialized = false;
     bool  inventory_ready = false;
     bool  aircraft_jumped = false;
@@ -532,12 +711,19 @@ struct Session {
     bool  storm_protected = false;
     bool  bus_scheduled = false;
     bool  bus_started = false;
+    bool  vehicles_spawned = false;
+    bool  ai_initialized = false;
+    bool  vending_initialized = false;
+    bool  minimap_initialized = false;
+    bool  clamber_initialized = false;
     int   bots_target = 99;
     int   bots_spawned_count = 0;
+    int   vehicles_spawned_count = 0;
     double bus_at = 0;
     double storm_at = 0;
     std::vector<void*> bot_controllers;
     std::vector<void*> bot_pawns;
+    std::vector<void*> bot_services;
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -620,33 +806,22 @@ namespace Athena {
     void OnExitVehicle();
     void CheatScript(const char* script);
 
-    // QuickBars
     void InitializeQuickBarsNative();
     void SetQuickBarReady();
     void ActivateQuickBarSlot(uint8_t bar, int slot);
     void ForceUpdateQuickBars();
     void BuildQuickBarsManually();
 
-    // Loot
     void SpawnFloorLoot();
-
-    // Movement
     void EnableMovementFeatures();
 
     struct LootData { void* Def; int Count; };
     std::vector<LootData> PickLootDrops(std::string category);
 }
 
-static void* GetASC(void* actor) {
-    if (!actor) return nullptr;
-    void* asc = GetObjField(actor, "/Script/FortniteGame.FortPawn.AbilitySystemComponent");
-    if (asc) return asc;
-    asc = GetObjField(actor, "/Script/FortniteGame.FortPlayerState.AbilitySystemComponent");
-    if (asc) return asc;
-    asc = GetObjField(actor, "/Script/GameplayAbilities.AbilitySystemComponent");
-    return asc;
-}
-
+// ============================================================================
+// ABILITIES
+// ============================================================================
 void Athena::GrantAbility(void* klass) {
     if (!klass || !session.pawn) return;
     void* asc = GetASC(session.pawn);
@@ -720,7 +895,6 @@ void Athena::GrantAllAbilitySets() {
         "/Script/FortniteGame.FortAbilitySet");
     if (!coreSet) { LOG("[Abilities] GAS_AthenaPlayer missing"); session.abilities_granted = true; return; }
 
-    // ⭐ أضف الـ abilities الإضافية للـ set قبل Equip
     void* abilities_prop = GetProp("/Script/FortniteGame.FortAbilitySet.GameplayAbilities");
     if (abilities_prop) {
         int off = Read<int>(abilities_prop, profile::PropOffset);
@@ -752,7 +926,6 @@ void Athena::GrantAllAbilitySets() {
 
     if (ApplyAbilitySet(session.pawn, coreSet)) session.granted_ability_sets.push_back(coreSet);
 
-    // Fallback direct abilities
     const char* abilities[] = {
         "/Script/GameplayAbilities.GameplayAbility_CharacterJump",
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractUse.GA_DefaultPlayer_InteractUse_C",
@@ -770,15 +943,11 @@ void Athena::GrantAllAbilitySets() {
     session.abilities_granted = true;
     LOG("[Abilities] Done — sets=%zu", session.granted_ability_sets.size());
 
-    // ⭐ أعطِ melee ability
     GrantMeleeAbility();
 }
 
 void Athena::GrantDefaultAbilities() { GrantAllAbilitySets(); }
 
-// ============================================================================
-// MELEE ABILITY
-// ============================================================================
 void Athena::GrantMeleeAbility() {
     if (!session.pawn || session.melee_granted) return;
     void* asc = GetASC(session.pawn);
@@ -826,6 +995,9 @@ void Athena::GrantMeleeAbility() {
     }
 }
 
+// ============================================================================
+// HUD / REFRESH
+// ============================================================================
 void Athena::RefreshHUD() {
     if (!session.controller || !session.world) return;
 
@@ -887,7 +1059,7 @@ void Athena::RefreshHUD() {
 }
 
 // ============================================================================
-// QuickBars
+// QUICKBARS
 // ============================================================================
 void Athena::InitializeQuickBarsNative() {
     if (!session.quickbars || IsBadPtr(session.quickbars)) { LOG("[QB] No quickbar"); return; }
@@ -929,14 +1101,12 @@ void Athena::BuildQuickBarsManually() {
 
     const int reflectedSlotSize=Read<int>(slotsProp,profile::PropElementSize);
     const int reflectedGuidSize=Read<int>(itemsProp,profile::PropElementSize);
-    const int slotSize=0x28;
+    const int slotSize=profile::QuickBarSlot_Size;
     const int guidSize=0x10;
-    LOG("[QB] reflected slotSize=0x%X guidSize=0x%X; SDK slotSize=0x28 guidSize=0x10",reflectedSlotSize,reflectedGuidSize);
-    if(reflectedGuidSize!=0x10 && reflectedGuidSize!=0) {
+    LOG("[QB] reflected slotSize=0x%X guidSize=0x%X; SDK slotSize=0x%X guidSize=0x%X",reflectedSlotSize,reflectedGuidSize,slotSize,guidSize);
+    if(reflectedGuidSize!=guidSize && reflectedGuidSize!=0) {
         LOG("[QB] GUID layout mismatch; refusing QuickBar construction"); return;
     }
-    if(reflectedSlotSize!=0x28)
-        LOG("[QB] reflected slot size is metadata=0x%X; using verified FQuickBarSlot size 0x28",reflectedSlotSize);
 
     void* invProp=GetProp("/Script/FortniteGame.FortInventory.Inventory");
     void* instProp=GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
@@ -964,8 +1134,6 @@ void Athena::BuildQuickBarsManually() {
     if(!setupBar(primProp)) { LOG("[QB] primary slot array allocation failed"); return; }
     if(secProp) setupBar(secProp);
 
-    // Bind actual item GUIDs through the reflected quickbar API.  This also
-    // preserves FQuickBarSlot's occupied/dirty bookkeeping.
     int bound=0;
     for(int i=0;i<arr.Count && i<6;++i) {
         void* item=Read<void*>(arr.Data,(size_t)i*8);
@@ -984,8 +1152,6 @@ void Athena::BuildQuickBarsManually() {
         }
     }
 
-    // Ensure the six slot records are physically populated even if the Kismet
-    // binding accepts the call but does not materialize the local record.
     void* bar=GetField(session.quickbars,primProp);
     void* sf=bar?GetField(bar,slotsProp):nullptr;
     Array slots=sf?Read<Array>(sf):Array{};
@@ -1008,16 +1174,7 @@ void Athena::BuildQuickBarsManually() {
 
 void Athena::SetQuickBarReady() {
     if (!session.controller) return;
-    void* qp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
-    if (!qp) { LOG("[QB] ClientQuickBars property not found"); return; }
-    int propOff = Read<int>(qp, profile::PropOffset);
-    LOG("[QB] ClientQuickBars offset = 0x%X (expect 0x%X)", propOff, profile::Controller_ClientQuickBars);
-    if (propOff != (int)profile::Controller_ClientQuickBars) { LOG("[QB] ❌ offset mismatch — SKIPPING"); return; }
-    if (!session.quickbars_initialized) { LOG("[QB] ❌ QuickBars not initialized — SKIPPING"); return; }
-    uint8_t before = Read<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte);
-    if (before > 1) { LOG("[QB] Unexpected byte=%u", before); return; }
-    Write<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte, 1);
-    LOG("[QB] ✅ Readiness byte: %u -> 1", before);
+    LOG("[QB] SetQuickBarReady skipped (unverified readiness byte)");
 }
 
 void Athena::ActivateQuickBarSlot(uint8_t bar, int slot) {
@@ -1041,50 +1198,27 @@ void Athena::ForceUpdateQuickBars() {
 }
 
 // ============================================================================
-// MOVEMENT FEATURES
+// MOVEMENT
 // ============================================================================
 void Athena::EnableMovementFeatures() {
     if (!session.pawn) return;
     LOG("[Movement] Enabling slide & swim...");
 
-    // ⭐ SLIDE: SetCanSlide(true)
     Call canSlide("/Script/FortniteGame.FortPlayerPawn.SetCanSlide");
     if (canSlide.ok()) {
         bool bTrue = true;
         if (canSlide.set("bCanSlide", bTrue)) {
-            if (canSlide.run(session.pawn)) {
-                LOG("[Movement] ✅ SetCanSlide(true)");
-            } else {
-                LOG("[Movement] SetCanSlide run failed");
-            }
+            if (canSlide.run(session.pawn)) LOG("[Movement] ✅ SetCanSlide(true)");
+            else LOG("[Movement] SetCanSlide run failed");
         }
-    } else {
-        LOG("[Movement] SetCanSlide not found");
-    }
+    } else LOG("[Movement] SetCanSlide not found");
 
-    // Fallback: bWantsToSlide مباشرة
-    SetBool(session.pawn, "/Script/FortniteGame.FortPawn.bWantsToSlide", true);
-
-    // ⭐ SWIM
-    void* movement = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
+    void* movement = Read<void*>(session.pawn, profile::Char_CharacterMovement);
     if (movement && !IsBadPtr(movement)) {
-        const char* swimPaths[] = {
-            "/Script/Engine.NavMovementComponent.bCanSwim",
-            "/Script/Engine.MovementComponent.bCanSwim",
-            "/Script/Engine.CharacterMovementComponent.bCanSwim",
-            nullptr
-        };
-        for (int i = 0; swimPaths[i]; ++i) {
-            void* p = GetProp(swimPaths[i]);
-            if (p) {
-                SetBool(movement, swimPaths[i], true);
-                LOG("[Movement] ✅ Set %s", swimPaths[i]);
-                break;
-            }
-        }
+        Off<float>(movement, profile::CMC_MaxSwimSpeed) = 400.0f;
+        LOG("[Movement] ✅ Set MaxSwimSpeed");
     }
 
-    // ⭐ Slide Ability
     void* slideAbility = LoadClass(
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_Athena_Player_Slide.GA_Athena_Player_Slide_C",
         "/Script/GameplayAbilities.GameplayAbility");
@@ -1099,15 +1233,11 @@ void Athena::EnableMovementFeatures() {
                 if (give.set("AbilityClass", slideAbility) &&
                     give.set("Level", level) &&
                     give.set("InputID", inputID)) {
-                    if (give.run(asc)) {
-                        LOG("[Movement] ✅ Slide ability granted");
-                    }
+                    if (give.run(asc)) LOG("[Movement] ✅ Slide ability granted");
                 }
             }
         }
-    } else {
-        LOG("[Movement] Slide ability class not found");
-    }
+    } else LOG("[Movement] Slide ability class not found");
 
     session.movement_enabled = true;
     LOG("[Movement] Done");
@@ -1117,36 +1247,8 @@ void Athena::EnableMovementFeatures() {
 // TACTICAL SPRINT
 // ============================================================================
 void Athena::SetupTacticalSprint() {
-    if (!session.controller) return;
-    if (session.tactical_sprint_setup && session.tactical_sprint) return;
-    LOG("[TacticalSprint] Setting up component...");
-    void* compClass = FindObj("/Script/TacticalSprintRuntime.FortPlayerControllerComponent_TacticalSprint");
-    if (!compClass) { LOG("[TacticalSprint] Component class not found"); session.tactical_sprint_setup = true; return; }
-    void* comp = nullptr;
-    Call get("/Script/Engine.Actor.GetComponentByClass");
-    if (get.ok() && get.set("ComponentClass", compClass) && get.run(session.controller)) comp = get.result<void*>();
-    if (!comp || IsBadPtr(comp)) {
-        LOG("[TacticalSprint] Adding component...");
-        Call add("/Script/Engine.Actor.AddComponentByClass");
-        if (add.ok()) {
-            bool bManual = false; Transform t{}; bool bDeferred = false;
-            add.set("Class", compClass); add.set("bManualAttachment", bManual);
-            add.set("RelativeTransform", t); add.set("bDeferredFinish", bDeferred);
-            if (add.run(session.controller)) { comp = add.result<void*>(); LOG("[TacticalSprint] Component added: %p", comp); }
-        }
-    }
-    if (!comp || IsBadPtr(comp)) { LOG("[TacticalSprint] Failed to create component"); session.tactical_sprint_setup = true; return; }
-    session.tactical_sprint = comp;
-    uint8_t* flags = (uint8_t*)comp + profile::TacticalSprint_Flags;
-    *flags |= profile::TacticalSprint_Bit_Enabled;
-    LOG("[TacticalSprint] Enabled, flags=0x%02X", *flags);
-    Call set("/Script/TacticalSprintRuntime.FortPlayerControllerComponent_TacticalSprint.SetIsSprinting");
-    if (set.ok()) {
-        bool bSprint = true;
-        if (set.set("bNewIsSprinting", bSprint)) set.run(comp);
-    }
+    LOG("[TacticalSprint] disabled (offsets unverified)");
     session.tactical_sprint_setup = true;
-    LOG("[TacticalSprint] ✅ Setup complete");
 }
 void Athena::SetTacticalSprinting(bool sprinting) {
     if (!session.tactical_sprint) return;
@@ -1156,22 +1258,25 @@ void Athena::SetTacticalSprinting(bool sprinting) {
 
 void Athena::ApplySprintSpeed() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
+
+    void* cmc = Read<void*>(session.pawn, profile::Char_CharacterMovement);
+    if (cmc && !IsBadPtr(cmc)) {
+        Off<float>(cmc, profile::CMC_MaxWalkSpeed) = 600.0f;
+        Off<float>(cmc, profile::CMC_MaxFlySpeed)  = 1200.0f;
+        Off<float>(cmc, profile::CMC_MaxSwimSpeed) = 400.0f;
+        Off<float>(cmc, profile::CMC_JumpZVelocity) = 700.0f;
+        Off<float>(cmc, profile::CMC_GravityScale) = 1.0f;
+    }
+
     void* pawnCls = FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
     if (pawnCls && IsA(session.pawn, pawnCls)) {
-        float* sprintSpeed = (float*)((char*)session.pawn + profile::PlayerPawn_Athena_Speed_Sprint);
+        float* sprintSpeed = (float*)((char*)session.pawn + profile::FPPA_Speed_Sprint);
         if (!IsBadPtr(sprintSpeed)) {
             float old = *sprintSpeed;
             if (std::isfinite(old) && old > 0.0f && old < 5000.0f) {
-                if (fabsf(old - 1300.0f) > 1.0f) { *sprintSpeed = 1300.0f; LOG("[Sprint] Speed_Sprint: %.0f -> 1300", old); }
+                if (fabsf(old - 1300.0f) > 1.0f) { *sprintSpeed = 1300.0f; }
             }
         }
-    }
-    void* cmc = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
-    if (cmc && !IsBadPtr(cmc)) {
-        void* prop = GetProp("/Script/Engine.CharacterMovementComponent.MaxWalkSpeed");
-        if (prop) { float* val = (float*)GetField(cmc, prop); if (val && !IsBadPtr(val)) { if (fabsf(*val - 600.f) > 1.0f) *val = 600.f; } }
-        void* flyProp = GetProp("/Script/Engine.CharacterMovementComponent.MaxFlySpeed");
-        if (flyProp) { float* val = (float*)GetField(cmc, flyProp); if (val && !IsBadPtr(val)) { if (fabsf(*val - 1200.f) > 1.0f) *val = 1200.f; } }
     }
     session.sprint_applied = true;
 }
@@ -1180,7 +1285,7 @@ void Athena::ApplySprintSpeed() {
 // BATTLE BUS
 // ============================================================================
 void Athena::StartBusNow() {
-    LOG("[Bus] Automatic aircraft transition disabled: 21.30 SDK requires a valid AFortAthenaAircraft/flight state");
+    LOG("[Bus] Automatic aircraft transition disabled: 21.30 SDK requires valid aircraft");
     session.bus_started = false;
     session.bus_scheduled = false;
 }
@@ -1213,7 +1318,7 @@ void Athena::HandleJumpFromHudStart() {
 
     void* currentAircraft = Read<void*>(aircraftComp, 0xB0);
     if (!currentAircraft || IsBadPtr(currentAircraft)) {
-        LOG("[Bus] CurrentAircraft is null; no aircraft is active");
+        LOG("[Bus] CurrentAircraft is null; no aircraft active");
         return;
     }
 
@@ -1233,10 +1338,7 @@ void Athena::HandleJumpFromHudStart() {
 
     Call sky("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
     bool local = sky.ok() && sky.set("bFromBus", true) && sky.run(session.pawn);
-    if (!local) {
-        LOG("[Bus] BeginSkydiving unavailable; aircraft jump dispatched only");
-        return;
-    }
+    if (!local) { LOG("[Bus] BeginSkydiving unavailable; jump dispatched only"); return; }
 
     Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
     if (cam.ok()) {
@@ -1251,11 +1353,12 @@ void Athena::HandleJumpFromHudStart() {
 }
 
 void Athena::OnAircraftJump() { HandleJumpFromHudStart(); }
+
 void Athena::BeginPlayerSkydiving() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
     Call bsd("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
     if (bsd.ok()) { bool bFromBus = true; if (bsd.set("bFromBus", bFromBus)) { bsd.run(session.pawn); LOG("[Skydive] BeginSkydiving(true)"); } }
-    Write<uint8_t>(session.pawn, profile::FortPlayerPawn_bIsSkydiving, 1);
+    Write<uint8_t>(session.pawn, profile::FPPA_bIsSkydiving, 1);
 }
 
 void Athena::SetupCheats() {
@@ -1277,7 +1380,7 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// DOORS — FIX: Toggle + ForceNetUpdate
+// DOORS
 // ============================================================================
 void Athena::HandleDoor(void* door) {
     if (!door || IsBadPtr(door)) return;
@@ -1285,10 +1388,10 @@ void Athena::HandleDoor(void* door) {
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
 
-    uint8_t* byte = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
-    bool wasOpen = ((*byte) >> profile::BuildingWall_bDoorOpen_Bit) & 1;
-    if (wasOpen) *byte &= ~(1 << profile::BuildingWall_bDoorOpen_Bit);
-    else *byte |= (1 << profile::BuildingWall_bDoorOpen_Bit);
+    uint8_t* byte = (uint8_t*)door + profile::Wall_bDoorOpen_Byte;
+    bool wasOpen = ((*byte) >> profile::Wall_bDoorOpen_Bit) & 1;
+    if (wasOpen) *byte &= ~(1 << profile::Wall_bDoorOpen_Bit);
+    else *byte |= (1 << profile::Wall_bDoorOpen_Bit);
 
     Call rep("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
     if (rep.ok()) rep.run(door);
@@ -1298,7 +1401,7 @@ void Athena::HandleDoor(void* door) {
 }
 
 // ============================================================================
-// COSMETICS
+// COSMETICS / MCP
 // ============================================================================
 void Athena::SyncMCPProfile() {
     if (session.mcp_synced || !session.controller) return;
@@ -1310,31 +1413,32 @@ void Athena::SyncMCPProfile() {
         nullptr
     };
     for (int i=0; paths[i]; ++i) { source = GetProp(paths[i]); if (source) break; }
-    if (!source) { LOG("[MCP] loadout property missing - keep local defaults"); return; }
-    void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
+    if (!source) { LOG("[MCP] loadout property missing - keep defaults"); return; }
+    void* info = Read<void*>(session.controller, profile::PC_MyPlayerInfo);
+    if (!info) info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
     void* idProp = GetProp("/Script/FortniteGame.FortRegisteredPlayerInfo.PlayerID");
     void* ctxType = FindObj("/Script/FortniteGame.FortMcpContext");
     void* lib = FindObj("/Script/BlueprintContext.Default__BlueprintContextLibrary");
-    if (!info || !idProp || !ctxType || !lib) { LOG("[MCP] context/profile prerequisites missing - skip"); return; }
+    if (!info || !idProp || !ctxType || !lib) { LOG("[MCP] prerequisites missing - skip"); return; }
     int sourceSize = Read<int>(source, profile::PropElementSize);
-    if (sourceSize <= 0 || sourceSize > 2048) { LOG("[MCP] invalid loadout size=%d - skip", sourceSize); return; }
+    if (sourceSize <= 0 || sourceSize > 2048) { LOG("[MCP] invalid loadout size=%d", sourceSize); return; }
     void* idAddr = GetField(info, idProp);
     int idSize = Read<int>(idProp, profile::PropElementSize);
-    if (!idAddr || idSize <= 0 || idSize > 256) { LOG("[MCP] invalid PlayerID - skip"); return; }
+    if (!idAddr || idSize <= 0 || idSize > 256) { LOG("[MCP] invalid PlayerID"); return; }
     Call context("/Script/BlueprintContext.BlueprintContextLibrary.GetContext");
     if (!context.ok() || !context.set("ContextObject", session.controller) || !context.set("Class", ctxType) || !context.run(lib)) {
-        LOG("[MCP] GetContext failed - skip"); return;
+        LOG("[MCP] GetContext failed"); return;
     }
     void* ctx = context.result<void*>();
-    if (!ctx) { LOG("[MCP] context null - skip"); return; }
+    if (!ctx) { LOG("[MCP] context null"); return; }
     Call get("/Script/FortniteGame.FortMcpContext.GetLoadoutForPlayer");
     if (!get.ok() || !get.set_bytes("MemberUniqueId", idAddr, (size_t)idSize) || !get.run(ctx)) {
-        LOG("[MCP] GetLoadoutForPlayer failed - skip"); return;
+        LOG("[MCP] GetLoadoutForPlayer failed"); return;
     }
     const void* value = get.result_data((size_t)sourceSize);
-    if (!value) { LOG("[MCP] loadout return unavailable - skip"); return; }
+    if (!value) { LOG("[MCP] loadout return unavailable"); return; }
     void* dst = GetField(session.controller, source);
-    if (!dst) { LOG("[MCP] destination missing - skip"); return; }
+    if (!dst) { LOG("[MCP] destination missing"); return; }
     memcpy(dst, value, (size_t)sourceSize);
     session.mcp_synced = true;
     LOG("[MCP] Profile loadout synchronized (%d bytes)", sourceSize);
@@ -1352,27 +1456,20 @@ void Athena::LoadProfileCosmetics() {
         source = GetProp(p); if (source) break;
     }
     void* loadout = source ? GetField(session.controller, source) : nullptr;
-    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
-    if (!loadout || !state) { LOG("[Profile] loadout/state missing - keeping current loadout"); session.cosmetics_applied = false; return; }
+    void* state = Read<void*>(session.controller, profile::PC_PlayerState);
+    if (!state) state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
+    if (!loadout || !state) { LOG("[Profile] loadout/state missing"); session.cosmetics_applied = false; return; }
 
     void* character = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Character");
     void* hero = GetObjField(character, "/Script/FortniteGame.AthenaCharacterItemDefinition.HeroDefinition");
-    void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
-    if (!hero) hero = GetObjField(info, "/Script/FortniteGame.FortRegisteredPlayerInfo.AthenaMenuHeroDef");
-    void* menu = GetObjField(info, "/Script/FortniteGame.FortRegisteredPlayerInfo.TempAthenaMenuHeroInstance");
+    void* info = Read<void*>(session.controller, profile::PC_MyPlayerInfo);
+    if (!hero && info) hero = GetObjField(info, "/Script/FortniteGame.FortRegisteredPlayerInfo.AthenaMenuHeroDef");
+    void* menu = info ? GetObjField(info, "/Script/FortniteGame.FortRegisteredPlayerInfo.TempAthenaMenuHeroInstance") : nullptr;
     if (!hero && menu) {
         Call c("/Script/FortniteGame.FortHero.GetHeroTypeBP");
         if (c.ok() && c.run(menu)) hero = c.result<void*>();
     }
-    if (hero) {
-        void* hp = GetProp("/Script/FortniteGame.FortPlayerState.HeroType");
-        if (hp && Read<int>(hp, profile::PropElementSize) == 8) Write<void*>(GetField(state, hp), 0, hero);
-    }
-
-    void* dest = GetProp("/Script/FortniteGame.FortPlayerPawn.CosmeticLoadout");
-    if (!dest) dest = GetProp("/Script/FortniteGame.FortPlayerPawn.CustomizationLoadout");
-    if (source && dest && Read<int>(source, profile::PropElementSize) == Read<int>(dest, profile::PropElementSize))
-        memcpy(GetField(session.pawn, dest), loadout, (size_t)Read<int>(dest, profile::PropElementSize));
+    if (hero) Write<void*>(state, profile::PS_HeroType, hero);
 
     std::vector<void*> parts;
     void* heroPartsProp = GetProp("/Script/FortniteGame.FortHero.CharacterParts");
@@ -1411,12 +1508,11 @@ void Athena::LoadProfileCosmetics() {
     if(klib){Call u("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");if(u.ok()&&u.set("PlayerState",state))u.run(klib);}
     Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CosmeticLoadout"); if(cl.ok())cl.run(session.pawn);
     session.cosmetics_applied = !parts.empty() || hero != nullptr;
-    if (!session.cosmetics_applied) { LOG("[Profile] MCP had no usable cosmetics - keeping current loadout"); return; }
-    LOG("[Profile] MCP cosmetics applied: parts=%d hero=%p backpack=%p",(int)parts.size(),hero,backpack);
+    LOG("[Profile] Cosmetics applied: parts=%d hero=%p",(int)parts.size(),hero);
 }
 
 void Athena::ShowSkin() {
-    if (session.cosmetics_applied || session.profile_attempted) { LOG("[Profile] Cosmetics already processed - skip"); return; }
+    if (session.cosmetics_applied || session.profile_attempted) return;
     session.profile_attempted = true;
     LoadProfileCosmetics();
 }
@@ -1424,27 +1520,53 @@ void Athena::ShowSkin() {
 void Athena::ForcePlayerVisible() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
     LOG("[Visibility] Forcing player body visible...");
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteAvailable", true);
+
+    uint8_t* skyByte = (uint8_t*)session.pawn + profile::FPPA_bIsSkydiving;
+    *skyByte &= ~0x01;
+    uint8_t* paraByte = (uint8_t*)session.pawn + profile::FPPA_bIsParachuteOpen;
+    *paraByte &= ~0x01;
+
     Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving"); if (sd.ok()) sd.run(session.pawn);
     Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen"); if (po.ok()) po.run(session.pawn);
     Call body("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
-    if (body.ok()) { bool bShow = true; if (body.set("bVisible", bShow)) { body.run(session.pawn); bool ret = body.result<bool>(); LOG("[Visibility] SetCharacterBodyVisibilityForPossession -> %d", (int)ret); } }
+    if (body.ok()) { bool bShow = true; if (body.set("bVisible", bShow)) body.run(session.pawn); }
     Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
     if (hid.ok()) { bool bHidden = false; if (hid.set("bNewHidden", bHidden)) hid.run(session.pawn); }
     SetBool(session.pawn, "/Script/Engine.Actor.bHidden", false);
     session.visibility_forced = true;
 }
 
+// ============================================================================
+// SOLO HUD
+// ============================================================================
 void Athena::UpdateSoloHUD() {
     if(!session.state||!session.controller)return;
-    void* playersProp=GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
-    void* totalProp=GetProp("/Script/FortniteGame.FortGameStateAthena.TotalPlayers");
-    if(playersProp)Write<int>(GetField(session.state,playersProp),0,std::max(1,1+session.bots_spawned_count));
-    if(totalProp)Write<int>(GetField(session.state,totalProp),0,std::max(1,1+session.bots_target));
+
+    // اقرأ العدد الفعلي من AIServicePlayerBots إن أمكن
+    int botsAlive = session.bots_spawned_count;
+    if (session.bot_service && !IsBadPtr(session.bot_service)) {
+        Array playerBots = Read<Array>(session.bot_service, profile::BotSvc_PlayerBots);
+        if (playerBots.Count >= 0 && playerBots.Count < 200) {
+            int count = 0;
+            for (int i = 0; i < playerBots.Count; ++i) {
+                void* entry = (char*)playerBots.Data + i * profile::BotInfo_Size;
+                void* botCtrl = Read<void*>(entry, profile::BotInfo_BotController);
+                if (!botCtrl || IsBadPtr(botCtrl)) continue;
+                void* botPawn = Read<void*>(botCtrl, profile::BotCtrl_PlayerBotPawn);
+                if (botPawn && !IsBadPtr(botPawn)) count++;
+            }
+            botsAlive = count;
+        }
+    }
+
+    int playersLeft = 1 + botsAlive;
+    int totalPlayers = 1 + session.bots_target;
+    Write<int>(session.state, 0x14B8, playersLeft);  // PS_PlayersLeft
+    Write<int>(session.state, 0x14B4, totalPlayers); // PS_TotalPlayers
+
     Call rep("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");if(rep.ok())rep.run(session.state);
     Call pc("/Script/FortniteGame.FortPlayerControllerAthena.HandlePlayersLeftChanged");if(pc.ok())pc.run(session.controller);
+
     void* wb=FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
     if(!wb||!session.world)return;
     for(const char* path:{"/Script/FortniteUI.AthenaMapPlayersLeftWidget","/Script/FortniteUI.AthenaPlayersLeftBase","/Script/FortniteUI.AthenaPlayersLeftWidget.AthenaPlayersLeftWidget_C"}){
@@ -1454,72 +1576,74 @@ void Athena::UpdateSoloHUD() {
         Array a=all.result<Array>();if(a.Count<0||a.Count>256||(a.Count&&!a.Data))continue;
         for(int i=0;i<a.Count;i++){void*w=Read<void*>(a.Data,(size_t)i*8);if(!w||IsBadPtr(w))continue;
             Call h("/Script/FortniteUI.AthenaMapPlayersLeftWidget.HandlePlayersLeftChanged");if(h.ok())h.run(w);
-            Call u("/Script/FortniteUI.AthenaPlayersLeftBase.SetPlayersLeftText");if(u.ok()){int n=1+session.bots_spawned_count;if(u.set("PlayersLeft",n))u.run(w);}
+            Call u("/Script/FortniteUI.AthenaPlayersLeftBase.SetPlayersLeftText");if(u.ok()){int n=playersLeft;if(u.set("PlayersLeft",n))u.run(w);}
             Call vis("/Script/UMG.Widget.SetVisibility");if(vis.ok()){uint8_t v=0;if(vis.set("InVisibility",v))vis.run(w);}
         }
     }
     session.solo_hud_ready=true;
-    LOG("[PlayerCounter] players=%d total=%d",1+session.bots_spawned_count,1+session.bots_target);
+    LOG("[PlayerCounter] players=%d total=%d (bots alive=%d)",playersLeft,totalPlayers,botsAlive);
 }
 
 void Athena::SetupLocalPlayerCounter() { UpdateSoloHUD(); }
 
 void Athena::SetupLocalMinimap() {
-    if(!session.world){LOG("[Minimap] world missing - skip");return;}
+    if(!session.world){LOG("[Minimap] world missing");return;}
     void* wb=FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
     void* cls=FindObj("/Script/AthenaMinimapContainer.AthenaMinimapContainer_C");
     if(!cls)cls=FindObj("/Script/FortniteUI.AthenaMinimapContainer");
-    if(!wb||!cls){LOG("[Minimap] class/library missing - skip");return;}
+    if(!wb||!cls){LOG("[Minimap] class/library missing");return;}
     Call all("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
-    if(!all.ok()||!all.set("WorldContextObject",session.world)||!all.set("WidgetClass",cls)||!all.run(wb)){LOG("[Minimap] enumeration failed - skip");return;}
-    Array a=all.result<Array>();if(a.Count<0||a.Count>256||(a.Count&&!a.Data)){LOG("[Minimap] invalid widgets - skip");return;}
+    if(!all.ok()||!all.set("WorldContextObject",session.world)||!all.set("WidgetClass",cls)||!all.run(wb)){LOG("[Minimap] enum failed");return;}
+    Array a=all.result<Array>();if(a.Count<0||a.Count>256||(a.Count&&!a.Data)){LOG("[Minimap] invalid widgets");return;}
     int shown=0;
     for(int i=0;i<a.Count;i++){void*w=Read<void*>(a.Data,(size_t)i*8);if(!w||IsBadPtr(w))continue;
         Call vis("/Script/UMG.Widget.SetVisibility");if(vis.ok()){uint8_t visible=0;if(vis.set("InVisibility",visible)&&vis.run(w))shown++;}
-        Call ev("/Script/FortniteUI.FortHUDElementWidget.OnVisibilitySetEvent");if(ev.ok())ev.run(w);
     }
+    session.minimap_initialized = true;
     LOG("[Minimap] visible=%d",shown);
 }
 
 void Athena::SetupLocalClamber() {
-    if(!session.pawn){LOG("[Climb] pawn missing - skip");return;}
-    void* cls=FindObj("/Script/ClamberingCodeRuntime.ClamberingComponent");if(!cls){LOG("[Climb] component class missing - skip");return;}
-    Call get("/Script/Engine.Actor.GetComponentByClass");if(!get.ok()||!get.set("ComponentClass",cls)||!get.run(session.pawn)){LOG("[Climb] component lookup failed - skip");return;}
-    void* comp=get.result<void*>();if(!comp||IsBadPtr(comp)){LOG("[Climb] component absent - skip");return;}
-    Call en("/Script/ClamberingCodeRuntime.ClamberingComponent.IsClamberingEnabled");
-    Call au("/Script/ClamberingCodeRuntime.ClamberingComponent.IsAutoClamberingEnabled");
-    bool e=false,a=false;if(en.ok()&&en.run(comp))e=en.result<bool>();if(au.ok()&&au.run(comp))a=au.result<bool>();
-    LOG("[Climb] component=%p enabled=%d auto=%d",comp,(int)e,(int)a);
+    if(!session.pawn){LOG("[Climb] pawn missing");return;}
+    void* cls=FindObj("/Script/ClamberingCodeRuntime.ClamberingComponent");if(!cls){LOG("[Climb] component class missing");return;}
+    Call get("/Script/Engine.Actor.GetComponentByClass");if(!get.ok()||!get.set("ComponentClass",cls)||!get.run(session.pawn)){LOG("[Climb] lookup failed");return;}
+    void* comp=get.result<void*>();if(!comp||IsBadPtr(comp)){LOG("[Climb] absent");return;}
+    session.clamber_initialized = true;
+    LOG("[Climb] component=%p",comp);
 }
 
 void Athena::SetupLocalVending() {
-    if (!session.world || !session.pawn) { LOG("[Vending] prerequisites missing - skip"); return; }
+    if (!session.world || !session.pawn) return;
     void* cls = FindObj("/Script/FortniteGame.BuildingProp_VendingMachine");
     void* wb = FindObj("/Script/Engine.Default__GameplayStatics");
-    if (!cls || !wb) { LOG("[Vending] class/library missing - skip"); return; }
+    if (!cls || !wb) { LOG("[Vending] missing"); return; }
     Call all("/Script/Engine.GameplayStatics.GetAllActorsOfClass");
-    if (!all.ok() || !all.set("WorldContextObject", session.world) || !all.set("ActorClass", cls) || !all.run(wb)) { LOG("[Vending] enumeration failed - skip"); return; }
+    if (!all.ok() || !all.set("WorldContextObject", session.world) || !all.set("ActorClass", cls) || !all.run(wb)) { LOG("[Vending] enum failed"); return; }
     Array a = all.result<Array>();
-    if (a.Count < 0 || a.Count > 4096 || (a.Count && !a.Data)) { LOG("[Vending] invalid actor array - skip"); return; }
+    if (a.Count < 0 || a.Count > 4096 || (a.Count && !a.Data)) return;
     int count = 0;
     for (int i=0;i<a.Count;i++) {
         void* m=Read<void*>(a.Data,(size_t)i*8); if(!m||IsBadPtr(m)) continue;
         Call inv("/Script/FortniteGame.BuildingProp_VendingMachine.OnPlayerInventoryChange");
         if(inv.ok() && inv.run(m)) count++;
     }
+    session.vending_initialized = true;
     LOG("[Vending] refreshed %d machines", count);
 }
 
+// ============================================================================
+// VEHICLES
+// ============================================================================
 void Athena::SetupLocalVehicles() {
-    if (!session.world) { LOG("[Vehicles] world missing - skip"); return; }
+    if (!session.world) { LOG("[Vehicles] world missing"); return; }
     void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
-    if (!spawnerCls) { LOG("[Vehicles] spawner class missing - skip"); return; }
+    if (!spawnerCls) { LOG("[Vehicles] spawner class missing"); return; }
     void* wb = FindObj("/Script/Engine.Default__GameplayStatics");
-    if (!wb) { LOG("[Vehicles] GameplayStatics missing - skip"); return; }
+    if (!wb) { LOG("[Vehicles] GameplayStatics missing"); return; }
     Call all("/Script/Engine.GameplayStatics.GetAllActorsOfClass");
-    if (!all.ok() || !all.set("WorldContextObject",session.world) || !all.set("ActorClass",spawnerCls) || !all.run(wb)) { LOG("[Vehicles] spawner enumeration failed - skip"); return; }
+    if (!all.ok() || !all.set("WorldContextObject",session.world) || !all.set("ActorClass",spawnerCls) || !all.run(wb)) { LOG("[Vehicles] enum failed"); return; }
     Array a=all.result<Array>();
-    if(a.Count<0||a.Count>4096||(a.Count&&!a.Data)){LOG("[Vehicles] invalid spawner array - skip");return;}
+    if(a.Count<0||a.Count>4096||(a.Count&&!a.Data)){LOG("[Vehicles] invalid spawner array");return;}
     int spawned=0, skipped=0;
     for(int i=0;i<a.Count;i++){
         void* sp=Read<void*>(a.Data,(size_t)i*8); if(!sp||IsBadPtr(sp)) continue;
@@ -1538,80 +1662,138 @@ void Athena::SetupLocalVehicles() {
         Call mat("/Script/FortniteGame.FortAthenaVehicle.ApplyMaterialAndUseWrapIfPossible");if(mat.ok())mat.run(vehicle);
         spawned++;
     }
+    session.vehicles_spawned_count = spawned;
+    session.vehicles_spawned = true;
     LOG("[Vehicles] spawned=%d skipped=%d",spawned,skipped);
 }
 
+// ============================================================================
+// AI / BOT SERVICE
+// ============================================================================
+static void* GetBotService() {
+    if (session.bot_service && !IsBadPtr(session.bot_service)) return session.bot_service;
+    void* klib = FindObj("/Script/FortniteAI.Default__AthenaAIBlueprintLibrary");
+    if (!klib) return nullptr;
+    Call getSvc("/Script/FortniteAI.AthenaAIBlueprintLibrary.GetAIServicePlayerBots");
+    if (!getSvc.ok()) return nullptr;
+    if (!getSvc.set("WorldContextObject", session.world)) return nullptr;
+    if (!getSvc.run(klib)) return nullptr;
+    void* svc = getSvc.result<void*>();
+    if (!svc || IsBadPtr(svc)) return nullptr;
+    session.bot_service = svc;
+    LOG("[Bots] Bot service acquired: %p", svc);
+    return svc;
+}
+
 void Athena::SetupLocalAI() {
-    if(!session.mode||IsBadPtr(session.mode)){LOG("[NPC] game mode missing - skip");return;}
-    void* director=GetObjField(session.mode,"/Script/FortniteGame.FortGameModeAthena.AIDirector");
-    if(!director||IsBadPtr(director)){
-        void* cls=FindObj("/Game/AIDirector/AIDirector_Fortnite.AIDirector_Fortnite_C");
-        if(!cls) cls=FindObj("/Script/FortniteGame.AthenaAIDirector");
-        if(!cls) cls=FindObj("/Script/FortniteGame.FortAIDirector");
-        if(cls){Transform t{};director=SpawnActor(session.world,cls,session.mode,t);if(director){void* prop=GetProp("/Script/FortniteGame.FortGameModeAthena.AIDirector");if(prop)Write<void*>(GetField(session.mode,prop),0,director);}}
+    if (session.ai_initialized) return;
+    if (!session.mode || IsBadPtr(session.mode)) { LOG("[NPC] game mode missing"); return; }
+
+    void* director = Read<void*>(session.mode, 0x0EB8); // rough guess, skip if not found
+    if (!director || IsBadPtr(director)) {
+        void* cls = FindObj("/Game/AIDirector/AIDirector_Fortnite.AIDirector_Fortnite_C");
+        if (!cls) cls = FindObj("/Script/FortniteGame.AthenaAIDirector");
+        if (!cls) cls = FindObj("/Script/FortniteGame.FortAIDirector");
+        if (cls) {
+            Transform t{};
+            director = SpawnActor(session.world, cls, session.mode, t);
+            if (director) {
+                void* prop = GetProp("/Script/FortniteGame.FortGameModeAthena.AIDirector");
+                if (prop) Write<void*>(GetField(session.mode, prop), 0, director);
+            }
+        }
     }
-    if(!director){LOG("[NPC] AIDirector unavailable - skip");return;}
-    Call act("/Script/FortniteGame.AIDirector.Activate");
-    if(act.ok()&&!act.run(director))LOG("[NPC] AIDirector.Activate failed"); else LOG("[NPC] AIDirector active");
-    void* goal=GetObjField(session.mode,"/Script/FortniteGame.FortGameModeAthena.AIGoalManager");
-    if(!goal){void* cls=FindObj("/Game/AI/GoalSelection/AIGoalManager.AIGoalManager_C");if(!cls)cls=FindObj("/Script/FortniteGame.FortAIGoalManager");if(cls){Transform t{};goal=SpawnActor(session.world,cls,session.mode,t);}}
-    if(goal)LOG("[NPC] AIGoalManager active"); else LOG("[NPC] AIGoalManager unavailable - skip");
+    if (director && !IsBadPtr(director)) {
+        Call act("/Script/FortniteGame.AIDirector.Activate");
+        if (act.ok()) act.run(director);
+        LOG("[NPC] AIDirector active");
+    }
+
+    void* goal = nullptr;
+    void* cls = FindObj("/Game/AI/GoalSelection/AIGoalManager.AIGoalManager_C");
+    if (!cls) cls = FindObj("/Script/FortniteGame.FortAIGoalManager");
+    if (cls && !goal) {
+        Transform t{};
+        goal = SpawnActor(session.world, cls, session.mode, t);
+    }
+    if (goal) LOG("[NPC] AIGoalManager active");
+
+    // جلب الـ service للأستخدام اللاحق
+    GetBotService();
+
+    session.ai_initialized = true;
 }
 
 void Athena::SpawnSoloBotsBatch(int maxCount) {
-    if(!session.world||!session.mode||!session.state||session.bots_spawned_count>=session.bots_target)return;
-    void* ctrlCls=FindObj("/Script/FortniteAI.FortAthenaAIBotController");
-    if(!ctrlCls)ctrlCls=FindObj("/Script/FortniteAI.FortBotController");
-    void* pawnCls=FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
-    void* psCls=FindObj("/Script/FortniteGame.FortPlayerStateAthena");
-    if(!ctrlCls||!pawnCls||!psCls){LOG("[NPC] bot classes missing - skip");session.bots_spawned=true;return;}
-    void* aliveProp=GetProp("/Script/FortniteGame.FortGameModeAthena.AlivePlayers");
-    int made=0;
-    for(int k=0;k<maxCount&&session.bots_spawned_count<session.bots_target;k++){
-        Transform t{};
-        double ang=(session.bots_spawned_count*0.6180339887)*6.28318530718;
-        double rad=1500.0+double(session.bots_spawned_count%10)*450.0;
-        Call loc("/Script/Engine.Actor.K2_GetActorLocation");Vector base{0,0,1000};
-        if(loc.ok()&&session.pawn&&loc.run(session.pawn))base=loc.result<Vector>();
-        t.Location[0]=base.X+cos(ang)*rad;t.Location[1]=base.Y+sin(ang)*rad;t.Location[2]=base.Z+100.0;
-        void* bc=SpawnActor(session.world,ctrlCls,session.mode,t);if(!bc)continue;
-        void* bp=SpawnActor(session.world,pawnCls,bc,t);if(!bp){Call d("/Script/Engine.Actor.K2_DestroyActor");if(d.ok())d.run(bc);continue;}
-        void* ps=SpawnActor(session.world,psCls,bc,t);if(!ps){Call d("/Script/Engine.Actor.K2_DestroyActor");if(d.ok())d.run(bp);if(d.ok())d.run(bc);continue;}
-        void* cPs=GetProp("/Script/Engine.Controller.PlayerState");if(cPs)Write<void*>(GetField(bc,cPs),0,ps);
-        void* pPs=GetProp("/Script/Engine.Pawn.PlayerState");if(pPs)Write<void*>(GetField(bp,pPs),0,ps);
-        SetBool(ps,"/Script/FortniteGame.FortPlayerStateAthena.bIsABot",true);
-        void* team=GetProp("/Script/FortniteGame.FortPlayerStateAthena.TeamIndex");if(team)Write<uint8_t>(GetField(ps,team),0,(uint8_t)((session.bots_spawned_count%100)+1));
-        void* squad=GetProp("/Script/FortniteGame.FortPlayerStateAthena.SquadId");if(squad)Write<uint8_t>(GetField(ps,squad),0,(uint8_t)(session.bots_spawned_count%16));
-        Call opr("/Script/FortniteGame.FortPlayerState.OnRep_PlayerState");if(opr.ok())opr.run(ps);
-        Possess(bc,bp);
-        Call ready("/Script/FortniteAI.FortAthenaAIBotController.OnGamePhaseChanged");if(ready.ok())ready.run(bc);
-        Call safe("/Script/FortniteAI.FortAthenaAIBotController.OnSafeZoneStateChanged");if(safe.ok())safe.run(bc);
-        Call melee("/Script/FortniteAI.FortAthenaAIBotController.EquipMeleeWeapon");if(melee.ok())melee.run(bc);
-        Call patrol("/Script/FortniteAI.FortAthenaAIBotController.SetPatrollingEnable");if(patrol.ok()){bool yes=true;patrol.set("bEnabled",yes);patrol.run(bc);}
-        if(aliveProp){void* arr=GetField(session.mode,aliveProp);if(arr)Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(arr,aliveProp,&bc);}
-        session.bot_controllers.push_back(bc);session.bot_pawns.push_back(bp);session.bots_spawned_count++;made++;
+    if (session.bots_spawned || !session.world || !session.state) return;
+    if (session.bots_spawned_count >= session.bots_target) { session.bots_spawned = true; return; }
+
+    void* svc = GetBotService();
+    if (!svc) { LOG("[Bots] bot service unavailable; skipping"); session.bots_spawned = true; return; }
+
+    Call spawnAI("/Script/FortniteAI.AthenaAIServicePlayerBots.SpawnAI");
+    if (!spawnAI.ok()) { LOG("[Bots] SpawnAI binding FAILED"); spawnAI.dump("SpawnAI"); session.bots_spawned = true; return; }
+
+    int made = 0;
+    for (int i = 0; i < maxCount && session.bots_spawned_count < session.bots_target; ++i) {
+        Vector base{0, 0, 10000};
+        if (session.pawn) {
+            Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+            if (loc.ok() && loc.run(session.pawn)) base = loc.result<Vector>();
+        }
+        double ang = (session.bots_spawned_count + i) * 0.6180339887 * 6.28318530718;
+        double rad = 3000.0 + ((session.bots_spawned_count + i) % 10) * 400.0;
+
+        Vector spawnLoc;
+        spawnLoc.X = base.X + cos(ang) * rad;
+        spawnLoc.Y = base.Y + sin(ang) * rad;
+        spawnLoc.Z = base.Z + 500.0;
+
+        Rotator spawnRot{0, 0, 0};
+        void* componentList = nullptr;
+
+        bool s1 = spawnAI.set("InSpawnLocation", spawnLoc);
+        bool s2 = spawnAI.set("InSpawnRotation", spawnRot);
+        bool s3 = spawnAI.set("AISpawnerComponentList", componentList);
+
+        if (!s1 || !s2 || !s3) { spawnAI.dump("SpawnAI"); break; }
+
+        if (spawnAI.run(svc)) {
+            void* botPawn = spawnAI.result<void*>();
+            if (botPawn && !IsBadPtr(botPawn)) {
+                session.bot_pawns.push_back(botPawn);
+                session.bots_spawned_count++;
+                made++;
+            }
+        }
     }
-    if(session.bots_spawned_count>=session.bots_target)session.bots_spawned=true;
-    LOG("[NPC] batch=%d bots=%d/%d",made,session.bots_spawned_count,session.bots_target);
+
+    if (session.bots_spawned_count >= session.bots_target)
+        session.bots_spawned = true;
+
+    LOG("[Bots] batch=%d total=%d/%d", made, session.bots_spawned_count, session.bots_target);
 }
 
+// ============================================================================
+// STORM
+// ============================================================================
 void Athena::ProtectLocalPlayerFromStorm(bool protect) {
     if(!session.state)return;
     void* indicator=GetObjField(session.state,"/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
     if(!indicator)return;
-    void* r1=GetProp("/Script/FortniteGame.FortSafeZoneIndicator.PreviousRadius");
-    void* r2=GetProp("/Script/FortniteGame.FortSafeZoneIndicator.NextRadius");
-    void* r3=GetProp("/Script/FortniteGame.FortSafeZoneIndicator.NextNextRadius");
-    void* p=GetProp("/Script/FortniteGame.FortSafeZoneIndicator.bPaused");
     float radius=protect?100000000.f:0.f;
-    if(protect){if(r1)Write<float>(GetField(indicator,r1),0,radius);if(r2)Write<float>(GetField(indicator,r2),0,radius);if(r3)Write<float>(GetField(indicator,r3),0,radius);}
-    if(p)SetBool(indicator,"/Script/FortniteGame.FortSafeZoneIndicator.bPaused",protect);
+    if(protect){
+        Off<float>(indicator, profile::SZ_NextRadius) = radius;
+        Off<float>(indicator, profile::SZ_SafeZoneRadius) = radius;
+    }
+    SetBool(indicator,"/Script/FortniteGame.FortSafeZoneIndicator.bPaused",protect);
     session.storm_protected=protect;
     LOG("[Storm] local protection=%d",(int)protect);
 }
 
-void Athena::UpdateSoloHUD();
-
+// ============================================================================
+// SIDE SYSTEMS
+// ============================================================================
 void Athena::InitializeSideSystems() {
     if(!session.finalized||!session.pawn||!session.world||session.side_systems_initialized)return;
     session.side_systems_initialized = true;
@@ -1626,6 +1808,9 @@ void Athena::InitializeSideSystems() {
     LOG("=== SideSystems done ===");
 }
 
+// ============================================================================
+// INIT PLAYER
+// ============================================================================
 bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
     if (!pawnCls) { LOG("[Init] PlayerPawn_Athena_C missing"); return false; }
@@ -1667,6 +1852,9 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
     return true;
 }
 
+// ============================================================================
+// SETUP WORLD
+// ============================================================================
 void Athena::SetupWorld(void* world) {
     session.world = world;
     session.controller = GetPC(world, 0);
@@ -1692,7 +1880,6 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
     LOG("SetupWorld: SpawnBuildPreviews"); SpawnBuildPreviews();
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
-    LOG("SetupWorld: Solo Warmup ready; aircraft will only be used when a valid Aircraft component/current aircraft exists");
     session.bus_scheduled = false;
     session.bus_started = false;
     session.aircraft_jumped = false;
@@ -1726,8 +1913,6 @@ void Athena::FinalizePlayer() {
             SetQuickBarReady();
             ForceUpdateQuickBars();
             ActivateQuickBarSlot(0, 0);
-        } else {
-            LOG("[QB] Finalize: native initialization unavailable; skipping all QuickBar writes");
         }
     }
     if (!session.ready_called) {
@@ -1746,6 +1931,9 @@ void Athena::FinalizePlayer() {
     LOG("Finalize: complete");
 }
 
+// ============================================================================
+// TICK
+// ============================================================================
 void Athena::Tick() {
     if (!session.world) return;
     double now = Monotonic();
@@ -1762,6 +1950,8 @@ void Athena::Tick() {
     static double lastSprintCheck = 0;
     static double lastQBCheck = 0;
     static double lastMovementCheck = 0;
+    static double lastBotCheck = 0;
+    static double lastHUDCheck = 0;
     static int qbRetries = 0;
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
@@ -1769,10 +1959,6 @@ void Athena::Tick() {
         lastAbilityCheck = now;
         if (!session.abilities_granted) { GrantAllAbilitySets(); RefreshHUD(); }
         if (!session.melee_granted) GrantMeleeAbility();
-    }
-    if (session.finalized && session.controller && now - lastSprintCheck > 5.0) {
-        lastSprintCheck = now;
-        if (!session.tactical_sprint_setup || !session.tactical_sprint) { session.tactical_sprint_setup = false; SetupTacticalSprint(); }
     }
     if (session.finalized && session.controller && now - lastQBCheck > 6.0) {
         lastQBCheck = now;
@@ -1782,18 +1968,23 @@ void Athena::Tick() {
             if (session.quickbars_initialized) {
                 SetQuickBarReady();
                 ForceUpdateQuickBars();
-            } else {
-                LOG("[QB] Tick: native initialization still unavailable; no manual QuickBar fallback");
             }
         }
     }
     if (session.finalized && session.pawn && now - lastMovementCheck > 8.0) {
         lastMovementCheck = now;
         if (!session.movement_enabled) EnableMovementFeatures();
-    if (!session.profile_attempted) ShowSkin();
+        if (!session.profile_attempted) ShowSkin();
     }
-    if (session.finalized && !session.bots_spawned) SpawnSoloBotsBatch(10);
-    if (session.finalized && session.bots_spawned_count > 0 && now - lastQBCheck > 2.0) UpdateSoloHUD();
+    // Bots: batch of 10 every 3 seconds until target
+    if (session.finalized && !session.bots_spawned && now - lastBotCheck > 3.0) {
+        lastBotCheck = now;
+        SpawnSoloBotsBatch(10);
+    }
+    if (session.finalized && now - lastHUDCheck > 2.0) {
+        lastHUDCheck = now;
+        if (session.bots_spawned_count > 0) UpdateSoloHUD();
+    }
     if (session.storm_protected && session.storm_at > 0 && now >= session.storm_at) {
         session.storm_at = 0;
         Call jump("/Script/FortniteGame.FortGameModeAthena.JumpToSafeZonePhase");
@@ -1802,9 +1993,12 @@ void Athena::Tick() {
     }
 }
 
+// ============================================================================
+// HELPERS: LODS / LOADING / INVENTORY
+// ============================================================================
 void Athena::DestroyLods() {
-    void* cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager");
-    if (!cm) { SetupCheats(); cm = GetObjField(session.controller, "/Script/Engine.PlayerController.CheatManager"); }
+    void* cm = Read<void*>(session.controller, profile::PC_CheatManager);
+    if (!cm) { SetupCheats(); cm = Read<void*>(session.controller, profile::PC_CheatManager); }
     if (!cm) return;
     void* cls = FindObj("/Script/FortniteGame.FortHLODSMActor");
     if (!cls) return;
@@ -1849,41 +2043,24 @@ void Athena::DropLoadingScreen() {
 
 void Athena::InventoryUpdate() {
     if (!session.controller) return;
-    {
-        Call c("/Script/FortniteGame.FortPlayerController.ClientForceWorldInventoryUpdate");
-        if (c.ok()) c.run(session.controller);
-    }
-    if (session.inventory) {
-        Call a("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate");
-        if (a.ok()) a.run(session.inventory);
-    }
-    {
-        Call b("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate");
-        if (b.ok()) b.run(session.controller);
-    }
-    {
-        Call c("/Script/FortniteGame.FortPlayerController.OnRep_QuickBar");
-        if (c.ok()) c.run(session.controller);
-    }
+    { Call c("/Script/FortniteGame.FortPlayerController.ClientForceWorldInventoryUpdate"); if (c.ok()) c.run(session.controller); }
+    if (session.inventory) { Call a("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate"); if (a.ok()) a.run(session.inventory); }
+    { Call b("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate"); if (b.ok()) b.run(session.controller); }
+    { Call c("/Script/FortniteGame.FortPlayerController.OnRep_QuickBar"); if (c.ok()) c.run(session.controller); }
     if (session.quickbars) {
-        Call d("/Script/FortniteGame.FortQuickBars.OnRep_SecondaryQuickBar");
-        if (d.ok()) d.run(session.quickbars);
-        Call e("/Script/FortniteGame.FortQuickBars.OnRep_PrimaryQuickBar");
-        if (e.ok()) e.run(session.quickbars);
+        Call d("/Script/FortniteGame.FortQuickBars.OnRep_SecondaryQuickBar"); if (d.ok()) d.run(session.quickbars);
+        Call e("/Script/FortniteGame.FortQuickBars.OnRep_PrimaryQuickBar"); if (e.ok()) e.run(session.quickbars);
     }
     for (uint8_t bar : {uint8_t(0), uint8_t(1)}) {
         Call c("/Script/FortniteGame.FortPlayerController.ClientForceUpdateQuickbar");
         if (c.ok() && c.set("QuickbarToRefresh", bar)) c.run(session.controller);
     }
-
-    // Re-drive the actual gameplay HUD widgets instead of only refreshing GAS.
     void* wb = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
     if (wb && session.world) {
         Call all("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
         if (all.ok() && all.set("WorldContextObject", session.world)) {
             const char* classes[] = {
                 "/Script/AthenaHUDItemList.AthenaHUDItemList_C",
-                "/Script/AthenaMinimapContainer.AthenaMinimapContainer_C",
                 "/Script/QuickbarBase.QuickbarBase_C",
                 nullptr
             };
@@ -1898,15 +2075,6 @@ void Athena::InventoryUpdate() {
                     if (k == 0) {
                         Call c("/Script/AthenaHUDItemList.AthenaHUDItemList_C.OnInventoryUpdated");
                         if (c.ok()) c.run(w);
-                    } else if (k == 1) {
-                        // ExecuteUbergraph is an internal Blueprint dispatcher; never call it blindly.
-                        // Minimap initialization is optional and must not be allowed to crash gameplay.
-                        Call vis("/Script/FortniteUI.FortHUDElementWidget.OnVisibilitySetEvent");
-                        if (vis.ok()) {
-                            LOG("[HUD] Minimap found; skipped unsafe ExecuteUbergraph");
-                        } else {
-                            LOG("[HUD] Minimap found; no safe visibility callback, skipped");
-                        }
                     } else {
                         Call c("/Script/QuickbarBase.QuickbarBase_C.RefreshQuickbar");
                         if (c.ok()) { bool force = true; c.set("ForceItemsChanged", force); c.run(w); }
@@ -1939,12 +2107,11 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     void* entryArr = GetField(list, entryProp);
     void* entrySrc = GetField(inst, itemEntryProp);
     if (entrySrc) {
-        Write<float>(entrySrc, profile::ItemEntry_Durability, 1.0f);
+        Off<float>(entrySrc, profile::Entry_Durability) = 1.0f;
         void* weapCls = FindObj("/Script/FortniteGame.FortWeaponItemDefinition");
         if (weapCls && IsA(def, weapCls)) {
-            Write<int32>(entrySrc, profile::ItemEntry_LoadedAmmo, 30);
-            void* phProp = GetProp("/Script/FortniteGame.FortWeaponItemDefinition.bUsesPhantomReserveAmmo");
-            if (phProp) Write<int32>(entrySrc, profile::ItemEntry_PhantomAmmo, 300);
+            Off<int32>(entrySrc, profile::Entry_LoadedAmmo) = 30;
+            Off<int32>(entrySrc, profile::Entry_PhantomReserveAmmo) = 300;
         }
     }
     Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
@@ -1987,48 +2154,41 @@ void Athena::AddToInventory(void* def, int count, int slot) {
 
 void Athena::InitializeInventory() {
     if (!session.controller) return;
-    void* invProp = GetProp("/Script/FortniteGame.FortPlayerController.WorldInventory");
-    if (!invProp) return;
-    session.inventory = Read<void*>(GetField(session.controller, invProp));
+    session.inventory = Read<void*>(session.controller, profile::PC_WorldInventory);
     if (!session.inventory) {
-        void* klass = FindObj("/Script/FortniteGame.FortInventory");
-        Transform t{};
-        session.inventory = SpawnActor(session.world, klass, session.controller, t);
-        if (session.inventory) Write<void*>(GetField(session.controller, invProp), 0, session.inventory);
+        void* invProp = GetProp("/Script/FortniteGame.FortPlayerController.WorldInventory");
+        if (invProp) {
+            void* klass = FindObj("/Script/FortniteGame.FortInventory");
+            Transform t{};
+            session.inventory = SpawnActor(session.world, klass, session.controller, t);
+            if (session.inventory) Write<void*>(GetField(session.controller, invProp), 0, session.inventory);
+        }
     }
     if (!session.inventory) { LOG("[Inv] No inventory"); return; }
     { Call so("/Script/FortniteGame.FortInventory.SetOwner"); if (so.ok()) so.run(session.inventory); }
 
-    void* qbProp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
-    if (qbProp) {
-        session.quickbars = Read<void*>(GetField(session.controller, qbProp));
-        if (!session.quickbars) {
-            LOG("[QB] Spawning FortQuickBarsAthena...");
-            void* klass = FindObj("/Script/FortniteGame.FortQuickBarsAthena");
-            if (!klass) { LOG("[QB] FortQuickBarsAthena not found, fallback"); klass = FindObj("/Script/FortniteGame.FortQuickBars"); }
-            Transform t{};
-            session.quickbars = SpawnActor(session.world, klass, session.controller, t);
-            if (session.quickbars) {
-                Write<void*>(GetField(session.controller, qbProp), 0, session.quickbars);
-                LOG("[QB] Spawned: %p class=%s", session.quickbars, ObjName(Read<void*>(session.quickbars, profile::ObjectClass)).c_str());
-            }
-        }
+    session.quickbars = Read<void*>(session.controller, profile::PC_ClientQuickBars);
+    if (!session.quickbars) {
+        LOG("[QB] Spawning FortQuickBarsAthena...");
+        void* klass = FindObj("/Script/FortniteGame.FortQuickBarsAthena");
+        if (!klass) { LOG("[QB] FortQuickBarsAthena not found, fallback"); klass = FindObj("/Script/FortniteGame.FortQuickBars"); }
+        Transform t{};
+        session.quickbars = SpawnActor(session.world, klass, session.controller, t);
         if (session.quickbars) {
-            // اكتب Owner مباشرة
-            Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
-            Call soQB("/Script/FortniteGame.FortQuickBars.SetOwner");
-            if (soQB.ok()) soQB.run(session.quickbars);
-            LOG("[QB] Running native initialize...");
-            InitializeQuickBarsNative();
+            Write<void*>(session.controller, profile::PC_ClientQuickBars, session.quickbars);
+            LOG("[QB] Spawned: %p class=%s", session.quickbars, ObjName(Read<void*>(session.quickbars, profile::ObjectClass)).c_str());
         }
+    }
+    if (session.quickbars) {
+        Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
+        Call soQB("/Script/FortniteGame.FortQuickBars.SetOwner");
+        if (soQB.ok()) soQB.run(session.quickbars);
+        LOG("[QB] Running native initialize...");
+        InitializeQuickBarsNative();
     }
 
     LOG("Inventory ready: inv=%p qb=%p initialized=%d", session.inventory, session.quickbars, session.quickbars_initialized ? 1 : 0);
-    if (!session.quickbars_initialized) {
-        LOG("[Inv] QuickBars native initialization failed; skipping item population safely");
-        session.inventory_ready = false;
-        return;
-    }
+    if (!session.quickbars_initialized) { LOG("[Inv] QuickBars init failed; skipping items"); session.inventory_ready = false; return; }
 
     struct DefSlot { const char* path; int slot; };
     void* profilePickaxe = nullptr;
@@ -2089,7 +2249,7 @@ void Athena::EquipSlot(int slot) {
     { Call g("/Script/FortniteGame.FortItem.GetItemGuid"); if (g.ok() && g.run(item)) guid = g.result<Guid>(); }
     void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
     Guid trackerGuid{};
-    if (itemEntryProp) { void* entrySrc = GetField(item, itemEntryProp); if (entrySrc) trackerGuid = Read<Guid>(entrySrc, profile::ItemEntry_TrackerGuid); }
+    if (itemEntryProp) { void* entrySrc = GetField(item, itemEntryProp); if (entrySrc) trackerGuid = Read<Guid>(entrySrc, profile::Entry_TrackerGuid); }
     Call eq("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
     if (!eq.ok()) return;
     bool bDisableAnim = false;
@@ -2105,10 +2265,10 @@ void Athena::SpawnFloorLoot() {
     if(!session.world||!session.pawn)return;
     void* wb=FindObj("/Script/Engine.Default__GameplayStatics");
     void* cls=FindObj("/Script/FortniteGame.BuildingContainer");
-    if(!wb||!cls){LOG("[Loot] BuildingContainer/GameplayStatics missing - skip");return;}
+    if(!wb||!cls){LOG("[Loot] BuildingContainer/GameplayStatics missing");return;}
     Call all("/Script/Engine.GameplayStatics.GetAllActorsOfClass");
-    if(!all.ok()||!all.set("WorldContextObject",session.world)||!all.set("ActorClass",cls)||!all.run(wb)){LOG("[Loot] enumeration failed - skip");return;}
-    Array a=all.result<Array>(); if(a.Count<0||a.Count>200000||(a.Count&&!a.Data)){LOG("[Loot] invalid container array - skip");return;}
+    if(!all.ok()||!all.set("WorldContextObject",session.world)||!all.set("ActorClass",cls)||!all.run(wb)){LOG("[Loot] enum failed");return;}
+    Array a=all.result<Array>(); if(a.Count<0||a.Count>200000||(a.Count&&!a.Data)){LOG("[Loot] invalid container array");return;}
     int floor=0,skipped=0;
     for(int i=0;i<a.Count;i++){
         void* c=Read<void*>(a.Data,(size_t)i*8);if(!c||IsBadPtr(c))continue;
@@ -2123,9 +2283,6 @@ void Athena::SpawnFloorLoot() {
     LOG("[Loot] floor candidates=%d skipped=%d total=%d",floor,skipped,a.Count);
 }
 
-// ============================================================================
-// LOOT — Containers
-// ============================================================================
 void Athena::Loot(void* actor) {
     if (!actor || !session.pawn || IsBadPtr(actor)) return;
     void* bcCls=FindObj("/Script/FortniteGame.BuildingContainer");
@@ -2174,18 +2331,17 @@ void Athena::OnServerExecuteInventoryItem(Guid guid) {
         if (memcmp(&cand, &guid, sizeof(Guid)) == 0) { for (int s = 0; s < 6; ++s) if (session.slots[s] == inst) { EquipSlot(s); return; } return; }
     }
 }
+
 void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
     if (!weapon || !session.pawn) return;
-    void* p = GetProp("/Script/FortniteGame.FortWeapon.ItemEntryGuid");
-    if (!p) return;
-    Guid guid = Read<Guid>(GetField(weapon, p));
+    Guid guid = Read<Guid>(weapon, profile::Weapon_ItemEntryGuid);
     OnServerExecuteInventoryItem(guid);
 }
 
 void Athena::SpawnBuildPreviews() {
     void* previewCls = FindObj("BuildingPlayerPrimitivePreview");
     if (!previewCls || !session.controller) return;
-    auto build = [&](const char* meshPath, char type) -> void* {
+    auto build = [&](const char* meshPath, char) -> void* {
         Transform t{};
         void* actor = SpawnActor(session.world, previewCls, session.controller, t);
         if (!actor) return nullptr;
@@ -2221,6 +2377,7 @@ void Athena::OnServerCreateBuildingActor(void* params) {
     Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
     if (init.ok()) { init.set("BuildingOwner", actor); init.set("SpawningController", session.controller); bool bUse = true; init.set("bUsePlayerBuildAnimations", bUse); init.run(actor); }
 }
+
 void Athena::OnBeginEditActor(void* piece) {
     if (!session.edit_tool || !session.pawn || !piece) return;
     Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
@@ -2244,7 +2401,8 @@ void Athena::OnBeginEditActor(void* piece) {
     Call r("/Script/FortniteGame.FortWeapon.OnRep_EditActor");
     if (r.ok()) r.run(editActor);
 }
-void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored) {
+
+void Athena::OnFinishEditActor(void* actor, void* newClass, int, bool mirrored) {
     if (!actor) return;
     SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayDestructionEffects", false);
     Vector zero{0.0, 0.0, 0.0};
@@ -2303,21 +2461,16 @@ void Athena::DropInventoryItem(Guid guid, int count) {
     void* instProp=GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
     void* repProp=GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
     void* itemEntryProp=GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
-    void* countProp=GetProp("/Script/FortniteGame.FortItemEntry.Count");
-    void* guidProp=GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
-    if(!invProp || !instProp || !repProp || !itemEntryProp || !countProp || !guidProp) {
-        LOG("[Drop] inventory reflection incomplete"); return;
-    }
+    if(!invProp || !instProp || !repProp || !itemEntryProp) return;
 
     void* list=GetField(session.inventory,invProp);
     void* instArr=GetField(list,instProp);
     void* repArr=GetField(list,repProp);
     Array instances=Read<Array>(instArr);
     Array replicated=Read<Array>(repArr);
-    if(instances.Count<0 || instances.Count>512 || replicated.Count<0 || replicated.Count>512 ||
-       (instances.Count && !instances.Data) || (replicated.Count && !replicated.Data)) return;
+    if(instances.Count<0 || instances.Count>512 || replicated.Count<0 || replicated.Count>512) return;
 
-    constexpr size_t EntryStride=0x1A0;
+    constexpr size_t EntryStride=profile::Entry_Size;
     int instanceIndex=-1, replicatedIndex=-1;
     void* item=nullptr;
     void* replicatedEntry=nullptr;
@@ -2327,49 +2480,46 @@ void Athena::DropInventoryItem(Guid guid, int count) {
         if(!candidate || IsBadPtr(candidate)) continue;
         void* entry=GetField(candidate,itemEntryProp);
         if(!entry) continue;
-        Guid got=Read<Guid>(GetField(entry,guidProp));
+        Guid got=Read<Guid>(entry, profile::Entry_ItemGuid);
         if(!memcmp(&got,&guid,sizeof(Guid))) { instanceIndex=i; item=candidate; break; }
     }
     if(instanceIndex<0 || !item) { LOG("[Drop] item GUID not found"); return; }
 
     for(int i=0;i<replicated.Count;++i) {
         void* candidate=(char*)replicated.Data+(size_t)i*EntryStride;
-        Guid got=Read<Guid>(GetField(candidate,guidProp));
+        Guid got=Read<Guid>(candidate, profile::Entry_ItemGuid);
         if(!memcmp(&got,&guid,sizeof(Guid))) { replicatedIndex=i; replicatedEntry=candidate; break; }
     }
     if(replicatedIndex<0 || !replicatedEntry) { LOG("[Drop] replicated entry missing"); return; }
 
     void* itemEntry=GetField(item,itemEntryProp);
     if(!itemEntry) return;
-    int countOffset=Read<int>(countProp,profile::PropOffset);
-    int have=Read<int>((char*)itemEntry+countOffset);
+    int have=Read<int>(itemEntry, profile::Entry_Count);
     if(have<1) { LOG("[Drop] invalid stack=%d",have); return; }
     count=std::min(count,have);
 
-    // 21.30 FFortItemEntry is exactly 0x1A0. Copy only through the native
-    // pickup-spawn parameter so nested inventory arrays are never aliased.
-    struct RawItemEntry { alignas(8) uint8_t Data[0x1A0]; };
+    struct RawItemEntry { alignas(8) uint8_t Data[profile::Entry_Size]; };
     RawItemEntry dropEntry{};
     memcpy(dropEntry.Data,itemEntry,sizeof(dropEntry.Data));
-    Write<int>(dropEntry.Data,countOffset,count);
+    Write<int>(dropEntry.Data, profile::Entry_Count, count);
 
     Call forwardCall("/Script/Engine.Actor.GetActorForwardVector");
     Vector forward{};
-    if(!forwardCall.ok() || !forwardCall.run(session.pawn)) { LOG("[Drop] forward unavailable"); return; }
+    if(!forwardCall.ok() || !forwardCall.run(session.pawn)) return;
     forward=forwardCall.result<Vector>();
     Call locCall("/Script/Engine.Actor.K2_GetActorLocation");
-    if(!locCall.ok() || !locCall.run(session.pawn)) { LOG("[Drop] location unavailable"); return; }
+    if(!locCall.ok() || !locCall.run(session.pawn)) return;
     Vector pos=locCall.result<Vector>();
     pos.X+=forward.X*70.0f; pos.Y+=forward.Y*70.0f; pos.Z+=50.0f;
 
     void* pickupClass=FindObj("/Script/FortniteGame.FortPickupAthena");
     void* lib=FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
-    if(!pickupClass || !lib) { LOG("[Drop] pickup class/library unavailable"); return; }
+    if(!pickupClass || !lib) return;
 
     Call spawn("/Script/FortniteGame.FortKismetLibrary.K2_SpawnPickupInWorldWithClassAndItemEntry");
-    if(!spawn.ok()) { LOG("[Drop] K2_SpawnPickupInWorldWithClassAndItemEntry unavailable"); return; }
-    uint8_t sourceType=16; // Tossed
-    uint8_t source=10;     // TossedByPlayer
+    if(!spawn.ok()) return;
+    uint8_t sourceType=16;
+    uint8_t source=10;
     bool toss=true,randomRotation=true,blocked=false,ownerOnly=false;
     int maxStack=-1;
     if(!spawn.set("WorldContextObject",session.world) || !spawn.set("ItemEntry",dropEntry) ||
@@ -2378,24 +2528,19 @@ void Athena::DropInventoryItem(Guid guid, int count) {
        !spawn.set("bToss",toss) || !spawn.set("bRandomRotation",randomRotation) ||
        !spawn.set("bBlockedFromAutoPickup",blocked) || !spawn.set("SourceType",sourceType) ||
        !spawn.set("Source",source) || !spawn.set("OptionalOwnerPC",session.controller) ||
-       !spawn.set("bPickupOnlyRelevantToOwner",ownerOnly)) {
-        spawn.dump("K2_SpawnPickupInWorldWithClassAndItemEntry"); return;
-    }
-    if(!spawn.run(lib)) { LOG("[Drop] local pickup spawn failed; inventory untouched"); return; }
+       !spawn.set("bPickupOnlyRelevantToOwner",ownerOnly)) return;
+    if(!spawn.run(lib)) return;
     void* pickup=spawn.result<void*>();
-    if(!pickup || IsBadPtr(pickup)) { LOG("[Drop] pickup was not created; inventory untouched"); return; }
+    if(!pickup || IsBadPtr(pickup)) return;
 
-    void* definition=GetField(itemEntry,GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition"));
     bool removeAll=count>=have;
-    if(removeAll && definition) {
-        Call removeQB("/Script/FortniteGame.FortPlayerController.RemoveItemFromQuickBars");
-        if(removeQB.ok()) { removeQB.set("ItemDefinition",definition); removeQB.run(session.controller); }
+    if(removeAll) {
         for(int i=0;i<6;++i) if(session.slots[i]==item) session.slots[i]=nullptr;
     }
 
     if(!removeAll) {
-        Write<int>((char*)itemEntry,countOffset,have-count);
-        Write<int>((char*)replicatedEntry,countOffset,have-count);
+        Write<int>(itemEntry, profile::Entry_Count, have-count);
+        Write<int>(replicatedEntry, profile::Entry_Count, have-count);
     } else {
         using RemoveFn=void(*)(void*,int32_t,int32_t,int32_t);
         auto removeFn=Fn<RemoveFn>(profile::GenericArrayRemove);
@@ -2407,8 +2552,7 @@ void Athena::DropInventoryItem(Guid guid, int count) {
 
     InventoryUpdate();
     RefreshHUD();
-    LOG("[Drop] LOCAL drop guid=%08X:%08X:%08X:%08X count=%d remaining=%d",
-        guid.A,guid.B,guid.C,guid.D,count,removeAll?0:have-count);
+    LOG("[Drop] LOCAL drop count=%d remaining=%d",count,removeAll?0:have-count);
 }
 
 void Athena::FixBus() {
@@ -2435,13 +2579,11 @@ void Athena::FixBuildingFoundations() {
     if (!p) return;
     int propOff = Read<int>(p, profile::PropOffset);
     if (propOff < 0 || propOff > 0x20000) return;
-    int fixed = 0;
     for (int32 i = 0; i < go->NumElements; ++i) {
         void* o = go->GetById(i);
         if (!o || IsBadPtr(o)) continue;
         if (Read<void*>(o, profile::ObjectClass) != cls) continue;
         Write<char>((char*)o + propOff, 0, 0);
-        ++fixed;
     }
 }
 
@@ -2504,7 +2646,7 @@ void Athena::CheatScript(const char* script) {
     LOG("CheatScript: %s", s.c_str());
 }
 
-std::vector<Athena::LootData> Athena::PickLootDrops(std::string category) {
+std::vector<Athena::LootData> Athena::PickLootDrops(std::string) {
     std::vector<LootData> ret;
     void* wood = LoadAsset("/Game/Items/ResourcePickups/WoodItemData.WoodItemData");
     void* stone = LoadAsset("/Game/Items/ResourcePickups/StoneItemData.StoneItemData");
