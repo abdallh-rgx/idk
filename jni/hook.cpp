@@ -1,7 +1,6 @@
 // ============================================================================
-// EraCH3 v13.1 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE FIX: Erbium-style aircraft phase, safe HUD, delayed bus
-// Build fixes: added Call::result_data, Session::ai_initialized
+// EraCH3 v14.0 — Fortnite 21.30 CL-21088273 Android
+// FIXED: Native UFunction calls, correct paths, correct offsets from SDK 21.30
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -55,11 +54,11 @@ using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=
 using TCHAR=char16_t;
 
 // ============================================================================
-// PROFILE
+// PROFILE (RVAs for Fortnite 21.30 Android)
 // ============================================================================
 namespace profile {
 constexpr uintptr_t ProcessEvent         = 0x07611B5C;
-constexpr uintptr_t StaticFindObject     = 0x0762A664;
+constexpr uintptr_t StaticObjects        = 0x0762A664;
 constexpr uintptr_t StaticLoadObject     = 0x0761C568;
 constexpr uintptr_t StaticLoadClass      = 0x0762CFB8;
 constexpr uintptr_t NameAppendString     = 0x074937CC;
@@ -80,6 +79,7 @@ constexpr uintptr_t Realloc              = 0x0735E520;
 constexpr uintptr_t CopyScriptStruct     = 0x07535848;
 constexpr uintptr_t GetInterfaceAddress  = 0x0761AA88;
 
+// Struct offsets (UE4 Standard)
 constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
@@ -102,6 +102,7 @@ constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
 constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 
+// Actor Offsets
 constexpr unsigned AActor_Owner             = 0x0138;
 constexpr unsigned PC_PlayerState           = 0x0278;
 constexpr unsigned PC_CheatManager          = 0x03D8;
@@ -136,6 +137,7 @@ constexpr unsigned Weapon_ItemEntryGuid     = 0x0B18;
 constexpr unsigned Pickup_PrimaryPickupItemEntry = 0x02F8;
 constexpr unsigned Pickup_bPickedUp_Byte         = 0x0590;
 
+// SafeZone Offsets (from SDK 21.30)
 constexpr unsigned SZ_SafeZoneRadius            = 0x0284;
 constexpr unsigned SZ_NextRadius                = 0x02E0;
 constexpr unsigned SZ_SafeZoneStartShrinkTime   = 0x0288;
@@ -143,6 +145,7 @@ constexpr unsigned SZ_SafeZoneFinishShrinkTime  = 0x028C;
 constexpr unsigned SZ_CurrentPhase              = 0x0290;
 constexpr unsigned SZ_PhaseCount                = 0x0294;
 
+// Aircraft Offsets
 constexpr unsigned Aircraft_FlightInfo          = 0x0318;
 constexpr unsigned Aircraft_FlightStartTime     = 0x0360;
 constexpr unsigned Aircraft_FlightEndTime       = 0x0364;
@@ -151,6 +154,7 @@ constexpr unsigned Aircraft_DropEndTime         = 0x036C;
 constexpr unsigned Aircraft_FlightElapsedTime   = 0x0370;
 constexpr unsigned Aircraft_ReplicatedFlightTimestamp = 0x0374;
 
+// Item Entry Offsets
 constexpr unsigned Entry_ItemDefinition      = 0x0000;
 constexpr unsigned Entry_Count               = 0x0014;
 constexpr unsigned Entry_Durability          = 0x0024;
@@ -175,10 +179,12 @@ constexpr unsigned CMC_MaxSwimSpeed   = 0x01F0;
 constexpr unsigned CMC_JumpZVelocity  = 0x0170;
 constexpr unsigned CMC_GravityScale   = 0x0168;
 
-constexpr unsigned GS_GamePhase             = 0x14AC;
-constexpr unsigned GS_GamePhaseStep         = 0x14AD;
+// CORRECTED: GamePhase offset from SDK 21.30 (was 0x14AC, now 0x2150)
+constexpr unsigned GS_GamePhase             = 0x2150;
+constexpr unsigned GS_GamePhaseStep         = 0x2381;
 constexpr unsigned GS_PlayersLeft           = 0x14B8;
 constexpr unsigned GS_TotalPlayers          = 0x14B4;
+constexpr unsigned GS_SafeZoneIndicator     = 0x19A8;
 
 constexpr unsigned BotCtrl_PlayerBotPawn       = 0x05E8;
 constexpr unsigned BotSvc_PlayerBots           = 0x0B50;
@@ -193,7 +199,7 @@ constexpr unsigned TacticalSprint_Flags        = 0xC0;
 extern "C" int DobbyHook(void* target, void* replace, void** origin);
 
 // ============================================================================
-// MEMORY
+// MEMORY HELPERS
 // ============================================================================
 static inline bool IsBadPtr(const void* p) {
     if (!p) return true;
@@ -203,12 +209,15 @@ static inline bool IsBadPtr(const void* p) {
     if ((v & 0x7) != 0) return true;
     return false;
 }
+
 template<class T> static T Read(const void* p, size_t off = 0) {
     T r{}; if (p) memcpy(&r, (const char*)p + off, sizeof(T)); return r;
 }
+
 template<class T> static void Write(void* p, size_t off, const T& v) {
     if (p) memcpy((char*)p + off, &v, sizeof(T));
 }
+
 template<typename T>
 static T& Off(void* base, unsigned offset) {
     return *reinterpret_cast<T*>(reinterpret_cast<char*>(base) + offset);
@@ -221,22 +230,29 @@ static thread_local bool g_internal = false;
 struct Guard { bool s = g_internal; Guard() { g_internal = true; } ~Guard() { g_internal = s; } };
 template<class F> static F Fn(uintptr_t rva) { return reinterpret_cast<F>(g_base + rva); }
 
+// ============================================================================
+// TYPES (CORRECTED for UE4 Android - float not double)
+// ============================================================================
 struct FStringNative { TCHAR* Data; int32 Count; int32 Max; };
 struct FName         { uint32 CompIdx; uint32 DispIdx; };
 struct Array         { void* Data; int32 Count; int32 Max; };
 struct Guid          { uint32 A, B, C, D; };
-struct Vector        { double X, Y, Z; };
-struct Rotator       { double Pitch, Yaw, Roll; };
 
+// CORRECTED: Vector is float (12 bytes) not double (24 bytes)
+struct Vector        { float X, Y, Z; };
+struct Rotator       { float Pitch, Yaw, Roll; };
+
+// CORRECTED: Transform is 48 bytes (float) not 96 bytes (double)
 struct alignas(16) Transform {
-    double Rotation[4]{0, 0, 0, 1};
-    double Location[3]{0, 0, 0};
-    uint8_t _padL[8]{};
-    double Scale[3]{1, 1, 1};
-    uint8_t _padS[8]{};
+    float Rotation[4]{0, 0, 0, 1};
+    float Location[3]{0, 0, 0};
+    uint8_t _padL[4]{};
+    float Scale[3]{1, 1, 1};
+    uint8_t _padS[4]{};
 };
-static_assert(sizeof(Vector) == 24, "Vector LWC");
-static_assert(sizeof(Transform) == 96, "Transform LWC");
+
+static_assert(sizeof(Vector) == 12, "Vector must be 12 bytes (float)");
+static_assert(sizeof(Transform) == 48, "Transform must be 48 bytes (float)");
 
 struct FUObjectItem { void* Object; int32 Flags; int32 Cluster; int32 Serial; };
 struct GObjects_t {
@@ -256,10 +272,11 @@ struct GObjects_t {
         return chunk[wi].Object;
     }
 };
+
 struct TScriptInterface { void* Object; void* Interface; };
 
 // ============================================================================
-// FORWARD DECLS
+// FORWARD DECLARATIONS
 // ============================================================================
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
@@ -292,6 +309,7 @@ static bool SubclassOfFast(void* klass, void* targetClass) {
     }
     return false;
 }
+
 static bool IsA(void* obj, void* type) {
     if (!obj || !type || IsBadPtr(obj) || IsBadPtr(type)) return false;
     void* klass = Read<void*>(obj, profile::ObjectClass);
@@ -303,15 +321,18 @@ static bool IsA(void* obj, void* type) {
 // STRINGS
 // ============================================================================
 static std::u16string ToWide(const std::string& s) { return std::u16string(s.begin(), s.end()); }
+
 static std::string Narrow(const char16_t* s, int max) {
     std::string out;
     if (s) for (int i = 0; i < max && s[i]; ++i) out.push_back(s[i] < 128 ? (char)s[i] : '?');
     return out;
 }
+
 static void* FindObj(const std::string& path) {
     auto w = ToWide(path);
-    return Fn<void*(*)(void*, void*, const char16_t*, bool)>(profile::StaticFindObject)(nullptr, nullptr, w.c_str(), false);
+    return Fn<void*(*)(void*, void*, const char16_t*, bool)>(profile::StaticObjects)(nullptr, nullptr, w.c_str(), false);
 }
+
 static bool SafeFieldName(void* field, uint32 nameOff, std::string& out) {
     if (!field || IsBadPtr(field)) return false;
     uint32 compIdx = Read<uint32>(field, nameOff + 0);
@@ -324,6 +345,7 @@ static bool SafeFieldName(void* field, uint32 nameOff, std::string& out) {
     if (ns.Data) Fn<void(*)(void*)>(profile::Free)(ns.Data);
     return true;
 }
+
 static std::string ObjName(void* obj) {
     if (!obj || IsBadPtr(obj)) return {};
     void* klass = Read<void*>(obj, profile::ObjectClass);
@@ -349,7 +371,7 @@ static std::string ObjName(void* obj) {
 }
 
 // ============================================================================
-// PROPS
+// PROPERTIES
 // ============================================================================
 static void* GetProp(const char* path) {
     if (!path) return nullptr;
@@ -379,14 +401,17 @@ static void* GetProp(const char* path) {
     }
     return nullptr;
 }
+
 static void* GetPropEx(const char* a, const char* b) {
     if (void* p = GetProp(a)) return p;
     return b ? GetProp(b) : nullptr;
 }
+
 static void* GetField(void* obj, void* prop) {
     if (!obj || !prop) return nullptr;
     return (char*)obj + Read<int>(prop, profile::PropOffset);
 }
+
 static void SetBool(void* obj, const char* path, bool enabled) {
     void* p = GetProp(path);
     if (!p || !obj) return;
@@ -397,6 +422,7 @@ static void SetBool(void* obj, const char* path, bool enabled) {
     auto dst = (uint8_t*)GetField(obj, p) + byte;
     *dst = enabled ? (*dst | mask) : (*dst & ~mask);
 }
+
 static void* GetObjField(void* obj, const char* path) {
     void* p = GetProp(path);
     if (!p || !obj) return nullptr;
@@ -416,7 +442,7 @@ static Tick_t orig_Tick = nullptr;
 static Exec_t orig_Exec = nullptr;
 
 // ============================================================================
-// CALL
+// CALL (UFunction Invocation)
 // ============================================================================
 class Call {
     void* m_func = nullptr;
@@ -424,6 +450,7 @@ class Call {
     std::vector<Param> m_params;
     alignas(16) std::array<uint8_t, 8192> m_data{};
     bool m_valid = false;
+    
     void add_param(void* p, uint64_t flags, int total, bool ffield) {
         if (!(flags & profile::CPF_Parm)) return;
         int off = Read<int>(p, profile::PropOffset);
@@ -434,6 +461,7 @@ class Call {
         if (!SafeFieldName(p, nameOff, pname)) return;
         m_params.push_back({pname, off, sz, flags});
     }
+    
 public:
     explicit Call(const char* path) {
         m_func = FindObj(path);
@@ -452,8 +480,10 @@ public:
         }
         m_valid = (total == 0) || !m_params.empty();
     }
+    
     bool ok() const { return m_valid; }
     void* func() const { return m_func; }
+    
     template<class T> bool set(const char* key, const T& value) {
         for (auto& p : m_params)
             if (p.name == key && p.size == (int)sizeof(T)) {
@@ -462,6 +492,7 @@ public:
             }
         return false;
     }
+    
     bool set_bytes(const char* key, const void* src, size_t size) {
         if (!src || size == 0) return false;
         for (auto& p : m_params)
@@ -471,18 +502,21 @@ public:
             }
         return false;
     }
+    
     const void* result_data(size_t size) const {
         for (auto& p : m_params)
             if ((p.flags & profile::CPF_ReturnParm) && p.size == (int)size)
                 return m_data.data() + p.offset;
         return nullptr;
     }
+    
     template<class T> T result() const {
         for (auto& p : m_params)
             if ((p.flags & profile::CPF_ReturnParm) && p.size == (int)sizeof(T))
                 return Read<T>(m_data.data(), p.offset);
         return {};
     }
+    
     bool run(void* object) {
         if (!m_valid || !object || !orig_PE) return false;
         if (IsBadPtr(object) || IsBadPtr(m_func)) return false;
@@ -493,7 +527,7 @@ public:
 };
 
 // ============================================================================
-// ASSETS
+// ASSETS & SPAWNING
 // ============================================================================
 static void* LoadAsset(const std::string& path,
                        const char* type_path = "/Script/FortniteGame.FortItemDefinition") {
@@ -504,6 +538,7 @@ static void* LoadAsset(const std::string& path,
     return Fn<void*(*)(void*, void*, const char16_t*, const char16_t*, uint32_t, void*, bool, void*)>(
         profile::StaticLoadObject)(type, nullptr, s.c_str(), nullptr, 0, nullptr, true, nullptr);
 }
+
 static void* LoadClass(const char* path, const char* base_path = "/Script/Engine.Actor") {
     if (void* r = FindObj(path)) return r;
     auto s = ToWide(path);
@@ -512,10 +547,12 @@ static void* LoadClass(const char* path, const char* base_path = "/Script/Engine
     return Fn<void*(*)(void*, void*, const char16_t*, const char16_t*, uint32_t, void*)>(
         profile::StaticLoadClass)(parent, nullptr, s.c_str(), nullptr, 0, nullptr);
 }
+
 static void* GetPC(void* world, int index = 0) {
     if (!world || IsBadPtr(world)) return nullptr;
     return Fn<void*(*)(void*, int)>(profile::GetPlayerController)(world, index);
 }
+
 static void* GetPawn(void* controller) {
     if (!controller || IsBadPtr(controller)) return nullptr;
     static void* pawnProp = nullptr;
@@ -524,6 +561,7 @@ static void* GetPawn(void* controller) {
     if (!pawnProp) return nullptr;
     return Read<void*>(GetField(controller, pawnProp));
 }
+
 static void Possess(void* controller, void* pawn) {
     if (!controller || !pawn) return;
     Call c("/Script/Engine.Controller.Possess");
@@ -531,17 +569,20 @@ static void Possess(void* controller, void* pawn) {
     if (!c.set("InPawn", pawn)) return;
     c.run(controller);
 }
+
 static void* SpawnActor(void* world, void* klass, void* owner, const Transform& t) {
     if (!world || !klass || IsBadPtr(world) || IsBadPtr(klass)) return nullptr;
     void* actor = Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
         profile::BeginSpawn)(world, klass, &t, 1, owner);
     return actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
 }
+
 static void* ResolveInterface(void* object, void* ifaceClass) {
     if (!object || !ifaceClass) return nullptr;
     using Fn_t = void*(*)(void*, void*);
     return ((Fn_t)(g_base + profile::GetInterfaceAddress))(object, ifaceClass);
 }
+
 static bool IsStandaloneWorld(void* world) {
     if (!world || IsBadPtr(world)) return false;
     return Fn<bool(*)(void*)>(profile::IsStandalone)(world);
@@ -566,7 +607,7 @@ static void* GetASC(void* actor) {
 }
 
 // ============================================================================
-// SESSION
+// SESSION STATE
 // ============================================================================
 struct Session {
     void* world = nullptr;
@@ -636,7 +677,7 @@ static double Monotonic() {
 }
 
 // ============================================================================
-// ATHENA
+// ATHENA NAMESPACE (Forward Declarations)
 // ============================================================================
 namespace Athena {
     void SetupWorld(void* world);
@@ -866,11 +907,14 @@ void Athena::BuildQuickBarsManually() {
     LOG("[QB] bound=%d", bound);
     session.quickbars_initialized = (bound > 0);
 }
+
 void Athena::InitializeQuickBarsNative() {
     LOG("[QB] native disabled");
     session.quickbars_initialized = false;
 }
+
 void Athena::SetQuickBarReady() {}
+
 void Athena::ActivateQuickBarSlot(uint8_t bar, int slot) {
     if (!session.controller) return;
     Call act("/Script/FortniteGame.FortPlayerController.ClientActivateSlot");
@@ -882,6 +926,7 @@ void Athena::ActivateQuickBarSlot(uint8_t bar, int slot) {
         !act.set("bForceExecution", bf)) return;
     act.run(session.controller);
 }
+
 void Athena::ForceUpdateQuickBars() {
     if (!session.controller) return;
     for (uint8_t bar : {(uint8_t)0, (uint8_t)1}) {
@@ -940,7 +985,7 @@ void Athena::ApplySprintSpeed() {
 }
 
 // ============================================================================
-// AIRCRAFT
+// AIRCRAFT (FIXED: Using StartAircraftPhase instead of FlightInfos)
 // ============================================================================
 void Athena::StartAircraftPhase() { SpawnBattleBus(); }
 void Athena::OnAircraftJump() { HandleJumpFromHudStart(); }
@@ -952,130 +997,26 @@ void Athena::SpawnBattleBus() {
 
     LOG("[Bus] === StartAircraftPhase ===");
 
-    void* mapInfo = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.MapInfo");
-    if (!mapInfo) { LOG("[Bus] no MapInfo"); return; }
-
-    void* flightArrProp = GetProp("/Script/FortniteGame.AthenaMapInfo.FlightInfos");
-    if (!flightArrProp) { LOG("[Bus] no FlightInfos prop"); return; }
-    void* flightArrField = GetField(mapInfo, flightArrProp);
-    if (!flightArrField) { LOG("[Bus] no flight array"); return; }
-    Array flights = Read<Array>(flightArrField);
-    LOG("[Bus] FlightInfos count=%d", flights.Count);
-    if (flights.Count < 1 || !flights.Data) { LOG("[Bus] no FlightInfo"); return; }
-    void* flightInfoPtr = flights.Data;
-
-    void* aircraftClsProp = GetProp("/Script/FortniteGame.AthenaMapInfo.AircraftClass");
-    void* aircraftCls = nullptr;
-    if (aircraftClsProp) aircraftCls = Read<void*>(GetField(mapInfo, aircraftClsProp));
-    if (!aircraftCls || IsBadPtr(aircraftCls))
-        aircraftCls = LoadClass("/Game/Athena/Aircraft/B_Athena_Aircraft.B_Athena_Aircraft_C",
-                                "/Script/FortniteGame.FortAthenaAircraft");
-    if (!aircraftCls || IsBadPtr(aircraftCls)) { LOG("[Bus] no aircraft class"); return; }
-    LOG("[Bus] class=%s", ObjName(aircraftCls).c_str());
-
-    void* aircraft = nullptr;
-    Call spawnAircraft("/Script/FortniteGame.FortAthenaAircraft.SpawnAircraft");
-    if (spawnAircraft.ok()) {
-        spawnAircraft.set("WorldContextObject", session.world);
-        spawnAircraft.set("AircraftClass", aircraftCls);
-        spawnAircraft.set_bytes("FlightInfo", flightInfoPtr, 0x60);
-        void* cdo = FindObj("/Script/FortniteGame.Default__FortAthenaAircraft");
-        if (cdo && spawnAircraft.run(cdo)) {
-            aircraft = spawnAircraft.result<void*>();
-            if (aircraft && IsBadPtr(aircraft)) aircraft = nullptr;
-            LOG("[Bus] native aircraft=%p", aircraft);
+    // CORRECTED: Use native StartAircraftPhase function instead of manual FlightInfos manipulation
+    Call startAircraft("/Script/FortniteGame.FortGameModeAthena.StartAircraftPhase");
+    if (startAircraft.ok() && startAircraft.run(session.mode)) {
+        LOG("[Bus] StartAircraftPhase called successfully");
+        session.aircraft_phase_started = true;
+        session.aircraft = nullptr; // Will be set by the game
+    } else {
+        LOG("[Bus] StartAircraftPhase failed or not found");
+        // Fallback: Try to manually set GamePhase to Aircraft (3)
+        void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
+        if (gp) {
+            uint8_t phase = 3; // Aircraft
+            Write<uint8_t>(GetField(session.state, gp), 0, phase);
+            Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
+            if (n.ok()) { uint8_t old = 2; n.set("OldGamePhase", old); n.run(session.state); }
+            LOG("[Bus] GamePhase manually set to Aircraft (3)");
+            session.aircraft_phase_started = true;
         }
     }
 
-    if (!aircraft) {
-        LOG("[Bus] fallback spawn via SpawnActor");
-        Transform t{};
-        t.Location[0] = 0.0;
-        t.Location[1] = 0.0;
-        t.Location[2] = 25000.0;
-        t.Scale[0] = t.Scale[1] = t.Scale[2] = 1.0;
-        aircraft = SpawnActor(session.world, aircraftCls, session.state, t);
-        LOG("[Bus] fallback aircraft=%p", aircraft);
-    }
-    if (!aircraft || IsBadPtr(aircraft)) { LOG("[Bus] spawn failed"); return; }
-    session.aircraft = aircraft;
-
-    float now = (float)Monotonic();
-    Off<float>(aircraft, profile::Aircraft_FlightStartTime)   = now;
-    Off<float>(aircraft, profile::Aircraft_FlightEndTime)     = now + 60.0f;
-    Off<float>(aircraft, profile::Aircraft_DropStartTime)     = now + 5.0f;
-    Off<float>(aircraft, profile::Aircraft_DropEndTime)       = now + 40.0f;
-    Off<float>(aircraft, profile::Aircraft_FlightElapsedTime) = 0.0f;
-    Off<float>(aircraft, profile::Aircraft_ReplicatedFlightTimestamp) = now;
-
-    void* arrProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircrafts");
-    if (arrProp) {
-        void* arrField = GetField(session.state, arrProp);
-        if (arrField) {
-            Array a = Read<Array>(arrField);
-            if (a.Count == 0) {
-                Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(arrField, arrProp, &aircraft);
-                LOG("[Bus] added to Aircrafts[]");
-            }
-        }
-    }
-    void* singleProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircraft");
-    if (singleProp) Write<void*>(GetField(session.state, singleProp), 0, aircraft);
-
-    LOG("[Bus] destroying local pawn %p", session.pawn);
-    if (session.pawn && !IsBadPtr(session.pawn)) {
-        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone", true);
-        Call safe("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInsideSafeZone");
-        if (safe.ok()) safe.run(session.pawn);
-        Call destroy("/Script/Engine.Actor.K2_DestroyActor");
-        if (destroy.ok()) destroy.run(session.pawn);
-    }
-    session.pawn = nullptr;
-
-    LOG("[Bus] spawning skydive pawn");
-    void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
-    if (pawnCls) {
-        Transform t{};
-        t.Location[0] = 0.0;
-        t.Location[1] = 0.0;
-        t.Location[2] = 25000.0;
-        t.Scale[0] = t.Scale[1] = t.Scale[2] = 1.0;
-        void* newPawn = SpawnActor(session.world, pawnCls, session.controller, t);
-        if (newPawn && !IsBadPtr(newPawn)) {
-            session.pawn = newPawn;
-            SetBool(newPawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", true);
-            SetBool(newPawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydivingFromBus", true);
-            SetBool(newPawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-            Possess(session.controller, newPawn);
-
-            Call rc("/Script/Engine.PlayerController.ClientRestart");
-            if (rc.ok()) { rc.set("NewPawn", newPawn); rc.run(session.controller); }
-
-            Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
-            if (cam.ok()) {
-                cam.set("NewViewTarget", newPawn);
-                float blend = 0.5f;
-                cam.set("BlendTime", blend);
-                cam.run(session.controller);
-            }
-            LOG("[Bus] new skydive pawn %p", newPawn);
-        }
-    }
-
-    void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
-    if (gp) {
-        uint8_t phase = 3;
-        Write<uint8_t>(GetField(session.state, gp), 0, phase);
-        Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
-        if (n.ok()) { uint8_t old = 2; n.set("OldGamePhase", old); n.run(session.state); }
-    }
-    void* stepProp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhaseStep");
-    if (stepProp) {
-        uint8_t s = 4;
-        Write<uint8_t>(GetField(session.state, stepProp), 0, s);
-    }
-
-    session.aircraft_phase_started = true;
     session.storm_at = Monotonic() + 90.0;
     LOG("[Bus] aircraft phase active");
 }
@@ -1087,7 +1028,7 @@ void Athena::HandleJumpFromHudStart() {
 
     void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
     if (gp) {
-        uint8_t phase = 4;
+        uint8_t phase = 4; // SafeZones
         Write<uint8_t>(GetField(session.state, gp), 0, phase);
         Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
         if (n.ok()) { uint8_t old = 3; n.set("OldGamePhase", old); n.run(session.state); }
@@ -1355,6 +1296,7 @@ void Athena::UpdateSoloHUD() {
     Call pc("/Script/FortniteGame.FortPlayerControllerAthena.HandlePlayersLeftChanged");if(pc.ok())pc.run(session.controller);
     session.solo_hud_ready=true;
 }
+
 void Athena::SetupLocalPlayerCounter() { UpdateSoloHUD(); }
 
 void Athena::SetupLocalMinimap() {
@@ -1403,37 +1345,43 @@ void Athena::SetupLocalVending() {
     session.vending_initialized = true;
 }
 
+// ============================================================================
+// VEHICLES (FIXED: Using CheatManager.SpawnVehicle)
+// ============================================================================
 void Athena::SetupLocalVehicles() {
-    if (!session.world) return;
-    void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
-    if (!spawnerCls) return;
-    void* wb = FindObj("/Script/Engine.Default__GameplayStatics");
-    if (!wb) return;
-    Call all("/Script/Engine.GameplayStatics.GetAllActorsOfClass");
-    if (!all.ok() || !all.set("WorldContextObject",session.world) ||
-        !all.set("ActorClass",spawnerCls) || !all.run(wb)) return;
-    Array a=all.result<Array>();
-    if(a.Count<0||a.Count>4096||(a.Count&&!a.Data))return;
-    int spawned=0;
-    for(int i=0;i<a.Count;i++){
-        void* sp=Read<void*>(a.Data,(size_t)i*8); if(!sp||IsBadPtr(sp)) continue;
-        Call get("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass");
-        if(!get.ok()||!get.run(sp))continue;
-        void* vc=get.result<void*>(); if(!vc||IsBadPtr(vc))continue;
-        Call loc("/Script/Engine.Actor.K2_GetActorLocation");
-        Call rot("/Script/Engine.Actor.K2_GetActorRotation");
-        if(!loc.ok()||!rot.ok()||!loc.run(sp)||!rot.run(sp))continue;
-        Transform t{}; Vector v=loc.result<Vector>(); Rotator r=rot.result<Rotator>();
-        t.Location[0]=v.X; t.Location[1]=v.Y; t.Location[2]=v.Z;
-        t.Scale[0]=t.Scale[1]=t.Scale[2]=1.0;
-        void* vehicle=SpawnActor(session.world,vc,sp,t);
-        if(!vehicle)continue;
-        Call fuel("/Script/FortniteGame.FortDagwoodVehicle.SetFuel");
-        if(fuel.ok()){float f=100.f;fuel.set("Fuel",f);fuel.run(vehicle);}
-        spawned++;
+    if (!session.world || session.vehicles_spawned) return;
+    
+    // CORRECTED: Use CheatManager.SpawnVehicle instead of manual spawner search
+    void* pc = session.controller;
+    if (!pc) return;
+    
+    void* cheatMgr = GetObjField(pc, "/Script/Engine.PlayerController.CheatManager");
+    if (!cheatMgr || IsBadPtr(cheatMgr)) {
+        SetupCheats();
+        cheatMgr = GetObjField(pc, "/Script/Engine.PlayerController.CheatManager");
     }
-    session.vehicles_spawned = true;
-    LOG("[Vehicles] %d", spawned);
+    
+    if (!cheatMgr || IsBadPtr(cheatMgr)) {
+        LOG("[Vehicles] CheatManager not available");
+        return;
+    }
+    
+    Call spawnVeh("/Script/FortniteGame.FortCheatManager.SpawnVehicle");
+    if (spawnVeh.ok()) {
+        FString vehicleName{}; // Empty = spawn default/random vehicle
+        spawnVeh.set("VehicleName", vehicleName);
+        spawnVeh.set("ForcedMaterialVariantIndex", 0);
+        spawnVeh.set("GroundHeightOffset", 100.0f);
+        
+        if (spawnVeh.run(cheatMgr)) {
+            LOG("[Vehicles] SpawnVehicle called via CheatManager");
+            session.vehicles_spawned = true;
+        } else {
+            LOG("[Vehicles] SpawnVehicle failed");
+        }
+    } else {
+        LOG("[Vehicles] SpawnVehicle function not found");
+    }
 }
 
 static void* GetBotService() {
@@ -1495,7 +1443,7 @@ void Athena::SpawnSoloBotsBatch(int maxCount) {
 }
 
 // ============================================================================
-// STORM
+// STORM (FIXED: Using InitializeWithMapDefaultPhases + StartPhase)
 // ============================================================================
 void Athena::ProtectLocalPlayerFromStorm(bool protect) {
     if(!session.state)return;
@@ -1512,8 +1460,29 @@ void Athena::ProtectLocalPlayerFromStorm(bool protect) {
 
 void Athena::SpawnSafeZoneIndicator() {
     if (session.safezone_spawned || !session.state || !session.world) return;
+    
+    // CORRECTED: Use native functions instead of manual manipulation
     void* existing = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
-    if (existing && !IsBadPtr(existing)) { session.safezone_spawned = true; return; }
+    if (existing && !IsBadPtr(existing)) {
+        // SafeZone already exists, just initialize it
+        Call init("/Script/FortniteGame.FortSafeZoneIndicator.InitializeWithMapDefaultPhases");
+        if (init.ok() && init.run(existing)) {
+            LOG("[Storm] Initialized existing SafeZoneIndicator");
+        }
+        
+        Call start("/Script/FortniteGame.FortSafeZoneIndicator.StartPhase");
+        if (start.ok()) {
+            int phaseIndex = 0;
+            start.set("InPhaseIndex", phaseIndex);
+            start.run(existing);
+            LOG("[Storm] Started Phase 0");
+        }
+        
+        session.safezone_spawned = true;
+        return;
+    }
+    
+    // Try to spawn new SafeZoneIndicator
     void* cls = nullptr;
     if (session.mode && !IsBadPtr(session.mode)) {
         void* p = GetProp("/Script/FortniteGame.FortGameMode.SafeZoneIndicatorClass");
@@ -1522,13 +1491,32 @@ void Athena::SpawnSafeZoneIndicator() {
     }
     if (!cls) cls = FindObj("/Script/FortniteGame.FortSafeZoneIndicator");
     if (!cls || IsBadPtr(cls)) { LOG("[Storm] no class"); return; }
+    
     Transform t{};
     void* indicator = SpawnActor(session.world, cls, session.state, t);
     if (!indicator || IsBadPtr(indicator)) { LOG("[Storm] spawn failed"); return; }
+    
     void* prop = GetProp("/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
     if (prop) Write<void*>(GetField(session.state, prop), 0, indicator);
+    
     Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_SafeZoneIndicator");
     if (n.ok()) n.run(session.state);
+    
+    // Initialize with map defaults
+    Call init("/Script/FortniteGame.FortSafeZoneIndicator.InitializeWithMapDefaultPhases");
+    if (init.ok() && init.run(indicator)) {
+        LOG("[Storm] InitializeWithMapDefaultPhases called");
+    }
+    
+    // Start first phase
+    Call start("/Script/FortniteGame.FortSafeZoneIndicator.StartPhase");
+    if (start.ok()) {
+        int phaseIndex = 0;
+        start.set("InPhaseIndex", phaseIndex);
+        start.run(indicator);
+        LOG("[Storm] StartPhase called for Phase 0");
+    }
+    
     session.safezone_spawned = true;
     LOG("[Storm] indicator=%p", indicator);
 }
@@ -2261,16 +2249,32 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
     return orig_Exec(engine, world, command, output);
 }
 
+// ============================================================================
+// INSTALL HOOKS
+// ============================================================================
 static void InstallHooks() {
     LOG("=== InstallHooks ===");
-    if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) != 0 || !orig_PE) { LOG("PE FAILED"); return; }
+    if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) != 0 || !orig_PE) {
+        LOG("PE FAILED"); return;
+    }
     LOG("PE hooked");
-    if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) != 0 || !orig_Tick) LOG("Tick FAILED");
-    else LOG("Tick hooked");
-    if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) != 0 || !orig_Exec) LOG("Exec FAILED");
-    else LOG("Exec hooked");
+    
+    if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) != 0 || !orig_Tick) {
+        LOG("Tick FAILED");
+    } else {
+        LOG("Tick hooked");
+    }
+    
+    if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) != 0 || !orig_Exec) {
+        LOG("Exec FAILED");
+    } else {
+        LOG("Exec hooked");
+    }
 }
 
+// ============================================================================
+// INSPECT CALLBACK
+// ============================================================================
 static int InspectCb(dl_phdr_info* info, size_t, void*) {
     const char* name = strrchr(info->dlpi_name, '/');
     name = name ? name + 1 : info->dlpi_name;
@@ -2281,26 +2285,37 @@ static int InspectCb(dl_phdr_info* info, size_t, void*) {
     return 1;
 }
 
+// ============================================================================
+// WORKER THREAD
+// ============================================================================
 static void* Worker(void*) {
-    LOG("=== EraCH3 starting (v13.1) ===");
+    LOG("=== EraCH3 starting (v14.0) ===");
     LOG("sizeof(Vector)=%zu sizeof(Rotator)=%zu sizeof(Transform)=%zu",
         sizeof(Vector), sizeof(Rotator), sizeof(Transform));
+    
     for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
         dl_iterate_phdr(InspectCb, nullptr);
         if (g_status.load() == 0) usleep(100000);
     }
+    
     if (g_status.load() != 1) { LOG("Timeout"); return nullptr; }
     usleep(300000);
+    
     InstallHooks();
     LOG("=== Ready ===");
     return nullptr;
 }
 
+// ============================================================================
+// LIBRARY MAIN
+// ============================================================================
 extern "C" __attribute__((constructor))
 void LibMain() {
     InitLog();
     pthread_t t;
-    if (pthread_create(&t, nullptr, Worker, nullptr) == 0) pthread_detach(t);
+    if (pthread_create(&t, nullptr, Worker, nullptr) == 0) {
+        pthread_detach(t);
+    }
 }
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
