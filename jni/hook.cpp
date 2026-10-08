@@ -1921,7 +1921,7 @@ void Athena::AddToInventory(void* def, int count, int slot) {
         }
     }
     if (!profile::GenericArrayAdd) { LOG("[Inv] GenericArrayAdd unavailable"); return; }
-    Fn<int(*)(void*,void*,const void*)> addArray(profile::GenericArrayAdd);
+    auto addArray = Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd);
     if (!addArray) { LOG("[Inv] GenericArrayAdd binding invalid"); return; }
     addArray(instArr, instProp, &inst);
     addArray(entryArr, entryProp, entrySrc);
@@ -1954,7 +1954,7 @@ void Athena::AddToInventory(void* def, int count, int slot) {
                 if (itemsProp) {
                     void* itemsArr = GetField(slotObj, itemsProp);
                     if (itemsArr && !IsBadPtr(itemsArr) && profile::GenericArrayAdd) {
-                        Fn<int(*)(void*,void*,const void*)> addSlotItem(profile::GenericArrayAdd);
+                        auto addSlotItem = Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd);
                         if (addSlotItem) addSlotItem(itemsArr, itemsProp, &itemGuid);
                     } else {
                         LOG("[QB] Slot Items array unavailable; item kept in inventory only");
