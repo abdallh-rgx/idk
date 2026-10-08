@@ -1669,9 +1669,10 @@ void Athena::SpawnFloorLoot() {
     void* wb = FindObj("/Script/Engine.Default__GameplayStatics");
     if (!wb) { LOG("[Loot] GameplayStatics missing"); return; }
 
-    const wchar_t* containers[] = {
-        L"/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C",
-        L"/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_Warmup.Tiered_Athena_FloorLoot_Warmup_C",
+    // ⭐ FIX: const char* بدل const wchar_t* + إزالة L
+    const char* containers[] = {
+        "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C",
+        "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_Warmup.Tiered_Athena_FloorLoot_Warmup_C",
         nullptr
     };
 
