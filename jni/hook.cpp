@@ -1740,12 +1740,13 @@ void Athena::FinalizePlayer() {
     if (!session.profile_attempted) ShowSkin();
     if (!session.quickbars_initialized) {
         InitializeQuickBarsNative();
-        if (!session.quickbars_initialized) BuildQuickBarsManually();
-        SetQuickBarReady();
-        ForceUpdateQuickBars();
-        ActivateQuickBarSlot(0, 0);
-        ActivateQuickBarSlot(0, 1);
-        ActivateQuickBarSlot(0, 0);
+        if (session.quickbars_initialized) {
+            SetQuickBarReady();
+            ForceUpdateQuickBars();
+            ActivateQuickBarSlot(0, 0);
+        } else {
+            LOG("[QB] Finalize: native initialization unavailable; skipping all QuickBar writes");
+        }
     }
     if (!session.ready_called) {
         Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch"); if (srt.ok()) srt.run(pc);
@@ -1796,8 +1797,12 @@ void Athena::Tick() {
         if (!session.quickbars_initialized && qbRetries++ < 5) {
             LOG("Tick: QuickBars retry #%d", qbRetries);
             InitializeQuickBarsNative();
-            if (!session.quickbars_initialized) BuildQuickBarsManually();
-            if (session.quickbars_initialized) SetQuickBarReady();
+            if (session.quickbars_initialized) {
+                SetQuickBarReady();
+                ForceUpdateQuickBars();
+            } else {
+                LOG("[QB] Tick: native initialization still unavailable; no manual QuickBar fallback");
+            }
         }
     }
     if (session.finalized && session.pawn && now - lastMovementCheck > 8.0) {
