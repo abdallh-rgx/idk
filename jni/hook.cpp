@@ -1883,7 +1883,9 @@ void Athena::InventoryUpdate() {
 }
 
 void Athena::AddToInventory(void* def, int count, int slot) {
-    if (IsBadPtr(def) || !session.inventory || !session.quickbars) return;
+    if (IsBadPtr(def) || !session.inventory || IsBadPtr(session.inventory) ||
+        !session.quickbars || IsBadPtr(session.quickbars) || count <= 0) return;
+    if (!session.quickbars_initialized) { LOG("[Inv] AddToInventory skipped: QuickBars not initialized"); return; }
     void* inst = nullptr;
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
@@ -1900,9 +1902,15 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     void* itemGuidProp  = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
     if (!invProp || !instProp || !entryProp || !itemEntryProp) return;
     void* list = GetField(session.inventory, invProp);
+    if (!list || IsBadPtr(list)) { LOG("[Inv] Inventory list unavailable"); return; }
     void* instArr  = GetField(list, instProp);
     void* entryArr = GetField(list, entryProp);
     void* entrySrc = GetField(inst, itemEntryProp);
+    if (!instArr || IsBadPtr(instArr) || !entryArr || IsBadPtr(entryArr) ||
+        !entrySrc || IsBadPtr(entrySrc)) {
+        LOG("[Inv] item arrays/entry unavailable; skipping item");
+        return;
+    }
     if (entrySrc) {
         Write<float>(entrySrc, profile::ItemEntry_Durability, 1.0f);
         void* weapCls = FindObj("/Script/FortniteGame.FortWeaponItemDefinition");
@@ -1912,8 +1920,11 @@ void Athena::AddToInventory(void* def, int count, int slot) {
             if (phProp) Write<int32>(entrySrc, profile::ItemEntry_PhantomAmmo, 300);
         }
     }
-    Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
-    Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(entryArr, entryProp, entrySrc);
+    if (!profile::GenericArrayAdd) { LOG("[Inv] GenericArrayAdd unavailable"); return; }
+    Fn<int(*)(void*,void*,const void*)> addArray(profile::GenericArrayAdd);
+    if (!addArray) { LOG("[Inv] GenericArrayAdd binding invalid"); return; }
+    addArray(instArr, instProp, &inst);
+    addArray(entryArr, entryProp, entrySrc);
     Guid itemGuid{0, 0, 0, 0};
     if (itemGuidProp && entrySrc) {
         itemGuid = Read<Guid>(GetField(entrySrc, itemGuidProp));
@@ -1928,17 +1939,32 @@ void Athena::AddToInventory(void* def, int count, int slot) {
         void* primBar = GetField(session.quickbars, primBarProp);
         void* slotsProp = GetProp("/Script/FortniteGame.FortQuickBar.Slots");
         if (slotsProp) {
-            Array slotsArr = Read<Array>(GetField(primBar, slotsProp));
-            int slotSize = Read<int>(slotsProp, profile::PropElementSize);
-            if (slot >= 0 && slot < slotsArr.Count && slotSize > 0) {
-                void* slotObj = (char*)slotsArr.Data + slot * slotSize;
+            if (!primBar || IsBadPtr(primBar)) { LOG("[QB] PrimaryQuickBar unavailable; item kept in inventory only"); }
+            else {
+                void* slotField = GetField(primBar, slotsProp);
+                if (!slotField || IsBadPtr(slotField)) { LOG("[QB] Primary Slots field unavailable"); return; }
+                Array slotsArr = Read<Array>(slotField);
+                const int slotSize = 0x28;
+                if (!slotsArr.Data || IsBadPtr(slotsArr.Data) || slot < 0 || slot >= slotsArr.Count || slotsArr.Count > 64) {
+                    LOG("[QB] Invalid slot array data/count; item kept in inventory only");
+                } else {
+                    void* slotObj = (char*)slotsArr.Data + (size_t)slot * slotSize;
                 void* itemsProp = GetProp("/Script/FortniteGame.FortQuickBarSlot.Items");
                 void* enabledProp = GetProp("/Script/FortniteGame.FortQuickBarSlot.bEnabled");
-                if (itemsProp) { void* itemsArr = GetField(slotObj, itemsProp); Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(itemsArr, itemsProp, &itemGuid); }
+                if (itemsProp) {
+                    void* itemsArr = GetField(slotObj, itemsProp);
+                    if (itemsArr && !IsBadPtr(itemsArr) && profile::GenericArrayAdd) {
+                        Fn<int(*)(void*,void*,const void*)> addSlotItem(profile::GenericArrayAdd);
+                        if (addSlotItem) addSlotItem(itemsArr, itemsProp, &itemGuid);
+                    } else {
+                        LOG("[QB] Slot Items array unavailable; item kept in inventory only");
+                    }
+                }
                 if (enabledProp) {
                     uint8_t byte = Read<uint8_t>(enabledProp, profile::BoolByteOffset);
                     uint8_t mask = Read<uint8_t>(enabledProp, profile::BoolFieldMask);
                     ((uint8_t*)slotObj)[byte] |= mask;
+                    }
                 }
             }
         }
@@ -1985,10 +2011,18 @@ void Athena::InitializeInventory() {
             if (soQB.ok()) soQB.run(session.quickbars);
             LOG("[QB] Running native initialize...");
             InitializeQuickBarsNative();
+            if (!session.quickbars_initialized) {
+                LOG("[QB] Native init failed; switching to verified manual initialization before inventory items");
+                BuildQuickBarsManually();
+            }
         }
     }
 
-    LOG("Inventory ready: inv=%p qb=%p", session.inventory, session.quickbars);
+    LOG("Inventory ready: inv=%p qb=%p initialized=%d", session.inventory, session.quickbars, session.quickbars_initialized ? 1 : 0);
+    if (!session.quickbars || !session.quickbars_initialized) {
+        LOG("[Inv] QuickBars unavailable; aborting item population safely");
+        return;
+    }
 
     struct DefSlot { const char* path; int slot; };
     void* profilePickaxe = nullptr;
