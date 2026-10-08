@@ -1379,7 +1379,7 @@ void Athena::SetupLocalPlayerCounter() {
     int off = Read<int>(prop, profile::PropOffset);
     if (off < 0 || off > 0x20000) { LOG("[PlayerCounter] invalid offset - skip"); return; }
     int32 one = 1;
-    Write<int32>((char*)session.state + off, one);
+    Write<int32>(session.state, off, one);
     Call rep("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
     if (rep.ok()) rep.run(session.state);
     LOG("[PlayerCounter] PlayersLeft=%d", one);
