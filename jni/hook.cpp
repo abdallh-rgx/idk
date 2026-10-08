@@ -519,7 +519,6 @@ struct Session {
     bool  melee_granted = false;
     bool  melee_attempted = false;
     bool  cosmetics_applied = false;
-    bool  profile_attempted = false;
     bool  side_systems_initialized = false;
     bool  stamina_initialized = false;
     bool  tactical_sprint_setup = false;
@@ -1180,12 +1179,54 @@ void Athena::ApplySprintSpeed() {
 // BATTLE BUS
 // ============================================================================
 void Athena::StartBusNow() {
-    if(session.bus_started||!session.state)return;
-    void* gp=GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
-    if(gp){uint8_t phase=3;Write<uint8_t>(GetField(session.state,gp),0,phase);Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");if(n.ok()){uint8_t old=2;n.set("OldGamePhase",old);n.run(session.state);}}
-    if(session.pawn){Vector loc{0,0,50000};Rotator rot{0,0,0};Call sl("/Script/Engine.Actor.K2_SetActorLocationAndRotation");if(sl.ok()){bool sweep=false,tp=true;sl.set("NewLocation",loc);sl.set("NewRotation",rot);sl.set("bSweep",sweep);sl.set("bTeleport",tp);sl.run(session.pawn);}BeginPlayerSkydiving();}
-    session.bus_started=true;session.aircraft_jumped=true;
-    LOG("[Bus] Solo aircraft phase + skydive started");
+    if (session.bus_started || !session.state || !session.controller || !session.pawn) {
+        LOG("[Bus] Start skipped: invalid state/controller/pawn");
+        return;
+    }
+
+    Guard g;
+    LOG("[Bus] Starting aircraft phase after warmup");
+
+    if (!session.pawn || !session.controller) {
+        LOG("[Bus] Pawn/controller unavailable");
+        return;
+    }
+
+    TeleportToSpawnIsland();
+
+    void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
+    if (!gp) {
+        LOG("[Bus] GamePhase property missing; aborting aircraft transition");
+        return;
+    }
+
+    void* gpAddr = GetField(session.state, gp);
+    if (!gpAddr) {
+        LOG("[Bus] GamePhase field missing; aborting aircraft transition");
+        return;
+    }
+
+    uint8_t oldPhase = Read<uint8_t>(gpAddr);
+    uint8_t aircraftPhase = 3;
+    Write<uint8_t>(gpAddr, 0, aircraftPhase);
+
+    Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
+    if (n.ok()) {
+        n.set("OldGamePhase", oldPhase);
+        if (!n.run(session.state)) {
+            LOG("[Bus] OnRep_GamePhase failed");
+            Write<uint8_t>(gpAddr, 0, oldPhase);
+            return;
+        }
+    } else {
+        LOG("[Bus] OnRep_GamePhase missing; restoring GamePhase");
+        Write<uint8_t>(gpAddr, 0, oldPhase);
+        return;
+    }
+
+    session.bus_started = true;
+    session.aircraft_jumped = false;
+    LOG("[Bus] Aircraft phase started; waiting for jump");
 }
 
 void Athena::SpawnBattleBus() {
@@ -1666,7 +1707,14 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
     LOG("SetupWorld: SpawnBuildPreviews"); SpawnBuildPreviews();
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
-    LOG("SetupWorld: SpawnBattleBus"); SpawnBattleBus();
+    LOG("SetupWorld: scheduling Solo warmup -> aircraft");
+    session.bus_scheduled = true;
+    session.bus_started = false;
+    session.aircraft_jumped = false;
+    session.bus_at = Monotonic() + 8.0;
+    session.storm_at = Monotonic() + 90.0;
+    ProtectLocalPlayerFromStorm(true);
+    LOG("[Bus] Warmup stabilized; aircraft deferred by 8 seconds");
     LOG("SetupWorld: RemoveNetDebugUI"); RemoveNetDebugUI();
     RefreshHUD();
     session.finalize_at = Monotonic() + 2.0;
@@ -1883,9 +1931,7 @@ void Athena::InventoryUpdate() {
 }
 
 void Athena::AddToInventory(void* def, int count, int slot) {
-    if (IsBadPtr(def) || !session.inventory || IsBadPtr(session.inventory) ||
-        !session.quickbars || IsBadPtr(session.quickbars) || count <= 0) return;
-    if (!session.quickbars_initialized) { LOG("[Inv] AddToInventory skipped: QuickBars not initialized"); return; }
+    if (IsBadPtr(def) || !session.inventory || !session.quickbars) return;
     void* inst = nullptr;
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
@@ -1902,15 +1948,9 @@ void Athena::AddToInventory(void* def, int count, int slot) {
     void* itemGuidProp  = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
     if (!invProp || !instProp || !entryProp || !itemEntryProp) return;
     void* list = GetField(session.inventory, invProp);
-    if (!list || IsBadPtr(list)) { LOG("[Inv] Inventory list unavailable"); return; }
     void* instArr  = GetField(list, instProp);
     void* entryArr = GetField(list, entryProp);
     void* entrySrc = GetField(inst, itemEntryProp);
-    if (!instArr || IsBadPtr(instArr) || !entryArr || IsBadPtr(entryArr) ||
-        !entrySrc || IsBadPtr(entrySrc)) {
-        LOG("[Inv] item arrays/entry unavailable; skipping item");
-        return;
-    }
     if (entrySrc) {
         Write<float>(entrySrc, profile::ItemEntry_Durability, 1.0f);
         void* weapCls = FindObj("/Script/FortniteGame.FortWeaponItemDefinition");
@@ -1920,11 +1960,8 @@ void Athena::AddToInventory(void* def, int count, int slot) {
             if (phProp) Write<int32>(entrySrc, profile::ItemEntry_PhantomAmmo, 300);
         }
     }
-    if (!profile::GenericArrayAdd) { LOG("[Inv] GenericArrayAdd unavailable"); return; }
-    auto addArray = Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd);
-    if (!addArray) { LOG("[Inv] GenericArrayAdd binding invalid"); return; }
-    addArray(instArr, instProp, &inst);
-    addArray(entryArr, entryProp, entrySrc);
+    Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(instArr, instProp, &inst);
+    Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(entryArr, entryProp, entrySrc);
     Guid itemGuid{0, 0, 0, 0};
     if (itemGuidProp && entrySrc) {
         itemGuid = Read<Guid>(GetField(entrySrc, itemGuidProp));
@@ -1939,32 +1976,17 @@ void Athena::AddToInventory(void* def, int count, int slot) {
         void* primBar = GetField(session.quickbars, primBarProp);
         void* slotsProp = GetProp("/Script/FortniteGame.FortQuickBar.Slots");
         if (slotsProp) {
-            if (!primBar || IsBadPtr(primBar)) { LOG("[QB] PrimaryQuickBar unavailable; item kept in inventory only"); }
-            else {
-                void* slotField = GetField(primBar, slotsProp);
-                if (!slotField || IsBadPtr(slotField)) { LOG("[QB] Primary Slots field unavailable"); return; }
-                Array slotsArr = Read<Array>(slotField);
-                const int slotSize = 0x28;
-                if (!slotsArr.Data || IsBadPtr(slotsArr.Data) || slot < 0 || slot >= slotsArr.Count || slotsArr.Count > 64) {
-                    LOG("[QB] Invalid slot array data/count; item kept in inventory only");
-                } else {
-                    void* slotObj = (char*)slotsArr.Data + (size_t)slot * slotSize;
+            Array slotsArr = Read<Array>(GetField(primBar, slotsProp));
+            int slotSize = Read<int>(slotsProp, profile::PropElementSize);
+            if (slot >= 0 && slot < slotsArr.Count && slotSize > 0) {
+                void* slotObj = (char*)slotsArr.Data + slot * slotSize;
                 void* itemsProp = GetProp("/Script/FortniteGame.FortQuickBarSlot.Items");
                 void* enabledProp = GetProp("/Script/FortniteGame.FortQuickBarSlot.bEnabled");
-                if (itemsProp) {
-                    void* itemsArr = GetField(slotObj, itemsProp);
-                    if (itemsArr && !IsBadPtr(itemsArr) && profile::GenericArrayAdd) {
-                        auto addSlotItem = Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd);
-                        if (addSlotItem) addSlotItem(itemsArr, itemsProp, &itemGuid);
-                    } else {
-                        LOG("[QB] Slot Items array unavailable; item kept in inventory only");
-                    }
-                }
+                if (itemsProp) { void* itemsArr = GetField(slotObj, itemsProp); Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(itemsArr, itemsProp, &itemGuid); }
                 if (enabledProp) {
                     uint8_t byte = Read<uint8_t>(enabledProp, profile::BoolByteOffset);
                     uint8_t mask = Read<uint8_t>(enabledProp, profile::BoolFieldMask);
                     ((uint8_t*)slotObj)[byte] |= mask;
-                    }
                 }
             }
         }
@@ -2011,16 +2033,13 @@ void Athena::InitializeInventory() {
             if (soQB.ok()) soQB.run(session.quickbars);
             LOG("[QB] Running native initialize...");
             InitializeQuickBarsNative();
-            if (!session.quickbars_initialized) {
-                LOG("[QB] Native init failed; manual QuickBar construction disabled for safety");
-                LOG("[QB] Inventory population will be skipped until native QuickBar init succeeds");
-            }
         }
     }
 
     LOG("Inventory ready: inv=%p qb=%p initialized=%d", session.inventory, session.quickbars, session.quickbars_initialized ? 1 : 0);
-    if (!session.quickbars || !session.quickbars_initialized) {
-        LOG("[Inv] QuickBars unavailable; aborting item population safely");
+    if (!session.quickbars_initialized) {
+        LOG("[Inv] QuickBars native initialization failed; skipping item population safely");
+        session.inventory_ready = false;
         return;
     }
 
