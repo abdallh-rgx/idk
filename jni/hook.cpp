@@ -519,6 +519,7 @@ struct Session {
     bool  melee_granted = false;
     bool  melee_attempted = false;
     bool  cosmetics_applied = false;
+    bool  profile_attempted = false;
     bool  side_systems_initialized = false;
     bool  stamina_initialized = false;
     bool  tactical_sprint_setup = false;
