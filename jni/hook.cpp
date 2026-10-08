@@ -1,7 +1,6 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE EXTENDED — All fixes: Drop, Loot, QuickBars, Melee, Doors,
-// Mantling, HUD, Building, Emotes, Vehicles, Cosmetics, Bus
+// COMPLETE EXTENDED v3 — Fixed crash bugs (0x2D0, native static sigs)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -194,7 +193,7 @@ constexpr unsigned FortPlayerController_bInfiniteAmmo_Bit          = 2;
 constexpr unsigned FortPlayerController_bTryPickupSwap             = 0x2731;
 constexpr unsigned FortPlayerController_CheatManager               = 0x2F20;
 constexpr unsigned FortPlayerController_MyPlayerInfo               = 0x2088;
-constexpr unsigned FortPlayerController_PlayerState                = 0x02D0;
+// ❌ حُذف: FortPlayerController_PlayerState = 0x02D0 (كان سبب الكراش)
 
 // ─── AFortPlayerStateAthena ───
 constexpr unsigned FortPlayerState_TeamIndex       = 0x0C24;
@@ -584,25 +583,26 @@ static void* ResolveInterface(void* object, void* ifaceClass) {
 }
 
 // ============================================================================
-// NATIVE WRAPPERS — Direct ORIG calls
+// NATIVE WRAPPERS — Direct ORIG calls (static funcs: NO klib as this)
 // ============================================================================
 static void* GetKismetLib() {
     static void* klib = nullptr;
     if (!klib) klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
     return klib;
 }
+
+// ★ OpenActor/CloseActor signatures: static, take 3/2 args (NO this)
 static bool NativeOpenActor(void* actor, void* controller, bool bFast) {
-    void* klib = GetKismetLib();
-    if (!klib || !actor) return false;
-    using FnT = bool(*)(void*, void*, void*, bool);
-    return ((FnT)(g_base + profile::ORIG_OpenActor))(klib, actor, controller, bFast);
+    if (!actor) return false;
+    using FnT = bool(*)(void*, void*, bool);
+    return ((FnT)(g_base + profile::ORIG_OpenActor))(actor, controller, bFast);
 }
 static bool NativeCloseActor(void* actor, void* controller) {
-    void* klib = GetKismetLib();
-    if (!klib || !actor) return false;
-    using FnT = bool(*)(void*, void*, void*);
-    return ((FnT)(g_base + profile::ORIG_CloseActor))(klib, actor, controller);
+    if (!actor) return false;
+    using FnT = bool(*)(void*, void*);
+    return ((FnT)(g_base + profile::ORIG_CloseActor))(actor, controller);
 }
+
 static void NativeSpawnLoot(void* container) {
     if (!container) return;
     using FnT = void(*)(void*);
@@ -653,18 +653,12 @@ static void NativeK2_InitStats(void* asc, void* attrClass, void* dataTable) {
     using FnT = void(*)(void*, void*, void*);
     ((FnT)(g_base + profile::ORIG_K2_InitStats))(asc, attrClass, dataTable);
 }
+
+// ★ static function: takes PlayerState only
 static void NativeUpdatePlayerCustomCharacterParts(void* state) {
     if (!state) return;
-    void* klib = GetKismetLib();
-    if (!klib) return;
-    using FnT = void(*)(void*, void*);
-    ((FnT)(g_base + profile::ORIG_UpdatePlayerCustomCharacterParts))(klib, state);
-}
-static void NativeApplyCharacterCosmetics(void* world, void* partsArr, void* state) {
-    void* klib = GetKismetLib();
-    if (!klib) return;
-    using FnT = void(*)(void*, void*, void*, void*);
-    ((FnT)(g_base + profile::ORIG_ApplyCharacterCosmetics))(klib, world, partsArr, state);
+    using FnT = void(*)(void*);
+    ((FnT)(g_base + profile::ORIG_UpdatePlayerCustomCharacterParts))(state);
 }
 
 // ============================================================================
@@ -960,7 +954,6 @@ void Athena::InitializeInventory() {
         AddToInventory(def, d.count, d.slot);
     }
 
-    // Ammo
     const char* ammo[] = {
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight",
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium",
@@ -971,7 +964,6 @@ void Athena::InitializeInventory() {
         void* def = LoadAsset(ammo[i]);
         if (def) AddToInventory(def, 999, 10);
     }
-    // Resources
     const char* res[] = {
         "/Game/Items/ResourcePickups/WoodItemData.WoodItemData",
         "/Game/Items/ResourcePickups/StoneItemData.StoneItemData",
@@ -1054,7 +1046,7 @@ void Athena::EquipSlot(int slot) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DROP — Via RPC only (safe, no crash)
+// DROP
 // ═══════════════════════════════════════════════════════════════
 void Athena::DropInventoryItem(Guid guid, int count) {
     if (!session.controller) return;
@@ -1101,7 +1093,7 @@ void Athena::OnServerExecuteInventoryWeapon(void* weapon) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// LOOT — Native SpawnLoot ORIG
+// LOOT
 // ═══════════════════════════════════════════════════════════════
 void Athena::Loot(void* actor) {
     if (!actor || IsBadPtr(actor) || !session.pawn) return;
@@ -1158,7 +1150,7 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DOORS — Native OpenActor/CloseActor ORIG
+// DOORS
 // ═══════════════════════════════════════════════════════════════
 void Athena::HandleDoor(void* door) {
     if (!door || IsBadPtr(door) || !session.pawn) return;
@@ -1186,7 +1178,6 @@ void Athena::HandleDoor(void* door) {
 // ═══════════════════════════════════════════════════════════════
 void Athena::OnServerCreateBuildingActor(void* params) {
     if (!params || !session.world) return;
-    // FCreateBuildingActorData (21.30) = { uint32 Handle; pad; Vector; Rotator; bool; float; FBuildingClassData }
     struct NewP {
         uint32 ClassHandle; uint8 _p[0x4];
         Vector Loc; Rotator Rot;
@@ -1202,27 +1193,20 @@ void Athena::OnServerCreateBuildingActor(void* params) {
     void* actor = SpawnActor(session.world, cls, session.controller, t);
     if (!actor) return;
 
-    // bPlayerPlaced = bit 3 of 0x04DE
     ((uint8_t*)actor)[profile::BuildingSMActor_bPlayerPlaced_Byte] |= (1 << profile::BuildingSMActor_bPlayerPlaced_Bit);
-
-    // CurrentBuildingLevel
     Write<int32>(actor, profile::BuildingSMActor_CurrentBuildingLevel, p->ClassData.Upgrade);
     Call lvl("/Script/FortniteGame.BuildingActor.OnRep_CurrentBuildingLevel");
     if (lvl.ok()) lvl.run(actor);
-
-    // SetMirrored
     Call m("/Script/FortniteGame.BuildingActor.SetMirrored");
     if (m.ok()) { bool bM = p->Mirrored != 0; m.set("bNewMirrored", bM); m.run(actor); }
 
-    // Team
-    void* state = Read<void*>(session.controller, profile::FortPlayerController_PlayerState);
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     if (state) {
         uint8 team = Read<uint8>(state, profile::FortPlayerState_TeamIndex);
         Write<uint8>(actor, profile::BuildingSMActor_Team, team);
         Write<uint8>(actor, profile::BuildingSMActor_TeamIndex, team);
     }
 
-    // Initialize kismet
     Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
     if (init.ok()) {
         init.set("BuildingOwner", actor);
@@ -1235,18 +1219,14 @@ void Athena::OnServerCreateBuildingActor(void* params) {
 
 void Athena::OnBeginEditActor(void* piece) {
     if (!piece || !session.pawn || !session.controller) return;
-
-    // bDestroyed check
     uint8_t destroyed = Read<uint8_t>(piece, profile::BuildingSMActor_bDestroyed_Byte);
     if ((destroyed >> profile::BuildingSMActor_bDestroyed_Bit) & 1) return;
 
-    // Set EditingPlayer
-    void* state = Read<void*>(session.controller, profile::FortPlayerController_PlayerState);
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     Write<void*>(piece, profile::BuildingSMActor_EditingPlayer, state);
     Call r("/Script/FortniteGame.BuildingSMActor.OnRep_EditingPlayer");
     if (r.ok()) r.run(piece);
 
-    // Equip edit tool
     if (!session.edit_tool) {
         session.edit_tool = LoadAsset("/Game/Items/Weapons/BuildingTools/EditTool.EditTool");
         if (!session.edit_tool) session.edit_tool = FindObj("/Game/Items/Weapons/BuildingTools/EditTool.EditTool");
@@ -1285,14 +1265,11 @@ void Athena::OnBeginEditActor(void* piece) {
 
 void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored) {
     if (!actor) return;
-
-    // Clear EditingPlayer
     Write<void*>(actor, profile::BuildingSMActor_EditingPlayer, nullptr);
     Call r("/Script/FortniteGame.BuildingSMActor.OnRep_EditingPlayer");
     if (r.ok()) r.run(actor);
-
     if (!newClass) return;
-    // Spawn the new actor
+
     Transform t{};
     Call loc("/Script/Engine.Actor.K2_GetActorLocation");
     if (loc.ok() && loc.run(actor)) {
@@ -1302,15 +1279,11 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
 
     void* newActor = SpawnActor(session.world, newClass, session.controller, t);
     if (!newActor) return;
-
-    // Mark player-placed
     ((uint8_t*)newActor)[profile::BuildingSMActor_bPlayerPlaced_Byte] |= (1 << profile::BuildingSMActor_bPlayerPlaced_Bit);
 
-    // SetMirrored
     Call m("/Script/FortniteGame.BuildingActor.SetMirrored");
     if (m.ok()) { bool bM = mirrored; m.set("bNewMirrored", bM); m.run(newActor); }
 
-    // Initialize kismet
     Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
     if (init.ok()) {
         init.set("BuildingOwner", newActor);
@@ -1320,7 +1293,6 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
         init.run(newActor);
     }
 
-    // Destroy the old actor silently
     SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayDestructionEffects", false);
     Call d("/Script/Engine.Actor.K2_DestroyActor");
     if (d.ok()) d.run(actor);
@@ -1361,13 +1333,13 @@ void Athena::LoadProfileCosmetics() {
     }
 
     if (!heroType || IsBadPtr(heroType)) {
-        void* st = Read<void*>(session.controller, profile::FortPlayerController_PlayerState);
+        void* st = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
         if (st && !IsBadPtr(st)) heroType = Read<void*>(st, profile::FortPlayerState_HeroType);
     }
 
     if (!applied) { LoadDefaultCosmetics(); return; }
 
-    void* state = Read<void*>(session.controller, profile::FortPlayerController_PlayerState);
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     if (state && !IsBadPtr(state)) {
         if (heroType && !IsBadPtr(heroType))
             Write<void*>(state, profile::FortPlayerState_HeroType, heroType);
@@ -1400,7 +1372,7 @@ void Athena::LoadDefaultCosmetics() {
                 session.character_parts.push_back(asset);
         }
     }
-    void* state = Read<void*>(session.controller, profile::FortPlayerController_PlayerState);
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
     if (!state || IsBadPtr(state)) return;
     void* hero = LoadAsset("/Game/Athena/Heroes/HID_001_Athena_Commando_F.HID_001_Athena_Commando_F", "/Script/FortniteGame.FortHeroType");
     if (!hero) hero = LoadAsset("/Game/Athena/Heroes/HID_001_Athena_Commando_M.HID_001_Athena_Commando_M", "/Script/FortniteGame.FortHeroType");
@@ -1564,7 +1536,6 @@ void Athena::HandleJumpFromHudStart() {
     session.aircraft_jumped = true;
     LOG("[Bus] JumpFromHudStart");
 
-    // Read camera rotation
     Vector rot{0, 0, 0};
     void* rotProp = GetProp("/Script/Engine.Controller.ControlRotation");
     if (rotProp && Read<int>(rotProp, profile::PropElementSize) == 24) {
