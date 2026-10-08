@@ -566,7 +566,6 @@ namespace Athena {
     void FinalizePlayer();
     void ShowSkin();
     void LoadProfileCosmetics();
-    void LoadDefaultCosmetics();
     void InitializeSideSystems();
     void SyncMCPProfile();
     void ApplyProfileWrap(Guid guid);
@@ -1327,7 +1326,7 @@ void Athena::LoadProfileCosmetics() {
     }
     void* loadout = source ? GetField(session.controller, source) : nullptr;
     void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
-    if (!loadout || !state) { LOG("[Profile] loadout/state missing - fallback"); LoadDefaultCosmetics(); return; }
+    if (!loadout || !state) { LOG("[Profile] loadout/state missing - keeping current loadout"); session.cosmetics_applied = false; return; }
 
     void* character = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Character");
     void* hero = GetObjField(character, "/Script/FortniteGame.AthenaCharacterItemDefinition.HeroDefinition");
@@ -1385,12 +1384,13 @@ void Athena::LoadProfileCosmetics() {
     if(klib){Call u("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");if(u.ok()&&u.set("PlayerState",state))u.run(klib);}
     Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CosmeticLoadout"); if(cl.ok())cl.run(session.pawn);
     session.cosmetics_applied = !parts.empty() || hero != nullptr;
-    if (!session.cosmetics_applied) { LOG("[Profile] MCP had no usable character parts - fallback"); LoadDefaultCosmetics(); return; }
+    if (!session.cosmetics_applied) { LOG("[Profile] MCP had no usable cosmetics - keeping current loadout"); return; }
     LOG("[Profile] MCP cosmetics applied: parts=%d hero=%p backpack=%p",(int)parts.size(),hero,backpack);
 }
 
 void Athena::ShowSkin() {
-    if (session.cosmetics_applied) { LOG("[Profile] Cosmetics already applied - skip"); return; }
+    if (session.cosmetics_applied || session.profile_attempted) { LOG("[Profile] Cosmetics already processed - skip"); return; }
+    session.profile_attempted = true;
     LoadProfileCosmetics();
 }
 
@@ -1586,7 +1586,8 @@ void Athena::ProtectLocalPlayerFromStorm(bool protect) {
 void Athena::UpdateSoloHUD();
 
 void Athena::InitializeSideSystems() {
-    if(!session.finalized||!session.pawn||!session.world)return;
+    if(!session.finalized||!session.pawn||!session.world||session.side_systems_initialized)return;
+    session.side_systems_initialized = true;
     LOG("=== SideSystems ===");
     SetupLocalPlayerCounter();
     SetupLocalMinimap();
@@ -1686,11 +1687,14 @@ void Athena::FinalizePlayer() {
     if (!session.abilities_granted) GrantAllAbilitySets();
     if (!session.tactical_sprint_setup) SetupTacticalSprint();
     if (!session.movement_enabled) EnableMovementFeatures();
+    if (!session.profile_attempted) ShowSkin();
     if (!session.quickbars_initialized) {
         InitializeQuickBarsNative();
         if (!session.quickbars_initialized) BuildQuickBarsManually();
         SetQuickBarReady();
         ForceUpdateQuickBars();
+        ActivateQuickBarSlot(0, 0);
+        ActivateQuickBarSlot(0, 1);
         ActivateQuickBarSlot(0, 0);
     }
     if (!session.ready_called) {
@@ -1749,6 +1753,7 @@ void Athena::Tick() {
     if (session.finalized && session.pawn && now - lastMovementCheck > 8.0) {
         lastMovementCheck = now;
         if (!session.movement_enabled) EnableMovementFeatures();
+    if (!session.profile_attempted) ShowSkin();
     }
     if (session.bus_scheduled && !session.bus_started && now >= session.bus_at) StartBusNow();
     if (session.finalized && !session.bots_spawned) SpawnSoloBotsBatch(10);
