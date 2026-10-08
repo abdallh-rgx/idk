@@ -738,7 +738,6 @@ void Athena::GrantDefaultAbilities() { GrantAllAbilitySets(); }
 // ============================================================================
 void Athena::GrantMeleeAbility() {
     if (!session.pawn || session.melee_granted || session.melee_attempted) return;
-    session.melee_attempted = true;
     void* asc = GetASC(session.pawn);
     if (!asc) return;
 
@@ -767,6 +766,7 @@ void Athena::GrantMeleeAbility() {
             if (give2.run(asc)) {
                 LOG("[Melee] ✅ Granted via GiveAbility");
                 session.melee_granted = true;
+                session.melee_attempted = true;
             }
         }
         return;
@@ -780,6 +780,7 @@ void Athena::GrantMeleeAbility() {
     if (give.run(asc)) {
         LOG("[Melee] ✅ Granted via K2_GiveAbility");
         session.melee_granted = true;
+        session.melee_attempted = true;
     }
 }
 
@@ -921,12 +922,16 @@ void Athena::BuildQuickBarsManually() {
         LOG("[QB] reflected quickbar properties unavailable"); return;
     }
 
-    const int slotSize=Read<int>(slotsProp,profile::PropElementSize);
-    const int guidSize=Read<int>(itemsProp,profile::PropElementSize);
-    LOG("[QB] reflected slotSize=0x%X guidSize=0x%X",slotSize,guidSize);
-    if(slotSize!=0x28 || guidSize!=0x10) {
-        LOG("[QB] layout mismatch; refusing raw slot construction"); return;
+    const int reflectedSlotSize=Read<int>(slotsProp,profile::PropElementSize);
+    const int reflectedGuidSize=Read<int>(itemsProp,profile::PropElementSize);
+    const int slotSize=0x28;
+    const int guidSize=0x10;
+    LOG("[QB] reflected slotSize=0x%X guidSize=0x%X; SDK slotSize=0x28 guidSize=0x10",reflectedSlotSize,reflectedGuidSize);
+    if(reflectedGuidSize!=0x10 && reflectedGuidSize!=0) {
+        LOG("[QB] GUID layout mismatch; refusing QuickBar construction"); return;
     }
+    if(reflectedSlotSize!=0x28)
+        LOG("[QB] reflected slot size is metadata=0x%X; using verified FQuickBarSlot size 0x28",reflectedSlotSize);
 
     void* invProp=GetProp("/Script/FortniteGame.FortInventory.Inventory");
     void* instProp=GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
