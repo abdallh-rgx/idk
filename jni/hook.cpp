@@ -754,6 +754,7 @@ void Athena::GrantMeleeAbility() {
         if (meleeCls) { LOG("[Melee] Loaded: %s", meleePaths[i]); break; }
     }
     if (!meleeCls) { LOG("[Melee] ❌ No melee ability class found"); return; }
+    session.melee_attempted = true;
 
     Call give("/Script/GameplayAbilities.AbilitySystemComponent.K2_GiveAbility");
     if (!give.ok()) {
@@ -766,7 +767,6 @@ void Athena::GrantMeleeAbility() {
             if (give2.run(asc)) {
                 LOG("[Melee] ✅ Granted via GiveAbility");
                 session.melee_granted = true;
-                session.melee_attempted = true;
             }
         }
         return;
@@ -780,102 +780,64 @@ void Athena::GrantMeleeAbility() {
     if (give.run(asc)) {
         LOG("[Melee] ✅ Granted via K2_GiveAbility");
         session.melee_granted = true;
-        session.melee_attempted = true;
     }
 }
 
 void Athena::RefreshHUD() {
     if (!session.controller || !session.world) return;
 
-    // Re-enter the real client HUD lifecycle.  This is local-only and is the
-    // same client path used by the 21.30 Fortnite UI after a pawn is spawned.
-    {
-        Call c("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
-        if (c.ok()) c.run(session.controller);
-    }
-    {
-        Call c("/Script/FortniteGame.FortPlayerController.RefreshHUDElementVisibilitiesToSettings");
-        if (c.ok()) c.run(session.controller);
-    }
-    {
-        Call c("/Script/FortniteGame.FortPlayerController.DisplayHUDElementVisibility");
-        if (c.ok()) c.run(session.controller);
-    }
-    {
-        Call c("/Script/Engine.PlayerController.GetHUD");
-        if (c.ok() && c.run(session.controller)) {
-            void* hud = c.result<void*>();
-            if (hud) {
-                Call show("/Script/Engine.HUD.ShowHUD");
-                if (show.ok()) show.run(hud);
-            }
-        }
+    Call spawn("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
+    if (spawn.ok()) spawn.run(session.controller);
+
+    Call worldInv("/Script/FortniteGame.FortPlayerController.ClientForceWorldInventoryUpdate");
+    if (worldInv.ok()) worldInv.run(session.controller);
+
+    Call inv("/Script/FortniteGame.FortInventory.HandleInventoryLocalUpdate");
+    if (inv.ok() && session.inventory) inv.run(session.inventory);
+
+    Call local("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate");
+    if (local.ok()) local.run(session.controller);
+
+    for (uint8_t bar : {uint8_t(0), uint8_t(1)}) {
+        Call qb("/Script/FortniteGame.FortPlayerController.ClientForceUpdateQuickbar");
+        if (qb.ok() && qb.set("QuickbarToRefresh", bar)) qb.run(session.controller);
     }
 
-    // FortHUDContext is the owner of the gameplay HUD state.  Calling its
-    // pawn-spawned callback is much safer than constructing HUD widgets.
-    {
-        void* lib = FindObj("/Script/BlueprintContext.Default__BlueprintContextLibrary");
-        void* type = FindObj("/Script/FortniteUI.FortHUDContext");
-        if (lib && type) {
-            Call get("/Script/BlueprintContext.BlueprintContextLibrary.GetContext");
-            if (get.set("ContextObject", session.controller) &&
-                get.set("Class", type) && get.run(lib)) {
-                void* hudctx = get.result<void*>();
-                if (hudctx) {
-                    Call pawn("/Script/FortniteUI.FortHUDContext.HandleLocalPawnSpawned");
-                    if (pawn.ok()) pawn.run(hudctx);
-                    Call build("/Script/FortniteUI.FortHUDContext.HandleLocalPlayerBuildCostChanged");
-                    if (build.ok()) build.run(hudctx);
-                    Call indicators("/Script/FortniteUI.FortHUDContext.SetIndicatorsAllowed");
-                    if (indicators.ok()) { bool enabled=true; indicators.set("bIndicatorsAllowed",enabled); indicators.run(hudctx); }
-                }
-            }
+    Call hudInit("/Script/Engine.GameModeBase.InitializeHUDForPlayer");
+    if (hudInit.ok() && session.mode && hudInit.set("NewPlayer", session.controller)) {
+        hudInit.run(session.mode);
+        LOG("[HUD] InitializeHUDForPlayer dispatched");
+    }
+
+    Call getHud("/Script/Engine.PlayerController.GetHUD");
+    if (getHud.ok() && getHud.run(session.controller)) {
+        void* hud = getHud.result<void*>();
+        if (hud) {
+            Call show("/Script/Engine.HUD.ShowHUD");
+            if (show.ok()) show.run(hud);
+            LOG("[HUD] HUD=%p shown", hud);
         }
     }
 
     void* asc = GetASC(session.pawn);
     if (asc) {
-        Call c("/Script/GameplayAbilities.AbilitySystemComponent.OnRep_ActivateAbilities");
-        if (c.ok()) c.run(asc);
+        Call abilities("/Script/GameplayAbilities.AbilitySystemComponent.OnRep_ActivateAbilities");
+        if (abilities.ok()) abilities.run(asc);
     }
 
-    void* wb = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
-    if (!wb) return;
-    Call all("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
-    if (!all.ok() || !all.set("WorldContextObject", session.world)) return;
-
-    const char* classes[] = {
-        "/Script/AthenaHUDItemList.AthenaHUDItemList_C",
-        "/Script/AthenaMinimapContainer.AthenaMinimapContainer_C",
-        "/Script/QuickbarBase.QuickbarBase_C",
-        nullptr
-    };
-    for (int k=0; classes[k]; ++k) {
-        void* cls=FindObj(classes[k]);
-        if (!cls || !all.set("WidgetClass",cls) || !all.run(wb)) continue;
-        Array widgets=all.result<Array>();
-        if (widgets.Count<0 || widgets.Count>256 || (widgets.Count && !widgets.Data)) continue;
-        for (int i=0;i<widgets.Count;++i) {
-            void* w=Read<void*>(widgets.Data,(size_t)i*8);
-            if (!w || IsBadPtr(w)) continue;
-            if (k==0) {
-                Call c("/Script/AthenaHUDItemList.AthenaHUDItemList_C.OnInventoryUpdated");
-                if (c.ok()) c.run(w);
-            } else if (k==1) {
-                Call vis("/Script/FortniteUI.FortHUDElementWidget.OnVisibilitySetEvent");
-                if (vis.ok()) { uint8_t visible=4; vis.set("InVisibility",visible); vis.run(w); }
-            } else {
-                Call spawned("/Script/QuickbarBase.QuickbarBase_C.OnLocalPlayerSpawned");
-                if (spawned.ok()) spawned.run(w);
-                Call full("/Script/QuickbarBase.QuickbarBase_C.OnQuickbarForceFullUpdate");
-                if (full.ok()) {
-                    uint8_t primary=0,secondary=1;
-                    if (full.set("QuickbarIndex",primary)) full.run(w);
-                    if (full.set("QuickbarIndex",secondary)) full.run(w);
-                }
-                Call refresh("/Script/QuickbarBase.QuickbarBase_C.RefreshQuickbar");
-                if (refresh.ok()) { bool force=true; refresh.set("ForceItemsChanged",force); refresh.run(w); }
+    void* lib = FindObj("/Script/BlueprintContext.Default__BlueprintContextLibrary");
+    void* type = FindObj("/Script/FortniteUI.FortHUDContext");
+    if (lib && type) {
+        Call get("/Script/BlueprintContext.BlueprintContextLibrary.GetContext");
+        if (get.ok() && get.set("ContextObject", session.controller) && get.set("Class", type) && get.run(lib)) {
+            void* ctx = get.result<void*>();
+            if (ctx) {
+                Call pawn("/Script/FortniteUI.FortHUDContext.HandleLocalPawnSpawned");
+                if (pawn.ok()) pawn.run(ctx);
+                Call build("/Script/FortniteUI.FortHUDContext.HandleLocalPlayerBuildCostChanged");
+                if (build.ok()) build.run(ctx);
+                Call ind("/Script/FortniteUI.FortHUDContext.SetIndicatorsAllowed");
+                if (ind.ok()) { bool yes=true; ind.set("bIndicatorsAllowed",yes); ind.run(ctx); }
             }
         }
     }
@@ -1253,28 +1215,21 @@ void Athena::SetupCheats() {
 // DOORS — FIX: Toggle + ForceNetUpdate
 // ============================================================================
 void Athena::HandleDoor(void* door) {
-    if(!door || IsBadPtr(door)) return;
-    static void* wallCls=nullptr;
-    if(!wallCls) wallCls=FindObj("/Script/FortniteGame.BuildingWall");
-    if(!wallCls || !IsA(door,wallCls)) return;
+    if (!door || IsBadPtr(door)) return;
+    static void* wallCls = nullptr;
+    if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
+    if (!wallCls || !IsA(door, wallCls)) return;
 
-    // Let the door's own Blueprint interaction own the open/close state. The
-    // previous version toggled the bit and then called BlueprintOnInteract,
-    // effectively applying the interaction twice and leaving doors open.
-    Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract");
-    if(interact.ok() && session.pawn && interact.set("InteractingPawn",session.pawn) && interact.run(door)) {
-        Call netup("/Script/Engine.Actor.ForceNetUpdate"); if(netup.ok()) netup.run(door);
-        LOG("[Door] Blueprint interaction dispatched");
-        return;
-    }
+    uint8_t* byte = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
+    bool wasOpen = ((*byte) >> profile::BuildingWall_bDoorOpen_Bit) & 1;
+    if (wasOpen) *byte &= ~(1 << profile::BuildingWall_bDoorOpen_Bit);
+    else *byte |= (1 << profile::BuildingWall_bDoorOpen_Bit);
 
-    uint8_t* byte=(uint8_t*)door+profile::BuildingWall_bDoorOpen_Byte;
-    bool wasOpen=((*byte)>>profile::BuildingWall_bDoorOpen_Bit)&1;
-    if(wasOpen) *byte &= ~(1<<profile::BuildingWall_bDoorOpen_Bit);
-    else *byte |= (1<<profile::BuildingWall_bDoorOpen_Bit);
-    Call rep("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen"); if(rep.ok()) rep.run(door);
-    Call netup("/Script/Engine.Actor.ForceNetUpdate"); if(netup.ok()) netup.run(door);
-    LOG("[Door] fallback toggle: %s -> %s",wasOpen?"OPEN":"CLOSED",wasOpen?"CLOSED":"OPEN");
+    Call rep("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
+    if (rep.ok()) rep.run(door);
+    Call netup("/Script/Engine.Actor.ForceNetUpdate");
+    if (netup.ok()) netup.run(door);
+    LOG("[Door] local toggle: %s -> %s", wasOpen ? "OPEN" : "CLOSED", wasOpen ? "CLOSED" : "OPEN");
 }
 
 // ============================================================================
