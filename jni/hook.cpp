@@ -1,6 +1,7 @@
 // ============================================================================
-// EraCH3 v13 — Fortnite 21.30 CL-21088273 Android
+// EraCH3 v13.1 — Fortnite 21.30 CL-21088273 Android
 // COMPLETE FIX: Erbium-style aircraft phase, safe HUD, delayed bus
+// Build fixes: added Call::result_data, Session::ai_initialized
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -470,6 +471,12 @@ public:
             }
         return false;
     }
+    const void* result_data(size_t size) const {
+        for (auto& p : m_params)
+            if ((p.flags & profile::CPF_ReturnParm) && p.size == (int)size)
+                return m_data.data() + p.offset;
+        return nullptr;
+    }
     template<class T> T result() const {
         for (auto& p : m_params)
             if ((p.flags & profile::CPF_ReturnParm) && p.size == (int)sizeof(T))
@@ -599,6 +606,8 @@ struct Session {
     bool  minimap_initialized = false;
     bool  clamber_initialized = false;
     bool  solo_hud_ready = false;
+    bool  ai_initialized = false;
+    bool  tactical_sprint_setup = false;
 
     int   bots_target = 99;
     int   bots_spawned_count = 0;
@@ -766,7 +775,7 @@ void Athena::GrantAllAbilitySets() {
         if (!set) continue;
         if (ApplyAbilitySet(session.pawn, set)) {
             session.granted_ability_sets.push_back(set);
-            LOG("[Abilities] ✅ extra: %s", extraSets[i]);
+            LOG("[Abilities] extra: %s", extraSets[i]);
         }
     }
 
@@ -931,7 +940,7 @@ void Athena::ApplySprintSpeed() {
 }
 
 // ============================================================================
-// AIRCRAFT — Erbium style
+// AIRCRAFT
 // ============================================================================
 void Athena::StartAircraftPhase() { SpawnBattleBus(); }
 void Athena::OnAircraftJump() { HandleJumpFromHudStart(); }
@@ -943,11 +952,9 @@ void Athena::SpawnBattleBus() {
 
     LOG("[Bus] === StartAircraftPhase ===");
 
-    // 1) Get MapInfo
     void* mapInfo = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.MapInfo");
     if (!mapInfo) { LOG("[Bus] no MapInfo"); return; }
 
-    // 2) Get FlightInfo[0] from MapInfo
     void* flightArrProp = GetProp("/Script/FortniteGame.AthenaMapInfo.FlightInfos");
     if (!flightArrProp) { LOG("[Bus] no FlightInfos prop"); return; }
     void* flightArrField = GetField(mapInfo, flightArrProp);
@@ -957,7 +964,6 @@ void Athena::SpawnBattleBus() {
     if (flights.Count < 1 || !flights.Data) { LOG("[Bus] no FlightInfo"); return; }
     void* flightInfoPtr = flights.Data;
 
-    // 3) AircraftClass
     void* aircraftClsProp = GetProp("/Script/FortniteGame.AthenaMapInfo.AircraftClass");
     void* aircraftCls = nullptr;
     if (aircraftClsProp) aircraftCls = Read<void*>(GetField(mapInfo, aircraftClsProp));
@@ -967,7 +973,6 @@ void Athena::SpawnBattleBus() {
     if (!aircraftCls || IsBadPtr(aircraftCls)) { LOG("[Bus] no aircraft class"); return; }
     LOG("[Bus] class=%s", ObjName(aircraftCls).c_str());
 
-    // 4) Try native SpawnAircraft
     void* aircraft = nullptr;
     Call spawnAircraft("/Script/FortniteGame.FortAthenaAircraft.SpawnAircraft");
     if (spawnAircraft.ok()) {
@@ -982,7 +987,6 @@ void Athena::SpawnBattleBus() {
         }
     }
 
-    // 5) Fallback — raw SpawnActor
     if (!aircraft) {
         LOG("[Bus] fallback spawn via SpawnActor");
         Transform t{};
@@ -996,7 +1000,6 @@ void Athena::SpawnBattleBus() {
     if (!aircraft || IsBadPtr(aircraft)) { LOG("[Bus] spawn failed"); return; }
     session.aircraft = aircraft;
 
-    // 6) Set flight times
     float now = (float)Monotonic();
     Off<float>(aircraft, profile::Aircraft_FlightStartTime)   = now;
     Off<float>(aircraft, profile::Aircraft_FlightEndTime)     = now + 60.0f;
@@ -1005,7 +1008,6 @@ void Athena::SpawnBattleBus() {
     Off<float>(aircraft, profile::Aircraft_FlightElapsedTime) = 0.0f;
     Off<float>(aircraft, profile::Aircraft_ReplicatedFlightTimestamp) = now;
 
-    // 7) Register
     void* arrProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircrafts");
     if (arrProp) {
         void* arrField = GetField(session.state, arrProp);
@@ -1020,7 +1022,6 @@ void Athena::SpawnBattleBus() {
     void* singleProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircraft");
     if (singleProp) Write<void*>(GetField(session.state, singleProp), 0, aircraft);
 
-    // 8) Destroy local pawn (Erbium style)
     LOG("[Bus] destroying local pawn %p", session.pawn);
     if (session.pawn && !IsBadPtr(session.pawn)) {
         SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone", true);
@@ -1031,7 +1032,6 @@ void Athena::SpawnBattleBus() {
     }
     session.pawn = nullptr;
 
-    // 9) Spawn fresh skydiving pawn
     LOG("[Bus] spawning skydive pawn");
     void* pawnCls = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
     if (pawnCls) {
@@ -1049,7 +1049,7 @@ void Athena::SpawnBattleBus() {
             Possess(session.controller, newPawn);
 
             Call rc("/Script/Engine.PlayerController.ClientRestart");
-            if (rc.ok()) rc.set("NewPawn", newPawn), rc.run(session.controller);
+            if (rc.ok()) { rc.set("NewPawn", newPawn); rc.run(session.controller); }
 
             Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
             if (cam.ok()) {
@@ -1062,7 +1062,6 @@ void Athena::SpawnBattleBus() {
         }
     }
 
-    // 10) Switch GamePhase
     void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
     if (gp) {
         uint8_t phase = 3;
@@ -1072,13 +1071,13 @@ void Athena::SpawnBattleBus() {
     }
     void* stepProp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhaseStep");
     if (stepProp) {
-        uint8_t s = 4; // BusLocked
+        uint8_t s = 4;
         Write<uint8_t>(GetField(session.state, stepProp), 0, s);
     }
 
     session.aircraft_phase_started = true;
     session.storm_at = Monotonic() + 90.0;
-    LOG("[Bus] ✅ aircraft phase active");
+    LOG("[Bus] aircraft phase active");
 }
 
 void Athena::HandleJumpFromHudStart() {
@@ -1086,7 +1085,6 @@ void Athena::HandleJumpFromHudStart() {
     Guard g;
     LOG("[Bus] Jump intercepted");
 
-    // Transition to SafeZones phase
     void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
     if (gp) {
         uint8_t phase = 4;
@@ -1096,7 +1094,7 @@ void Athena::HandleJumpFromHudStart() {
     }
     void* stepProp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhaseStep");
     if (stepProp) {
-        uint8_t s = 6; // StormForming
+        uint8_t s = 6;
         Write<uint8_t>(GetField(session.state, stepProp), 0, s);
     }
 
@@ -1116,7 +1114,7 @@ void Athena::HandleJumpFromHudStart() {
     }
 
     session.aircraft_jumped = true;
-    LOG("[Bus] ✅ skydiving");
+    LOG("[Bus] skydiving");
 }
 
 // ============================================================================
@@ -1454,7 +1452,6 @@ static void* GetBotService() {
 
 void Athena::SetupLocalAI() {
     if (session.ai_initialized) return;
-    // no-op for now
     GetBotService();
     session.ai_initialized = true;
 }
@@ -1618,7 +1615,6 @@ void Athena::SetupWorld(void* world) {
         ObjName(session.controller).c_str(), ObjName(session.mode).c_str(), ObjName(session.state).c_str());
     if (!IsStandaloneWorld(world)) { LOG("SetupWorld: not standalone"); session.attempted = true; return; }
 
-    // Readiness
     void* rp = GetProp("/Script/FortniteGame.FortPlayerController.bReadyToStartMatch");
     if (rp) {
         int off = Read<int>(rp, profile::PropOffset);
@@ -1685,7 +1681,6 @@ void Athena::FinalizePlayer() {
     session.visibility_forced = false;
     ForcePlayerVisible();
 
-    // Delayed side systems
     SpawnSafeZoneIndicator();
     ProtectLocalPlayerFromStorm(true);
 
@@ -1693,7 +1688,6 @@ void Athena::FinalizePlayer() {
     RefreshHUD();
     InitializeSideSystems();
 
-    // Bus will fire after 30s
     session.bus_at = Monotonic() + 30.0;
     LOG("Finalize: complete (bus at +30s)");
 }
@@ -1716,12 +1710,11 @@ void Athena::Tick() {
     }
     if (!session.finalized) return;
 
-    // Trigger bus after 30s
     if (!session.aircraft_phase_started && session.bus_at > 0 && now >= session.bus_at) {
         SpawnBattleBus();
     }
 
-    static double lastVis = 0, lastSpd = 0, lastHUD = 0, lastBot = 0, lastStorm = 0, lastQB = 0, lastMove = 0, lastMelee = 0;
+    static double lastVis = 0, lastSpd = 0, lastBot = 0, lastQB = 0, lastMove = 0, lastMelee = 0;
     static int qbRetries = 0;
 
     if (now - lastVis > 15.0) {
@@ -1743,10 +1736,6 @@ void Athena::Tick() {
             qbRetries++;
             BuildQuickBarsManually();
         }
-    }
-    if (session.finalized && !session.aircraft_phase_started && now - lastHUD > 2.0 && session.solo_hud_ready == false) {
-        lastHUD = now;
-        if (session.bots_spawned_count > 0) UpdateSoloHUD();
     }
     if (!session.bots_spawned && now - lastBot > 5.0 && session.aircraft_jumped) {
         lastBot = now;
@@ -2293,7 +2282,7 @@ static int InspectCb(dl_phdr_info* info, size_t, void*) {
 }
 
 static void* Worker(void*) {
-    LOG("=== EraCH3 starting (v13) ===");
+    LOG("=== EraCH3 starting (v13.1) ===");
     LOG("sizeof(Vector)=%zu sizeof(Rotator)=%zu sizeof(Transform)=%zu",
         sizeof(Vector), sizeof(Rotator), sizeof(Transform));
     for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
