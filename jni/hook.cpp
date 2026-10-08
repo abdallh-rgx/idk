@@ -754,8 +754,6 @@ void Athena::GrantMeleeAbility() {
         if (meleeCls) { LOG("[Melee] Loaded: %s", meleePaths[i]); break; }
     }
     if (!meleeCls) { LOG("[Melee] ❌ No melee ability class found"); return; }
-    session.melee_attempted = true;
-
     Call give("/Script/GameplayAbilities.AbilitySystemComponent.K2_GiveAbility");
     if (!give.ok()) {
         LOG("[Melee] K2_GiveAbility not found, trying GiveAbility");
@@ -767,6 +765,7 @@ void Athena::GrantMeleeAbility() {
             if (give2.run(asc)) {
                 LOG("[Melee] ✅ Granted via GiveAbility");
                 session.melee_granted = true;
+                session.melee_attempted = true;
             }
         }
         return;
@@ -780,6 +779,7 @@ void Athena::GrantMeleeAbility() {
     if (give.run(asc)) {
         LOG("[Melee] ✅ Granted via K2_GiveAbility");
         session.melee_granted = true;
+        session.melee_attempted = true;
     }
 }
 
@@ -1606,8 +1606,14 @@ void Athena::InventoryUpdate() {
                         Call c("/Script/AthenaHUDItemList.AthenaHUDItemList_C.OnInventoryUpdated");
                         if (c.ok()) c.run(w);
                     } else if (k == 1) {
-                        Call c("/Script/AthenaMinimapContainer.AthenaMinimapContainer_C.ExecuteUbergraph_AthenaMinimapContainer");
-                        if (c.ok()) { int entry = 0; c.set("EntryPoint", entry); c.run(w); }
+                        // ExecuteUbergraph is an internal Blueprint dispatcher; never call it blindly.
+                        // Minimap initialization is optional and must not be allowed to crash gameplay.
+                        Call vis("/Script/FortniteUI.FortHUDElementWidget.OnVisibilitySetEvent");
+                        if (vis.ok()) {
+                            LOG("[HUD] Minimap found; skipped unsafe ExecuteUbergraph");
+                        } else {
+                            LOG("[HUD] Minimap found; no safe visibility callback, skipped");
+                        }
                     } else {
                         Call c("/Script/QuickbarBase.QuickbarBase_C.RefreshQuickbar");
                         if (c.ok()) { bool force = true; c.set("ForceItemsChanged", force); c.run(w); }
