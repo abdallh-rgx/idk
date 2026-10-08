@@ -502,6 +502,7 @@ struct Session {
     bool  visibility_forced = false;
     bool  abilities_granted = false;
     bool  melee_granted = false;
+    bool  melee_attempted = false;
     bool  stamina_initialized = false;
     bool  tactical_sprint_setup = false;
     bool  quickbars_initialized = false;
@@ -736,7 +737,8 @@ void Athena::GrantDefaultAbilities() { GrantAllAbilitySets(); }
 // MELEE ABILITY
 // ============================================================================
 void Athena::GrantMeleeAbility() {
-    if (!session.pawn || session.melee_granted) return;
+    if (!session.pawn || session.melee_granted || session.melee_attempted) return;
+    session.melee_attempted = true;
     void* asc = GetASC(session.pawn);
     if (!asc) return;
 
@@ -784,10 +786,10 @@ void Athena::GrantMeleeAbility() {
 void Athena::RefreshHUD() {
     if (!session.controller || !session.world) return;
 
-    // Re-run the client pawn/HUD path first. These are client-side functions;
-    // nothing here implements or depends on a GameServer.
+    // Re-enter the real client HUD lifecycle.  This is local-only and is the
+    // same client path used by the 21.30 Fortnite UI after a pawn is spawned.
     {
-        Call c("/Script/FortniteGame.FortPlayerController.ClientOnPawnSpawned");
+        Call c("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned");
         if (c.ok()) c.run(session.controller);
     }
     {
@@ -809,15 +811,34 @@ void Athena::RefreshHUD() {
         }
     }
 
+    // FortHUDContext is the owner of the gameplay HUD state.  Calling its
+    // pawn-spawned callback is much safer than constructing HUD widgets.
+    {
+        void* lib = FindObj("/Script/BlueprintContext.Default__BlueprintContextLibrary");
+        void* type = FindObj("/Script/FortniteUI.FortHUDContext");
+        if (lib && type) {
+            Call get("/Script/BlueprintContext.BlueprintContextLibrary.GetContext");
+            if (get.set("ContextObject", session.controller) &&
+                get.set("Class", type) && get.run(lib)) {
+                void* hudctx = get.result<void*>();
+                if (hudctx) {
+                    Call pawn("/Script/FortniteUI.FortHUDContext.HandleLocalPawnSpawned");
+                    if (pawn.ok()) pawn.run(hudctx);
+                    Call build("/Script/FortniteUI.FortHUDContext.HandleLocalPlayerBuildCostChanged");
+                    if (build.ok()) build.run(hudctx);
+                    Call indicators("/Script/FortniteUI.FortHUDContext.SetIndicatorsAllowed");
+                    if (indicators.ok()) { bool enabled=true; indicators.set("bIndicatorsAllowed",enabled); indicators.run(hudctx); }
+                }
+            }
+        }
+    }
+
     void* asc = GetASC(session.pawn);
     if (asc) {
         Call c("/Script/GameplayAbilities.AbilitySystemComponent.OnRep_ActivateAbilities");
         if (c.ok()) c.run(asc);
     }
 
-    // Inventory/QuickBar widgets have explicit client refresh events in the 21.30 SDK.
-    // Use those instead of reconstructing UUserWidgets or invoking arbitrary Ubergraph
-    // entry points on every tick.
     void* wb = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
     if (!wb) return;
     Call all("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
@@ -829,29 +850,31 @@ void Athena::RefreshHUD() {
         "/Script/QuickbarBase.QuickbarBase_C",
         nullptr
     };
-    for (int k = 0; classes[k]; ++k) {
-        void* cls = FindObj(classes[k]);
-        if (!cls || !all.set("WidgetClass", cls) || !all.run(wb)) continue;
-        Array widgets = all.result<Array>();
-        if (widgets.Count < 0 || widgets.Count > 256 || (widgets.Count && !widgets.Data)) continue;
-        for (int i = 0; i < widgets.Count; ++i) {
-            void* w = Read<void*>(widgets.Data, (size_t)i * 8);
+    for (int k=0; classes[k]; ++k) {
+        void* cls=FindObj(classes[k]);
+        if (!cls || !all.set("WidgetClass",cls) || !all.run(wb)) continue;
+        Array widgets=all.result<Array>();
+        if (widgets.Count<0 || widgets.Count>256 || (widgets.Count && !widgets.Data)) continue;
+        for (int i=0;i<widgets.Count;++i) {
+            void* w=Read<void*>(widgets.Data,(size_t)i*8);
             if (!w || IsBadPtr(w)) continue;
-            if (k == 0) {
+            if (k==0) {
                 Call c("/Script/AthenaHUDItemList.AthenaHUDItemList_C.OnInventoryUpdated");
                 if (c.ok()) c.run(w);
-            } else if (k == 1) {
-                // Do not call Construct or an arbitrary Ubergraph entry. The
-                // container owns the already-created minimap widget.
+            } else if (k==1) {
                 Call vis("/Script/FortniteUI.FortHUDElementWidget.OnVisibilitySetEvent");
-                if (vis.ok()) { uint8_t visible = 4; vis.set("InVisibility", visible); vis.run(w); }
+                if (vis.ok()) { uint8_t visible=4; vis.set("InVisibility",visible); vis.run(w); }
             } else {
                 Call spawned("/Script/QuickbarBase.QuickbarBase_C.OnLocalPlayerSpawned");
                 if (spawned.ok()) spawned.run(w);
                 Call full("/Script/QuickbarBase.QuickbarBase_C.OnQuickbarForceFullUpdate");
-                if (full.ok()) { uint8_t primary = 0; if (full.set("QuickbarIndex", primary)) full.run(w); uint8_t secondary = 1; if (full.set("QuickbarIndex", secondary)) full.run(w); }
+                if (full.ok()) {
+                    uint8_t primary=0,secondary=1;
+                    if (full.set("QuickbarIndex",primary)) full.run(w);
+                    if (full.set("QuickbarIndex",secondary)) full.run(w);
+                }
                 Call refresh("/Script/QuickbarBase.QuickbarBase_C.RefreshQuickbar");
-                if (refresh.ok()) { bool force = true; if (refresh.set("ForceItemsChanged", force)) refresh.run(w); }
+                if (refresh.ok()) { bool force=true; refresh.set("ForceItemsChanged",force); refresh.run(w); }
             }
         }
     }
@@ -886,68 +909,91 @@ void Athena::InitializeQuickBarsNative() {
 }
 
 void Athena::BuildQuickBarsManually() {
-    if (!session.quickbars) { LOG("[QB] No quickbars"); return; }
-    LOG("[QB] Building QuickBars manually...");
+    if (!session.quickbars || !session.inventory) { LOG("[QB] No quickbars/inventory"); return; }
+    LOG("[QB] Building QuickBars from reflected 21.30 layout...");
 
-    struct SlotEntry { int idx; Guid guid; };
-    std::vector<SlotEntry> entries;
+    void* primProp=GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
+    void* secProp=GetProp("/Script/FortniteGame.FortQuickBars.SecondaryQuickBar");
+    void* slotsProp=GetProp("/Script/FortniteGame.QuickBar.Slots");
+    void* itemsProp=GetProp("/Script/FortniteGame.QuickBarSlot.Items");
+    void* enabledProp=GetProp("/Script/FortniteGame.QuickBarSlot.bEnabled");
+    if(!primProp || !slotsProp || !itemsProp || !enabledProp) {
+        LOG("[QB] reflected quickbar properties unavailable"); return;
+    }
 
-    void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
-    void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
-    if (!invProp || !instProp) return;
+    const int slotSize=Read<int>(slotsProp,profile::PropElementSize);
+    const int guidSize=Read<int>(itemsProp,profile::PropElementSize);
+    LOG("[QB] reflected slotSize=0x%X guidSize=0x%X",slotSize,guidSize);
+    if(slotSize!=0x28 || guidSize!=0x10) {
+        LOG("[QB] layout mismatch; refusing raw slot construction"); return;
+    }
 
-    void* list = GetField(session.inventory, invProp);
-    Array arr = Read<Array>(GetField(list, instProp));
+    void* invProp=GetProp("/Script/FortniteGame.FortInventory.Inventory");
+    void* instProp=GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+    if(!invProp || !instProp) return;
+    void* list=GetField(session.inventory,invProp);
+    void* instField=list?GetField(list,instProp):nullptr;
+    Array arr=instField?Read<Array>(instField):Array{};
 
-    for (int i = 0; i < arr.Count && i < 6; ++i) {
-        void* inst = Read<void*>(arr.Data, (size_t)i * 8);
-        if (!inst) continue;
-        Call g("/Script/FortniteGame.FortItem.GetItemGuid");
-        if (g.ok() && g.run(inst)) {
-            Guid gg = g.result<Guid>();
-            entries.push_back({i, gg});
+    auto setupBar=[&](void* barProp)->bool {
+        if(!barProp) return false;
+        void* bar=GetField(session.quickbars,barProp);
+        if(!bar) return false;
+        void* sf=GetField(bar,slotsProp);
+        if(!sf) return false;
+        Array slots=Read<Array>(sf);
+        if(slots.Count<6) {
+            void* data=calloc(6,(size_t)slotSize);
+            if(!data) return false;
+            Write<void*>(sf,0,data); Write<int32>(sf,8,6); Write<int32>(sf,12,6);
+            slots=Read<Array>(sf);
+        }
+        return slots.Data && slots.Count>=6 && slots.Count<=64;
+    };
+
+    if(!setupBar(primProp)) { LOG("[QB] primary slot array allocation failed"); return; }
+    if(secProp) setupBar(secProp);
+
+    // Bind actual item GUIDs through the reflected quickbar API.  This also
+    // preserves FQuickBarSlot's occupied/dirty bookkeeping.
+    int bound=0;
+    for(int i=0;i<arr.Count && i<6;++i) {
+        void* item=Read<void*>(arr.Data,(size_t)i*8);
+        if(!item) continue;
+        Call defCall("/Script/FortniteGame.FortItem.GetItemDefinitionBP");
+        void* def=nullptr;
+        if(defCall.ok() && defCall.run(item)) def=defCall.result<void*>();
+        if(!def) continue;
+        Call bind("/Script/FortniteGame.FortKismetLibrary.EquipItemToQuickBarSlot");
+        if(bind.ok()) {
+            uint8_t bar=0; int slot=i;
+            bool dispatched=bind.set("WorldContextObject",session.world) &&
+                bind.set("ItemDefinition",def) && bind.set("QuickBarType",bar) &&
+                bind.set("SlotIndex",slot) && bind.run(FindObj("/Script/FortniteGame.Default__FortKismetLibrary"));
+            if(dispatched) ++bound;
         }
     }
 
-    LOG("[QB] Collected %zu item GUIDs", entries.size());
-
-    void* primary = (char*)session.quickbars + profile::QuickBars_PrimaryOffset;
-    void* slotsField = (char*)primary + 0x10;
-    Array slotsArr = Read<Array>(slotsField);
-
-    if (slotsArr.Count < 6) {
-        constexpr int SLOT_SIZE = 0x28;
-        constexpr int NEW_COUNT = 6;
-        void* newData = malloc(SLOT_SIZE * NEW_COUNT);
-        if (newData) {
-            memset(newData, 0, SLOT_SIZE * NEW_COUNT);
-            Write<void*>(slotsField, 0, newData);
-            Write<int32>(slotsField, 8, NEW_COUNT);
-            Write<int32>(slotsField, 12, NEW_COUNT);
-            slotsArr.Data = newData;
-            slotsArr.Count = NEW_COUNT;
-            slotsArr.Max = NEW_COUNT;
-            LOG("[QB] Allocated 6 slots at %p", newData);
-        }
+    // Ensure the six slot records are physically populated even if the Kismet
+    // binding accepts the call but does not materialize the local record.
+    void* bar=GetField(session.quickbars,primProp);
+    void* sf=bar?GetField(bar,slotsProp):nullptr;
+    Array slots=sf?Read<Array>(sf):Array{};
+    for(int i=0;i<6 && i<arr.Count && slots.Data;++i) {
+        void* item=Read<void*>(arr.Data,(size_t)i*8); if(!item) continue;
+        Guid guid{}; Call g("/Script/FortniteGame.FortItem.GetItemGuid");
+        if(!g.ok() || !g.run(item)) continue; guid=g.result<Guid>();
+        void* slot=(char*)slots.Data+(size_t)i*slotSize;
+        void* ia=GetField(slot,itemsProp);
+        Array values=ia?Read<Array>(ia):Array{};
+        bool found=false;
+        for(int j=0;j<values.Count;++j) if(values.Data && !memcmp((char*)values.Data+(size_t)j*guidSize,&guid,16)) found=true;
+        if(!found && ia) Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(ia,itemsProp,&guid);
+        SetBool(slot,"/Script/FortniteGame.QuickBarSlot.bEnabled",true);
     }
 
-    for (auto& e : entries) {
-        if (e.idx < 0 || e.idx >= slotsArr.Count) continue;
-        void* slot = (char*)slotsArr.Data + (size_t)e.idx * 0x28;
-        void* itemsField = slot;
-        Guid* guidData = (Guid*)malloc(16);
-        if (!guidData) continue;
-        *guidData = e.guid;
-        Write<void*>(itemsField, 0, guidData);
-        Write<int32>(itemsField, 8, 1);
-        Write<int32>(itemsField, 12, 1);
-        uint8_t* enablePtr = (uint8_t*)slot + 0x18;
-        *enablePtr = 1;
-        LOG("[QB] Slot %d -> GUID %08X:%08X", e.idx, e.guid.A, e.guid.B);
-    }
-
-    session.quickbars_initialized = true;
-    LOG("[QB] ✅ Manual initialization done");
+    session.quickbars_initialized=true;
+    LOG("[QB] Manual initialization complete bound=%d",bound);
 }
 
 void Athena::SetQuickBarReady() {
@@ -1202,28 +1248,28 @@ void Athena::SetupCheats() {
 // DOORS — FIX: Toggle + ForceNetUpdate
 // ============================================================================
 void Athena::HandleDoor(void* door) {
-    if (!door || IsBadPtr(door)) return;
-    static void* wallCls = nullptr;
-    if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
-    if (!wallCls || !IsA(door, wallCls)) return;
+    if(!door || IsBadPtr(door)) return;
+    static void* wallCls=nullptr;
+    if(!wallCls) wallCls=FindObj("/Script/FortniteGame.BuildingWall");
+    if(!wallCls || !IsA(door,wallCls)) return;
 
-    uint8_t* byte = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
-    bool wasOpen = ((*byte) >> profile::BuildingWall_bDoorOpen_Bit) & 1;
-    if (wasOpen) *byte &= ~(1 << profile::BuildingWall_bDoorOpen_Bit);
-    else         *byte |=  (1 << profile::BuildingWall_bDoorOpen_Bit);
-
-    Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
-    if (r.ok()) r.run(door);
-
-    Call netup("/Script/Engine.Actor.ForceNetUpdate");
-    if (netup.ok()) netup.run(door);
-
+    // Let the door's own Blueprint interaction own the open/close state. The
+    // previous version toggled the bit and then called BlueprintOnInteract,
+    // effectively applying the interaction twice and leaving doors open.
     Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract");
-    if (interact.ok() && session.pawn) {
-        if (interact.set("InteractingPawn", session.pawn)) interact.run(door);
+    if(interact.ok() && session.pawn && interact.set("InteractingPawn",session.pawn) && interact.run(door)) {
+        Call netup("/Script/Engine.Actor.ForceNetUpdate"); if(netup.ok()) netup.run(door);
+        LOG("[Door] Blueprint interaction dispatched");
+        return;
     }
 
-    LOG("[Door] Toggled: %s -> %s", wasOpen ? "OPEN" : "CLOSED", wasOpen ? "CLOSED" : "OPEN");
+    uint8_t* byte=(uint8_t*)door+profile::BuildingWall_bDoorOpen_Byte;
+    bool wasOpen=((*byte)>>profile::BuildingWall_bDoorOpen_Bit)&1;
+    if(wasOpen) *byte &= ~(1<<profile::BuildingWall_bDoorOpen_Bit);
+    else *byte |= (1<<profile::BuildingWall_bDoorOpen_Bit);
+    Call rep("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen"); if(rep.ok()) rep.run(door);
+    Call netup("/Script/Engine.Actor.ForceNetUpdate"); if(netup.ok()) netup.run(door);
+    LOG("[Door] fallback toggle: %s -> %s",wasOpen?"OPEN":"CLOSED",wasOpen?"CLOSED":"OPEN");
 }
 
 // ============================================================================
@@ -1991,152 +2037,119 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, bool toss) {
 }
 
 void Athena::DropInventoryItem(Guid guid, int count) {
-    if (!session.controller || !session.pawn || !session.inventory) return;
-    if (!(guid.A | guid.B | guid.C | guid.D)) { LOG("[Drop] invalid zero GUID"); return; }
-    if (count < 1 || count > 9999) { LOG("[Drop] invalid count=%d", count); return; }
+    if(!session.controller || !session.inventory || !session.world || !session.pawn) return;
+    if(!(guid.A|guid.B|guid.C|guid.D) || count<1 || count>9999) return;
 
-    void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
-    void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
-    void* repProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
-    void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
-    void* guidProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
-    void* countProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
-    if (!invProp || !instProp || !repProp || !itemEntryProp || !guidProp || !countProp) {
-        LOG("[Drop] inventory layout unavailable"); return;
+    void* invProp=GetProp("/Script/FortniteGame.FortInventory.Inventory");
+    void* instProp=GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+    void* repProp=GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
+    void* itemEntryProp=GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
+    void* countProp=GetProp("/Script/FortniteGame.FortItemEntry.Count");
+    void* guidProp=GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
+    if(!invProp || !instProp || !repProp || !itemEntryProp || !countProp || !guidProp) {
+        LOG("[Drop] inventory reflection incomplete"); return;
     }
 
-    void* list = GetField(session.inventory, invProp);
-    if (!list) return;
-    void* instArr = GetField(list, instProp);
-    void* repArr = GetField(list, repProp);
-    if (!instArr || !repArr) return;
+    void* list=GetField(session.inventory,invProp);
+    void* instArr=GetField(list,instProp);
+    void* repArr=GetField(list,repProp);
+    Array instances=Read<Array>(instArr);
+    Array replicated=Read<Array>(repArr);
+    if(instances.Count<0 || instances.Count>512 || replicated.Count<0 || replicated.Count>512 ||
+       (instances.Count && !instances.Data) || (replicated.Count && !replicated.Data)) return;
 
-    Array instances = Read<Array>(instArr);
-    Array replicated = Read<Array>(repArr);
-    int entryStride = Read<int>(repProp, profile::PropElementSize);
-    if (entryStride < 0x100 || entryStride > 0x400 || entryStride != 0x1A0) {
-        LOG("[Drop] unexpected ReplicatedEntries stride=%d", entryStride); return;
+    constexpr size_t EntryStride=0x1A0;
+    int instanceIndex=-1, replicatedIndex=-1;
+    void* item=nullptr;
+    void* replicatedEntry=nullptr;
+
+    for(int i=0;i<instances.Count;++i) {
+        void* candidate=Read<void*>(instances.Data,(size_t)i*8);
+        if(!candidate || IsBadPtr(candidate)) continue;
+        void* entry=GetField(candidate,itemEntryProp);
+        if(!entry) continue;
+        Guid got=Read<Guid>(GetField(entry,guidProp));
+        if(!memcmp(&got,&guid,sizeof(Guid))) { instanceIndex=i; item=candidate; break; }
     }
-    if (instances.Count < 0 || instances.Count > 512 || replicated.Count < 0 || replicated.Count > 512 ||
-        (instances.Count && !instances.Data) || (replicated.Count && !replicated.Data)) return;
+    if(instanceIndex<0 || !item) { LOG("[Drop] item GUID not found"); return; }
 
-    int instanceIndex = -1, replicatedIndex = -1;
-    void* item = nullptr;
-    void* replicatedEntry = nullptr;
-
-    for (int i = 0; i < instances.Count; ++i) {
-        void* candidate = Read<void*>(instances.Data, (size_t)i * 8);
-        if (!candidate || IsBadPtr(candidate)) continue;
-        void* entry = GetField(candidate, itemEntryProp);
-        if (!entry) continue;
-        Guid got = Read<Guid>(GetField(entry, guidProp));
-        if (!memcmp(&got, &guid, sizeof(Guid))) {
-            instanceIndex = i;
-            item = candidate;
-            break;
-        }
+    for(int i=0;i<replicated.Count;++i) {
+        void* candidate=(char*)replicated.Data+(size_t)i*EntryStride;
+        Guid got=Read<Guid>(GetField(candidate,guidProp));
+        if(!memcmp(&got,&guid,sizeof(Guid))) { replicatedIndex=i; replicatedEntry=candidate; break; }
     }
-    if (instanceIndex < 0 || !item) { LOG("[Drop] item GUID not found"); return; }
+    if(replicatedIndex<0 || !replicatedEntry) { LOG("[Drop] replicated entry missing"); return; }
 
-    for (int i = 0; i < replicated.Count; ++i) {
-        void* candidate = (char*)replicated.Data + (size_t)i * entryStride;
-        Guid got = Read<Guid>(GetField(candidate, guidProp));
-        if (!memcmp(&got, &guid, sizeof(Guid))) {
-            replicatedIndex = i;
-            replicatedEntry = candidate;
-            break;
-        }
-    }
-    if (replicatedIndex < 0 || !replicatedEntry) { LOG("[Drop] replicated entry missing"); return; }
+    void* itemEntry=GetField(item,itemEntryProp);
+    if(!itemEntry) return;
+    int countOffset=Read<int>(countProp,profile::PropOffset);
+    int have=Read<int>((char*)itemEntry+countOffset);
+    if(have<1) { LOG("[Drop] invalid stack=%d",have); return; }
+    count=std::min(count,have);
 
-    void* itemEntry = GetField(item, itemEntryProp);
-    if (!itemEntry) return;
-    int have = Read<int>(GetField(itemEntry, countProp));
-    if (have < 1) { LOG("[Drop] invalid stack=%d", have); return; }
-    count = std::min(count, have);
-
-    // Build the exact 21.30 FFortItemEntry used by the native pickup spawner.
-    // This follows the GameServer drop semantics, but runs entirely in the local
-    // standalone world. No ServerAttemptInventoryDrop implementation is needed.
-    constexpr int ItemEntrySize = 0x1A0;
-    struct RawItemEntry { alignas(8) uint8_t Data[ItemEntrySize]; };
+    // 21.30 FFortItemEntry is exactly 0x1A0. Copy only through the native
+    // pickup-spawn parameter so nested inventory arrays are never aliased.
+    struct RawItemEntry { alignas(8) uint8_t Data[0x1A0]; };
     RawItemEntry dropEntry{};
-    memcpy(dropEntry.Data, itemEntry, ItemEntrySize);
-    Write<int>(dropEntry.Data, Read<int>(countProp, profile::PropOffset), count);
+    memcpy(dropEntry.Data,itemEntry,sizeof(dropEntry.Data));
+    Write<int>(dropEntry.Data,countOffset,count);
 
     Call forwardCall("/Script/Engine.Actor.GetActorForwardVector");
     Vector forward{};
-    if (!forwardCall.ok() || !forwardCall.run(session.pawn)) {
-        LOG("[Drop] GetActorForwardVector unavailable"); return;
-    }
-    forward = forwardCall.result<Vector>();
-
+    if(!forwardCall.ok() || !forwardCall.run(session.pawn)) { LOG("[Drop] forward unavailable"); return; }
+    forward=forwardCall.result<Vector>();
     Call locCall("/Script/Engine.Actor.K2_GetActorLocation");
-    if (!locCall.ok() || !locCall.run(session.pawn)) { LOG("[Drop] location unavailable"); return; }
-    Vector pos = locCall.result<Vector>();
-    pos.X += forward.X * 70.0;
-    pos.Y += forward.Y * 70.0;
-    pos.Z += 50.0;
+    if(!locCall.ok() || !locCall.run(session.pawn)) { LOG("[Drop] location unavailable"); return; }
+    Vector pos=locCall.result<Vector>();
+    pos.X+=forward.X*70.0f; pos.Y+=forward.Y*70.0f; pos.Z+=50.0f;
 
-    void* pickupClass = FindObj("/Script/FortniteGame.FortPickupAthena");
-    void* lib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
-    if (!pickupClass || !lib) { LOG("[Drop] pickup class/library unavailable"); return; }
+    void* pickupClass=FindObj("/Script/FortniteGame.FortPickupAthena");
+    void* lib=FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    if(!pickupClass || !lib) { LOG("[Drop] pickup class/library unavailable"); return; }
 
     Call spawn("/Script/FortniteGame.FortKismetLibrary.K2_SpawnPickupInWorldWithClassAndItemEntry");
-    if (!spawn.ok()) { LOG("[Drop] local pickup spawner unavailable"); return; }
-    uint8_t sourceType = 16; // EFortPickupSourceTypeFlag::Tossed
-    uint8_t source = 10;     // EFortPickupSpawnSource::TossedByPlayer
-    bool toss = true, randomRotation = true, blocked = false, ownerOnly = false;
-    int maxStack = -1;
-    if (!spawn.set("WorldContextObject", session.world) ||
-        !spawn.set("ItemEntry", dropEntry) ||
-        !spawn.set("PickupClass", pickupClass) ||
-        !spawn.set("Position", pos) ||
-        !spawn.set("Direction", forward) ||
-        !spawn.set("OverrideMaxStackCount", maxStack) ||
-        !spawn.set("bToss", toss) ||
-        !spawn.set("bRandomRotation", randomRotation) ||
-        !spawn.set("bBlockedFromAutoPickup", blocked) ||
-        !spawn.set("SourceType", sourceType) ||
-        !spawn.set("Source", source) ||
-        !spawn.set("OptionalOwnerPC", session.controller) ||
-        !spawn.set("bPickupOnlyRelevantToOwner", ownerOnly)) {
+    if(!spawn.ok()) { LOG("[Drop] K2_SpawnPickupInWorldWithClassAndItemEntry unavailable"); return; }
+    uint8_t sourceType=16; // Tossed
+    uint8_t source=10;     // TossedByPlayer
+    bool toss=true,randomRotation=true,blocked=false,ownerOnly=false;
+    int maxStack=-1;
+    if(!spawn.set("WorldContextObject",session.world) || !spawn.set("ItemEntry",dropEntry) ||
+       !spawn.set("PickupClass",pickupClass) || !spawn.set("Position",pos) ||
+       !spawn.set("Direction",forward) || !spawn.set("OverrideMaxStackCount",maxStack) ||
+       !spawn.set("bToss",toss) || !spawn.set("bRandomRotation",randomRotation) ||
+       !spawn.set("bBlockedFromAutoPickup",blocked) || !spawn.set("SourceType",sourceType) ||
+       !spawn.set("Source",source) || !spawn.set("OptionalOwnerPC",session.controller) ||
+       !spawn.set("bPickupOnlyRelevantToOwner",ownerOnly)) {
         spawn.dump("K2_SpawnPickupInWorldWithClassAndItemEntry"); return;
     }
-    if (!spawn.run(lib)) { LOG("[Drop] local pickup spawn failed"); return; }
-    void* pickup = spawn.result<void*>();
-    if (!pickup || IsBadPtr(pickup)) { LOG("[Drop] pickup was not created; inventory untouched"); return; }
+    if(!spawn.run(lib)) { LOG("[Drop] local pickup spawn failed; inventory untouched"); return; }
+    void* pickup=spawn.result<void*>();
+    if(!pickup || IsBadPtr(pickup)) { LOG("[Drop] pickup was not created; inventory untouched"); return; }
 
-    void* definition = GetField(itemEntry, GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition"));
-    bool removeAll = (count >= have);
-
-    if (removeAll && definition) {
-        // The SDK exposes this client-side native helper. It only changes the
-        // quickbar mapping; inventory ownership remains under our local list below.
+    void* definition=GetField(itemEntry,GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition"));
+    bool removeAll=count>=have;
+    if(removeAll && definition) {
         Call removeQB("/Script/FortniteGame.FortPlayerController.RemoveItemFromQuickBars");
-        if (removeQB.ok()) { removeQB.set("ItemDefinition", definition); removeQB.run(session.controller); }
+        if(removeQB.ok()) { removeQB.set("ItemDefinition",definition); removeQB.run(session.controller); }
+        for(int i=0;i<6;++i) if(session.slots[i]==item) session.slots[i]=nullptr;
     }
 
-    int countOffset = Read<int>(countProp, profile::PropOffset);
-    if (!removeAll) {
-        Write<int>((char*)itemEntry + countOffset, 0, have - count);
-        Write<int>((char*)replicatedEntry + countOffset, 0, have - count);
+    if(!removeAll) {
+        Write<int>((char*)itemEntry,countOffset,have-count);
+        Write<int>((char*)replicatedEntry,countOffset,have-count);
     } else {
-        // Use the engine's GenericArrayRemove for both arrays so their allocators
-        // and element semantics stay consistent with TArray/FScriptArray.
-        using RemoveFn = void(*)(void*, int32_t, int32_t, int32_t);
-        auto removeFn = Fn<RemoveFn>(profile::GenericArrayRemove);
-        removeFn(instArr, instanceIndex, 1, 8);
-        // Re-read after the first removal because the array storage may move.
-        replicated = Read<Array>(repArr);
-        if (replicatedIndex >= 0 && replicatedIndex < replicated.Count && replicated.Data)
-            removeFn(repArr, replicatedIndex, 1, entryStride);
+        using RemoveFn=void(*)(void*,int32_t,int32_t,int32_t);
+        auto removeFn=Fn<RemoveFn>(profile::GenericArrayRemove);
+        removeFn(instArr,instanceIndex,1,8);
+        replicated=Read<Array>(repArr);
+        if(replicatedIndex>=0 && replicatedIndex<replicated.Count && replicated.Data)
+            removeFn(repArr,replicatedIndex,1,(int32_t)EntryStride);
     }
 
     InventoryUpdate();
     RefreshHUD();
     LOG("[Drop] LOCAL drop guid=%08X:%08X:%08X:%08X count=%d remaining=%d",
-        guid.A, guid.B, guid.C, guid.D, count, removeAll ? 0 : have - count);
+        guid.A,guid.B,guid.C,guid.D,count,removeAll?0:have-count);
 }
 
 void Athena::FixBus() {
@@ -2276,8 +2289,8 @@ static void pe_hook(void* obj, void* func, void* params) {
                     void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
                     void* targetCls = Read<void*>(target, profile::ObjectClass);
                     LOG("[Interact] target=%p class=%s", target, ObjName(targetCls).c_str());
-                    if (bcCls && SubclassOfFast(targetCls, bcCls)) Athena::Loot(target);
-                    else if (wallCls && SubclassOfFast(targetCls, wallCls)) Athena::HandleDoor(target);
+                    if (bcCls && SubclassOfFast(targetCls, bcCls)) { Athena::Loot(target); return; }
+                    else if (wallCls && SubclassOfFast(targetCls, wallCls)) { Athena::HandleDoor(target); return; }
                 }
             }
             else if (n == "ServerAttemptAircraftJump" && !session.aircraft_jumped) Athena::HandleJumpFromHudStart();
@@ -2294,6 +2307,7 @@ static void pe_hook(void* obj, void* func, void* params) {
                 Guid gg = Read<Guid>(params);
                 int cnt = Read<int>(params, sizeof(Guid));
                 Athena::DropInventoryItem(gg, cnt);
+                return;
             }
         }
     }
