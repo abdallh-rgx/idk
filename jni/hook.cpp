@@ -2012,8 +2012,8 @@ void Athena::InitializeInventory() {
             LOG("[QB] Running native initialize...");
             InitializeQuickBarsNative();
             if (!session.quickbars_initialized) {
-                LOG("[QB] Native init failed; switching to verified manual initialization before inventory items");
-                BuildQuickBarsManually();
+                LOG("[QB] Native init failed; manual QuickBar construction disabled for safety");
+                LOG("[QB] Inventory population will be skipped until native QuickBar init succeeds");
             }
         }
     }
