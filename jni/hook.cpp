@@ -1180,54 +1180,9 @@ void Athena::ApplySprintSpeed() {
 // BATTLE BUS
 // ============================================================================
 void Athena::StartBusNow() {
-    if (session.bus_started || !session.state || !session.controller || !session.pawn) {
-        LOG("[Bus] Start skipped: invalid state/controller/pawn");
-        return;
-    }
-
-    Guard g;
-    LOG("[Bus] Starting aircraft phase after warmup");
-
-    if (!session.pawn || !session.controller) {
-        LOG("[Bus] Pawn/controller unavailable");
-        return;
-    }
-
-    TeleportToSpawnIsland();
-
-    void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
-    if (!gp) {
-        LOG("[Bus] GamePhase property missing; aborting aircraft transition");
-        return;
-    }
-
-    void* gpAddr = GetField(session.state, gp);
-    if (!gpAddr) {
-        LOG("[Bus] GamePhase field missing; aborting aircraft transition");
-        return;
-    }
-
-    uint8_t oldPhase = Read<uint8_t>(gpAddr);
-    uint8_t aircraftPhase = 3;
-    Write<uint8_t>(gpAddr, 0, aircraftPhase);
-
-    Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
-    if (n.ok()) {
-        n.set("OldGamePhase", oldPhase);
-        if (!n.run(session.state)) {
-            LOG("[Bus] OnRep_GamePhase failed");
-            Write<uint8_t>(gpAddr, 0, oldPhase);
-            return;
-        }
-    } else {
-        LOG("[Bus] OnRep_GamePhase missing; restoring GamePhase");
-        Write<uint8_t>(gpAddr, 0, oldPhase);
-        return;
-    }
-
-    session.bus_started = true;
-    session.aircraft_jumped = false;
-    LOG("[Bus] Aircraft phase started; waiting for jump");
+    LOG("[Bus] Automatic aircraft transition disabled: 21.30 SDK requires a valid AFortAthenaAircraft/flight state");
+    session.bus_started = false;
+    session.bus_scheduled = false;
 }
 
 void Athena::SpawnBattleBus() {
@@ -1241,31 +1196,60 @@ void Athena::SpawnBattleBus() {
 }
 
 void Athena::HandleJumpFromHudStart() {
-    if (!session.controller || !session.pawn) return;
-    if (session.aircraft_jumped) return;
+    if (!session.controller || !session.pawn || session.aircraft_jumped) return;
     Guard g;
     LOG("[Bus] JumpFromHudStart intercepted");
-    Vector rot{0, 0, 0};
+
+    Call getAircraft("/Script/FortniteGame.FortPlayerController.GetAircraftComponent");
+    if (!getAircraft.ok() || !getAircraft.run(session.controller)) {
+        LOG("[Bus] GetAircraftComponent unavailable; ignoring jump safely");
+        return;
+    }
+    void* aircraftComp = getAircraft.result<void*>();
+    if (!aircraftComp || IsBadPtr(aircraftComp)) {
+        LOG("[Bus] Aircraft component missing; ignoring jump safely");
+        return;
+    }
+
+    void* currentAircraft = Read<void*>(aircraftComp, 0xB0);
+    if (!currentAircraft || IsBadPtr(currentAircraft)) {
+        LOG("[Bus] CurrentAircraft is null; no aircraft is active");
+        return;
+    }
+
+    Vector rot{0,0,0};
     void* rotProp = GetProp("/Script/Engine.Controller.ControlRotation");
     if (rotProp && Read<int>(rotProp, profile::PropElementSize) == 24) {
         void* addr = GetField(session.controller, rotProp);
         if (addr) rot = Read<Vector>(addr);
     }
-    Call aircraft("/Script/FortniteGame.FortPlayerController.ServerAttemptAircraftJump");
-    if (aircraft.ok()) {
-        Rotator r{rot.X, rot.Y, rot.Z};
-        if (aircraft.set("ClientRotation", r)) aircraft.run(session.controller);
+
+    Rotator r{rot.X, rot.Y, rot.Z};
+    Call jump("/Script/FortniteGame.FortControllerComponent_Aircraft.ServerAttemptAircraftJump");
+    if (!jump.ok() || !jump.set("ClientRotation", r) || !jump.run(aircraftComp)) {
+        LOG("[Bus] ServerAttemptAircraftJump failed; leaving pawn unchanged");
+        return;
     }
+
     Call sky("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
-    if (sky.ok()) { bool bFromBus = true; if (sky.set("bFromBus", bFromBus)) sky.run(session.pawn); }
-    Write<uint8_t>(session.pawn, profile::FortPlayerPawn_bIsSkydiving, 1);
+    bool local = sky.ok() && sky.set("bFromBus", true) && sky.run(session.pawn);
+    if (!local) {
+        LOG("[Bus] BeginSkydiving unavailable; aircraft jump dispatched only");
+        return;
+    }
+
     Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
-    if (cam.ok()) { cam.set("NewViewTarget", session.pawn); float blend = 0.0f; cam.set("BlendTime", blend); cam.run(session.controller); }
-    Call rep("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-    if (rep.ok()) rep.run(session.pawn);
+    if (cam.ok()) {
+        cam.set("NewViewTarget", session.pawn);
+        float blend = 0.0f;
+        cam.set("BlendTime", blend);
+        cam.run(session.controller);
+    }
     session.aircraft_jumped = true;
-    LOG("[Bus] Skydiving started");
+    session.bus_started = true;
+    LOG("[Bus] Skydiving started through 21.30 Aircraft component");
 }
+
 void Athena::OnAircraftJump() { HandleJumpFromHudStart(); }
 void Athena::BeginPlayerSkydiving() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
@@ -1708,14 +1692,12 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
     LOG("SetupWorld: SpawnBuildPreviews"); SpawnBuildPreviews();
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
-    LOG("SetupWorld: scheduling Solo warmup -> aircraft");
-    session.bus_scheduled = true;
+    LOG("SetupWorld: Solo Warmup ready; aircraft will only be used when a valid Aircraft component/current aircraft exists");
+    session.bus_scheduled = false;
     session.bus_started = false;
     session.aircraft_jumped = false;
-    session.bus_at = Monotonic() + 8.0;
-    session.storm_at = Monotonic() + 90.0;
-    ProtectLocalPlayerFromStorm(true);
-    LOG("[Bus] Warmup stabilized; aircraft deferred by 8 seconds");
+    session.bus_at = 0.0;
+    session.storm_at = 0.0;
     LOG("SetupWorld: RemoveNetDebugUI"); RemoveNetDebugUI();
     RefreshHUD();
     session.finalize_at = Monotonic() + 2.0;
@@ -1810,7 +1792,6 @@ void Athena::Tick() {
         if (!session.movement_enabled) EnableMovementFeatures();
     if (!session.profile_attempted) ShowSkin();
     }
-    if (session.bus_scheduled && !session.bus_started && now >= session.bus_at) StartBusNow();
     if (session.finalized && !session.bots_spawned) SpawnSoloBotsBatch(10);
     if (session.finalized && session.bots_spawned_count > 0 && now - lastQBCheck > 2.0) UpdateSoloHUD();
     if (session.storm_protected && session.storm_at > 0 && now >= session.storm_at) {
