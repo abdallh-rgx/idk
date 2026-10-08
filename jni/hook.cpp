@@ -1,7 +1,8 @@
 // ============================================================================
 // EraCH3 — Fortnite 21.30 CL-21088273 Android
-// COMPLETE FINAL v5 — Full 1:1 with crash fixes
-// All ORIG constants + All functions + Early return in FinalizePlayer
+// COMPLETE FINAL v6 — All native calls replaced with Call() except:
+//   - NativeSpawnLoot (uses ORIG_SpawnLoot)
+//   - NativeOpenActor / NativeCloseActor (doors)
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -50,10 +51,10 @@ using uint8=uint8_t; using uint16=uint16_t; using uint32=uint32_t; using uint64=
 using TCHAR=char16_t;
 
 // ============================================================================
-// PROFILE — All constants (unused preserved for future use)
+// PROFILE
 // ============================================================================
 namespace profile {
-// ─── Core engine ───
+// Core engine
 constexpr uintptr_t ProcessEvent        = 0x07611B5C;
 constexpr uintptr_t StaticFindObject    = 0x0762A664;
 constexpr uintptr_t StaticLoadObject    = 0x0761C568;
@@ -76,7 +77,7 @@ constexpr uintptr_t Realloc             = 0x0735E520;
 constexpr uintptr_t CopyScriptStruct    = 0x07535848;
 constexpr uintptr_t GetInterfaceAddress = 0x0761AA88;
 
-// ─── Object layout ───
+// Object layout
 constexpr unsigned ObjectClass  = 0x10;
 constexpr unsigned ObjectName   = 0x18;
 constexpr unsigned ObjectOuter  = 0x20;
@@ -99,7 +100,7 @@ constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
 constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 
-// ─── ★ ALL ORIG native addresses ───
+// ORIG native addresses
 constexpr uintptr_t ORIG_OpenActor                              = 0x05ec83f4;
 constexpr uintptr_t ORIG_CloseActor                             = 0x05ec8468;
 constexpr uintptr_t ORIG_IsDoorOpen                             = 0x05957c5c;
@@ -128,7 +129,7 @@ constexpr uintptr_t ORIG_UpdatePlayerCustomCharacterParts       = 0x05ec7ca8;
 constexpr uintptr_t ORIG_BeginSkydiving                         = 0x065d031c;
 constexpr uintptr_t ORIG_SetMovementSpeedMultiplier             = 0x0656aca4;
 
-// ─── FFortItemEntry (size = 0x1A0) ───
+// FFortItemEntry (size = 0x1A0)
 constexpr unsigned ItemEntry_Durability           = 0x24;
 constexpr unsigned ItemEntry_LoadedAmmo           = 0x2C;
 constexpr unsigned ItemEntry_PhantomReserveAmmo   = 0x30;
@@ -141,11 +142,11 @@ constexpr unsigned ItemEntry_ParentInventory      = 0xE0;
 constexpr unsigned ItemEntry_GameplayAbilitySpecHandle = 0xE8;
 constexpr unsigned ItemEntry_Size                 = 0x1A0;
 
-// ─── FFortItemList ───
+// FFortItemList
 constexpr unsigned FortItemList_ReplicatedEntries = 0x0108;
 constexpr unsigned FortItemList_ItemInstances     = 0x0168;
 
-// ─── ABuildingContainer ───
+// ABuildingContainer
 constexpr unsigned BuildingContainer_SearchLootTierGroup      = 0x0E20;
 constexpr unsigned BuildingContainer_LootSpawnLocation        = 0x0F28;
 constexpr unsigned BuildingContainer_LootSpawnLocation_Athena = 0x0F78;
@@ -165,7 +166,7 @@ constexpr unsigned BuildingContainer_SearchAnimationCount     = 0x0FD0;
 constexpr unsigned BuildingContainer_ChosenRandomUpgrade     = 0x0F70;
 constexpr unsigned BuildingContainer_ReplicatedLootTier      = 0x0F74;
 
-// ─── ABuildingSMActor ───
+// ABuildingSMActor
 constexpr unsigned BuildingSMActor_bPlayerPlaced_Byte       = 0x04DE;
 constexpr unsigned BuildingSMActor_bPlayerPlaced_Bit        = 3;
 constexpr unsigned BuildingSMActor_CurrentBuildingLevel     = 0x03F0;
@@ -180,11 +181,11 @@ constexpr unsigned BuildingSMActor_EditingPlayer            = 0x0C28;
 constexpr unsigned BuildingSMActor_bDestroyed_Byte          = 0x0C30;
 constexpr unsigned BuildingSMActor_bDestroyed_Bit           = 0;
 
-// ─── ABuildingWall ───
+// ABuildingWall
 constexpr unsigned BuildingWall_bDoorOpen_Byte = 0x0FDE;
 constexpr unsigned BuildingWall_bDoorOpen_Bit  = 5;
 
-// ─── AFortPlayerControllerAthena ───
+// AFortPlayerControllerAthena
 constexpr unsigned FortPlayerController_WorldInventory             = 0x1D20;
 constexpr unsigned FortPlayerController_OutpostInventory           = 0x1D28;
 constexpr unsigned FortPlayerController_ClientQuickBars            = 0x1A60;
@@ -200,9 +201,8 @@ constexpr unsigned FortPlayerController_bInfiniteAmmo_Bit          = 2;
 constexpr unsigned FortPlayerController_bTryPickupSwap             = 0x2731;
 constexpr unsigned FortPlayerController_CheatManager               = 0x2F20;
 constexpr unsigned FortPlayerController_MyPlayerInfo               = 0x2088;
-// NOTE: FortPlayerController_PlayerState = 0x02D0 REMOVED — was crash source!
 
-// ─── AFortPlayerStateAthena ───
+// AFortPlayerStateAthena
 constexpr unsigned FortPlayerState_TeamIndex       = 0x0C24;
 constexpr unsigned FortPlayerState_SquadId         = 0x0C25;
 constexpr unsigned FortPlayerState_Kills           = 0x1120;
@@ -213,7 +213,7 @@ constexpr unsigned FortPlayerState_HeroType        = 0x0430;
 constexpr unsigned FortPlayerState_CharacterParts  = 0x0438;
 constexpr unsigned FortPlayerState_WorldPlayerId   = 0x0C50;
 
-// ─── AFortPlayerPawnAthena ───
+// AFortPlayerPawnAthena
 constexpr unsigned FortPlayerPawn_bIsSkydiving          = 0x1A1D;
 constexpr unsigned FortPlayerPawn_bIsParachuteOpen      = 0x1A1E;
 constexpr unsigned FortPlayerPawn_bIsSkydivingFromBus_Byte = 0x1A1F;
@@ -226,7 +226,7 @@ constexpr unsigned FortPlayerPawn_CurrentWeaponList      = 0x0800;
 constexpr unsigned FortPlayerPawn_Damagers               = 0x1058;
 constexpr unsigned FortPlayerPawn_LastFallDistance       = 0x4AD0;
 
-// ─── AFortPickup ───
+// AFortPickup
 constexpr unsigned FortPickup_PrimaryPickupItemEntry = 0x02F8;
 constexpr unsigned FortPickup_PickupLocationData     = 0x04A8;
 constexpr unsigned FortPickup_bPickedUp              = 0x0590;
@@ -234,11 +234,11 @@ constexpr unsigned FortPickup_bTossedFromContainer   = 0x0592;
 constexpr unsigned FortPickup_bRandomRotation        = 0x0645;
 constexpr unsigned FortPickup_PawnWhoDroppedPickup   = 0x05C8;
 
-// ─── RegisteredPlayerInfo ───
+// RegisteredPlayerInfo
 constexpr unsigned RegisteredPlayerInfo_HeroInstance = 0x2D0;
 constexpr unsigned FortHero_CharacterParts           = 0x238;
 
-// ─── MME AbilitySet paths ───
+// MME AbilitySet paths
 constexpr const char* AS_TacticalSprint     = "/TacticalSprintGame/Gameplay/AS_TacticalSprint.AS_TacticalSprint";
 constexpr const char* AS_TacticalSprint_Alt = "/TacticalSprint/Gameplay/AS_TacticalSprint.AS_TacticalSprint";
 constexpr const char* AS_Ascender           = "/Ascender/Gameplay/Ascender/AS_Ascender.AS_Ascender";
@@ -590,13 +590,8 @@ static void* ResolveInterface(void* object, void* ifaceClass) {
 }
 
 // ============================================================================
-// NATIVE WRAPPERS — All available
+// NATIVE WRAPPERS — Only the SAFE ones (SpawnLoot, Doors)
 // ============================================================================
-static void* GetKismetLib() {
-    static void* klib = nullptr;
-    if (!klib) klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
-    return klib;
-}
 static bool NativeOpenActor(void* actor, void* controller, bool bFast) {
     if (!actor) return false;
     using FnT = bool(*)(void*, void*, bool);
@@ -611,51 +606,6 @@ static void NativeSpawnLoot(void* container) {
     if (!container) return;
     using FnT = void(*)(void*);
     ((FnT)(g_base + profile::ORIG_SpawnLoot))(container);
-}
-static bool NativeBP_SpawnLoot(void* container, void* pawn) {
-    if (!container) return false;
-    using FnT = bool(*)(void*, void*);
-    return ((FnT)(g_base + profile::ORIG_BP_SpawnLoot))(container, pawn);
-}
-static bool NativeBP_IsAlreadySearched(void* c) {
-    if (!c) return false;
-    using FnT = bool(*)(void*);
-    return ((FnT)(g_base + profile::ORIG_BP_IsAlreadySearched))(c);
-}
-static void NativeBP_SetAlreadySearched(void* c, bool s) {
-    if (!c) return;
-    using FnT = void(*)(void*, bool);
-    ((FnT)(g_base + profile::ORIG_BP_SetAlreadySearched))(c, s);
-}
-static void NativeHandleWorldInventoryLocalUpdate(void* pc) {
-    if (!pc) return;
-    using FnT = void(*)(void*);
-    ((FnT)(g_base + profile::ORIG_HandleWorldInventoryLocalUpdate))(pc);
-}
-static void* NativeCreateTemporaryItemInstanceBP(void* def, int count, int level) {
-    if (!def) return nullptr;
-    using FnT = void*(*)(void*, int, int);
-    return ((FnT)(g_base + profile::ORIG_CreateTemporaryItemInstanceBP))(def, count, level);
-}
-static void NativeSetOwningControllerForTemporaryItem(void* item, void* controller) {
-    if (!item) return;
-    using FnT = void(*)(void*, void*);
-    ((FnT)(g_base + profile::ORIG_SetOwningControllerForTemporaryItem))(item, controller);
-}
-static bool NativeTryActivateAbilityByClass(void* asc, void* abilityClass, bool bRemote) {
-    if (!asc || !abilityClass) return false;
-    using FnT = bool(*)(void*, void*, bool);
-    return ((FnT)(g_base + profile::ORIG_TryActivateAbilityByClass))(asc, abilityClass, bRemote);
-}
-static void NativeK2_InitStats(void* asc, void* attrClass, void* dataTable) {
-    if (!asc) return;
-    using FnT = void(*)(void*, void*, void*);
-    ((FnT)(g_base + profile::ORIG_K2_InitStats))(asc, attrClass, dataTable);
-}
-static void NativeUpdatePlayerCustomCharacterParts(void* state) {
-    if (!state) return;
-    using FnT = void(*)(void*);
-    ((FnT)(g_base + profile::ORIG_UpdatePlayerCustomCharacterParts))(state);
 }
 
 // ============================================================================
@@ -851,8 +801,13 @@ void Athena::GrantAbility(void* klass) {
     if (!klass || !session.pawn) return;
     void* asc = GetASC(session.pawn);
     if (!asc) return;
-    NativeTryActivateAbilityByClass(asc, klass, true);
-    LOG("[Ability] Activated: %s", ObjName(klass).c_str());
+    Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
+    if (!c.ok()) return;
+    bool bRemote = true;
+    if (c.set("InAbilityToActivate", klass) && c.set("bAllowRemoteActivation", bRemote)) {
+        c.run(asc);
+        LOG("[Ability] Activated: %s", ObjName(klass).c_str());
+    }
 }
 
 void Athena::GrantAllAbilitySets() {
@@ -980,13 +935,23 @@ void Athena::InitializeInventory() {
 
 void Athena::AddToInventory(void* def, int count, int slot) {
     if (IsBadPtr(def) || !session.inventory || !session.controller) return;
-    void* inst = NativeCreateTemporaryItemInstanceBP(def, count, 1);
+
+    // ★ Call CreateTemporaryItemInstanceBP
+    Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
+    int cnt = count, lvl = 1;
+    if (!c.ok() || !c.set("Count", cnt) || !c.set("Level", lvl) || !c.run(def)) return;
+    void* inst = c.result<void*>();
     if (!inst || IsBadPtr(inst)) return;
-    NativeSetOwningControllerForTemporaryItem(inst, session.controller);
+
+    // ★ Call SetOwningControllerForTemporaryItem
+    Call so("/Script/FortniteGame.FortItem.SetOwningControllerForTemporaryItem");
+    if (so.ok() && so.set("InController", session.controller)) so.run(inst);
+
     void* entryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
     if (!entryProp) return;
     void* entrySrc = GetField(inst, entryProp);
     if (!entrySrc) return;
+
     Guid g = Read<Guid>(entrySrc, profile::ItemEntry_ItemGuid);
     if ((g.A | g.B | g.C | g.D) == 0) {
         Call ng("/Script/Engine.KismetGuidLibrary.NewGuid");
@@ -997,20 +962,27 @@ void Athena::AddToInventory(void* def, int count, int slot) {
         }
     }
     Write<float>(entrySrc, profile::ItemEntry_Durability, 1.0f);
+
     void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
     if (!invProp) return;
     void* list = (char*)session.inventory + Read<int>(invProp, profile::PropOffset);
     void* instArr = (char*)list + profile::FortItemList_ItemInstances;
     void* entryArr = (char*)list + profile::FortItemList_ReplicatedEntries;
+
     Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(instArr, invProp, &inst);
     Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(entryArr, invProp, entrySrc);
+
     if (slot >= 0 && slot < 6) session.slots[slot] = inst;
     LOG("[Inv+] %s x%d slot=%d", ObjName(def).c_str(), count, slot);
 }
 
 void Athena::InventoryUpdate() {
     if (!session.controller) return;
-    NativeHandleWorldInventoryLocalUpdate(session.controller);
+
+    // ★ Call HandleWorldInventoryLocalUpdate
+    Call hw("/Script/FortniteGame.FortPlayerController.HandleWorldInventoryLocalUpdate");
+    if (hw.ok()) hw.run(session.controller);
+
     for (uint8_t bar : {(uint8_t)0, (uint8_t)1}) {
         Call c("/Script/FortniteGame.FortPlayerController.ClientForceUpdateQuickbar");
         if (c.ok()) { c.set("QuickbarToRefresh", bar); c.run(session.controller); }
@@ -1315,7 +1287,12 @@ void Athena::LoadProfileCosmetics() {
         Call r2("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts"); if (r2.ok()) r2.run(state);
         Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData"); if (r3.ok()) r3.run(state);
     }
-    NativeUpdatePlayerCustomCharacterParts(state);
+    // ★ Call UpdatePlayerCustomCharacterPartsVisualization (بدل Native)
+    void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    if (klib && state) {
+        Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
+        if (upd.ok() && upd.set("PlayerState", state)) upd.run(klib);
+    }
     Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CustomizationLoadout");
     if (cl.ok()) cl.run(session.pawn);
 }
@@ -1347,7 +1324,12 @@ void Athena::LoadDefaultCosmetics() {
     Call r1("/Script/FortniteGame.FortPlayerState.OnRep_HeroType"); if (r1.ok()) r1.run(state);
     Call r2("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts"); if (r2.ok()) r2.run(state);
     Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData"); if (r3.ok()) r3.run(state);
-    NativeUpdatePlayerCustomCharacterParts(state);
+    // ★ Call UpdatePlayerCustomCharacterPartsVisualization
+    void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    if (klib) {
+        Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
+        if (upd.ok() && upd.set("PlayerState", state)) upd.run(klib);
+    }
     Call cl("/Script/FortniteGame.FortPlayerPawn.OnRep_CustomizationLoadout");
     if (cl.ok()) cl.run(session.pawn);
 }
@@ -1803,7 +1785,6 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: initial pass done");
 }
 
-// ★ Crash-safe FinalizePlayer with EARLY RETURN
 void Athena::FinalizePlayer() {
     if (session.finalized) return;
     session.finalized = true;
@@ -1815,7 +1796,6 @@ void Athena::FinalizePlayer() {
     void* pawnCls = FindObj("/Script/FortniteGame.FortPlayerPawnAthena");
     void* pawn = GetPawn(pc);
 
-    // ★★ الحماية الأساسية — اخرج بأمان قبل أي استدعاء
     if (!pawn || !pawnCls || IsBadPtr(pawn) || !IsA(pawn, pawnCls)) {
         LOG("Finalize: pawn invalid — ABORT (safe)");
         return;
@@ -1868,7 +1848,6 @@ void Athena::Tick() {
         lastSpeedReapply = now;
         ApplySprintSpeed();
     }
-    // FinalizeHUD في Tick — خارج FinalizePlayer
     if (session.finalized && !session.hud_ready && now - lastHudCheck > 2.0) {
         lastHudCheck = now;
         if (session.controller && session.pawn && session.state) {
