@@ -2040,8 +2040,14 @@ void Athena::SyncLockerLoadout() {
     if (character) {
         void* heroDef = GetObjField(character, "/Script/FortniteGame.AthenaCharacterItemDefinition.HeroDefinition");
         if (heroDef) {
-            Call ght("/Script/FortniteGame.FortHero.GetHeroTypeBP");
-            if (ght.ok() && ght.run(heroDef)) heroType = ght.result<void*>();
+            // [F72] skip the FortHero::GetHeroTypeBP call when heroDef is
+            // already a FortHeroType — the receiver check rejected it every
+            // run and the log line looked like a failure (it never was).
+            std::string hdCls = ObjName(Read<void*>(heroDef, profile::ObjectClass));
+            if (hdCls != "FortHeroType") {
+                Call ght("/Script/FortniteGame.FortHero.GetHeroTypeBP");
+                if (ght.ok() && ght.run(heroDef)) heroType = ght.result<void*>();
+            }
             // [F58] on 21.30 the HeroDefinition object IS a FortHeroType
             // (the old GetHeroTypeBP call was rejected: receiver=FortHeroType
             // owner=FortHero) — use it directly.
@@ -3032,17 +3038,29 @@ static const char* const kVehicleMounts[] = {
 };
 
 // [F55] Native 21.30 vehicle classes — always resident (no mount path
-// guessing). The SDK dump confirms CDOs for each; used as the last-mile
-// fallback so "cars at the game's spots" never depends on BP package names.
+// guessing). [F72] CRASH FIX: only FortAthenaSimpleCar (physics branch)
+// survives a raw UWorld::SpawnActor. Every SK-branch class
+// (Antelope/Goat/Doghouse/Ferret/Jackal : AFortAthenaSKVehicle) is a
+// skeletal-mesh vehicle whose wheel/skeleton/anim config lives in BP —
+// spawning the bare native class crashes the game (device log:
+// "spawned FortAthenaSimpleCar" OK -> Antelope -> dead, no further log).
 static const char* const kNativeVehicles[] = {
-    "/Script/FortniteGame.FortAthenaSimpleCar",      // ordinary car
-    "/Script/FortniteGame.FortAthenaAntelopeVehicle",// sports car (Whiplash)
-    "/Script/FortniteGame.FortAthenaGoatVehicle",    // big rig / offroad truck
-    "/Script/FortniteGame.FortAthenaDoghouseVehicle",// motorboat
-    "/Script/FortniteGame.FortAthenaFerretVehicle",
-    "/Script/FortniteGame.FortAthenaJackalVehicle",
+    "/Script/FortniteGame.FortAthenaSimpleCar",      // physics branch — raw-spawn safe
     nullptr
 };
+
+// [F72] Raw-spawn quarantine for the native SK bases. BP vehicle classes
+// (name ends "_C") carry their own config and are always allowed; the map's
+// own spawner classes are handled through SpawnVehicleWithConstruction.
+static bool UnsafeRawVehicleClass(void* vclass) {
+    if (!vclass || IsBadPtr(vclass)) return true;
+    std::string n = ObjName(vclass);
+    if (n.size() > 2 && n.compare(n.size() - 2, 2, "_C") == 0) return false;  // BP class — configured
+    return n == "FortAthenaAntelopeVehicle" || n == "FortAthenaGoatVehicle" ||
+           n == "FortAthenaDoghouseVehicle" || n == "FortAthenaFerretVehicle" ||
+           n == "FortAthenaJackalVehicle"   || n == "FortAthenaSKMotorVehicle" ||
+           n == "FortAthenaSKVehicle";
+}
 
 // [F55] Ask the map's own spawner to do its job — AFortAthenaVehicleSpawner
 // carries SpawnVehicle()/SpawnVehicleWithConstruction() UFunctions (SDK
@@ -3061,6 +3079,27 @@ static bool SpawnerNativeSpawn(void* spawner) {
     return false;
 }
 
+// [F72] The map's OWN vehicle class — GetVehicleClass() is a BlueprintPure
+// native returning exactly what this spawner is configured to spawn (same
+// class the game itself uses). Fallback: CachedFortVehicleItemDef's
+// VehicleActorClass.
+static void* SpawnerVehicleClass(void* spawner) {
+    if (!spawner || IsBadPtr(spawner)) return nullptr;
+    {
+        Call gvc("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass");
+        if (gvc.ok() && gvc.run(spawner)) {
+            void* c = gvc.result<void*>();
+            if (c && !IsBadPtr(c)) return c;
+        }
+    }
+    void* itemDef = Read<void*>(spawner, profile::VehicleSpawner_CachedItemDef);
+    if (itemDef && !IsBadPtr(itemDef)) {
+        void* c = Read<void*>(itemDef, profile::VehicleItemDef_ActorClass);
+        if (c && !IsBadPtr(c)) return c;
+    }
+    return nullptr;
+}
+
 int Athena::SpawnVehiclesNear(int max) {
     if (!session.world || max < 1) return 0;
     void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
@@ -3070,38 +3109,48 @@ int Athena::SpawnVehiclesNear(int max) {
     Rotator identity{};
     int spawned = 0;
 
-    auto spawn_at = [&](void* vclass, const Vector& at) -> bool {
-        if (!vclass || IsBadPtr(vclass) || !SubclassOfFast(vclass, vehicleCls)) return false;
-        Transform t{};
-        t.Location[0] = at.X; t.Location[1] = at.Y; t.Location[2] = at.Z + 150.0;
-        RotatorToQuat(identity, t.Rotation);
-        void* veh = SpawnActor(session.world, vclass, session.controller, t);
-        if (!veh) return false;
-        // [F47] register for the interaction/entry system
+    auto register_vehicle = [&](void* veh) {
+        if (!veh || IsBadPtr(veh)) return;
         if (std::find(session.vehicles.begin(), session.vehicles.end(), veh) == session.vehicles.end() &&
             session.vehicles.size() < 32)
             session.vehicles.push_back(veh);
         // Erbium: Dagwood (valet) vehicles spawn with empty tanks — fill the
         // fuel component (SetFuel lives on UFortVehicleFuelComponent, with
         // the vehicle holding CachedFuelComponent @0x1058).
-        { void* fuelComp = Read<void*>(veh, 0x1058);
-          if (fuelComp && !IsBadPtr(fuelComp)) {
-              Call fuel("/Script/FortniteGame.FortVehicleFuelComponent.SetFuel");
-              if (fuel.ok()) { float full = 100.0f; if (fuel.set("NewFuel", full)) fuel.run(fuelComp); }
-          } }
+        void* fuelComp = Read<void*>(veh, 0x1058);
+        if (fuelComp && !IsBadPtr(fuelComp)) {
+            Call fuel("/Script/FortniteGame.FortVehicleFuelComponent.SetFuel");
+            if (fuel.ok()) { float full = 100.0f; if (fuel.set("NewFuel", full)) fuel.run(fuelComp); }
+        }
+    };
+
+    auto spawn_at = [&](void* vclass, const Vector& at) -> bool {
+        if (!vclass || IsBadPtr(vclass) || !SubclassOfFast(vclass, vehicleCls)) return false;
+        if (UnsafeRawVehicleClass(vclass)) return false;   // [F72] SK native bases crash
+        Transform t{};
+        t.Location[0] = at.X; t.Location[1] = at.Y; t.Location[2] = at.Z + 150.0;
+        RotatorToQuat(identity, t.Rotation);
+        LOG("[Veh] raw spawn attempt: %s", ObjName(vclass).c_str());  // [F72] names the culprit if we die
+        void* veh = SpawnActor(session.world, vclass, session.controller, t);
+        if (!veh) return false;
+        // [F47] register for the interaction/entry system
+        register_vehicle(veh);
         LOG("[Veh] spawned %s", ObjName(vclass).c_str());
         return true;
     };
 
     // 1) Authentic path — the map's own spawners (retried by VehicleRetry).
-    //    [F55] Prefer the spawner's OWN native SpawnVehicle — the exact path
-    //    the game mode uses during warmup (correct class, transform, fuel).
-    //    [F66] VERIFY by counting live vehicles: SpawnVehicle can refuse
-    //    silently (phase gating) while the call itself "succeeds" — the
-    //    device log showed 12 "native spawner -> vehicle" lines followed by
-    //    "tracked 0 live vehicles". Native path is trusted only after the
-    //    count actually rises; otherwise every spawner falls back to
-    //    spawning the spawner's own CachedItemDef vehicle class.
+    //    [F72] Erbium-aligned, three-tier per spawner:
+    //      a) SpawnVehicleWithConstruction(GetVehicleClass(), transform) — the
+    //         game's OWN construction entry (fuel/seats/mods wired) with the
+    //         map's OWN class. SpawnVehicle() refuses offline (def/phase
+    //         gating — the count never rose), but this one takes explicit
+    //         args and is BlueprintCallable from map BPs.
+    //      b) raw SpawnActor of the map class (Erbium's exact move) — gated
+    //         by UnsafeRawVehicleClass.
+    //      c) legacy SpawnVehicle() probe + cache ring fallback.
+    //    Every success is verified by the returned pointer or a live count
+    //    rise (F66) — no blind trust.
     if (spawnerCls) {
         auto spawners = FindAllInstances(spawnerCls, 96);
         LOG("[Veh] %zu spawner actors on map (attempt %d)", spawners.size(), session.vehicles_attempts);
@@ -3113,6 +3162,8 @@ int Athena::SpawnVehiclesNear(int max) {
         };
         int before = countLive();
         bool nativeTrusted = false;
+        int constructed = 0;   // [F72] per-pass cap on the construction path
+        Call svc("/Script/FortniteGame.FortAthenaVehicleSpawner.SpawnVehicleWithConstruction");
         for (void* sp : spawners) {
             if (spawned >= max) break;
             if (!sp || IsBadPtr(sp)) continue;
@@ -3120,8 +3171,31 @@ int Athena::SpawnVehiclesNear(int max) {
             if (!loc.ok() || !loc.run(sp)) continue;
             at = loc.result<Vector>();
             if (!std::isfinite(at.X) || !std::isfinite(at.Y) || !std::isfinite(at.Z)) continue;
+
+            void* mapClass = SpawnerVehicleClass(sp);
             bool done = false;
-            if (!nativeTrusted && SpawnerNativeSpawn(sp)) {
+
+            // (a) the game's own construction call with the map's own class
+            if (mapClass && svc.ok() && constructed < 4) {
+                Transform t{};
+                t.Location[0] = at.X; t.Location[1] = at.Y; t.Location[2] = at.Z;
+                RotatorToQuat(identity, t.Rotation);
+                if (svc.set_any(mapClass, "Class_0", "Class") &&
+                    svc.set_bytes("Transform", &t, (int)sizeof(Transform)) && svc.run(sp)) {
+                    void* v = svc.result<void*>();
+                    if (v && !IsBadPtr(v) && SubclassOfFast(Read<void*>(v, profile::ObjectClass), vehicleCls)) {
+                        register_vehicle(v);
+                        ++spawned; ++constructed; done = true;
+                        LOG("[Veh] constructed %s at spawner (%.0f %.0f %.0f)",
+                            ObjName(mapClass).c_str(), at.X, at.Y, at.Z);
+                    }
+                }
+            }
+            // (b) Erbium's raw move with the map class (BP classes only)
+            if (!done && mapClass && spawn_at(mapClass, at)) { ++spawned; done = true; }
+
+            // (c) legacy native probe — trusted only after the count rises
+            if (!done && !nativeTrusted && SpawnerNativeSpawn(sp)) {
                 int after = countLive();
                 if (after > before) {
                     before = after;
@@ -3131,11 +3205,6 @@ int Athena::SpawnVehiclesNear(int max) {
                     LOG("[Veh] native spawner refused (no new vehicle) — fallback");
                     nativeTrusted = true;   // do not re-probe on every spawner (full GObjects scan)
                 }
-            }
-            if (!done) {
-                void* itemDef = Read<void*>(sp, profile::VehicleSpawner_CachedItemDef);
-                void* vclass  = (itemDef && !IsBadPtr(itemDef)) ? Read<void*>(itemDef, profile::VehicleItemDef_ActorClass) : nullptr;
-                if (spawn_at(vclass, at)) { ++spawned; done = true; }
             }
             if (!done && session.vehicle_cache_n > 0)
                 if (spawn_at(session.vehicle_cache[spawned % session.vehicle_cache_n], at)) ++spawned;
@@ -3196,28 +3265,36 @@ int Athena::SpawnVehiclesNear(int max) {
         }
     }
 
-    // 2) Static-load fallback — native 21.30 vehicle classes first (always
-    //    resident), then the exact Ch3 BP mounts, cached on first success.
-    //    Waits for attempt 3 (~15s) so the map's own spawners get first shot,
-    //    then only re-probes every 5th attempt (StaticLoadClass hits disk).
+    // 2) Static-load fallback — [F72] BP mounts FIRST (they carry their own
+    //    vehicle config), then the single raw-spawn-safe native class
+    //    (SimpleCar). The SK native bases are banned (crash). Cached on
+    //    first success. Waits for attempt 3 (~15s) so the map's own
+    //    spawners get first shot, then only re-probes every 5th attempt
+    //    (StaticLoadClass hits disk).
     if (spawned < max && session.vehicle_cache_n == 0 && session.vehicles_attempts >= 3 &&
         ((session.vehicles_attempts % 5) == 0 || session.vehicles_attempts == 3)) {
-        for (int i = 0; kNativeVehicles[i] && session.vehicle_cache_n < 32; ++i) {
-            if (void* c = FindObj(kNativeVehicles[i]))
-                session.vehicle_cache[session.vehicle_cache_n++] = c;
-        }
         for (int i = 0; kVehicleMounts[i] && session.vehicle_cache_n < 32; ++i) {
             if (void* c = LoadVehicleClassByName(kVehicleMounts[i]))
                 session.vehicle_cache[session.vehicle_cache_n++] = c;
         }
-        LOG("[Veh] fallback resolved %d vehicle classes (native+BP)", session.vehicle_cache_n);
+        for (int i = 0; kNativeVehicles[i] && session.vehicle_cache_n < 32; ++i) {
+            if (void* c = FindObj(kNativeVehicles[i]))
+                session.vehicle_cache[session.vehicle_cache_n++] = c;
+        }
+        LOG("[Veh] fallback resolved %d vehicle classes (BP first, SK natives banned)", session.vehicle_cache_n);
     }
     if (spawned < max && session.vehicle_cache_n > 0) {
         Vector origin{};
         if (ActorLocation(session.pawn ? session.pawn : session.controller, origin) || ActorLocation(session.world, origin)) {
             static const double offs[8][2] = {{700,0},{-700,0},{0,700},{0,-700},{700,700},{-700,-700},{700,-700},{-700,700}};
             int ring = 0;
-            for (int i = 0; i < session.vehicle_cache_n && spawned < max; ++i) {
+            // [F72] ONE ring spawn per pass (retry every 5s), rotating
+            // through the cache — a bad class can no longer take down 11
+            // spawns in a single frame, and the "raw spawn attempt" log
+            // line names the exact class.
+            int start = session.vehicles_attempts % session.vehicle_cache_n;
+            for (int k = 0; k < session.vehicle_cache_n && spawned < max && ring < 1; ++k) {
+                int i = (start + k) % session.vehicle_cache_n;
                 Vector at = origin;
                 at.X += offs[ring % 8][0]; at.Y += offs[ring % 8][1]; at.Z += 150.0;
                 ++ring;
@@ -3231,13 +3308,16 @@ int Athena::SpawnVehiclesNear(int max) {
 
 // [F39] Vehicle spawner retry — streaming levels load async, so the spawner
 // actors (and the vehicle BPs they reference) surface over the first ~2 min.
+// [F72] with 1-spawn-per-pass rate limiting, "spawned>0" can no longer stop
+// the retry loop — keep going until we track a usable fleet or run out.
 void Athena::VehicleRetry() {
     if (session.vehicles_attempts >= 30) return;
+    if (session.vehicles.size() >= 8) { session.vehicles_attempts = 30; return; }
     ++session.vehicles_attempts;
     double now = Monotonic();
     (void)now;
     int spawned = SpawnVehiclesNear(session.vehicle_cache_n ? 2 : 12);
-    if (spawned > 0) session.vehicles_attempts = 30;   // done — stop retrying
+    (void)spawned;
 }
 
 // [F30/F38] Wildlife — field fix: the first device run found "0 animal
@@ -5055,6 +5135,7 @@ void Athena::EditAssist() {
 }
 
 void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored) {
+    (void)rotIter;   // rotation iteration is preserved inside keepRot (F31)
     if (!actor) return;
     // [F31] Preserve the original piece transform for the edited replacement
     // (the old code respawned at world origin).
