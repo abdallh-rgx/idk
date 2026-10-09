@@ -1148,6 +1148,7 @@ struct Session {
     Guid  last_equip_guid{};                 // [F75] dedupe — skip re-equip of the held item
     void* bot_inventory_cls = nullptr;       // [F75] AFortInventory for bot WorldInventory
     std::set<void*> interact_logged;         // [F75-d] one-shot per interact candidate
+    bool  bot_pickaxe_warned = false;        // [F79-d] one-shot equip diagnostic
 } session;
 
 static double Monotonic() {
@@ -1186,6 +1187,15 @@ static void BRStartNewSafeZonePhase(int p, bool bInitial); // Erbium StartNewSaf
 static void BRStormTick();            // Erbium zone flags + storm damage
 static float BRWorldTime();           // UGameplayStatics::GetTimeSeconds
 static void* BRGetComponent();        // BattleRoyaleGamePhaseLogic component
+static void BRPawnRespawned(void* pawn); // [F79-a] post-jump respawn setup
+// [F79-e] reflection float read used by the death watcher (defined below); a
+// tiny inline twin avoids a forward-declaration ordering dependency.
+static bool BRReadFloatFwd(void* obj, const char* path, float& out) {
+    void* p = obj ? GetProp(path) : nullptr;
+    if (!p || Read<int>(p, profile::PropElementSize) != 4) return false;
+    out = Read<float>(GetField(obj, p), 0);
+    return true;
+}
 
 // [F73] BR machine state (mirrors Erbium's component statics + locals)
 struct BRCtx {
@@ -1225,6 +1235,18 @@ struct BRCtx {
     float  route_dur = 60;            // seconds start -> end
     float  bus_flight_start = -1;     // world time the flight began
     bool   bots_boarded = false;      // boarding assigned exactly once
+    // [F79-a] Erbium-pure bus flow — the pawn is DESTROYED at boarding (Erbium
+    // StartAircraftPhase destroys every AlivePlayer pawn + Reset + Spectating
+    // state) and respawned by the NATIVE ServerAttemptAircraftJump when the
+    // player jumps (HUD button or the DropEndTime force-out). This removes the
+    // whole F78 death class: no hidden live pawn at Z=80000 for the storm/fall
+    // to eat, and the camera rides the bus through the native Spectating state
+    // exactly like the real server.
+    double jump_requested_at = -1;    // monotonic stamp of the jump request
+    void*  old_pawn = nullptr;        // the pawn destroyed at boarding
+    bool   spectating = false;        // [F79-e] death spectate active
+    int    spectate_idx = 0;          // current spectate motor index
+    float  death_seen = -1;           // world time the pawn died
 };
 static BRCtx br;
 
@@ -1253,6 +1275,7 @@ struct BRBotMotor {
     float   jump_alpha = 0;      // route fraction to jump at (0.08..0.86)
     Vector  drop_target{};
     float   land_z = 0;
+    double  next_strike = 0;     // [F79-d] melee swing cadence (2s)
 };
 static std::vector<BRBotMotor> g_bot_motors;
 static std::vector<BRBotMotor> g_wild_motors;   // [F75-c] animals roam too
@@ -1297,6 +1320,7 @@ namespace Athena {
     void OnServerExecuteInventoryItem(Guid guid);
     void OnServerExecuteInventoryWeapon(void* weapon);
     void HandleJumpFromHudStart();
+    void SpectateNext();               // [F79-e] death spectate target cycle
     void SpawnBattleBus();
     void OnAircraftJump();
     void TeleportToSpawnIsland();
@@ -2003,8 +2027,10 @@ void Athena::SpawnBattleBus() {
 // the local skydive fallback and restore the pawn as the view target (Era
 // core behaviour, ported with the 21.30 component path added).
 void Athena::HandleJumpFromHudStart() {
-    if (!session.controller || !session.pawn) return;
+    if (!session.controller) return;
     if (session.aircraft_jumped) return;
+    // [F79-e] death spectate — the jump button cycles the spectate target.
+    if (br.spectating) { Athena::SpectateNext(); return; }
     Guard g;
     LOG("[Bus] JumpFromHudStart intercepted");
     Vector rot{0, 0, 0};
@@ -2013,28 +2039,72 @@ void Athena::HandleJumpFromHudStart() {
         void* addr = GetField(session.controller, rotProp);
         if (addr) rot = Read<Vector>(addr);
     }
-    // [F04] ServerAttemptAircraftJump lives on UFortControllerComponent_Aircraft.
+    // [F79-a] Erbium DropEndTime path — the pawn was destroyed at boarding, so
+    // the jump is the NATIVE respawn: ServerAttemptAircraftJump spawns a fresh
+    // pawn at the aircraft, puts it into the native skydive and hands it the
+    // camera. No manual teleport, no BeginSkydiving on a dead pawn (the F78
+    // "died without reason" was exactly that: our fallback chain ran on the
+    // pawn the native jump had already replaced).
     void* aircraft = GetAircraftComponent(session.controller);
-    if (aircraft) {
+    bool fired = false;
+    if (aircraft && !IsBadPtr(aircraft)) {
         Call ac("/Script/FortniteGame.FortControllerComponent_Aircraft.ServerAttemptAircraftJump");
         if (ac.ok()) {
             Rotator r{rot.X, rot.Y, rot.Z};
-            if (ac.set("ClientRotation", r)) ac.run(aircraft);
+            if (ac.set("ClientRotation", r) && ac.run(aircraft)) fired = true;
         }
-    } else {
-        LOG("[Bus] Aircraft component unavailable — local fallback only");
     }
-    Call sky("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
-    if (sky.ok()) { bool bFromBus = true; if (sky.set("bFromBus", bFromBus)) sky.run(session.pawn); }
-    Write<uint8_t>(session.pawn, profile::FortPlayerPawn_bIsSkydiving, 1);
-    Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
-    if (cam.ok()) { cam.set("NewViewTarget", session.pawn); float blend = 0.0f; cam.set("BlendTime", blend); cam.run(session.controller); }
-    Call rep("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving");
-    if (rep.ok()) rep.run(session.pawn);
+    if (!fired) {
+        // 21.30 also declares the jump on the controller itself (SDK
+        // AFortPlayerControllerAthena.ServerAttemptAircraftJump(FRotator)).
+        Call pc("/Script/FortniteGame.FortPlayerControllerAthena.ServerAttemptAircraftJump");
+        if (pc.ok()) {
+            Rotator r{rot.X, rot.Y, rot.Z};
+            if (pc.set("ClientRotation", r) && pc.run(session.controller)) fired = true;
+        }
+        if (!fired) {
+            Call pc2("/Script/FortniteGame.FortPlayerController.ServerAttemptAircraftJump");
+            if (pc2.ok()) {
+                Rotator r{rot.X, rot.Y, rot.Z};
+                if (pc2.set("ClientRotation", r) && pc2.run(session.controller)) fired = true;
+            }
+        }
+    }
     session.aircraft_jumped = true;
-    LOG("[Bus] Skydiving started");
+    br.jump_requested_at = Monotonic();
+    LOG("[Bus] jump requested — native respawn pending (fired=%d)", (int)fired);
+    // If the native refuses (precondition fail) the BRTick respawn watcher
+    // respawns the pawn on the ground at the route end after 1.5s — the player
+    // is never left with no pawn.
 }
-void Athena::OnAircraftJump() { BRJump(); } // [F73] bus-position teleport + skydive
+void Athena::OnAircraftJump() { BRJump(); } // [F79-a] native respawn jump
+
+// ----------------------------------------------------------------------------
+// [F79-e] death spectate — the F78 "Relocation/spectate system is broken":
+// on pawn death the camera moves to the nearest living bot; the jump button
+// cycles to the next one. Minimal, standalone-safe, uses the bots we own.
+// ----------------------------------------------------------------------------
+void Athena::SpectateNext() {
+    if (!session.controller) return;
+    if (g_bot_motors.empty()) { LOG("[Spectate] no bots to watch"); return; }
+    void* target = nullptr;
+    for (size_t attempt = 0; attempt < g_bot_motors.size() && !target; ++attempt) {
+        br.spectate_idx = (br.spectate_idx + 1) % (int)g_bot_motors.size();
+        BRBotMotor& m = g_bot_motors[(size_t)br.spectate_idx];
+        if (m.pawn && !IsBadPtr(m.pawn)) {
+            void* cls = Read<void*>(m.pawn, profile::ObjectClass);
+            if (cls && !IsBadPtr(cls)) target = m.pawn;
+        }
+    }
+    if (!target) { LOG("[Spectate] every bot pawn is gone"); return; }
+    Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+    if (cam.ok()) {
+        cam.set("NewViewTarget", target);
+        float blend = 1.0f;
+        if (cam.set("BlendTime", blend)) cam.run(session.controller);
+    }
+    LOG("[Spectate] watching bot #%d %p (jump cycles)", br.spectate_idx, target);
+}
 void Athena::BeginPlayerSkydiving() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
     Call bsd("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
@@ -2312,15 +2382,19 @@ void Athena::ShowSkin() { LoadDefaultCosmetics(); }
 
 void Athena::ForcePlayerVisible() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
-    // [F73] while riding the bus the pawn is deliberately hidden — do not
-    // fight the boarding state (retry happens after the jump).
-    if (br.started && br.phase == 3 && !session.aircraft_jumped) return;
+    // [F79-a] while riding the bus there IS no pawn (destroyed at boarding) —
+    // the early return above covers it. After the jump the fresh pawn is in
+    // the NATIVE skydive: never clear the skydive flags mid-freefall (the F78
+    // chain cancelled the dive by writing bIsSkydiving=false).
+    bool midDive = GetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving");
+    if (!midDive) {
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteAvailable", true);
+        Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving"); if (sd.ok()) sd.run(session.pawn);
+        Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen"); if (po.ok()) po.run(session.pawn);
+    }
     LOG("[Visibility] Forcing player body visible...");
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
-    SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteAvailable", true);
-    Call sd("/Script/FortniteGame.FortPlayerPawn.OnRep_IsSkydiving"); if (sd.ok()) sd.run(session.pawn);
-    Call po("/Script/FortniteGame.FortPlayerPawn.OnRep_IsParachuteOpen"); if (po.ok()) po.run(session.pawn);
     Call body("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
     if (body.ok()) { bool bShow = true; if (body.set("bVisible", bShow)) { body.run(session.pawn); bool ret = body.result<bool>(); LOG("[Visibility] SetCharacterBodyVisibilityForPossession -> %d", (int)ret); } }
     Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
@@ -2540,6 +2614,30 @@ void Athena::Tick() {
     // (warmup countdown -> aircraft/bus -> safe zones -> storm) replaces the
     // old F35 one-shot zone poke and the F36 static counter. Runs every tick.
     if (session.finalized) BRTick();
+    // [F79-a] native respawn detection — the aircraft jump destroyed the pawn;
+    // the first tick where the controller owns a NEW pawn re-applies every
+    // local system (abilities, cosmetics, visibility, quickbars).
+    if (session.finalized && !session.pawn && session.controller &&
+        !br.spectating) {
+        void* p = GetPawn(session.controller);
+        if (p && !IsBadPtr(p) && p != br.old_pawn) {
+            br.old_pawn = nullptr;
+            BRPawnRespawned(p);
+        }
+    }
+    // [F79-e] death spectate — Health <= 0 on the pawn switches the camera to
+    // the nearest living bot ("Relocation/spectate was broken"): watch, then
+    // cycle with the jump button. (BRReadFloat forward decl sits with the BR
+    // forward declarations below; the definition lands further down.)
+    if (session.finalized && session.pawn && !IsBadPtr(session.pawn) && !br.spectating) {
+        float hp = 100.0f;
+        if (BRReadFloatFwd(session.pawn, "/Script/FortniteGame.FortPawn.Health", hp) && hp <= 0.0f) {
+            br.spectating = true;
+            br.death_seen = BRWorldTime();
+            LOG("[Spectate] pawn died (hp=0) — entering bot spectate (F79)");
+            Athena::SpectateNext();
+        }
+    }
     // [F37] Harvest — health-delta watch grants wood/stone/metal on hits.
     if (session.finalized && session.harvest_enabled) HarvestTick();
     // [F40] Doors — keep player-opened doors open, unstick jammed ones.
@@ -2609,7 +2707,9 @@ void Athena::Tick() {
     // ClientOnPawnSpawned — re-kick after each game-phase change (warmup ->
     // aircraft -> safezones). The first call fired before the phase machine
     // even started, which is one reason the QuickBars stayed dead.
-    if (session.finalized && session.state && session.controller) {
+    // [F79-a] only while a pawn exists — during the bus flight the pawn is
+    // destroyed (Erbium) and a pawn-spawned HUD kick has nothing to build on.
+    if (session.finalized && session.state && session.controller && session.pawn) {
         void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
         if (gp && Read<int>(gp, profile::PropElementSize) == 1) {
             uint8_t ph = Read<uint8_t>(GetField(session.state, gp), 0);
@@ -4163,6 +4263,225 @@ static void BRWritePtr(void* obj, const char* path, void* ptr) {
     Write<void*>(GetField(obj, p), 0, ptr);
 }
 
+// ----------------------------------------------------------------------------
+// [F79] Erbium-pure bus + bot support helpers:
+//   BRFindFNameByString  — ClientGotoState("Spectating") needs the exact FName
+//                          value of the state name; FName values are name-pool
+//                          indices, so ANY object named "Spectating" carries it.
+//   BRSoftResolve        — single TSoftObjectPtr -> object (LoadAsset_Blocking).
+//   BRGameDataCosmetics  — the build's own cosmetics defaults CDO (default
+//                          character parts + fallback pickaxe live there).
+//   g_verified_pairs     — (head, body) pairs GUARANTEED to render on this
+//                          build (engine defaults + the player's own parts).
+//   BRPartMeta           — per-part PartType/Gender/BodyType reflection reads
+//                          so random head+body pairs can never mismatch again
+//                          (the F78 "some bots have no head" root cause).
+//   g_weapon_defs        — resident weapon definitions for bot loadouts.
+//   BREquipForPawn       — EquipWeaponDefinition on ANY pawn (bots included).
+//   BRPawnRespawned      — re-applies every local system after the native
+//                          aircraft jump spawns the fresh pawn.
+// ----------------------------------------------------------------------------
+static bool BRFindFNameByString(const char* want, FName& out) {
+    GObjects_t* go = GObjectArray();
+    if (!go || !want) return false;
+    size_t wl = strlen(want);
+    int32 cap = go->NumElements < 150000 ? go->NumElements : 150000;
+    for (int32 i = 0; i < cap; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o)) continue;
+        FStringNative s{nullptr, 0, 0};
+        Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)((char*)o + profile::ObjectName, &s);
+        if (!s.Data || s.Count < 1) continue;
+        size_t len = (size_t)(s.Count - 1);   // Count includes the terminator
+        if (len != wl) continue;
+        bool eq = true;
+        for (size_t k = 0; k < wl; ++k)
+            if ((wchar_t)s.Data[k] != (wchar_t)want[k]) { eq = false; break; }
+        if (eq) { out = Read<FName>((char*)o + profile::ObjectName); return true; }
+    }
+    return false;
+}
+
+static void* BRSoftResolve(void* softPtrBytes, int bytes) {
+    if (!softPtrBytes || IsBadPtr(softPtrBytes) || bytes < 8 || bytes > 0x40) return nullptr;
+    void* direct = Read<void*>(softPtrBytes, 0);
+    if (direct && !IsBadPtr(direct)) return direct;
+    Call load("/Script/Engine.KismetSystemLibrary.LoadAsset_Blocking");
+    if (!load.ok()) return nullptr;
+    if (load.set_bytes("Asset", softPtrBytes, bytes) &&
+        load.run(FindObj("/Script/Engine.Default__KismetSystemLibrary")))
+        return load.result<void*>();
+    return nullptr;
+}
+
+static void* BRGameDataCosmeticsCDO() {
+    static void* cdo = nullptr;
+    if (cdo && !IsBadPtr(cdo)) return cdo;
+    void* cls = FindObj("/Script/FortniteGame.GameDataCosmetics");
+    if (!cls) return nullptr;
+    GObjects_t* go = GObjectArray();
+    if (!go) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o) || !IsCDO(o)) continue;
+        void* oc = Read<void*>(o, profile::ObjectClass);
+        if (oc == cls || (oc && !IsBadPtr(oc) && SubclassOfFast(oc, cls))) { cdo = o; break; }
+    }
+    if (cdo) LOG("[BR] GameDataCosmetics CDO = %p", cdo);
+    return cdo;
+}
+
+// resident weapon definitions — one bounded GObjects pass, cached
+static std::vector<void*> g_weapon_defs;
+static void* g_fallback_pickaxe = nullptr;   // GameDataCosmetics.FallbackPickaxe
+
+// (head, body) pairs — verified pairs render on this build; matched pairs are
+// random but metadata-checked so the head always fits the body skeleton.
+struct BRPair { void* head; void* body; };
+static std::vector<BRPair> g_verified_pairs;
+static std::vector<BRPair> g_skin_pairs;    // [F79-d] matched (gender, bodyType)
+
+// UCustomCharacterPart metadata — property names from the 21.30 reflection;
+// every read is optional (a missing property just disables that filter).
+static bool BRPartMeta(void* part, uint8_t& partType, uint8_t& gender, uint8_t& bodyType) {
+    if (!part || IsBadPtr(part)) return false;
+    auto rd = [&](const char* leaf, uint8_t& out) -> bool {
+        void* p = GetProp((std::string("/Script/FortniteGame.CustomCharacterPart.") + leaf).c_str());
+        if (!p || Read<int>(p, profile::PropElementSize) != 1) return false;
+        out = Read<uint8_t>(GetField(part, p), 0);
+        return true;
+    };
+    bool ok = rd("PartType", partType);
+    rd("GenderPermitted", gender);
+    rd("BodyTypesPermitted", bodyType);
+    return ok;
+}
+
+static void BRBuildVerifiedPairs() {
+    if (!g_verified_pairs.empty()) return;
+    // (1) GameDataCosmetics.DefaultCharacterParts — the engine's own default
+    //     character (renders on EVERY build by construction).
+    if (void* cdo = BRGameDataCosmeticsCDO()) {
+        auto parts = SoftAssetArray(cdo, "/Script/FortniteGame.GameDataCosmetics.DefaultCharacterParts");
+        void* head = nullptr; void* body = nullptr;
+        for (void* part : parts) {
+            if (!part || IsBadPtr(part)) continue;
+            std::string n = ObjName(part);
+            if (!head && n.find("Head") != std::string::npos) head = part;
+            else if (!body && n.find("Body") != std::string::npos) body = part;
+        }
+        if (head && body) { g_verified_pairs.push_back({head, body}); LOG("[BR] verified pair #1: GameDataCosmetics defaults"); }
+        // (2) FallbackPickaxe — the build's guaranteed pickaxe for bots.
+        void* pp = GetProp("/Script/FortniteGame.GameDataCosmetics.FallbackPickaxe");
+        if (pp) {
+            int psz = Read<int>(pp, profile::PropElementSize);
+            if (psz > 0 && psz <= 0x40) {
+                if (void* pick = BRSoftResolve(GetField(cdo, pp), psz)) {
+                    g_fallback_pickaxe = pick;
+                    LOG("[BR] FallbackPickaxe = %s", ObjName(pick).c_str());
+                }
+            }
+        }
+    }
+    // (3) the local player's own parts — they demonstrably render (Lancelot).
+    if (session.pawn && !IsBadPtr(session.pawn)) {
+        void* cpProp = GetProp("/Script/FortniteGame.FortPlayerPawn.CharacterParts");
+        if (cpProp && Read<int>(cpProp, profile::PropElementSize) == 56) {   // UCustomCharacterPart*[7]
+            void* base = GetField(session.pawn, cpProp);
+            void* head = Read<void*>(base, 0 * 8);
+            void* body = Read<void*>(base, 1 * 8);
+            if (head && body && !IsBadPtr(head) && !IsBadPtr(body)) {
+                g_verified_pairs.push_back({head, body});
+                LOG("[BR] verified pair #2: local player parts");
+            }
+        }
+    }
+}
+
+// resident weapon definitions — one bounded GObjects pass, cached
+static void BRWeaponPool() {
+    if (!g_weapon_defs.empty()) return;
+    GObjects_t* go = GObjectArray();
+    void* wrCls = FindObj("/Script/FortniteGame.FortWeaponRangedItemDefinition");
+    if (!go || !wrCls) return;
+    for (int32 i = 0; i < go->NumElements && g_weapon_defs.size() < 48; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o) || IsCDO(o)) continue;
+        void* oc = Read<void*>(o, profile::ObjectClass);
+        if (!oc || IsBadPtr(oc) || !SubclassOfFast(oc, wrCls)) continue;
+        g_weapon_defs.push_back(o);
+    }
+    if (!g_weapon_defs.empty())
+        LOG("[BR] weapon pool: %zu resident ranged defs (bot loadouts)", g_weapon_defs.size());
+}
+
+// [F79-d] bot equip — the same native equip the player uses, on any pawn.
+static bool BREquipForPawn(void* pawn, void* weaponDef) {
+    if (!pawn || IsBadPtr(pawn) || !weaponDef || IsBadPtr(weaponDef)) return false;
+    Call eq("/Script/FortniteGame.FortPawn.EquipWeaponDefinition");
+    if (!eq.ok()) return false;
+    Guid g = MakeGuid();
+    Guid tracker{};
+    return eq.set("WeaponData", weaponDef) && eq.set("ItemEntryGuid", g) &&
+           eq.set("TrackerGuid", tracker) && eq.set("bDisableEquipAnimation", false) && eq.run(pawn);
+}
+
+// [F79-d] bot landing armament — one random ranged weapon from the build's
+// OWN resident definitions (the pickaxe was already equipped at spawn; a
+// second equip here would just leak the first weapon actor).
+static void BRBotLoadout(void* pawn) {
+    if (!pawn || IsBadPtr(pawn)) return;
+    BRWeaponPool();
+    if (!g_weapon_defs.empty()) {
+        void* wdef = g_weapon_defs[(size_t)(BRRand() % g_weapon_defs.size())];
+        if (wdef) BREquipForPawn(pawn, wdef);
+    }
+}
+
+// [F79-a] the native aircraft jump spawned a FRESH pawn — every local system
+// (visibility, body parts, cosmetics, abilities, movement, quickbars) applied
+// to the destroyed pawn must be re-applied to the new one. This is the same
+// list SetupWorld runs, in the same order.
+static void BRPawnRespawned(void* pawn) {
+    if (!pawn || IsBadPtr(pawn)) return;
+    session.pawn = pawn;
+    LOG("[BR] pawn respawned %p — re-applying local systems (F79)", pawn);
+    session.abilities_granted = false;
+    session.body_fixed = false;
+    session.visibility_forced = false;
+    session.movement_enabled = false;
+    session.tactical_sprint_setup = false;
+    session.world_abilities_granted = false;
+    session.last_equip_guid = Guid{};
+    // [F79-a] the controller rode the bus in the Spectating state — ClientRestart
+    // transitions the state machine back to Playing and rebinds input/HUD to
+    // the fresh pawn (the same call TryInitializePlayer makes on first spawn).
+    if (session.controller) {
+        Call restart("/Script/Engine.PlayerController.ClientRestart");
+        if (restart.ok() && restart.set("NewPawn", pawn)) restart.run(session.controller);
+    }
+    Athena::ForcePlayerVisible();
+    Athena::FixBodyAndAnimations();
+    Athena::SyncLockerLoadout();
+    Athena::GrantAllAbilitySets();
+    Athena::ApplySprintSpeed();
+    Athena::EnableMovementFeatures();
+    Athena::SetupTacticalSprint();
+    Athena::GrantWorldAbilities();
+    // Erbium StartAircraftPhase tail: ClientActivateSlot(0,0) re-arms the
+    // pickaxe on the fresh pawn.
+    Athena::BuildQuickBarsManually();
+    Athena::SetQuickBarReady();
+    Athena::ActivateQuickBarSlot(0, 0);
+    Athena::RefreshHUD();
+    // belt & braces camera — the native Possess already owns the view target
+    if (session.controller) {
+        Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+        if (cam.ok()) { cam.set("NewViewTarget", pawn); float blend = 0.0f; cam.set("BlendTime", blend); cam.run(session.controller); }
+    }
+    br.jump_requested_at = -1;
+}
+
 // UFortGameStateComponent_BattleRoyaleGamePhaseLogic — [F74-f] does NOT exist
 // in 21.30 (verified against the SDK dump: no such class in this build; the
 // phase machinery lives on AFortGameStateAthena + FortGameModeAthena). The
@@ -4721,8 +5040,13 @@ static void BRBusBotsTick(float alpha) {
                     if (cm && !IsBadPtr(cm)) { Vector v{}; Write<Vector>(cm, (size_t)vOff, v); }
                 }
                 m.next_heading = Monotonic();
+                // [F79-d] the bot lands AWARE: pickaxe + a random ranged
+                // weapon from the build's own resident definitions (the F78
+                // bots landed naked — "no pickaxe, no AI").
+                static int loadouts = 0;
+                if (loadouts < 99) { BRBotLoadout(m.pawn); ++loadouts; }
                 if (++landed == 1 || landed % 25 == 0)
-                    LOG("[Bus] bot landed #%d at (%.0f, %.0f)", landed, m.drop_target.X, m.drop_target.Y);
+                    LOG("[Bus] bot landed #%d at (%.0f, %.0f) — loadout armed", landed, m.drop_target.X, m.drop_target.Y);
                 continue;
             }
             Vector v{};
@@ -5021,19 +5345,49 @@ static void BRStartAircraftPhase() {
             br.drop_start - now, br.drop_end - now, br.flight_end - now);
     }
 
-    // Board the player (Erbium destroys pawns + ClientGotoState Spectating;
-    // standalone-safe equivalent: hide pawn + no collision + camera on bus).
+    // [F79-a] Board the player — ERBIUM 1:1 (BattleRoyaleGamePhaseLogic.cpp
+    // :301-327): OnEnteredAircraft fires, the pawn is DESTROYED and the
+    // controller goes to the Spectating state. The F78 "hidden pawn" design
+    // died exactly there: a live invisible pawn at Z=80000 ate storm/fall
+    // damage ("I never jumped and died without reason") while the camera
+    // stayed on the bus. With the pawn gone there is nothing to kill, and the
+    // native jump (ServerAttemptAircraftJump) spawns the fresh pawn mid-air.
     if (session.pawn && !IsBadPtr(session.pawn)) {
-        LOG("[BR] boarding player...");
-        Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
-        if (hid.ok()) { bool b = true; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
-        Call col("/Script/Engine.Actor.SetActorEnableCollision");
-        if (col.ok()) { bool b = false; if (col.set("bNewActorEnableCollision", b)) col.run(session.pawn); }
+        LOG("[BR] boarding player (Erbium: destroy pawn + Spectating)...");
+        // Erbium: Pawn->OnEnteredAircraft.Process() — the HUD/music bus entry
+        // event; cosmetic if the UFunction is absent.
+        { Call oe("/Script/FortniteGame.FortPlayerPawn.OnEnteredAircraft");
+          if (oe.ok()) oe.run(session.pawn); }
+        // Erbium: UnPossess before the destroy so the controller never holds a
+        // dangling pawn reference.
+        { Call up("/Script/Engine.Controller.UnPossess");
+          if (up.ok()) up.run(session.controller); }
+        br.old_pawn = session.pawn;
+        { Call dp("/Script/Engine.Actor.K2_DestroyActor");
+          if (dp.ok()) dp.run(session.pawn); }
+        session.pawn = nullptr;
+        // Erbium: ClientGotoState("Spectating") — the native bus-riding state.
+        // The FName value is recovered from any object named "Spectating".
+        {
+            static FName spectatingFName{};
+            static bool fnameReady = false;
+            if (!fnameReady) { fnameReady = true; BRFindFNameByString("Spectating", spectatingFName); }
+            if (spectatingFName.CompIdx || spectatingFName.DispIdx) {
+                Call gs("/Script/Engine.PlayerController.ClientGotoState");
+                if (gs.ok() && gs.set_bytes("NewState", &spectatingFName, sizeof(FName)))
+                    gs.run(session.controller);
+                else LOG("[BR] ClientGotoState binding unavailable — camera rides the bus via SetViewTarget");
+            } else {
+                LOG("[BR] 'Spectating' FName not resident — camera rides the bus via SetViewTarget");
+            }
+        }
+        // Camera on the bus — the native Spectating state should own this, but
+        // the explicit view target guarantees the follow from frame one.
         if (aircraft) {
             Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
             if (cam.ok()) { cam.set("NewViewTarget", aircraft); float blend = 0; cam.set("BlendTime", blend); cam.run(session.controller); }
         }
-        LOG("[BR] player boarded (pawn hidden, camera on bus)");
+        LOG("[BR] player boarded (pawn destroyed, spectating on the bus — F79)");
     }
 
     // [F78-c] Erbium's StartAircraftPhase boards EVERY AlivePlayer — the user
@@ -5061,30 +5415,12 @@ static void BRStartAircraftPhase() {
 }
 
 // ----------------------------------------------------------------------------
-// [F73-f] Jump from the bus — Erbium's ServerAttemptAircraftJump respawns the
-// pawn at the aircraft; standalone: teleport our pawn to the bus position,
-// restore visibility and run the existing skydive chain (F05).
+// [F79-a] Jump from the bus — the pawn was destroyed at boarding, so the jump
+// is purely the NATIVE respawn request (HandleJumpFromHudStart →
+// ServerAttemptAircraftJump). No teleport, no manual skydive, no camera fight:
+// the native spawns the pawn at the aircraft, skydives it and owns the camera.
 // ----------------------------------------------------------------------------
 void Athena::BRJump() {
-    if (!session.pawn) { HandleJumpFromHudStart(); return; }
-    if (br.aircraft && !IsBadPtr(br.aircraft)) {
-        Vector loc{};
-        if (ActorLocation(br.aircraft, loc)) {
-            loc.Z -= 200.0; // just under the bus so the camera exits cleanly
-            Call sl("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
-            if (sl.ok()) {
-                Rotator rot{}; Vector vloc = loc;
-                sl.set("NewLocation", vloc); sl.set("NewRotation", rot);
-                bool sweep = false, tp = true;
-                sl.set("bSweep", sweep); sl.set("bTeleport", tp);
-                sl.run(session.pawn);
-            }
-        }
-        Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
-        if (hid.ok()) { bool b = false; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
-        Call col("/Script/Engine.Actor.SetActorEnableCollision");
-        if (col.ok()) { bool b = true; if (col.set("bNewActorEnableCollision", b)) col.run(session.pawn); }
-    }
     HandleJumpFromHudStart();
 }
 
@@ -5169,6 +5505,52 @@ static void BRPartPools(bool force = false) {
         LOG("[BR] cosmetic pools: heads=%zu(+%zu) bodies=%zu(+%zu) outfits=%zu(+%zu) (F77 — resident locker scan)",
             g_head_pool.size(), g_head_pool.size() - heads0, g_body_pool.size(), g_body_pool.size() - bodies0,
             g_cid_outfits.size(), g_cid_outfits.size() - outfits0);
+
+    // [F79-d] build MATCHED random pairs — a head only fits a body when the
+    // (GenderPermitted, BodyTypesPermitted) families overlap. The F78 device
+    // log produced headless bots because heads and bodies were drawn from the
+    // pools independently; with the reflection metadata every pair is legal.
+    // CID outfits (head+body from ONE skin) are matched by construction and
+    // enter the pair list directly. When the metadata read fails (property
+    // absent) the pools degrade to the verified pairs only — never a
+    // headless bot again.
+    if (g_skin_pairs.size() < 64 && (!g_head_pool.empty() || !g_cid_outfits.empty())) {
+        BRBuildVerifiedPairs();
+        size_t before = g_skin_pairs.size();
+        for (auto& o : g_cid_outfits)
+            if (o.head && o.body) g_skin_pairs.push_back({o.head, o.body});
+        struct Meta { uint8_t type, gender, body; bool ok; };
+        auto meta = [](void* p) -> Meta {
+            Meta m{0, 0, 0, false};
+            m.ok = BRPartMeta(p, m.type, m.gender, m.body);
+            return m;
+        };
+        std::vector<Meta> hm, bm;
+        for (void* h : g_head_pool) hm.push_back(meta(h));
+        for (void* b : g_body_pool) bm.push_back(meta(b));
+        bool usable = false;
+        for (auto& m : hm) if (m.ok) usable = true;
+        for (auto& m : bm) if (m.ok) usable = true;
+        if (usable) {
+            for (size_t i = 0; i < hm.size() && g_skin_pairs.size() < 256; ++i) {
+                if (!hm[i].ok) continue;
+                for (size_t j = 0; j < bm.size() && g_skin_pairs.size() < 256; ++j) {
+                    if (!bm[j].ok) continue;
+                    // EFortCustomGender: 0 Male 1 Female 2 Both; parts that did
+                    // not answer the gender read pass unfiltered.
+                    bool gok = !hm[i].ok || !bm[j].ok || hm[i].gender == bm[j].gender ||
+                               hm[i].gender == 2 || bm[j].gender == 2;
+                    // EFortCustomBodyType: Small/Medium/Large bitmask-ish enum;
+                    // 0 (Small) + exact match or either side unfiltered.
+                    bool bok = !hm[i].ok || !bm[j].ok || hm[i].body == bm[j].body;
+                    if (gok && bok) g_skin_pairs.push_back({g_head_pool[i], g_body_pool[j]});
+                }
+            }
+        }
+        if (g_skin_pairs.size() != before)
+            LOG("[BR] skin pairs: %zu matched (+%zu) — headless-bomb pairs eliminated (F79)",
+                g_skin_pairs.size(), g_skin_pairs.size() - before);
+    }
 }
 
 static void BRSpawnBotBatch(int n) {
@@ -5277,15 +5659,20 @@ static void BRSpawnBotBatch(int n) {
         }
         SetBool(st, "/Script/FortniteGame.FortPlayerState.bIsABot", true);
 
-        // [F74-d + F77-b] cosmetics — the exact chain that gave the LOCAL
-        // player a working body, now with a RANDOM outfit per bot: prefer a
-        // complete resident skin (CID outfit — head+body from ONE skin), then
-        // independent random parts, then the Erbium trio statics.
+        // [F74-d + F77-b + F79-d] cosmetics — the exact chain that gave the
+        // LOCAL player a working body, now with a RANDOM MATCHED outfit per
+        // bot: prefer metadata-matched pairs (head fits body — no headless
+        // bots), then the verified pairs (engine defaults + the player's own
+        // rendering parts), then the Erbium trio statics.
         {
             void* botHead = nullptr; void* botBody = nullptr; void* botCid = nullptr;
-            if (!g_cid_outfits.empty()) {
-                const BRCidOutfit& o = g_cid_outfits[(size_t)(BRRand() % g_cid_outfits.size())];
-                botHead = o.head; botBody = o.body; botCid = o.cid;
+            BRPartPools();
+            if (!g_skin_pairs.empty()) {
+                const BRPair& p = g_skin_pairs[(size_t)(BRRand() % g_skin_pairs.size())];
+                botHead = p.head; botBody = p.body;
+            } else if (!g_verified_pairs.empty()) {
+                const BRPair& p = g_verified_pairs[(size_t)(BRRand() % g_verified_pairs.size())];
+                botHead = p.head; botBody = p.body;
             } else {
                 if (!g_head_pool.empty()) botHead = g_head_pool[(size_t)(BRRand() % g_head_pool.size())];
                 if (!g_body_pool.empty()) botBody = g_body_pool[(size_t)(BRRand() % g_body_pool.size())];
@@ -5407,6 +5794,26 @@ static void BRSpawnBotBatch(int n) {
             }
         }
 
+        // [F79-d] pickaxe at spawn — every bot lands with the harvest tool in
+        // hand (GameDataCosmetics.FallbackPickaxe → WeaponDefinition through
+        // the same native EquipWeaponDefinition the player uses). The ranged
+        // weapon lands at drop time (BRBusBotsTick landing → BRBotLoadout).
+        if (br.bots_spawned % 10 == 0) {   // one pool build per batch of 10
+            BRBuildVerifiedPairs();
+            BRWeaponPool();
+        }
+        {
+            void* pickDef = g_fallback_pickaxe;
+            if (!pickDef) pickDef = FindObj("/Game/Athena/Items/Weapons/WID_Harvest_Pickaxe_Athena_C_T01.WID_Harvest_Pickaxe_Athena_C_T01");
+            if (pickDef) {
+                void* weapon = ResolveWeaponDefForEquip(pickDef);
+                if (weapon && !BREquipForPawn(pawn, weapon) && !session.bot_pickaxe_warned) {
+                    session.bot_pickaxe_warned = true;
+                    LOG("[BR] bot pickaxe equip unavailable (EquipWeaponDefinition refused)");
+                }
+            }
+        }
+
         // [F75-a] GameMemberInfoArray — Erbium spawnbot registers every bot
         // (FGameMemberInfo{SquadId,TeamIndex} + array add). Native code
         // (team screens, PlayerArray walks) reads this list; leaving bots out
@@ -5514,7 +5921,19 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
         if (!cls || IsBadPtr(cls)) continue;                   // half-freed actor
         // [F78-c] bus riders / skydivers are BRBusBotsTick's job — the ground
         // AI must not fight the descent (or walk them out of the bus).
-        if (m.bus_state != 0) { list[w++] = m; continue; }
+        // [F79] wildlife freezes during the bus flight too — the F78 log showed
+        // animals pathing around WHILE the bus flew (the user saw entities
+        // dropping around the bus); animals sleep through the flight instead.
+        if (m.bus_state != 0 || (isWild && br.phase == 3)) { list[w++] = m; continue; }
+        // [F79-d] corpses don't AI — a bot at 0 HP stops moving (the storm
+        // tick's elimination bookkeeping destroys the actor + updates
+        // PlayersLeft; until then the body just lies there like the real game).
+        static void* hpPropM = nullptr;
+        if (!hpPropM) hpPropM = GetProp("/Script/FortniteGame.FortPawn.Health");
+        if (hpPropM && Read<int>(hpPropM, profile::PropElementSize) == 4) {
+            float hp = Read<float>(GetField(pawn, hpPropM), 0);
+            if (std::isfinite(hp) && hp <= 0.0f) { list[w++] = m; continue; }
+        }
         // current location (stuck-check anchor + wander center)
         Vector at{};
         bool haveAt = false;
@@ -5551,15 +5970,25 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
                         haveGoal = true;
                     }
                 }
-                // [F77-c] engagement — the player within 30m: face them and
-                // hold ground for 1-3s (a bot that notices you is alive).
+                // [F77-c → F79-d] engagement — the player within 30m: the bot
+                // is AWARE. Far (>8m): it navmeshes TOWARD the player (hunts
+                // them down instead of staring). Close: it holds ground and
+                // faces them (the melee window). Occasional hop keeps it alive
+                // visually — "aware, not stupid".
                 if (!haveGoal && havePlayer) {
                     float ddx = at.X - playerAt.X, ddy = at.Y - playerAt.Y;
-                    if (ddx * ddx + ddy * ddy < 3000.0f * 3000.0f) {
+                    float pd2 = ddx * ddx + ddy * ddy;
+                    if (pd2 < 3000.0f * 3000.0f) {
                         m.face = session.pawn;
                         m.face_until = now + 1.2 + BRRand01() * 2.5;
                         m.next_heading = m.face_until + 0.5;
-                        engage = true;
+                        if (pd2 > 6400.0f) {                          // >8m — pursue
+                            goal = Vector{ playerAt.X, playerAt.Y, at.Z };
+                            haveGoal = true;
+                            engage = false;          // keep moving while pursuing
+                        } else {
+                            engage = true;           // in melee range — hold + face
+                        }
                     }
                 }
             }
@@ -5590,7 +6019,9 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
                 m.vel_mode = 1;
             }
         }
-        // [F77-c] engaged — hold ground and track the player every tick
+        // [F77-c] engaged — hold ground and track the player every tick.
+        // [F79-d] in melee range the bot STRIKES (2.5m, 2s swing cadence,
+        // 12 damage) — an aware bot is a threat, not scenery.
         if (m.face && now < m.face_until) {
             Vector fat{};
             if (getLoc && getLoc->ok() && getLoc->run(m.face)) {
@@ -5599,6 +6030,18 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
                 if (ctrl && !IsBadPtr(ctrl) && rot && rot->ok() && haveAt) {
                     Rotator r{}; r.Yaw = std::atan2(fat.Y - at.Y, fat.X - at.X) * 57.2957795f;
                     if (rot->set("NewRotation", r)) rot->run(ctrl);
+                }
+                float sdx = fat.X - at.X, sdy = fat.Y - at.Y, sdz = fat.Z - at.Z;
+                float sd2 = sdx * sdx + sdy * sdy + sdz * sdz;
+                if (sd2 < 250.0f * 250.0f && now >= m.next_strike) {
+                    m.next_strike = now + 2.0 + BRRand01();
+                    void* gsCdo = FindObj("/Script/Engine.Default__GameplayStatics");
+                    Call ad("/Script/Engine.GameplayStatics.ApplyDamage");
+                    if (ad.ok() && gsCdo) {
+                        if (ad.set("DamagedActor", m.face) && ad.set("BaseDamage", 12.0f) &&
+                            ad.set("DamageCauser", pawn) && ad.set("EventInstigator", ctrl))
+                            ad.run(gsCdo);
+                    }
                 }
                 if (cmOff > 0 && vOff > 0) {
                     void* cm = Read<void*>(pawn, (size_t)cmOff);
@@ -5665,7 +6108,8 @@ static void BRBotMoveTick() { MotorTick(g_bot_motors, 320.0f, "Bot"); }
 // of PlayersLeft/AlivePlayers (real elimination bookkeeping).
 // ----------------------------------------------------------------------------
 static void BRStormTick() {
-    if (!br.indicator || IsBadPtr(br.indicator) || !session.pawn) return;
+    if (!br.indicator || IsBadPtr(br.indicator)) return;
+    if (!session.pawn && g_bot_motors.empty()) return;   // [F79] bots feel the storm too
     Vector c{}; float r = 0;
     { Call gc("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneCenter");
       if (gc.ok() && gc.run(br.indicator)) c = gc.result<Vector>(); }
@@ -5679,38 +6123,44 @@ static void BRStormTick() {
         return dx * dx + dy * dy > double(r) * double(r);
     };
 
-    // local pawn flags (Erbium printf -> our LOG, once per change)
-    bool in = !outside(session.pawn);
-    bool cur = GetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone");
-    if (cur != in) {
-        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone", in);
-        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInAnyStorm", !in);
-        Call ra("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInsideSafeZone");
-        if (ra.ok()) ra.run(session.pawn);
-        Call rb("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInAnyStorm");
-        if (rb.ok()) rb.run(session.pawn);
-        LOG("[BR] local pawn storm status: %s (phase %d r=%.0f)", in ? "safe" : "STORM", br.phase, r);
-    }
-
-    // damage bookkeeping
-    float maxhp = 100;
-    BRReadFloat(session.pawn, "/Script/FortniteGame.FortPawn.MaxHealth", maxhp);
+    // damage bookkeeping — the storm's current phase drives the percentage
+    // for the local pawn AND every bot (hoisted so both sections share it).
     int curPhase = 0;
     if (void* cpProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentPhase"))
         curPhase = Read<int>(GetField(br.indicator, cpProp), 0);
     if (curPhase < 0 || curPhase >= (int)br.damage.size()) curPhase = 0;
-    float pct = br.damage[curPhase];
-    if (!in && pct > 0) {
-        float dmg = maxhp * pct / 100.0f;
-        void* gsCdo = FindObj("/Script/Engine.Default__GameplayStatics");
-        Call ad("/Script/Engine.GameplayStatics.ApplyDamage");
-        if (ad.ok() && gsCdo) {
-            if (ad.set("DamagedActor", session.pawn) && ad.set("BaseDamage", dmg) &&
-                ad.set("DamageCauser", br.indicator)) {
-                void* zero = nullptr;
-                if (!ad.set("EventInstigator", zero)) ad.set_at(1, zero);
-                ad.run(gsCdo);
-                LOG("[BR] storm damage %.1f (%d%% of %.0f)", dmg, (int)pct, maxhp);
+    float pct = br.damage.empty() ? 0.0f : br.damage[curPhase];
+
+    // local pawn flags (Erbium printf -> our LOG, once per change)
+    // [F79-a] the pawn may legitimately be absent (destroyed on the bus) —
+    // the bots below still feel the storm.
+    if (session.pawn && !IsBadPtr(session.pawn)) {
+        bool in = !outside(session.pawn);
+        bool cur = GetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone");
+        if (cur != in) {
+            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone", in);
+            SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInAnyStorm", !in);
+            Call ra("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInsideSafeZone");
+            if (ra.ok()) ra.run(session.pawn);
+            Call rb("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInAnyStorm");
+            if (rb.ok()) rb.run(session.pawn);
+            LOG("[BR] local pawn storm status: %s (phase %d r=%.0f)", in ? "safe" : "STORM", br.phase, r);
+        }
+
+        float maxhp = 100;
+        BRReadFloat(session.pawn, "/Script/FortniteGame.FortPawn.MaxHealth", maxhp);
+        if (!in && pct > 0) {
+            float dmg = maxhp * pct / 100.0f;
+            void* gsCdo = FindObj("/Script/Engine.Default__GameplayStatics");
+            Call ad("/Script/Engine.GameplayStatics.ApplyDamage");
+            if (ad.ok() && gsCdo) {
+                if (ad.set("DamagedActor", session.pawn) && ad.set("BaseDamage", dmg) &&
+                    ad.set("DamageCauser", br.indicator)) {
+                    void* zero = nullptr;
+                    if (!ad.set("EventInstigator", zero)) ad.set_at(1, zero);
+                    ad.run(gsCdo);
+                    LOG("[BR] storm damage %.1f (%d%% of %.0f)", dmg, (int)pct, maxhp);
+                }
             }
         }
     }
@@ -5819,6 +6269,18 @@ static void BRStart() {
     BRSetGamePhase(2);     // EAthenaGamePhase::Warmup
     BRSetGamePhaseStep(2); // EAthenaGamePhaseStep::Warmup
     br.next_bot_wave = Monotonic() + 1.0;
+    // [F79] pre-warm the expensive one-time lookups while warmup runs (60s of
+    // headroom): the "Spectating" FName scan, the verified cosmetic pairs and
+    // the bot pickaxe/weapon pools. Boarding then costs nothing.
+    {
+        FName fn{};
+        if (BRFindFNameByString("Spectating", fn))
+            LOG("[BR] pre-warm: 'Spectating' FName = (%u, %u)", fn.CompIdx, fn.DispIdx);
+        else
+            LOG("[BR] pre-warm: 'Spectating' FName not found in first 150k GObjects — camera rides SetViewTarget");
+        BRBuildVerifiedPairs();
+        BRWeaponPool();
+    }
     LOG("[BR] warmup %.0fs — bus at T+%.0f (era.warmup N / era.bus to control)", warmup, warmup);
 }
 
@@ -5910,6 +6372,28 @@ void Athena::BRTick() {
         }
         void* ac = br.aircraft;
         if (ac && !IsBadPtr(ac)) {
+            // [F79-a] camera follow re-assert — while RIDING (not after the
+            // jump: once the native respawn owns the pawn, its camera must
+            // not be yanked back to the bus), snap the view target back to
+            // the aircraft every 2s if anything re-targeted it (the F78
+            // "camera wasn't following the bus well").
+            {
+                static double lastCamAssert = 0;
+                if (now - lastCamAssert > 2.0 && !session.aircraft_jumped) {
+                    lastCamAssert = now;
+                    bool onBus = true;
+                    Call gt("/Script/Engine.PlayerController.GetViewTarget");
+                    if (gt.ok() && gt.run(session.controller)) {
+                        void* vt = gt.result<void*>();
+                        if (vt && !IsBadPtr(vt) && vt != ac) onBus = false;
+                    }
+                    if (!onBus) {
+                        Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+                        if (cam.ok()) { cam.set("NewViewTarget", ac); float blend = 0.3f; cam.set("BlendTime", blend); cam.run(session.controller); }
+                        LOG("[BUS] camera re-asserted to the aircraft");
+                    }
+                }
+            }
             // [F78] bus flight heartbeat — names a dead bus immediately; if
             // the native aircraft tick stays silent for two beats our own
             // pilot flies the real route (the F77 fallback drove toward an
@@ -5938,10 +6422,14 @@ void Athena::BRTick() {
                 BRSetGamePhaseStep(5); // BusFlying
                 LOG("[BR] bus unlocked — jump button live (Erbium BusFlying)");
             }
-            if (!br.drop_forced && br.drop_end > 0 && now >= br.drop_end && !session.aircraft_jumped) {
+            // [F79-a] Erbium DropEndTime — everyone still aboard is force-jumped
+            // through the NATIVE respawn path. With the pawn destroyed at
+            // boarding this re-spawns the player mid-air (Erbium
+            // OnAircraftExitedDropZone_: ServerAttemptAircraftJump per player).
+            if (!br.drop_forced && br.drop_end > 0 && now >= br.drop_end) {
                 br.drop_forced = true;
                 LOG("[BR] drop window ended — forcing jump (Erbium OnAircraftExitedDropZone)");
-                BRJump();
+                if (!session.aircraft_jumped) BRJump();
             }
             // [F73] Erbium: aircraft destroyed once FlightEndTime passes —
             // regardless of how the player exited (manual jump or forced).
@@ -5951,24 +6439,14 @@ void Athena::BRTick() {
                 if (d.ok()) d.run(ac);
                 br.aircraft = nullptr;
                 LOG("[BR] aircraft destroyed (flight over)");
-                // [F78-a6] Erbium Tick: after the flight the match moves on —
-                // phase SafeZones, storm forming. F77 left the phase parked
-                // here, which is exactly the frozen "EVERYBODY OFF! LAST STOP
-                // IN 0s" bar the F77 device log ended with.
-                br.safezones_start = now + 12.0f;
+                // [F79-a] Erbium Tick: SafeZonesStartTime = DropEndTime + 60 —
+                // the storm waits a full minute after the drop window so every
+                // skydiver (player + bots) lands first. The F78 +12s was the
+                // killer: the storm formed over players still in the air.
+                br.safezones_start = ((br.drop_end > 0) ? br.drop_end : now) + 60.0f;
                 BRSetGamePhase(4);     // SafeZones
                 BRSetGamePhaseStep(6); // StormForming
-                LOG("[BR] flight over — SafeZones in 12s (storm forming)");
-            }
-            // [F73] failsafe — flight over but the jump chain never landed:
-            // restore the pawn so the player is never stuck hidden.
-            if (br.flight_done && !session.aircraft_jumped && session.pawn && !IsBadPtr(session.pawn)) {
-                Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
-                if (hid.ok()) { bool b = false; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
-                Call col("/Script/Engine.Actor.SetActorEnableCollision");
-                if (col.ok()) { bool b = true; if (col.set("bNewActorEnableCollision", b)) col.run(session.pawn); }
-                session.aircraft_jumped = true;
-                LOG("[BR] failsafe: pawn restored after flight window");
+                LOG("[BR] flight over — SafeZones at drop_end+60 (Erbium timing)");
             }
         } else if (!br.flight_done) {
             // no aircraft (spawn refused) — Erbium bSkipAircraft path
@@ -5977,6 +6455,44 @@ void Athena::BRTick() {
             BRSetGamePhase(4);     // SafeZones
             BRSetGamePhaseStep(6); // StormForming
             LOG("[BR] no aircraft — SafeZones in 15s (bSkipAircraft path)");
+        }
+        // [F79-a] respawn watcher — the jump was requested (button or forced)
+        // and the NATIVE respawn should have spawned a fresh pawn (detected in
+        // Athena::Tick). If it never appears within 1.5s (native preconditions
+        // failed), spawn the pawn ourselves at the route end ON THE GROUND —
+        // a safe landing, never a fall from 80000.
+        if (br.jump_requested_at > 0 && !session.pawn &&
+            Monotonic() - br.jump_requested_at > 1.5) {
+            br.jump_requested_at = -1;
+            LOG("[BR] native respawn did not appear — safe ground fallback (F79)");
+            Vector end{ br.route_start.X, br.route_start.Y, br.route_start.Z };
+            if (br.have_route) {
+                float rad = br.route_yaw * 3.14159265f / 180.0f;
+                end.X += std::cos(rad) * br.route_speed * br.route_dur;
+                end.Y += std::sin(rad) * br.route_speed * br.route_dur;
+            }
+            float gz = 0;
+            if (!BRGroundZ(end.X, end.Y, gz)) gz = 500;
+            if (!br.zone_centers.empty()) {
+                const Vector& c = br.zone_centers[0];
+                float zr = br.radius.empty() ? 25600.0f : br.radius[0];
+                if (zr > 1000) { end.X = c.X; end.Y = c.Y; gz = 0; if (!BRGroundZ(end.X, end.Y, gz)) gz = 500; }
+            }
+            void* pcls = BRBotPawnClass ? BRBotPawnClass
+                       : LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
+            if (pcls && session.world) {
+                Transform t{};
+                t.Location[0] = end.X; t.Location[1] = end.Y; t.Location[2] = gz + 200;
+                Rotator rr{}; rr.Yaw = br.route_yaw; RotatorToQuat(rr, t.Rotation);
+                void* p = SpawnActor(session.world, pcls, nullptr, t);
+                if (p) {
+                    Possess(session.controller, p);
+                    if (void* mfp = GetProp("/Script/FortniteGame.FortPlayerController.MyFortPawn"))
+                        Write<void*>(GetField(session.controller, mfp), 0, p);
+                    BRPawnRespawned(p);
+                    LOG("[BR] fallback pawn spawned on the ground at (%.0f, %.0f, %.0f)", end.X, end.Y, gz);
+                }
+            }
         }
         return;
     }
@@ -7778,11 +8294,36 @@ static void pe_hook(void* obj, void* func, void* params) {
             Athena::ForceReturnFalse(func, params);
             return;
         }
+        // [F75-a2 → F79-c] ClientActivateSlot — LOCAL ROUTING. The F75
+        // unconditional swallow protected the warmup-zero equip chain but also
+        // killed every quickbar tap for the whole match ("QuickBars dead").
+        // Now the tap is served entirely locally: read (bar, slot), resolve
+        // the bound item instance, equip through our own
+        // OnServerExecuteInventoryItem — the native equip chain (which crashes
+        // standalone) is never entered in ANY phase.
         if (fn == "ClientActivateSlot") {
             Guard g;
             static bool once = false;
-            if (!once) { once = true; LOG("[Equip] external ClientActivateSlot swallowed (native phase-change equip)"); }
-            return;   // the native continuation of this chain crashes standalone
+            uint8_t bar = 0; int slot = -1;
+            if (void* bp = incoming(func, params, "InQuickBar", 1)) bar = Read<uint8_t>(bp, 0);
+            if (void* sp = incoming(func, params, "Slot", 4)) slot = Read<int>(sp, 0);
+            void* inst = nullptr;
+            if (slot >= 0 && slot < 6)
+                inst = (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot];
+            if (inst && !IsBadPtr(inst)) {
+                Guid guid = ItemGuidOf(inst);
+                if ((guid.A | guid.B | guid.C | guid.D) && !memcmp(&guid, &session.last_equip_guid, sizeof(Guid))) {
+                    if (!once) { once = true; LOG("[QB] tap on already-held item — skipped (F79)"); }
+                } else {
+                    if (!once) { once = true; LOG("[QB] tap routed locally: bar=%u slot=%d (F79-c)", (unsigned)bar, slot); }
+                    session.last_equip_guid = guid;
+                    Athena::OnServerExecuteInventoryItem(guid);
+                }
+            } else if (!once) {
+                once = true;
+                LOG("[QB] tap swallowed — no item bound at bar=%u slot=%d (F79-c)", (unsigned)bar, slot);
+            }
+            return;
         }
         // [F77-a] GetReady->Bus seatbelt — the F76 crash tail (the native
         // warmup-end transition) ran exactly these calls on its way to death:
@@ -7861,7 +8402,12 @@ static void pe_hook(void* obj, void* func, void* params) {
                     Athena::OnFinishEditActor(p->BA, p->NC, p->RI, p->M != 0);
                 }
             }
-            else if (fn == "ServerPlayEmoteItem" && isPC) Athena::PlayEmoteItem(Read<void*>(params));
+            else if (fn == "ServerPlayEmoteItem" && isPC) { Athena::PlayEmoteItem(Read<void*>(params)); return; }   // [F79-b] never reach the crashing native emote path
+            // [F79-b] the CLIENT emote entry crashes too — the mobile emote
+            // wheel calls PlayEmoteItem directly on the controller in this
+            // build. Same safe route: resolve the montage, play locally, stop.
+            else if (fn == "PlayEmoteItem" && isPC) { Athena::PlayEmoteItem(Read<void*>(params)); return; }
+            else if (fn == "Cheat_ForcePlayEmoteItem" && isPC) { Athena::PlayEmoteItem(Read<void*>(params)); return; }
             else if (fn == "ServerAttemptExitVehicle") Athena::OnExitVehicle();
             // [F49] Harvest grant on player-placed builds (the health-delta
             // watcher covers world structures; this covers our own walls).
