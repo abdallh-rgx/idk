@@ -369,3 +369,20 @@ Stage Summary:
 - طور الباص Erbium-صرف: لا pawn حية على الباص — تدمير + Spectating + قفزة أصلية + رسبن مكتشف تلقائيًا + شبكة أمان أرضية؛ العاصفة drop_end+60
 - كراش الـ Emote مقتول من جذعه (return بعد السلسلة الآمنة)؛ QuickBars تنقر محليًا بكل الأطوار
 - البوتات: سكنات متطابقة مضمونة + فأس + سلاح عند الهبوط + مطاردة وضرب + جثث حقيقية + مشاهدة الموت تعمل
+
+---
+Task ID: 16
+Agent: Z.ai Code (main)
+Task: تسليم F79 إلى مستودع البناء abdallh-rgx/idk + تحقق CI الحقيقي (NDK r27)
+
+Work Log:
+- اكتشاف بنية المستودع: jni/hook.cpp (كان بنسخة F78 8248 سطرًا) + jni/Android.mk (ndk-build + Dobby) + .github/workflows/main.yml (GitHub Actions يبني libhook.so على كل push إلى main ويرفع artifact باسم libhook-arm64) — هذا خط التسليم الفعلي للمستخدم
+- تحديث jni/hook.cpp بالكامل إلى F79 (8794 سطرًا) + إضافة CHANGES.md + WORKLOG.md إلى جذر المستودع
+- commit 3ee076f "F79 — Erbium-pure bus ..." → push main → **GitHub Actions build SUCCESS** (run 37989627557)
+- مراجعة ذاتية اكتشفت خطأً منطقيًا: فحص br.spectating كان بعد early-return session.aircraft_jumped (ما زال true من قفزة الباص) — نقل الفحص لأول الدالة (8796 سطرًا) + إعادة فحص syntax EXIT=0 + إعادة توليد parts (832×6+3804) + commit e47c620 → push → **CI SUCCESS** (run 37989854223)
+- تحقق set_bytes("NewState", FName 8B) ضد تعريف Call — مطابق تمامًا لباراميتر ClientGotoState
+
+Stage Summary:
+- المُنتَج: libhook.so (arm64) مبني من F79 الكامل على NDK r27 الحقيقي — artifact جاهز للتحميل من Actions
+- المستودع يحوي: jni/hook.cpp (F79 8796 سطرًا) + CHANGES.md (تاريخ F01→F79 كاملًا) + WORKLOG.md
+- جولتان CI خضراء متتاليتان على الكود النهائي
