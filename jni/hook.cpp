@@ -381,7 +381,7 @@ static void* incoming(void* function, void* data, const char* key, int expected_
 static GObjects_t* GObjectArray();
 static void RotatorToQuat(const Rotator& r, double out[4]);   // [F28-F33] forward decl
 static bool IsCDO(void* obj);                                 // [F39] forward decl
-static void ZoneMonitor();                                    // [F35] forward decl
+// static void ZoneMonitor(); // [F35] removed — see [F73] note near BRTick
 static double Monotonic();                                    // [F54] forward decl (GObjectArray probe)
 
 // ============================================================================
@@ -1135,11 +1135,56 @@ static bool NearPlayer(const Vector& point, float limit) {
 }
 
 // ============================================================================
+// [F73] ERBIUM BATTLE ROYALE LIFECYCLE — forward decls (definitions below,
+// after SetPlayersLeft). 1:1 port of Erbium's BattleRoyaleGamePhaseLogic +
+// FortGameMode safe-zone/aircraft/bot flow, driven from our world tick.
+// ============================================================================
+static void BRStartAircraftPhase();   // Erbium StartAircraftPhase
+static void BRZoneTables();           // Erbium SafeZoneDefinition -> tables
+static void BRPickZoneCenters();      // Erbium InitializeSafeZoneLocations
+static void BRSetupSafeZoneIndicator(); // Erbium SetupSafeZoneIndicator
+static void BRStartNewSafeZonePhase(int p, bool bInitial); // Erbium StartNewSafeZonePhase
+static void BRStormTick();            // Erbium zone flags + storm damage
+static float BRWorldTime();           // UGameplayStatics::GetTimeSeconds
+static void* BRGetComponent();        // BattleRoyaleGamePhaseLogic component
+
+// [F73] BR machine state (mirrors Erbium's component statics + locals)
+struct BRCtx {
+    bool   started = false;           // HandleMatchHasStarted port ran
+    uint8_t phase = 0;                // EAthenaGamePhase (None..EndGame)
+    uint8_t step = 0;                 // EAthenaGamePhaseStep
+    void*  component = nullptr;       // FortGameStateComponent_BattleRoyaleGamePhaseLogic
+    void*  mapinfo = nullptr;         // AFortAthenaMapInfo
+    void*  indicator = nullptr;       // AFortSafeZoneIndicator (ours)
+    void*  aircraft = nullptr;        // AFortAthenaAircraft (the bus)
+    float  warmup_end = -1;           // WarmupCountdownEndTime (world seconds)
+    float  safezones_start = -1;      // SafeZonesStartTime
+    float  drop_start = -1, drop_end = -1, flight_end = -1; // aircraft windows
+    bool   bus_unlocked = false;      // BusFlying step fired
+    bool   drop_forced = false;       // OnAircraftExitedDropZone port fired
+    bool   flight_done = false;       // aircraft destroyed
+    bool   zone_formed = false;       // indicator + phases built
+    bool   zone_shrinking = false;    // state 3 fired for current phase
+    int    zone_count = 9;            // phases built
+    std::vector<float> radius, wait, shrink, damage; // per-phase zone tables
+    std::vector<Vector> zone_centers; // per-phase centers
+    int    bots_target = 99;          // Erbium full BR roster
+    int    bots_spawned = 0;          // ErbiumBot(#) counters
+    double next_bot_wave = 0;         // monotonic schedule
+    double last_storm_tick = 0;
+    int    last_logged_zone = -1;
+    bool   alive_added = false;       // local PC in GameMode->AlivePlayers
+};
+static BRCtx br;
+
+// ============================================================================
 // ATHENA NAMESPACE
 // ============================================================================
 namespace Athena {
     void SetupWorld(void* world);
     void Tick();
+    void BRTick();                     // [F73] Erbium BR phase machine
+    void BRJump();                     // [F73] jump from bus (HUD + auto-drop)
     bool TryInitializePlayer(void* world, void* mode, void* controller);
     void SetupCheats();
     void FinalizePlayer();
@@ -1147,7 +1192,7 @@ namespace Athena {
     void SyncLockerLoadout();          // [F22] MCP locker sync
     void LoadProfileCosmetics();
     void LoadDefaultCosmetics();
-    void ForcePlayerVisible();
+    void ForcePlayerVisible();         // [F73] skipped while riding the bus
     void BeginPlayerSkydiving();
     void EquipSlot(int slot);
     void DestroyLods();
@@ -1215,7 +1260,7 @@ namespace Athena {
     void ForceMapsVisible();           // [F33] minimap + full map
 
     // [F35-F45] world systems v2
-    void DriveSafeZone();              // [F35] phases + shrink + storm damage
+    // [F35] DriveSafeZone removed — see [F73] (BR lifecycle owns zones)
     void SetPlayersLeft(int n);        // [F36] HUD player counter
     bool StackAdd(void* def, int count); // [F37] stack resources onto existing entry
     void HarvestTick();                // [F37] pickaxe -> wood/stone/metal
@@ -1242,6 +1287,8 @@ namespace Athena {
     void HarvestGrantFor(void* actor, float damage); // [F49] shared harvest grant
     int  SpawnRealitySaplings(int max); // [F62] Ch3 S3 reality-tree saplings
     void SpawnLocalMarker();           // [F60] minimap marker actor (standalone)
+
+    // [F73] Erbium BR lifecycle — BRTick/BRJump defined in the BR section
 }
 
 // ============================================================================
@@ -1836,8 +1883,12 @@ static void* GetAircraftComponent(void* controller) {
 }
 
 void Athena::SpawnBattleBus() {
+    // [F73] cheat path — run the real Erbium aircraft phase when the BR
+    // machine is live; otherwise keep the legacy phase-3 poke so the command
+    // never dead-ends.
+    if (br.started && br.phase < 3) { BRStartAircraftPhase(); return; }
     if (!session.mode || !session.state) return;
-    LOG("[Bus] Attempting bus...");
+    LOG("[Bus] legacy aircraft poke (BR machine idle)");
     void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
     if (gp) {
         uint8_t phase = 3;
@@ -1895,7 +1946,7 @@ void Athena::HandleJumpFromHudStart() {
     session.aircraft_jumped = true;
     LOG("[Bus] Skydiving started");
 }
-void Athena::OnAircraftJump() { HandleJumpFromHudStart(); }
+void Athena::OnAircraftJump() { BRJump(); } // [F73] bus-position teleport + skydive
 void Athena::BeginPlayerSkydiving() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
     Call bsd("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
@@ -2173,6 +2224,9 @@ void Athena::ShowSkin() { LoadDefaultCosmetics(); }
 
 void Athena::ForcePlayerVisible() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
+    // [F73] while riding the bus the pawn is deliberately hidden — do not
+    // fight the boarding state (retry happens after the jump).
+    if (br.started && br.phase == 3 && !session.aircraft_jumped) return;
     LOG("[Visibility] Forcing player body visible...");
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", false);
     SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", false);
@@ -2267,10 +2321,13 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: InitializeInventory"); InitializeInventory();
     LOG("SetupWorld: SpawnFloorLoot"); SpawnFloorLoot();
     LOG("SetupWorld: ApplySprintSpeed"); ApplySprintSpeed();
-    LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
+    // [F73] Zone/bus removed from the init pass — the Erbium BR lifecycle
+    // (BRTick) owns warmup -> aircraft -> safe zones from finalize+2s. The
+    // old SpawnSafeZoneIndicator here spawned an EMPTY indicator (no phases)
+    // and the old SpawnBattleBus faked phase 3 + teleported to (0,0,50000):
+    // both fought the new machine.
     LOG("SetupWorld: SpawnBuildPreviews"); SpawnBuildPreviews();
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
-    LOG("SetupWorld: SpawnBattleBus"); SpawnBattleBus();
     LOG("SetupWorld: RemoveNetDebugUI"); RemoveNetDebugUI();
     // [F23] Free building + direct readiness bit (standalone-safe fallbacks).
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bBuildFree", true);
@@ -2387,16 +2444,10 @@ void Athena::Tick() {
         lastLootRetry = now;
         SpawnFloorLootRetry();
     }
-    // [F35] Zone — drive phases once, then monitor (logs shrink progress).
-    if (session.finalized && session.state) {
-        if (!session.zone_driven && now - session.finalized_at > 8.0) DriveSafeZone();
-        if (now - session.last_zone_monitor > 5.0) { session.last_zone_monitor = now; ZoneMonitor(); }
-    }
-    // [F36] Player counter — push once shortly after finalize.
-    if (session.finalized && !session.players_set && now - session.finalized_at > 6.0) {
-        session.players_set = true;
-        SetPlayersLeft(100);
-    }
+    // [F73] ERBIUM BR LIFECYCLE — the full BattleRoyaleGamePhaseLogic machine
+    // (warmup countdown -> aircraft/bus -> safe zones -> storm) replaces the
+    // old F35 one-shot zone poke and the F36 static counter. Runs every tick.
+    if (session.finalized) BRTick();
     // [F37] Harvest — health-delta watch grants wood/stone/metal on hits.
     if (session.finalized && session.harvest_enabled) HarvestTick();
     // [F40] Doors — keep player-opened doors open, unstick jammed ones.
@@ -3828,42 +3879,10 @@ void Athena::ForceMapsVisible() {
 // standalone is us) damages pawns outside the safe radius. The map spawns
 // its own phases via InitializeWithMapDefaultPhases(); we then start phase 0
 // and monitor radius/phase for the log. era.zone <i> jumps to a phase.
-void Athena::DriveSafeZone() {
-    if (!session.state || session.zone_driven) return;
-    void* ind = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
-    if (!ind || IsBadPtr(ind)) return;
-    Call init("/Script/FortniteGame.FortSafeZoneIndicator.InitializeWithMapDefaultPhases");
-    bool inited = false;
-    if (init.ok()) inited = init.run(ind);
-    Call start("/Script/FortniteGame.FortSafeZoneIndicator.StartPhase");
-    bool started = false;
-    if (start.ok()) { int idx = 0; if (start.set("InPhaseIndex", idx)) started = start.run(ind); }
-    session.zone_driven = inited || started;
-    LOG("[Zone] InitializeWithMapDefaultPhases=%d StartPhase(0)=%d", inited, started);
-    // The playlist may gate phases; make sure nothing stopped them.
-    SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bPlaylistStoppedSafeZonePhases", false);
-}
-
-// Zone monitor — logs phase/radius changes so the field log proves movement.
-static void ZoneMonitor() {
-    if (!session.state) return;
-    void* ind = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
-    if (!ind || IsBadPtr(ind)) return;
-    int phase = -1;
-    { Call c("/Script/FortniteGame.FortSafeZoneIndicator.GetCurrentPhaseIndex");
-      if (c.ok() && c.run(ind)) phase = c.result<int>(); }
-    float radius = 0.0f;
-    { Call c("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneRadius");
-      if (c.ok() && c.run(ind)) radius = c.result<float>(); }
-    Vector center{};
-    { Call c("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneCenter");
-      if (c.ok() && c.run(ind)) center = c.result<Vector>(); }
-    if (phase != session.last_zone_phase) {
-        session.last_zone_phase = phase;
-        LOG("[Zone] phase=%d radius=%.0f center=(%.0f,%.0f,%.0f)",
-            phase, radius, center.X, center.Y, center.Z);
-    }
-}
+// [F73] DriveSafeZone/ZoneMonitor (F35) removed — the Erbium BR lifecycle
+// (BRSetupSafeZoneIndicator + StartNewSafeZonePhase + BRTick) owns the zone
+// now; InitializeWithMapDefaultPhases could not create the phases array the
+// game needs ("everything dead" symptom).
 
 // ============================================================================
 // [F36] PLAYER COUNTER — FortGameStateAthena.PlayersLeft @0x14B8 is what the
@@ -3889,6 +3908,1012 @@ void Athena::SetPlayersLeft(int n) {
 // while the pickaxe is equipped and grant resources proportional to damage.
 // Yield model (Erbium): ResCount = CurveOut * Damage / MaxHealth, curve from
 // BuildingResourceAmountOverride evaluated via DataTableFunctionLibrary.
+// ============================================================================
+// [F73] ERBIUM BATTLE ROYALE LIFECYCLE — full 1:1 port of the Erbium BR
+// gameplay logic (github.com/plooshi/Erbium), the systems that make a match
+// "alive" on a real server and that the standalone build was missing entirely:
+//
+//   BattleRoyaleGamePhaseLogic.cpp : HandleMatchHasStarted (warmup countdown),
+//     Tick() phase machine (Warmup -> Aircraft -> SafeZones), StartAircraftPhase
+//     (SpawnAircraft + flight windows + board players), SetupSafeZoneIndicator
+//     (SafeZonePhases from MapInfo->SafeZoneDefinition), StartNewSafeZonePhase
+//     (centers/radii/shrink times/damage + OnReps + OnSafeZoneStateChange),
+//     zone shrink progression (state 3 -> StormShrinking -> next phase) and
+//     bIsInsideSafeZone / bIsInAnyStorm updates.
+//   FortGameMode.cpp               : SafeZonePhase bookkeeping
+//     (HandlePostSafeZonePhaseChanged), AlivePlayers, WarmupCountdown*.
+//   FortPlayerControllerAthena.cpp : the "spawnbot" routine (ErbiumBot roster:
+//     PlayerPawn_Athena_C + Athena_PlayerController_C + FortPlayerStateAthena,
+//     Possess + PlayerState wiring + TeamIndex/SquadId/bIsABot + ability sets
+//     + PlayersLeft++ + AlivePlayers).
+//
+// On a normal client all of this runs on the server; the standalone device has
+// no server, so the phases never advanced (everything stayed "dead"). We now
+// run the exact same state machine locally, in the game's own world time.
+// ============================================================================
+
+// xorshift RNG (no libc rand() dependency)
+static uint32_t BRRand() {
+    static uint32_t s = 0x9E3779B9u;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return s;
+}
+static float BRRand01() { return (BRRand() & 0xFFFFFF) / 16777216.0f; }
+
+// UGameplayStatics::GetTimeSeconds — Erbium compares every timer against WORLD
+// time (not monotonic): the native SafeZoneIndicator tick also uses these
+// fields, so all BR windows must live in the same clock.
+static float BRWorldTime() {
+    static float cached = 0;
+    static double at = 0;
+    double now = Monotonic();
+    if (now - at < 0.2) return cached;
+    at = now;
+    if (!session.world) return cached;
+    void* cdo = FindObj("/Script/Engine.Default__GameplayStatics");
+    Call c("/Script/Engine.GameplayStatics.GetTimeSeconds");
+    if (c.ok()) {
+        if (!c.set_any(session.world, "WorldContextObject", "World", "WorldContext")) return cached;
+        if (c.run(cdo ? cdo : session.world)) cached = c.result<float>();
+    }
+    return cached;
+}
+
+// typed float read/write via reflection
+static bool BRReadFloat(void* obj, const char* path, float& out) {
+    void* p = obj ? GetProp(path) : nullptr;
+    if (!p || Read<int>(p, profile::PropElementSize) != 4) return false;
+    out = Read<float>(GetField(obj, p), 0);
+    return true;
+}
+static bool BRWriteFloat(void* obj, const char* path, float v) {
+    void* p = obj ? GetProp(path) : nullptr;
+    if (!p || Read<int>(p, profile::PropElementSize) != 4) return false;
+    Write<float>(GetField(obj, p), 0, v);
+    return true;
+}
+static void BRWriteVector(void* obj, const char* path, const Vector& v) {
+    void* p = obj ? GetProp(path) : nullptr;
+    if (!p || Read<int>(p, profile::PropElementSize) != 24) return;
+    Write<Vector>(GetField(obj, p), 0, v);
+}
+
+// UFortGameStateComponent_BattleRoyaleGamePhaseLogic (exists since ~13.00;
+// on 21.30 it is the phase authority — Erbium reads/writes the same fields).
+static void* BRGetComponent() {
+    if (br.component && !IsBadPtr(br.component)) return br.component;
+    if (!session.state) return nullptr;
+    void* cls = FindObj("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic");
+    if (!cls) { static bool once = false; if (!once) { once = true; LOG("[BR] GamePhaseLogic component class missing"); } return nullptr; }
+    Call c("/Script/Engine.Actor.GetComponentByClass");
+    if (!c.ok()) return nullptr;
+    if (!c.set_any(cls, "ComponentClass", "ActorClass", "Class")) { c.dump("GetComponentByClass"); return nullptr; }
+    if (!c.run(session.state)) return nullptr;
+    br.component = c.result<void*>();
+    if (br.component && !IsBadPtr(br.component))
+        LOG("[BR] GamePhaseLogic component = %p", br.component);
+    return br.component;
+}
+
+// EAthenaGamePhase setter — Erbium SetGamePhase fallback path: write the
+// property then fire OnRep_GamePhase(Old). We drive BOTH the component
+// (game internals) and the GameState mirror (mobile HUD + [F69] HUD kick).
+static void BRSetGamePhase(uint8_t p) {
+    uint8_t old = br.phase;
+    if (BRGetComponent()) {
+        void* prop = GetProp("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.GamePhase");
+        if (prop) Write<uint8_t>(GetField(br.component, prop), 0, p);
+        Call r("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.OnRep_GamePhase");
+        if (r.ok()) { if (!r.set("OldGamePhase", old)) r.set_at(0, old); r.run(br.component); }
+    }
+    if (session.state) {
+        void* gp = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhase");
+        if (gp) Write<uint8_t>(GetField(session.state, gp), 0, p);
+        Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_GamePhase");
+        if (n.ok()) { if (!n.set("OldGamePhase", old)) n.set_at(0, old); n.run(session.state); }
+    }
+    br.phase = p;
+    LOG("[BR] GamePhase -> %u (Erbium EAthenaGamePhase)", (unsigned)p);
+}
+
+// EAthenaGamePhaseStep setter — Erbium SetGamePhaseStep: property write +
+// HandleGamePhaseStepChanged (the native that notifies HUD/music/announcer).
+static void BRSetGamePhaseStep(uint8_t s) {
+    br.step = s;
+    if (BRGetComponent()) {
+        void* prop = GetProp("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.GamePhaseStep");
+        if (prop) Write<uint8_t>(GetField(br.component, prop), 0, s);
+        Call h("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.HandleGamePhaseStepChanged");
+        if (h.ok()) { if (!h.set_any(s, "NewGamePhaseStep", "InGamePhaseStep", "GamePhaseStep")) h.set_at(0, s); h.run(br.component); }
+    }
+    if (session.state) {
+        void* prop = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhaseStep");
+        if (prop) Write<uint8_t>(GetField(session.state, prop), 0, s);
+    }
+    LOG("[BR] GamePhaseStep -> %u", (unsigned)s);
+}
+
+// ----------------------------------------------------------------------------
+// [F73-a] Zone tables — Erbium evaluates MapInfo->SafeZoneDefinition curves
+// (Radius/WaitTime/ShrinkTime ScalableFloats) + "Default.SafeZone.Damage".
+// FName construction is not available in reflection-land, so the curve rows
+// are replaced by the published BR pacing table; SafeZoneDefinition.Count is
+// still honoured when the map ships a literal Value (>0).
+// ----------------------------------------------------------------------------
+static void BRZoneTables() {
+    static const float kRadius[9] = {25600, 19800, 14600, 10600, 7600, 5400, 3600, 2200, 1000};
+    static const float kWait[9]   = {50, 40, 35, 30, 25, 20, 20, 15, 10};
+    static const float kShrink[9] = {40, 35, 32, 28, 25, 21, 17, 13, 10};
+    static const float kDamage[9] = {1, 1, 1, 2, 2, 5, 6, 8, 10}; // % of max health
+    int count = 9;
+    if (br.mapinfo) {
+        void* outer = GetProp("/Script/FortniteGame.FortAthenaMapInfo.SafeZoneDefinition");
+        void* inner = GetProp("/Script/FortniteGame.FortSafeZoneDefinition.Count");
+        if (outer && inner) {
+            int so = Read<int>(outer, profile::PropOffset);
+            int io = Read<int>(inner, profile::PropOffset);
+            if (so > 0 && io > 0 && so + io < 0x8000) {
+                float v = Read<float>((char*)br.mapinfo + so + io, 0);
+                if (v >= 4.0f && v <= 12.0f) count = (int)v;
+            }
+        }
+    }
+    br.zone_count = count;
+    br.radius.assign(kRadius, kRadius + 9);
+    br.wait.assign(kWait, kWait + 9);
+    br.shrink.assign(kShrink, kShrink + 9);
+    br.damage.assign(kDamage, kDamage + 9);
+    if (count > 9) { // pad with the last ring values
+        br.radius.resize(count, kRadius[8]); br.wait.resize(count, kWait[8]);
+        br.shrink.resize(count, kShrink[8]); br.damage.resize(count, kDamage[8]);
+    }
+    LOG("[BR] zone tables: count=%d r0=%.0f wait0=%.0f shrink0=%.0f", count, br.radius[0], br.wait[0], br.shrink[0]);
+}
+
+// ----------------------------------------------------------------------------
+// [F73-b] Zone centers — Erbium InitializeSafeZoneLocations uses
+// MapInfo->ConstructSafeZoneLocationParams + PickSafeZoneLocation (POI picker
+// + blacklist curve). The picker needs FName/blacklist plumbing reflection
+// cannot build, so we use the same shrink-in invariant the native picker
+// enforces: circle i is randomly placed fully inside circle i-1 around the
+// map center.
+// ----------------------------------------------------------------------------
+static void BRPickZoneCenters() {
+    br.zone_centers.clear();
+    Vector center{0, 0, 0};
+    if (br.mapinfo) {
+        Call c("/Script/FortniteGame.FortAthenaMapInfo.GetMapCenter");
+        if (c.ok() && c.run(br.mapinfo)) center = c.result<Vector>();
+    }
+    if (!std::isfinite(center.X) || !std::isfinite(center.Y)) center = Vector{0, 0, 0};
+    br.zone_centers.push_back(center);
+    for (int i = 1; i < br.zone_count; ++i) {
+        float gap = br.radius[i - 1] - br.radius[i];
+        if (gap < 500) gap = 500;
+        float dist = gap * (0.20f + 0.50f * BRRand01());
+        float ang = BRRand01() * 6.2831853f;
+        Vector c{ center.X + std::cos(ang) * dist, center.Y + std::sin(ang) * dist, center.Z };
+        br.zone_centers.push_back(c);
+    }
+    LOG("[BR] zone centers picked (%d) around (%.0f, %.0f)", br.zone_count, center.X, center.Y);
+}
+
+// FArrayProperty -> validated inner element size (ElementSize lives on the
+// inner property; the FArrayProperty header size differs between dumps, so
+// probe both candidates and validate the name of what we find).
+static int BRInnerSize(void* arrayProp) {
+    if (!arrayProp) return 0;
+    static const unsigned candidates[] = {0x50, 0x48, 0x58};
+    for (unsigned off : candidates) {
+        void* inner = Read<void*>(arrayProp, off);
+        if (!inner || IsBadPtr(inner)) continue;
+        void* innerCls = Read<void*>(inner, profile::ObjectClass);
+        std::string cn = (innerCls && !IsBadPtr(innerCls)) ? ObjName(innerCls) : "";
+        if (cn != "StructProperty" && cn != "Struct") continue;
+        int esz = Read<int>(inner, profile::PropElementSize);
+        if (esz >= 0x40 && esz <= 0x800) return esz;
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// [F73-c] Erbium SetupSafeZoneIndicator — spawn the REAL indicator, build the
+// SafeZonePhases array (Radius/Wait/Shrink/PlayerCap/Center/DamageInfo per
+// phase), fire PhaseCount/CurrentPhase OnReps and mirror it onto GameState +
+// GameMode + component exactly like the server flow does.
+// ----------------------------------------------------------------------------
+static void BRSetupSafeZoneIndicator() {
+    if (br.indicator && !IsBadPtr(br.indicator)) return;
+    if (!session.state || !session.world) return;
+
+    void* ind = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
+    bool reuse = ind && !IsBadPtr(ind);
+    if (!reuse) {
+        void* cls = nullptr;
+        void* clsProp = GetProp("/Script/FortniteGame.FortGameMode.SafeZoneIndicatorClass");
+        if (clsProp && session.mode) {
+            void* c = Read<void*>(GetField(session.mode, clsProp), 0);
+            if (c && !IsBadPtr(c)) cls = c;
+        }
+        if (!cls) cls = FindObj("/Script/FortniteGame.FortSafeZoneIndicator");
+        if (!cls) { LOG("[BR] SafeZoneIndicator class missing"); return; }
+        Transform t{};
+        ind = SpawnActor(session.world, cls, session.state, t);
+        if (!ind) { LOG("[BR] indicator spawn FAILED"); return; }
+    }
+    br.indicator = ind;
+
+    void* arrProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.SafeZonePhases");
+    int esz = BRInnerSize(arrProp);
+    if (!arrProp || !esz) { LOG("[BR] SafeZonePhases array missing (prop=%p esz=%d)", arrProp, esz); return; }
+
+    // FortSafeZonePhaseInfo field offsets
+    auto fo = [](const char* n) -> int {
+        void* p = GetProp((std::string("/Script/FortniteGame.FortSafeZonePhaseInfo.") + n).c_str());
+        return p ? Read<int>(p, profile::PropOffset) : -1;
+    };
+    int oRadius = fo("Radius"), oWait = fo("WaitTime"), oShrink = fo("ShrinkTime"),
+        oCap = fo("PlayerCap"), oCenter = fo("Center"), oDmg = fo("DamageInfo");
+    int oDmgD = -1, oDmgP = -1;
+    if (void* dp = GetProp("/Script/FortniteGame.FortSafeZoneDamageInfo.Damage"))
+        oDmgD = Read<int>(dp, profile::PropOffset);
+    if (void* dp = GetProp("/Script/FortniteGame.FortSafeZoneDamageInfo.bPercentageBasedDamage"))
+        oDmgP = Read<int>(dp, profile::PropOffset);
+    if (oRadius < 0 || oWait < 0 || oShrink < 0 || oCenter < 0) {
+        LOG("[BR] phase fields missing r=%d w=%d s=%d c=%d", oRadius, oWait, oShrink, oCenter);
+        return;
+    }
+    LOG("[BR] phase struct esz=0x%X r=0x%X w=0x%X s=0x%X ctr=0x%X dmg=0x%X(+%X/%X)",
+        esz, oRadius, oWait, oShrink, oCenter, oDmg, oDmgD, oDmgP);
+
+    std::vector<uint8_t> elem((size_t)esz, 0);
+    for (int i = 0; i < br.zone_count; ++i) {
+        std::fill(elem.begin(), elem.end(), (uint8_t)0);
+        Write<float>(elem.data(), oRadius, br.radius[i]);
+        Write<float>(elem.data(), oWait, br.wait[i]);
+        Write<float>(elem.data(), oShrink, br.shrink[i]);
+        if (oCap >= 0 && oCap + 4 <= esz) Write<int>(elem.data(), oCap, 100);
+        if (oCenter + 24 <= esz) Write<Vector>(elem.data(), oCenter, br.zone_centers[i]);
+        if (oDmg >= 0 && oDmgD >= 0 && oDmg + oDmgD + 4 <= esz)
+            Write<float>(elem.data(), oDmg + oDmgD, br.damage[i]);
+        if (oDmg >= 0 && oDmgP >= 0 && oDmg + oDmgP < esz)
+            Write<uint8_t>(elem.data(), oDmg + oDmgP, 1); // bPercentageBasedDamage
+        Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(GetField(ind, arrProp), arrProp, elem.data());
+    }
+
+    void* pcProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.PhaseCount");
+    if (pcProp) Write<int>(GetField(ind, pcProp), 0, br.zone_count);
+    Call rpc("/Script/FortniteGame.FortSafeZoneIndicator.OnRep_PhaseCount");
+    if (rpc.ok()) rpc.run(ind);
+
+    // Erbium tail: phase-0 window + CurrentPhase = 0 (+ OnRep)
+    float now = BRWorldTime();
+    BRWriteFloat(ind, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneStartShrinkTime", now + br.wait[0]);
+    BRWriteFloat(ind, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneFinishShrinkTime", now + br.wait[0] + br.shrink[0]);
+    void* cpProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentPhase");
+    if (cpProp) Write<int>(GetField(ind, cpProp), 0, 0);
+    Call rcp("/Script/FortniteGame.FortSafeZoneIndicator.OnRep_CurrentPhase");
+    if (rcp.ok()) rcp.run(ind);
+
+    if (!reuse) {
+        // GameState->SafeZoneIndicator + OnRep (what the HUD reads)
+        void* stProp = GetProp("/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
+        if (stProp) Write<void*>(GetField(session.state, stProp), 0, ind);
+        Call rs("/Script/FortniteGame.FortGameStateAthena.OnRep_SafeZoneIndicator");
+        if (rs.ok()) rs.run(session.state);
+        // GameMode->SafeZoneIndicator (native storm/zone paths read it)
+        void* gmProp = GetProp("/Script/FortniteGame.FortGameMode.SafeZoneIndicator");
+        if (gmProp && session.mode) Write<void*>(GetField(session.mode, gmProp), 0, ind);
+        // component->SafeZoneIndicator
+        if (BRGetComponent()) {
+            void* coProp = GetProp("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.SafeZoneIndicator");
+            if (coProp) Write<void*>(GetField(br.component, coProp), 0, ind);
+        }
+        SetBool(session.mode, "/Script/FortniteGame.FortGameMode.bSafeZoneActive", true);
+        SetBool(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.bSafeZoneActive", true);
+    }
+    SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bPlaylistStoppedSafeZonePhases", false);
+    LOG("[BR] SafeZoneIndicator %s phases=%d (%p)", reuse ? "reused" : "spawned", br.zone_count, ind);
+}
+
+// ----------------------------------------------------------------------------
+// [F73-d] Erbium StartNewSafeZonePhase — sets Previous/Next/NextNext centers +
+// radii, the shrink window, CurrentDamageInfo, CurrentPhase (+ OnReps), the
+// SafeZoneState byte (offset = FutureReplicator - 4) to 2, OnSafeZoneStateChange
+// and StormHolding; then the GameMode's own HandlePostSafeZonePhaseChanged
+// bookkeeping (Erbium reaches it through the OnSafeZonePhaseChanged delegate
+// bound to the GameMode — the direct call is the same effect).
+// ----------------------------------------------------------------------------
+static void BRStartNewSafeZonePhase(int p, bool bInitial) {
+    if (!br.indicator || IsBadPtr(br.indicator) || p < 0 || p >= br.zone_count) return;
+    float now = BRWorldTime();
+
+    // GameMode bookkeeping FIRST (Erbium runs the OG hook before re-writing
+    // the windows — same order here).
+    Call hpc("/Script/FortniteGame.FortGameMode.HandlePostSafeZonePhaseChanged");
+    if (hpc.ok() && session.mode && !IsBadPtr(session.mode)) {
+        if (!hpc.set_any((int)-1, "NewSafeZonePhase", "InSafeZonePhase", "NewPhase")) hpc.set_at(0, -1);
+        hpc.run(session.mode);
+    }
+    void* szp = GetProp("/Script/FortniteGame.FortGameMode.SafeZonePhase");
+    if (szp && session.mode) Write<int>(GetField(session.mode, szp), 0, p);
+
+    if (p - 1 >= 0) {
+        BRWriteVector(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.PreviousCenter", br.zone_centers[p - 1]);
+        BRWriteFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.PreviousRadius", br.radius[p - 1]);
+    }
+    BRWriteVector(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.NextCenter", br.zone_centers[p]);
+    BRWriteFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.NextRadius", br.radius[p]);
+    if (p + 1 < br.zone_count) {
+        BRWriteVector(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.NextNextCenter", br.zone_centers[p + 1]);
+        BRWriteFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.NextNextRadius", br.radius[p + 1]);
+        if (void* fr = GetObjField(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.FutureReplicator");
+            fr && !IsBadPtr(fr)) {
+            BRWriteVector(fr, "/Script/FortniteGame.FortSafeZoneIndicatorFuture.NextNextCenter", br.zone_centers[p + 1]);
+            BRWriteFloat(fr, "/Script/FortniteGame.FortSafeZoneIndicatorFuture.NextNextRadius", br.radius[p + 1]);
+        }
+    }
+    float start = now + br.wait[p];
+    BRWriteFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneStartShrinkTime", start);
+    BRWriteFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneFinishShrinkTime", start + br.shrink[p]);
+
+    // CurrentDamageInfo = { damage[p], percentage=true }
+    if (void* diProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentDamageInfo")) {
+        int diOff = Read<int>(diProp, profile::PropOffset);
+        int oDmgD = -1, oDmgP = -1;
+        if (void* dp = GetProp("/Script/FortniteGame.FortSafeZoneDamageInfo.Damage"))
+            oDmgD = Read<int>(dp, profile::PropOffset);
+        if (void* dp = GetProp("/Script/FortniteGame.FortSafeZoneDamageInfo.bPercentageBasedDamage"))
+            oDmgP = Read<int>(dp, profile::PropOffset);
+        if (oDmgD >= 0) Write<float>((char*)br.indicator + diOff + oDmgD, 0, br.damage[p]);
+        if (oDmgP >= 0) Write<uint8_t>((char*)br.indicator + diOff + oDmgP, 0, 1);
+    }
+    Call rdi("/Script/FortniteGame.FortSafeZoneIndicator.OnRep_CurrentDamageInfo");
+    if (rdi.ok()) rdi.run(br.indicator);
+
+    void* cpProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentPhase");
+    if (cpProp) Write<int>(GetField(br.indicator, cpProp), 0, p);
+    Call rcp("/Script/FortniteGame.FortSafeZoneIndicator.OnRep_CurrentPhase");
+    if (rcp.ok()) rcp.run(br.indicator);
+
+    // SafeZoneState byte = 2 (storm formed; Erbium writes &FutureReplicator-4)
+    if (void* frProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.FutureReplicator")) {
+        int fro = Read<int>(frProp, profile::PropOffset);
+        if (fro > 4 && fro < 0x8000) Write<uint8_t>(br.indicator, fro - 4, 2);
+    }
+    Call osc("/Script/FortniteGame.FortSafeZoneIndicator.OnSafeZoneStateChange");
+    if (osc.ok()) {
+        if (!osc.set_at(0, (uint8_t)2)) osc.dump("OnSafeZoneStateChange");
+        osc.set_at(1, (uint8_t)bInitial ? (uint8_t)1 : (uint8_t)0);
+        osc.run(br.indicator);
+    }
+    BRSetGamePhaseStep(7); // EAthenaGamePhaseStep::StormHolding
+    br.last_logged_zone = -1; // force a Zone log line next tick
+    LOG("[BR] zone phase %d r=%.0f ctr=(%.0f,%.0f) wait=%.0f shrink=%.0f dmg=%.1f%%",
+        p, br.radius[p], br.zone_centers[p].X, br.zone_centers[p].Y, br.wait[p], br.shrink[p], br.damage[p]);
+}
+
+// ----------------------------------------------------------------------------
+// [F73-e] Erbium StartAircraftPhase — SpawnAircraft from MapInfo->AircraftClass
+// + FlightInfos[0], the flight/drop windows (world time), GameState->Aircrafts,
+// bAircraftIsLocked, board the player (Erbium destroys pawns + Spectating;
+// standalone keeps the pawn, hides it and switches the view target to the bus
+// so the ride + HUD jump button work exactly like the real flow).
+// ----------------------------------------------------------------------------
+static void BRStartAircraftPhase() {
+    if (br.phase >= 3) return;
+    if (!session.world || !session.state) return;
+    float now = BRWorldTime();
+    LOG("[BR] StartAircraftPhase (Erbium)");
+
+    void* acCls = br.mapinfo ? GetObjField(br.mapinfo, "/Script/FortniteGame.FortAthenaMapInfo.AircraftClass") : nullptr;
+    if (!acCls || IsBadPtr(acCls)) acCls = FindObj("/Script/FortniteGame.FortAthenaAircraft");
+
+    // FlightInfos[0] element bytes (same struct the SpawnAircraft param takes)
+    void* arrProp = br.mapinfo ? GetProp("/Script/FortniteGame.FortAthenaMapInfo.FlightInfos") : nullptr;
+    Array* fi = arrProp ? (Array*)GetField(br.mapinfo, arrProp) : nullptr;
+    int fiElem = BRInnerSize(arrProp);
+    bool haveFI = fi && fi->Count > 0 && fi->Data && !IsBadPtr(fi->Data) && fiElem > 0;
+    if (haveFI) {
+        auto fif = [&](const char* n, float& out) {
+            void* p = GetProp((std::string("/Script/FortniteGame.FortAthenaAircraftFlightInfo.") + n).c_str());
+            if (!p) p = GetProp((std::string("/Script/FortniteGame.AthenaAircraftFlightInfo.") + n).c_str());
+            if (!p) return false;
+            int off = Read<int>(p, profile::PropOffset);
+            if (off < 0 || off + 4 > fiElem) return false;
+            out = Read<float>(fi->Data, off);
+            return true;
+        };
+        float speed = 0;
+        bool haveSpeed = fif("FlightSpeed", speed); // map flight speed (logged)
+        float tfe = 0, tds = 0, tde = 0;
+        fif("TimeTillFlightEnd", tfe); fif("TimeTillDropStart", tds); fif("TimeTillDropEnd", tde);
+        if (tfe > 1 && tde > tds) {
+            br.drop_start = now + tds;
+            br.drop_end = now + tde;
+            br.flight_end = now + tfe;
+        }
+        LOG("[BR] FlightInfos[0]: speed=%.0f (ok=%d) drop %.0f->%.0f flight %.0f",
+            speed, (int)haveSpeed, tds, tde, tfe);
+    }
+
+    void* aircraft = nullptr;
+    if (acCls && !IsBadPtr(acCls)) {
+        if (haveFI) {
+            // Erbium: AFortGameStateAthena::SpawnAircraft(World, Class, FlightInfo)
+            Call sp("/Script/FortniteGame.FortGameStateAthena.SpawnAircraft");
+            if (sp.ok()) {
+                bool w = sp.set_any(session.world, "World", "WorldContextObject", "InWorld");
+                bool k = sp.set_any(acCls, "InAircraftClass", "AircraftClass", "Aircraft");
+                bool f = sp.set_bytes("FlightInfo", fi->Data, fiElem);
+                if (w && k && f && sp.run(session.state)) aircraft = sp.result<void*>();
+                if (!aircraft) { sp.dump("SpawnAircraft"); LOG("[BR] SpawnAircraft param bind w=%d k=%d f=%d", (int)w, (int)k, (int)f); }
+            }
+        }
+        if (!aircraft) {
+            // Manual fallback — the real class, empty transform (its own Tick
+            // interpolates FlightInfo fields we write next).
+            Transform t{};
+            aircraft = SpawnActor(session.world, acCls, session.state, t);
+            if (aircraft) LOG("[BR] aircraft spawned manually (class=%s)", ObjName(acCls).c_str());
+        }
+    }
+    if (!aircraft) LOG("[BR] aircraft spawn FAILED (cls=%p)", acCls);
+    else {
+        br.aircraft = aircraft;
+        // Flight window props (Erbium sets these after SpawnAircraft)
+        if (br.drop_start < 0) { br.drop_start = now + 5; br.drop_end = now + 50; br.flight_end = now + 55; }
+        // Flight path data: copy MapInfo->FlightInfos[0] into the aircraft's
+        // own FlightInfo struct AND the individual fields (Erbium writes the
+        // field variant; 21.30 aircraft carries both) so the native aircraft
+        // Tick flies the real route.
+        if (haveFI) {
+            if (void* fiProp = GetProp("/Script/FortniteGame.FortAthenaAircraft.FlightInfo")) {
+                int psz = Read<int>(fiProp, profile::PropElementSize);
+                if (psz > 0 && psz <= 0x400)
+                    memcpy(GetField(aircraft, fiProp), fi->Data, (size_t)(psz < fiElem ? psz : fiElem));
+            }
+            Vector startLoc{};
+            if (void* lp = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.FlightStartLocation")) {
+                int off = Read<int>(lp, profile::PropOffset);
+                if (off >= 0 && off + 24 <= fiElem) startLoc = Read<Vector>(fi->Data, off);
+            }
+            float spd = 1500, tfe = 0, tds = 0, tde = 0;
+            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.FlightSpeed");
+              if (p) { int off = Read<int>(p, profile::PropOffset);
+                       if (off >= 0 && off + 4 <= fiElem) spd = Read<float>(fi->Data, off); } }
+            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.TimeTillFlightEnd");
+              if (p) { int off = Read<int>(p, profile::PropOffset);
+                       if (off >= 0 && off + 4 <= fiElem) tfe = Read<float>(fi->Data, off); } }
+            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.TimeTillDropStart");
+              if (p) { int off = Read<int>(p, profile::PropOffset);
+                       if (off >= 0 && off + 4 <= fiElem) tds = Read<float>(fi->Data, off); } }
+            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.TimeTillDropEnd");
+              if (p) { int off = Read<int>(p, profile::PropOffset);
+                       if (off >= 0 && off + 4 <= fiElem) tde = Read<float>(fi->Data, off); } }
+            BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightSpeed", spd);
+            BRWriteVector(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightStartLocation", startLoc);
+            if (tfe > 0) BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.TimeTillFlightEnd", tfe);
+            if (tde > 0) BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.TimeTillDropEnd", tde);
+            BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.TimeTillDropStart", tds);
+            LOG("[BR] flight path: start=(%.0f,%.0f,%.0f) speed=%.0f", startLoc.X, startLoc.Y, startLoc.Z, spd);
+        }
+        BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightElapsedTime", 0);
+        BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.DropStartTime", br.drop_start);
+        BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.DropEndTime", br.drop_end);
+        BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightStartTime", now);
+        BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightEndTime", br.flight_end);
+        BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.ReplicatedFlightTimestamp", now);
+        // GameState->Aircrafts + OnRep (HUD bus panel + native aircraft logic)
+        void* acsProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircrafts");
+        if (acsProp) {
+            Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(GetField(session.state, acsProp), acsProp, &aircraft);
+            Call ra("/Script/FortniteGame.FortGameStateAthena.OnRep_Aircrafts");
+            if (ra.ok()) ra.run(session.state);
+        }
+        void* ac1 = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircraft");
+        if (ac1) Write<void*>(GetField(session.state, ac1), 0, aircraft);
+        SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bAircraftIsLocked", true);
+        if (BRGetComponent())
+            SetBool(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.bAircraftIsLocked", true);
+        LOG("[BR] aircraft %p class=%s drop=%.0f..%.0f flightEnd=%.0f", aircraft,
+            ObjName(Read<void*>(aircraft, profile::ObjectClass)).c_str(),
+            br.drop_start - now, br.drop_end - now, br.flight_end - now);
+    }
+
+    // Board the player (Erbium destroys pawns + ClientGotoState Spectating;
+    // standalone-safe equivalent: hide pawn + no collision + camera on bus).
+    if (session.pawn && !IsBadPtr(session.pawn)) {
+        Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+        if (hid.ok()) { bool b = true; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
+        Call col("/Script/Engine.Actor.SetActorEnableCollision");
+        if (col.ok()) { bool b = false; if (col.set("bNewActorEnableCollision", b)) col.run(session.pawn); }
+        if (aircraft) {
+            Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+            if (cam.ok()) { cam.set("NewViewTarget", aircraft); float blend = 0; cam.set("BlendTime", blend); cam.run(session.controller); }
+        }
+        LOG("[BR] player boarded (pawn hidden, camera on bus)");
+    }
+
+    BRSetGamePhase(3);     // EAthenaGamePhase::Aircraft
+    BRSetGamePhaseStep(4); // EAthenaGamePhaseStep::BusLocked
+}
+
+// ----------------------------------------------------------------------------
+// [F73-f] Jump from the bus — Erbium's ServerAttemptAircraftJump respawns the
+// pawn at the aircraft; standalone: teleport our pawn to the bus position,
+// restore visibility and run the existing skydive chain (F05).
+// ----------------------------------------------------------------------------
+void Athena::BRJump() {
+    if (!session.pawn) { HandleJumpFromHudStart(); return; }
+    if (br.aircraft && !IsBadPtr(br.aircraft)) {
+        Vector loc{};
+        if (ActorLocation(br.aircraft, loc)) {
+            loc.Z -= 200.0; // just under the bus so the camera exits cleanly
+            Call sl("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+            if (sl.ok()) {
+                Rotator rot{}; Vector vloc = loc;
+                sl.set("NewLocation", vloc); sl.set("NewRotation", rot);
+                bool sweep = false, tp = true;
+                sl.set("bSweep", sweep); sl.set("bTeleport", tp);
+                sl.run(session.pawn);
+            }
+        }
+        Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+        if (hid.ok()) { bool b = false; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
+        Call col("/Script/Engine.Actor.SetActorEnableCollision");
+        if (col.ok()) { bool b = true; if (col.set("bNewActorEnableCollision", b)) col.run(session.pawn); }
+    }
+    HandleJumpFromHudStart();
+}
+
+// ----------------------------------------------------------------------------
+// [F73-g] Erbium spawnbot — the full roster procedure from
+// FortPlayerControllerAthena.cpp: pawn + BP controller + PlayerState, Possess,
+// PlayerState wiring (+ OnReps), SetMaxHealth, TeamIndex/SquadId/bIsABot,
+// ability sets, cosmetics (Commando default), AlivePlayers, PlayersLeft++.
+// Bots stand where they land (Erbium bots have no AI — they are the match
+// population the storm and the player thin out).
+// ----------------------------------------------------------------------------
+static void* BRBotPawnClass = nullptr;
+static void* BRBotCtrlClass = nullptr;
+static void* BRBotStateClass = nullptr;
+static void* BRBotHeroType = nullptr;
+static void* BRBotHead = nullptr;
+static void* BRBotBody = nullptr;
+
+static void BRSpawnBotBatch(int n) {
+    if (!session.world || !session.mode || !session.state) return;
+    if (!BRBotPawnClass) BRBotPawnClass = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
+    if (!BRBotCtrlClass) BRBotCtrlClass = LoadClass("/Game/Athena/Athena_PlayerController.Athena_PlayerController_C", "/Script/FortniteGame.FortPlayerControllerAthena");
+    if (!BRBotCtrlClass) BRBotCtrlClass = FindObj("/Script/FortniteGame.FortPlayerControllerAthena");
+    if (!BRBotStateClass) BRBotStateClass = FindObj("/Script/FortniteGame.FortPlayerStateAthena");
+    if (!BRBotHeroType) BRBotHeroType = LoadAsset("/Game/Athena/Heroes/HID_001_Athena_Commando_F.HID_001_Athena_Commando_F", "/Script/FortniteGame.FortHeroType");
+    if (!BRBotHead) BRBotHead = LoadAsset("/Game/Athena/Heroes/Meshes/Heads/F_Med_Head1_ATH.F_Med_Head1_ATH", "/Script/FortniteGame.CustomCharacterPart");
+    if (!BRBotBody) BRBotBody = LoadAsset("/Game/Athena/Heroes/Meshes/Bodies/CP_001_Athena_Body.CP_001_Athena_Body", "/Script/FortniteGame.CustomCharacterPart");
+    if (!BRBotPawnClass || !BRBotCtrlClass || !BRBotStateClass) {
+        LOG("[BR] bot classes missing p=%p c=%p s=%p — disabling roster", BRBotPawnClass, BRBotCtrlClass, BRBotStateClass);
+        br.bots_target = br.bots_spawned;
+        return;
+    }
+
+    // spawn points: PlayerStart instances (Erbium uses the caller pawn's spot;
+    // a roster needs spread — PlayerStarts are the game's own spread points)
+    static std::vector<void*> starts;
+    static bool startsCached = false;
+    if (!startsCached) {
+        startsCached = true;
+        void* psCls = FindObj("/Script/Engine.PlayerStart");
+        if (psCls) starts = FindAllInstances(psCls, 128);
+        LOG("[BR] PlayerStarts available: %d", (int)starts.size());
+    }
+
+    void* aliveProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
+    int spawned = 0;
+    for (int k = 0; k < n && br.bots_spawned < br.bots_target; ++k) {
+        Vector loc{0, 0, 500};
+        bool haveLoc = false;
+        if (!starts.empty()) {
+            void* s = starts[BRRand() % starts.size()];
+            if (s && !IsBadPtr(s)) { if (ActorLocation(s, loc)) { loc.Z += 150; haveLoc = true; } }
+        }
+        if (!haveLoc) {
+            Vector c{0, 0, 0};
+            if (!br.zone_centers.empty()) c = br.zone_centers[0];
+            float ang = BRRand01() * 6.2831853f, dist = 2000 + BRRand01() * 60000;
+            loc = Vector{c.X + std::cos(ang) * dist, c.Y + std::sin(ang) * dist, c.Z + 1000};
+        }
+        Transform t{};
+        t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
+
+        void* pawn = SpawnActor(session.world, BRBotPawnClass, nullptr, t);
+        void* ctrl = pawn ? SpawnActor(session.world, BRBotCtrlClass, nullptr, t) : nullptr;
+        void* st   = ctrl ? SpawnActor(session.world, BRBotStateClass, nullptr, t) : nullptr;
+        if (!pawn || !ctrl || !st) {
+            LOG("[BR] bot spawn failed p=%p c=%p s=%p (spawned %d before failure)", pawn, ctrl, st, spawned);
+            if (pawn) { Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(pawn); }
+            if (ctrl) { Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(ctrl); }
+            if (st)   { Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(st); }
+            break;
+        }
+
+        // PlayerState wiring (Erbium: SetOwner + both OnRep_PlayerState paths)
+        Call so("/Script/Engine.Actor.SetOwner");
+        if (so.ok() && so.set("Owner", ctrl)) so.run(st);
+        if (void* psProp = GetProp("/Script/Engine.Controller.PlayerState"))
+            Write<void*>(GetField(ctrl, psProp), 0, st);
+        Call orc("/Script/Engine.PlayerController.OnRep_PlayerState");
+        if (orc.ok()) orc.run(ctrl);
+        if (void* ppProp = GetProp("/Script/Engine.Pawn.PlayerState"))
+            Write<void*>(GetField(pawn, ppProp), 0, st);
+        Call orp("/Script/Engine.Pawn.OnRep_PlayerState");
+        if (orp.ok()) orp.run(pawn);
+
+        Possess(ctrl, pawn);
+        if (void* mfp = GetProp("/Script/FortniteGame.FortPlayerController.MyFortPawn"))
+            Write<void*>(GetField(ctrl, mfp), 0, pawn);
+        for (const char* method : {"/Script/FortniteGame.FortPawn.SetMaxHealth", "/Script/FortniteGame.FortPawn.SetHealth"}) {
+            Call mh(method);
+            if (mh.ok() && mh.set_at(0, 100.0f)) mh.run(pawn);
+        }
+
+        // TeamIndex/SquadId/bIsABot (Erbium PickTeam: unique team per solo bot)
+        uint8_t team = (uint8_t)(3 + br.bots_spawned);
+        if (void* tiProp = GetProp("/Script/FortniteGame.FortPlayerState.TeamIndex")) {
+            int esz = Read<int>(tiProp, profile::PropElementSize);
+            void* addr = GetField(st, tiProp);
+            if (esz == 1) Write<uint8_t>(addr, 0, team);
+            else if (esz == 2) Write<uint16_t>(addr, 0, team);
+            else if (esz == 4) Write<int>(addr, 0, team);
+        }
+        if (void* sqProp = GetProp("/Script/FortniteGame.FortPlayerState.SquadId")) {
+            int esz = Read<int>(sqProp, profile::PropElementSize);
+            void* addr = GetField(st, sqProp);
+            int16_t sq = (int16_t)(team - 3);
+            if (esz == 2) Write<int16_t>(addr, 0, sq);
+            else if (esz == 4) Write<int>(addr, 0, sq);
+        }
+        SetBool(st, "/Script/FortniteGame.FortPlayerState.bIsABot", true);
+
+        // cosmetics (Erbium: HeroType + CharacterParts + ApplyCharacterCustomization)
+        if (BRBotHeroType) {
+            if (void* htProp = GetProp("/Script/FortniteGame.FortPlayerState.HeroType"))
+                Write<void*>(GetField(st, htProp), 0, BRBotHeroType);
+            Call rht("/Script/FortniteGame.FortPlayerState.OnRep_HeroType");
+            if (rht.ok()) rht.run(st);
+        }
+        if (BRBotHead && BRBotBody) {
+            void* parts[2] = {BRBotHead, BRBotBody};
+            Array partsArr{parts, 2, 2};
+            void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+            Call apply("/Script/FortniteGame.FortKismetLibrary.ApplyCharacterCosmetics");
+            if (apply.ok() && klib && apply.set("WorldContextObject", session.world) &&
+                apply.set("CharacterParts", partsArr) && apply.set("PlayerState", st))
+                apply.run(klib);
+            Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
+            if (upd.ok() && klib && upd.set("PlayerState", st)) upd.run(klib);
+            Call rcd("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData");
+            if (rcd.ok()) rcd.run(st);
+        }
+
+        // ability sets (Erbium: GiveAbilitySet per AbilitySets entry)
+        for (void* set : session.granted_ability_sets) ApplyAbilitySet(pawn, set);
+
+        // AlivePlayers (storm/zone natives iterate this)
+        if (aliveProp)
+            Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(GetField(session.mode, aliveProp), aliveProp, &ctrl);
+
+        br.bots_spawned++;
+        spawned++;
+    }
+
+    if (spawned > 0) {
+        // PlayersLeft = 1 (local) + bots, OnRep once per batch
+        void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+        if (plProp) {
+            Write<int>(GetField(session.state, plProp), 0, 1 + br.bots_spawned);
+            Call rpl("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+            if (rpl.ok()) rpl.run(session.state);
+        }
+        LOG("[BR] +%d bots — roster %d/%d, PlayersLeft=%d", spawned, br.bots_spawned, br.bots_target, 1 + br.bots_spawned);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// [F73-h] Storm pass — Erbium's GamePhaseLogic Tick tail: bIsInsideSafeZone /
+// bIsInAnyStorm for every pawn + storm damage. The native indicator applies
+// the GameplayEffect path when a server ticks it; standalone we mirror it with
+// GameplayStatics.ApplyDamage (percentage of MaxHealth per second outside),
+// causer = the indicator. Bots that reach 0 HP are destroyed and thinned out
+// of PlayersLeft/AlivePlayers (real elimination bookkeeping).
+// ----------------------------------------------------------------------------
+static void BRStormTick() {
+    if (!br.indicator || IsBadPtr(br.indicator) || !session.pawn) return;
+    Vector c{}; float r = 0;
+    { Call gc("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneCenter");
+      if (gc.ok() && gc.run(br.indicator)) c = gc.result<Vector>(); }
+    { Call gr("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneRadius");
+      if (gr.ok() && gr.run(br.indicator)) r = gr.result<float>(); }
+    if (r <= 0) return;
+    auto outside = [&](void* pawn) -> bool {
+        Vector l{};
+        if (!ActorLocation(pawn, l)) return false;
+        double dx = l.X - c.X, dy = l.Y - c.Y;
+        return dx * dx + dy * dy > double(r) * double(r);
+    };
+
+    // local pawn flags (Erbium printf -> our LOG, once per change)
+    bool in = !outside(session.pawn);
+    bool cur = GetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone");
+    if (cur != in) {
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInsideSafeZone", in);
+        SetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsInAnyStorm", !in);
+        Call ra("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInsideSafeZone");
+        if (ra.ok()) ra.run(session.pawn);
+        Call rb("/Script/FortniteGame.FortPlayerPawn.OnRep_IsInAnyStorm");
+        if (rb.ok()) rb.run(session.pawn);
+        LOG("[BR] local pawn storm status: %s (phase %d r=%.0f)", in ? "safe" : "STORM", br.phase, r);
+    }
+
+    // damage bookkeeping
+    float maxhp = 100;
+    BRReadFloat(session.pawn, "/Script/FortniteGame.FortPawn.MaxHealth", maxhp);
+    int curPhase = 0;
+    if (void* cpProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentPhase"))
+        curPhase = Read<int>(GetField(br.indicator, cpProp), 0);
+    if (curPhase < 0 || curPhase >= (int)br.damage.size()) curPhase = 0;
+    float pct = br.damage[curPhase];
+    if (!in && pct > 0) {
+        float dmg = maxhp * pct / 100.0f;
+        void* gsCdo = FindObj("/Script/Engine.Default__GameplayStatics");
+        Call ad("/Script/Engine.GameplayStatics.ApplyDamage");
+        if (ad.ok() && gsCdo) {
+            if (ad.set("DamagedActor", session.pawn) && ad.set("BaseDamage", dmg) &&
+                ad.set("DamageCauser", br.indicator)) {
+                void* zero = nullptr;
+                if (!ad.set("EventInstigator", zero)) ad.set_at(1, zero);
+                ad.run(gsCdo);
+                LOG("[BR] storm damage %.1f (%d%% of %.0f)", dmg, (int)pct, maxhp);
+            }
+        }
+    }
+
+    // bots: outside -> damage; dead -> destroy + roster bookkeeping
+    void* aliveProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
+    void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+    if (!aliveProp || !session.mode) return;
+    Array* alive = (Array*)GetField(session.mode, aliveProp);
+    if (!alive || alive->Count < 1 || !alive->Data) return;
+    // NOTE: alive->Data/Count re-read every iteration — GenericArrayRemove can
+    // realloc the storage mid-loop (backwards index keeps ordering safe).
+    for (int32 i = (int32)alive->Count - 1; i >= 0; --i) {
+        void* pc = Read<void*>(alive->Data, (size_t)i * 8);
+        if (!pc || pc == session.controller || IsBadPtr(pc)) continue;
+        void* pawn = GetPawn(pc);
+        if (!pawn || IsBadPtr(pawn)) continue;
+        float hp = 0;
+        BRReadFloat(pawn, "/Script/FortniteGame.FortPawn.Health", hp);
+        if (!outside(pawn) && hp > 0) {
+            float bmax = 100; BRReadFloat(pawn, "/Script/FortniteGame.FortPawn.MaxHealth", bmax);
+            float dmg = bmax * pct / 100.0f;
+            void* gsCdo = FindObj("/Script/Engine.Default__GameplayStatics");
+            Call ad("/Script/Engine.GameplayStatics.ApplyDamage");
+            if (ad.ok() && gsCdo && ad.set("DamagedActor", pawn) && ad.set("BaseDamage", dmg) &&
+                ad.set("DamageCauser", br.indicator)) {
+                void* zero = nullptr;
+                if (!ad.set("EventInstigator", zero)) ad.set_at(1, zero);
+                ad.run(gsCdo);
+            }
+            continue;
+        }
+        if (hp <= 0) { // eliminated by the storm
+            char name[64]{};
+            snprintf(name, sizeof(name), "ErbiumBot(#%d)", i);
+            Call d("/Script/Engine.Actor.K2_DestroyActor");
+            if (d.ok()) d.run(pawn);
+            if (plProp) {
+                int left = Read<int>(GetField(session.state, plProp), 0);
+                if (left > 1) Write<int>(GetField(session.state, plProp), 0, left - 1);
+                Call rpl("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+                if (rpl.ok()) rpl.run(session.state);
+            }
+            // GenericArrayRemove takes the ELEMENT INDEX (same shape as the
+            // inventory usage) — resolve it before removing.
+            for (int32 j = 0; j < (int32)alive->Count; ++j)
+                if (Read<void*>(alive->Data, (size_t)j * 8) == pc) {
+                    Fn<void(*)(void*, void*, int)>(profile::GenericArrayRemove)(GetField(session.mode, aliveProp), aliveProp, j);
+                    break;
+                }
+            LOG("[BR] 💀 %s eliminated by the storm (left=%d)", name,
+                plProp ? Read<int>(GetField(session.state, plProp), 0) : -1);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// [F73-i] Match start — Erbium HandleMatchHasStarted: warmup countdown on the
+// component + GameState, GamePhase(Warmup), local PC into AlivePlayers, bot
+// waves scheduled. (era.warmup N shortens the countdown on device.)
+// ----------------------------------------------------------------------------
+static void BRStart() {
+    br.started = true;
+    LOG("=== [BR] match start — Erbium HandleMatchHasStarted ===");
+    BRGetComponent();
+    if (!br.mapinfo || IsBadPtr(br.mapinfo))
+        br.mapinfo = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.MapInfo");
+    float now = BRWorldTime();
+    float warmup = 60.0f;
+    if (br.component) {
+        BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupCountdownStartTime", now);
+        BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupCountdownEndTime", now + warmup);
+        BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupCountdownDuration", 10);
+        BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupEarlyCountdownDuration", warmup - 10);
+    }
+    BRWriteFloat(session.state, "/Script/FortniteGame.FortGameStateAthena.WarmupCountdownStartTime", now);
+    BRWriteFloat(session.state, "/Script/FortniteGame.FortGameStateAthena.WarmupCountdownEndTime", now + warmup);
+    BRWriteFloat(session.mode, "/Script/FortniteGame.FortGameMode.WarmupCountdownDuration", warmup);
+    BRWriteFloat(session.mode, "/Script/FortniteGame.FortGameMode.WarmupEarlyCountdownDuration", warmup - 10);
+    br.warmup_end = now + warmup;
+
+    // Erbium WarmupRequiredPlayerCount = 1 (single player starts the match)
+    void* wpc = GetProp("/Script/FortniteGame.FortGameMode.WarmupRequiredPlayerCount");
+    if (wpc) Write<int>(GetField(session.mode, wpc), 0, 1);
+    SetBool(session.mode, "/Script/FortniteGame.FortGameMode.bWorldIsReady", true);
+    SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bPlaylistStoppedSafeZonePhases", false);
+
+    // AlivePlayers: the local PC (HandleStartingNewPlayer normally does this)
+    if (!br.alive_added) {
+        void* aliveProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
+        if (aliveProp && session.controller) {
+            Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(GetField(session.mode, aliveProp), aliveProp, &session.controller);
+            br.alive_added = true;
+        }
+    }
+    void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+    if (plProp) {
+        Write<int>(GetField(session.state, plProp), 0, 1);
+        Call rpl("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+        if (rpl.ok()) rpl.run(session.state);
+    }
+
+    BRSetGamePhase(2);     // EAthenaGamePhase::Warmup
+    BRSetGamePhaseStep(2); // EAthenaGamePhaseStep::Warmup
+    br.next_bot_wave = Monotonic() + 1.0;
+    LOG("[BR] warmup %.0fs — bus at T+%.0f (era.warmup N / era.bus to control)", warmup, warmup);
+}
+
+// ----------------------------------------------------------------------------
+// [F73-j] The machine — Erbium BattleRoyaleGamePhaseLogic::Tick, every world
+// tick once the player is finalized.
+// ----------------------------------------------------------------------------
+void Athena::BRTick() {
+    if (!session.finalized || !session.state || !session.mode || !session.world) return;
+    if (session.lobby_requested) return;
+    double mono = Monotonic();
+
+    if (!br.started) {
+        if (mono - session.finalized_at < 2.0) return;
+        BRStart();
+        return;
+    }
+
+    // Erbium bot roster — waves of 10 every 2s until the target is reached
+    if (br.bots_spawned < br.bots_target && mono >= br.next_bot_wave) {
+        br.next_bot_wave = mono + 2.0;
+        BRSpawnBotBatch(10);
+    }
+
+    float now = BRWorldTime();
+
+    if (br.phase <= 2) { // Warmup (None/Setup/Warmup)
+        if (br.warmup_end >= 0 && now >= br.warmup_end) BRStartAircraftPhase();
+        return;
+    }
+
+    if (br.phase == 3) { // Aircraft
+        void* ac = br.aircraft;
+        if (ac && !IsBadPtr(ac)) {
+            if (!br.bus_unlocked && br.drop_start > 0 && now >= br.drop_start) {
+                br.bus_unlocked = true;
+                SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bAircraftIsLocked", false);
+                if (br.component)
+                    SetBool(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.bAircraftIsLocked", false);
+                BRSetGamePhaseStep(5); // BusFlying
+                LOG("[BR] bus unlocked — jump button live (Erbium BusFlying)");
+            }
+            if (!br.drop_forced && br.drop_end > 0 && now >= br.drop_end && !session.aircraft_jumped) {
+                br.drop_forced = true;
+                LOG("[BR] drop window ended — forcing jump (Erbium OnAircraftExitedDropZone)");
+                BRJump();
+            }
+            // [F73] Erbium: aircraft destroyed once FlightEndTime passes —
+            // regardless of how the player exited (manual jump or forced).
+            if (!br.flight_done && br.flight_end > 0 && now >= br.flight_end) {
+                br.flight_done = true;
+                Call d("/Script/Engine.Actor.K2_DestroyActor");
+                if (d.ok()) d.run(ac);
+                br.aircraft = nullptr;
+                LOG("[BR] aircraft destroyed (flight over)");
+            }
+            // [F73] failsafe — flight over but the jump chain never landed:
+            // restore the pawn so the player is never stuck hidden.
+            if (br.flight_done && !session.aircraft_jumped && session.pawn && !IsBadPtr(session.pawn)) {
+                Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+                if (hid.ok()) { bool b = false; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
+                Call col("/Script/Engine.Actor.SetActorEnableCollision");
+                if (col.ok()) { bool b = true; if (col.set("bNewActorEnableCollision", b)) col.run(session.pawn); }
+                session.aircraft_jumped = true;
+                LOG("[BR] failsafe: pawn restored after flight window");
+            }
+        } else if (!br.flight_done) {
+            // no aircraft (spawn refused) — Erbium bSkipAircraft path
+            br.flight_done = true;
+            br.safezones_start = now + 15.0f;
+            BRSetGamePhase(4);     // SafeZones
+            BRSetGamePhaseStep(6); // StormForming
+            LOG("[BR] no aircraft — SafeZones in 15s (bSkipAircraft path)");
+        }
+        return;
+    }
+
+    if (br.phase == 4) { // SafeZones
+        if (!br.zone_formed) {
+            if (br.safezones_start > 0 && now >= br.safezones_start) {
+                br.zone_formed = true;
+                BRZoneTables();
+                BRPickZoneCenters();
+                BRSetupSafeZoneIndicator();
+                BRStartNewSafeZonePhase(1, true);
+            }
+        } else if (br.indicator && !IsBadPtr(br.indicator)) {
+            float startT = 0, finishT = 0;
+            BRReadFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneStartShrinkTime", startT);
+            BRReadFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneFinishShrinkTime", finishT);
+            if (!br.zone_shrinking && startT > 0 && now >= startT && now < finishT) {
+                br.zone_shrinking = true;
+                if (void* frProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.FutureReplicator")) {
+                    int fro = Read<int>(frProp, profile::PropOffset);
+                    if (fro > 4 && fro < 0x8000) Write<uint8_t>(br.indicator, fro - 4, 3);
+                }
+                Call osc("/Script/FortniteGame.FortSafeZoneIndicator.OnSafeZoneStateChange");
+                if (osc.ok()) { osc.set_at(0, (uint8_t)3); osc.set_at(1, (uint8_t)0); osc.run(br.indicator); }
+                BRSetGamePhaseStep(8); // StormShrinking
+                LOG("[BR] zone shrinking (state 3)");
+            }
+            if (br.zone_shrinking && finishT > 0 && now >= finishT) {
+                int cur = 0;
+                if (void* cpProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentPhase"))
+                    cur = Read<int>(GetField(br.indicator, cpProp), 0);
+                if (cur + 1 < br.zone_count) {
+                    br.zone_shrinking = false;
+                    BRStartNewSafeZonePhase(cur + 1, false);
+                } else {
+                    br.zone_shrinking = false; // final zone holds forever (Erbium)
+                    BRWriteFloat(br.indicator, "/Script/FortniteGame.FortSafeZoneIndicator.SafeZoneFinishShrinkTime", finishT + 3600);
+                }
+            }
+            // zone log (Erbium printf per change)
+            int cur = 0;
+            if (void* cpProp = GetProp("/Script/FortniteGame.FortSafeZoneIndicator.CurrentPhase"))
+                cur = Read<int>(GetField(br.indicator, cpProp), 0);
+            if (cur != br.last_logged_zone) {
+                br.last_logged_zone = cur;
+                Vector c{}; float r = 0;
+                { Call gc("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneCenter");
+                  if (gc.ok() && gc.run(br.indicator)) c = gc.result<Vector>(); }
+                { Call gr("/Script/FortniteGame.FortSafeZoneIndicator.GetSafeZoneRadius");
+                  if (gr.ok() && gr.run(br.indicator)) r = gr.result<float>(); }
+                LOG("[Zone] phase=%d radius=%.0f center=(%.0f,%.0f,%.0f)", cur, r, c.X, c.Y, c.Z);
+            }
+        }
+        if (mono - br.last_storm_tick >= 1.0) {
+            br.last_storm_tick = mono;
+            BRStormTick();
+        }
+        return;
+    }
+}
+
 bool Athena::StackAdd(void* def, int count) {
     if (!def || !session.inventory || count < 1) return false;
     void* invProp   = GetProp("/Script/FortniteGame.FortInventory.Inventory");
@@ -5354,6 +6379,29 @@ void Athena::TeleportToReticle() {
 
 // fly/walk/ghost/god — Era core exec handlers ported.
 void Athena::ApplyCheats(const std::string& cmd) {
+    // [F73] BR lifecycle commands — available before the pawn exists too.
+    if (cmd.rfind("era.bots", 0) == 0) {
+        int n = -1; sscanf(cmd.c_str(), "era.bots %d", &n);
+        if (n < 0) n = 0;
+        br.bots_target = n > 120 ? 120 : n;
+        br.next_bot_wave = 0;
+        LOG("[BR] bot roster target = %d (spawned %d)", br.bots_target, br.bots_spawned);
+        return;
+    }
+    if (cmd.rfind("era.warmup", 0) == 0) {
+        float n = 10; sscanf(cmd.c_str(), "era.warmup %f", &n);
+        if (!br.started) { LOG("[BR] machine not started yet"); return; }
+        br.warmup_end = BRWorldTime() + n;
+        LOG("[BR] warmup ends in %.0fs", n);
+        return;
+    }
+    if (cmd == "era.bus") {
+        if (!br.started) { LOG("[BR] machine not started — starting match first"); br.started = true; }
+        LOG("[BR] era.bus — launching aircraft phase now");
+        br.warmup_end = BRWorldTime();
+        SpawnBattleBus();
+        return;
+    }
     if (!session.pawn || !session.controller) return;
     if (cmd == "god") {
         bool current = GetBool(session.pawn, "/Script/Engine.Actor.bCanBeDamaged");
@@ -5732,11 +6780,24 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
         // [F35-F45] world systems v2
         else if (normalized.rfind("era.zone", 0) == 0) {
             int idx = -1; sscanf(normalized.c_str(), "era.zone %d", &idx);
-            void* ind = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator");
-            if (idx >= 0 && ind && !IsBadPtr(ind)) {
-                Call s("/Script/FortniteGame.FortSafeZoneIndicator.StartPhase");
-                if (s.ok() && s.set("InPhaseIndex", idx) && s.run(ind)) LOG("[Zone] jumped to phase %d", idx);
-            } else { session.zone_driven = false; Athena::DriveSafeZone(); }
+            if (idx >= 0 && br.started) {
+                // [F73] direct phase jump through the Erbium machine
+                br.zone_formed = true;
+                br.zone_shrinking = false;
+                br.safezones_start = 0;
+                BRZoneTables();
+                if (br.zone_centers.empty()) BRPickZoneCenters();
+                BRSetupSafeZoneIndicator();
+                BRStartNewSafeZonePhase(idx > 0 && idx < br.zone_count ? idx : 1, false);
+            } else {
+                // start the SafeZones phase immediately (Erbium bSkipAircraft)
+                if (br.started) {
+                    br.flight_done = true;
+                    br.safezones_start = BRWorldTime();
+                    if (br.phase < 4) { BRSetGamePhase(4); BRSetGamePhaseStep(6); }
+                }
+                LOG("[Zone] BR machine %s — safezones triggered", br.started ? "running" : "idle (no match yet)");
+            }
         }
         else if (normalized.rfind("era.players", 0) == 0) {
             int n = 100; sscanf(normalized.c_str(), "era.players %d", &n);
