@@ -3043,6 +3043,35 @@ static bool PrologueMatch(const char* label, uintptr_t rva, const uint32_t* word
     return true;
 }
 
+// [F26] ProcessEvent prologue varies across builds in its first instruction:
+//   libUE4.so  (CL-8936006, reference): STR X28,[SP,#-0x60]!  = 0xf81a0ffc
+//   libUnreal.so (CL-21088273 / 21.30): STP X28,X27,[SP,#-0x60]! = 0xa9ba6ffc
+// Words 1..3 are identical in both builds (STP X26,X25 / X24,X23 / X22,X21).
+// Accept either save-X28 form, then verify the shared tail.
+static bool PrologueMatchPE(const char* label, uintptr_t rva) {
+    static const uint32_t word0_variants[] = {0xa9ba6ffc, 0xf81a0ffc};
+    static const uint32_t tail[]           = {0xa90167fa, 0xa9025ff8, 0xa90357f6};
+    uint32_t actual0 = Read<uint32_t>((const void*)(g_base + rva), 0);
+    bool ok0 = false;
+    for (size_t i = 0; i < sizeof(word0_variants) / sizeof(word0_variants[0]); ++i)
+        if (actual0 == word0_variants[i]) { ok0 = true; break; }
+    if (!ok0) {
+        LOG("PROLOGUE MISMATCH %s RVA=%llx word=0 expected=a9ba6ffc|f81a0ffc actual=%08x",
+            label, (unsigned long long)rva, actual0);
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); ++i) {
+        uint32_t actual = Read<uint32_t>((const void*)(g_base + rva), 4 * (i + 1));
+        if (actual != tail[i]) {
+            LOG("PROLOGUE MISMATCH %s RVA=%llx word=%zu expected=%08x actual=%08x",
+                label, (unsigned long long)rva, i + 1, tail[i], actual);
+            return false;
+        }
+    }
+    LOG("Prologue verified %s RVA=%llx word0=%08x", label, (unsigned long long)rva, actual0);
+    return true;
+}
+
 static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
     if (!g_internal && func && g_gameTid.load() == (int)gettid()) {
@@ -3274,24 +3303,33 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
 
 static void InstallHooks() {
     LOG("=== InstallHooks ===");
-    // [F25] Verify every hooked RVA belongs to this build before patching.
-    static const uint32_t pe_words[]    = {0xf81a0ffc, 0xa90167fa, 0xa9025ff8, 0xa90357f6};
+    // [F25/F26] Verify every hooked RVA belongs to this build before patching.
+    // Each hook installs independently — one prologue mismatch must never
+    // disable the remaining hooks (the old all-or-nothing return left the
+    // game with zero hooks: no controller binding, no respawn).
     static const uint32_t tick_words[]  = {0xd10503ff, 0x6d0d23e9, 0xa90e6ffc, 0xa90f67fa};
     static const uint32_t exec_words[]  = {0xd10183ff, 0xa9025ff8, 0xa90357f6, 0xa9044ff4};
     static const uint32_t qb_words[]    = {0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd};
-    bool pe_valid   = PrologueMatch("ProcessEvent",   profile::ProcessEvent,   pe_words,   4);
-    bool tick_valid = PrologueMatch("WorldTick",      profile::WorldTick,      tick_words, 4);
-    bool exec_valid = PrologueMatch("EngineExec",     profile::EngineExec,     exec_words, 4);
-    bool qb_valid   = PrologueMatch("AthenaQuickBars",profile::InitializeAthenaQuickBars, qb_words, 4);
-    if (!pe_valid || !tick_valid || !exec_valid) { LOG("Hook prologue mismatch; refusing to patch"); return; }
-    if (!qb_valid) LOG("[QB] initializer prologue mismatch — native init disabled, manual path only");
+    bool pe_valid   = PrologueMatchPE("ProcessEvent",    profile::ProcessEvent);
+    bool tick_valid = PrologueMatch("WorldTick",       profile::WorldTick,       tick_words, 4);
+    bool exec_valid = PrologueMatch("EngineExec",      profile::EngineExec,      exec_words, 4);
+    bool qb_valid   = PrologueMatch("AthenaQuickBars", profile::InitializeAthenaQuickBars, qb_words, 4);
 
-    if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) != 0 || !orig_PE) { LOG("ProcessEvent FAILED"); return; }
-    LOG("ProcessEvent hooked");
-    if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) != 0 || !orig_Tick) LOG("WorldTick FAILED");
-    else LOG("WorldTick hooked");
-    if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) != 0 || !orig_Exec) LOG("EngineExec FAILED");
-    else LOG("EngineExec hooked");
+    int installed = 0, failed = 0;
+    if (pe_valid) {
+        if (DobbyHook((void*)(g_base + profile::ProcessEvent), (void*)pe_hook, (void**)&orig_PE) == 0 && orig_PE) { LOG("ProcessEvent hooked"); ++installed; }
+        else { LOG("ProcessEvent FAILED"); ++failed; }
+    } else { LOG("ProcessEvent skipped (prologue)"); ++failed; }
+    if (tick_valid) {
+        if (DobbyHook((void*)(g_base + profile::WorldTick), (void*)tick_hook, (void**)&orig_Tick) == 0 && orig_Tick) { LOG("WorldTick hooked"); ++installed; }
+        else { LOG("WorldTick FAILED"); ++failed; }
+    } else { LOG("WorldTick skipped (prologue)"); ++failed; }
+    if (exec_valid) {
+        if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) == 0 && orig_Exec) { LOG("EngineExec hooked"); ++installed; }
+        else { LOG("EngineExec FAILED"); ++failed; }
+    } else { LOG("EngineExec skipped (prologue)"); ++failed; }
+    if (!qb_valid) LOG("[QB] initializer prologue mismatch — native init disabled, manual path only");
+    LOG("InstallHooks done: installed=%d failed=%d", installed, failed);
 }
 
 static int InspectCb(dl_phdr_info* info, size_t, void*) {
