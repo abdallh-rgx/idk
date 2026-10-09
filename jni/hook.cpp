@@ -2028,9 +2028,11 @@ void Athena::SpawnBattleBus() {
 // core behaviour, ported with the 21.30 component path added).
 void Athena::HandleJumpFromHudStart() {
     if (!session.controller) return;
-    if (session.aircraft_jumped) return;
     // [F79-e] death spectate — the jump button cycles the spectate target.
+    // (Checked BEFORE the aircraft_jumped early-return: the flag is still set
+    // from the bus jump when the player later dies, and the cycle must work.)
     if (br.spectating) { Athena::SpectateNext(); return; }
+    if (session.aircraft_jumped) return;
     Guard g;
     LOG("[Bus] JumpFromHudStart intercepted");
     Vector rot{0, 0, 0};
