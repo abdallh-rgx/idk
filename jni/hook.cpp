@@ -1170,12 +1170,19 @@ struct BRCtx {
     std::vector<Vector> zone_centers; // per-phase centers
     int    bots_target = 99;          // Erbium full BR roster
     int    bots_spawned = 0;          // ErbiumBot(#) counters
+    std::vector<void*> bot_pawns;     // [F74-e] live bot pawns (movement driver)
     double next_bot_wave = 0;         // monotonic schedule
     double last_storm_tick = 0;
     int    last_logged_zone = -1;
     bool   alive_added = false;       // local PC in GameMode->AlivePlayers
 };
 static BRCtx br;
+
+// [F74-e] bot movement motor state — one entry per live bot pawn (Erbium bots
+// are static props of the roster; the user wants a living match, so each bot
+// wanders: SetControlRotation heading + AddMovementInput drive pulses).
+struct BRBotMotor { void* pawn; float yaw; double next_heading; };
+static std::vector<BRBotMotor> g_bot_motors;
 
 // ============================================================================
 // ATHENA NAMESPACE
@@ -3977,14 +3984,23 @@ static void BRWriteVector(void* obj, const char* path, const Vector& v) {
     if (!p || Read<int>(p, profile::PropElementSize) != 24) return;
     Write<Vector>(GetField(obj, p), 0, v);
 }
+// [F74-c] typed object-pointer write via reflection (bus skin fields)
+static void BRWritePtr(void* obj, const char* path, void* ptr) {
+    void* p = obj ? GetProp(path) : nullptr;
+    if (!p || Read<int>(p, profile::PropElementSize) != 8) return;
+    Write<void*>(GetField(obj, p), 0, ptr);
+}
 
-// UFortGameStateComponent_BattleRoyaleGamePhaseLogic (exists since ~13.00;
-// on 21.30 it is the phase authority — Erbium reads/writes the same fields).
+// UFortGameStateComponent_BattleRoyaleGamePhaseLogic — [F74-f] does NOT exist
+// in 21.30 (verified against the SDK dump: no such class in this build; the
+// phase machinery lives on AFortGameStateAthena + FortGameModeAthena). The
+// lookup stays for builds that ship it; on 21.30 every caller falls back to
+// the GameState path — this is expected, not an error.
 static void* BRGetComponent() {
     if (br.component && !IsBadPtr(br.component)) return br.component;
     if (!session.state) return nullptr;
     void* cls = FindObj("/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic");
-    if (!cls) { static bool once = false; if (!once) { once = true; LOG("[BR] GamePhaseLogic component class missing"); } return nullptr; }
+    if (!cls) { static bool once = false; if (!once) { once = true; LOG("[BR] no GamePhaseLogic component (expected on 21.30 — GameState path drives phases)"); } return nullptr; }
     Call c("/Script/Engine.Actor.GetComponentByClass");
     if (!c.ok()) return nullptr;
     if (!c.set_any(cls, "ComponentClass", "ActorClass", "Class")) { c.dump("GetComponentByClass"); return nullptr; }
@@ -4018,6 +4034,14 @@ static void BRSetGamePhase(uint8_t p) {
 
 // EAthenaGamePhaseStep setter — Erbium SetGamePhaseStep: property write +
 // HandleGamePhaseStepChanged (the native that notifies HUD/music/announcer).
+// [F74-f] 21.30 has NO FortGameStateComponent_BattleRoyaleGamePhaseLogic
+// (verified in the SDK dump — the class doesn't exist in this build). The
+// step broadcast lives on AFortGameStateAthena.GamePhaseStepChanged and its
+// registered handlers: FortGameModeAthena.OnGamePhaseStepChanged +
+// FortPlayerPawnAthena.GamePhaseStepChanged (both take
+// {TScriptInterface<IFortSafeZoneInterface>, EEAthenaGamePhaseStep}). We call
+// them with the SafeZoneIndicator as the interface once it exists (storm
+// steps — the real server flow); aircraft steps notify via OnRep_GamePhase.
 static void BRSetGamePhaseStep(uint8_t s) {
     br.step = s;
     if (BRGetComponent()) {
@@ -4029,6 +4053,17 @@ static void BRSetGamePhaseStep(uint8_t s) {
     if (session.state) {
         void* prop = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhaseStep");
         if (prop) Write<uint8_t>(GetField(session.state, prop), 0, s);
+    }
+    if (br.indicator && !IsBadPtr(br.indicator)) {
+        uint64_t iface[2] = {(uint64_t)(uintptr_t)br.indicator, (uint64_t)(uintptr_t)br.indicator};
+        Call gm("/Script/FortniteGame.FortGameModeAthena.OnGamePhaseStepChanged");
+        if (gm.ok() && session.mode &&
+            gm.set_bytes("SafeZoneInterface", iface, 16) && gm.set("GamePhaseStep", s))
+            gm.run(session.mode);
+        Call pp("/Script/FortniteGame.FortPlayerPawnAthena.GamePhaseStepChanged");
+        if (pp.ok() && session.pawn &&
+            pp.set_bytes("SafeZoneInterface", iface, 16) && pp.set("GamePhaseStep", s))
+            pp.run(session.pawn);
     }
     LOG("[BR] GamePhaseStep -> %u", (unsigned)s);
 }
@@ -4294,20 +4329,24 @@ static void BRStartNewSafeZonePhase(int p, bool bInitial) {
 }
 
 // ----------------------------------------------------------------------------
-// [F73-e] Erbium StartAircraftPhase — SpawnAircraft from MapInfo->AircraftClass
-// + FlightInfos[0], the flight/drop windows (world time), GameState->Aircrafts,
-// bAircraftIsLocked, board the player (Erbium destroys pawns + Spectating;
-// standalone keeps the pawn, hides it and switches the view target to the bus
-// so the ride + HUD jump button work exactly like the real flow).
+// [F73-e/F74] Erbium StartAircraftPhase — 21.30 correction: SpawnAircraft is
+// a STATIC on AFortAthenaAircraft (UFunction verified in the 21.30 dump:
+// World + AircraftClass + FAircraftFlightInfo InFlightInfo@0x10 0x48 bytes;
+// the old FortGameStateAthena.SpawnAircraft path never existed in this build).
+// [F74-c] Bus skin: DefaultBattleBus (GameState) + DefaultBusSkin/ActiveSkin
+// (aircraft/cosmetic actor) from BBID_DefaultBus — Erbium FortGameMode.cpp
+// sets these right after the aircraft exists.
+// [F74] every step logs BEFORE running so any residual crash names itself.
 // ----------------------------------------------------------------------------
 static void BRStartAircraftPhase() {
     if (br.phase >= 3) return;
     if (!session.world || !session.state) return;
     float now = BRWorldTime();
-    LOG("[BR] StartAircraftPhase (Erbium)");
+    LOG("[BR] StartAircraftPhase (Erbium) t=%.0f", now);
 
     void* acCls = br.mapinfo ? GetObjField(br.mapinfo, "/Script/FortniteGame.FortAthenaMapInfo.AircraftClass") : nullptr;
     if (!acCls || IsBadPtr(acCls)) acCls = FindObj("/Script/FortniteGame.FortAthenaAircraft");
+    LOG("[BR] aircraft class=%s", acCls && !IsBadPtr(acCls) ? ObjName(acCls).c_str() : "<null>");
 
     // FlightInfos[0] element bytes (same struct the SpawnAircraft param takes)
     void* arrProp = br.mapinfo ? GetProp("/Script/FortniteGame.FortAthenaMapInfo.FlightInfos") : nullptr;
@@ -4339,23 +4378,41 @@ static void BRStartAircraftPhase() {
 
     void* aircraft = nullptr;
     if (acCls && !IsBadPtr(acCls)) {
+        // [F74-c] resolve the bus skin BEFORE the spawn — the native
+        // SpawnAircraft reads GameState->DefaultBattleBus while building the
+        // cosmetic bus actor (Erbium sets it in HandleMatchHasStarted, i.e.
+        // before any aircraft exists).
+        void* busDef = LoadAsset("/Game/Athena/Items/Cosmetics/BattleBuses/BBID_DefaultBus.BBID_DefaultBus");
+        if (busDef) BRWritePtr(session.state, "/Script/FortniteGame.FortGameStateAthena.DefaultBattleBus", busDef);
+        else LOG("[BR] BBID_DefaultBus not resident — bus renders default");
         if (haveFI) {
-            // Erbium: AFortGameStateAthena::SpawnAircraft(World, Class, FlightInfo)
-            Call sp("/Script/FortniteGame.FortGameStateAthena.SpawnAircraft");
+            // [F74-b] The REAL 21.30 spawn path — static UFunction on the
+            // aircraft class, run on its CDO (Erbium:
+            // AFortAthenaAircraft::SpawnAircraft(World, Class, FlightInfo)).
+            Call sp("/Script/FortniteGame.FortAthenaAircraft.SpawnAircraft");
             if (sp.ok()) {
+                LOG("[BR] SpawnAircraft (static) elem=%d", fiElem);
                 bool w = sp.set_any(session.world, "World", "WorldContextObject", "InWorld");
                 bool k = sp.set_any(acCls, "InAircraftClass", "AircraftClass", "Aircraft");
-                bool f = sp.set_bytes("FlightInfo", fi->Data, fiElem);
-                if (w && k && f && sp.run(session.state)) aircraft = sp.result<void*>();
-                if (!aircraft) { sp.dump("SpawnAircraft"); LOG("[BR] SpawnAircraft param bind w=%d k=%d f=%d", (int)w, (int)k, (int)f); }
+                bool f = sp.set_bytes("InFlightInfo", fi->Data, fiElem) ||
+                         sp.set_bytes("FlightInfo", fi->Data, fiElem);
+                void* cdo = FindObj("/Script/FortniteGame.Default__FortAthenaAircraft");
+                if (w && k && f && sp.run(cdo ? cdo : session.state)) aircraft = sp.result<void*>();
+                LOG("[BR] SpawnAircraft -> %p (w=%d k=%d f=%d)", aircraft, (int)w, (int)k, (int)f);
+                if (!aircraft) sp.dump("SpawnAircraft");
+            } else {
+                LOG("[BR] static SpawnAircraft UFunction not found — manual fallback");
             }
         }
         if (!aircraft) {
             // Manual fallback — the real class, empty transform (its own Tick
             // interpolates FlightInfo fields we write next).
+            LOG("[BR] manual aircraft spawn...");
             Transform t{};
             aircraft = SpawnActor(session.world, acCls, session.state, t);
-            if (aircraft) LOG("[BR] aircraft spawned manually (class=%s)", ObjName(acCls).c_str());
+            LOG("[BR] manual aircraft -> %p", aircraft);
+            if (aircraft)
+                SetBool(aircraft, "/Script/FortniteGame.FortAthenaAircraft.bWasSpawnedForAircraftPhase", true);
         }
     }
     if (!aircraft) LOG("[BR] aircraft spawn FAILED (cls=%p)", acCls);
@@ -4367,6 +4424,7 @@ static void BRStartAircraftPhase() {
         // own FlightInfo struct AND the individual fields (Erbium writes the
         // field variant; 21.30 aircraft carries both) so the native aircraft
         // Tick flies the real route.
+        LOG("[BR] writing flight path fields...");
         if (haveFI) {
             if (void* fiProp = GetProp("/Script/FortniteGame.FortAthenaAircraft.FlightInfo")) {
                 int psz = Read<int>(fiProp, profile::PropElementSize);
@@ -4404,7 +4462,23 @@ static void BRStartAircraftPhase() {
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightStartTime", now);
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightEndTime", br.flight_end);
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.ReplicatedFlightTimestamp", now);
+
+        // [F74-c] BattleBus skin — post-spawn half (Erbium FortGameMode.cpp
+        // :1043-1109): DefaultBusSkin on the aircraft + ActiveSkin on the
+        // cosmetic bus actor (DefaultBattleBus was set pre-spawn above).
+        LOG("[BR] applying bus skin...");
+        void* busDef2 = LoadAsset("/Game/Athena/Items/Cosmetics/BattleBuses/BBID_DefaultBus.BBID_DefaultBus");
+        if (busDef2) {
+            BRWritePtr(aircraft, "/Script/FortniteGame.FortAthenaAircraft.DefaultBusSkin", busDef2);
+            void* sca = GetObjField(aircraft, "/Script/FortniteGame.FortAthenaAircraft.SpawnedCosmeticActor");
+            if (sca && !IsBadPtr(sca)) {
+                BRWritePtr(sca, "/Script/FortniteGame.BattleBusCosmeticInstanceBase.ActiveSkin", busDef2);
+                LOG("[BR] bus cosmetic actor skin set");
+            }
+        }
+
         // GameState->Aircrafts + OnRep (HUD bus panel + native aircraft logic)
+        LOG("[BR] registering aircraft in GameState...");
         void* acsProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircrafts");
         if (acsProp) {
             Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(GetField(session.state, acsProp), acsProp, &aircraft);
@@ -4424,6 +4498,7 @@ static void BRStartAircraftPhase() {
     // Board the player (Erbium destroys pawns + ClientGotoState Spectating;
     // standalone-safe equivalent: hide pawn + no collision + camera on bus).
     if (session.pawn && !IsBadPtr(session.pawn)) {
+        LOG("[BR] boarding player...");
         Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
         if (hid.ok()) { bool b = true; if (hid.set("bNewHidden", b)) hid.run(session.pawn); }
         Call col("/Script/Engine.Actor.SetActorEnableCollision");
@@ -4435,8 +4510,22 @@ static void BRStartAircraftPhase() {
         LOG("[BR] player boarded (pawn hidden, camera on bus)");
     }
 
+    // Erbium StartAircraftPhase tail: ClientActivateSlot(0,0) re-arms the
+    // pickaxe for landing. The [F74-a] swallow makes this safe standalone.
+    if (session.controller) {
+        Call cas("/Script/FortniteGame.FortPlayerController.ClientActivateSlot");
+        if (cas.ok()) {
+            uint8_t bar = 0; int slot = 0; float delay = 0;
+            bool upd = true, force = true;
+            if (cas.set("InQuickBar", bar) && cas.set("Slot", slot) && cas.set("ActivateDelay", delay) &&
+                cas.set("bUpdatePreviousFocusedSlot", upd) && cas.set("bForceExecution", force))
+                cas.run(session.controller);
+        }
+    }
+
     BRSetGamePhase(3);     // EAthenaGamePhase::Aircraft
     BRSetGamePhaseStep(4); // EAthenaGamePhaseStep::BusLocked
+    LOG("[BR] StartAircraftPhase complete");
 }
 
 // ----------------------------------------------------------------------------
@@ -4468,19 +4557,17 @@ void Athena::BRJump() {
 }
 
 // ----------------------------------------------------------------------------
-// [F73-g] Erbium spawnbot — the full roster procedure from
+// [F73-g/F74] Erbium spawnbot — the full roster procedure from
 // FortPlayerControllerAthena.cpp: pawn + BP controller + PlayerState, Possess,
 // PlayerState wiring (+ OnReps), SetMaxHealth, TeamIndex/SquadId/bIsABot,
-// ability sets, cosmetics (Commando default), AlivePlayers, PlayersLeft++.
-// Bots stand where they land (Erbium bots have no AI — they are the match
-// population the storm and the player thin out).
+// ability sets, cosmetics (F74-d full chain), AlivePlayers, PlayersLeft++.
+// [F74-e] every bot registers a movement motor (BRBotMoveTick) — a living
+// match instead of mannequins.
 // ----------------------------------------------------------------------------
 static void* BRBotPawnClass = nullptr;
 static void* BRBotCtrlClass = nullptr;
 static void* BRBotStateClass = nullptr;
 static void* BRBotHeroType = nullptr;
-static void* BRBotHead = nullptr;
-static void* BRBotBody = nullptr;
 
 static void BRSpawnBotBatch(int n) {
     if (!session.world || !session.mode || !session.state) return;
@@ -4489,8 +4576,9 @@ static void BRSpawnBotBatch(int n) {
     if (!BRBotCtrlClass) BRBotCtrlClass = FindObj("/Script/FortniteGame.FortPlayerControllerAthena");
     if (!BRBotStateClass) BRBotStateClass = FindObj("/Script/FortniteGame.FortPlayerStateAthena");
     if (!BRBotHeroType) BRBotHeroType = LoadAsset("/Game/Athena/Heroes/HID_001_Athena_Commando_F.HID_001_Athena_Commando_F", "/Script/FortniteGame.FortHeroType");
-    if (!BRBotHead) BRBotHead = LoadAsset("/Game/Athena/Heroes/Meshes/Heads/F_Med_Head1_ATH.F_Med_Head1_ATH", "/Script/FortniteGame.CustomCharacterPart");
-    if (!BRBotBody) BRBotBody = LoadAsset("/Game/Athena/Heroes/Meshes/Bodies/CP_001_Athena_Body.CP_001_Athena_Body", "/Script/FortniteGame.CustomCharacterPart");
+    // [F74-d] head/body parts are resolved per-batch inside the cosmetic block
+    // (BRBotHead/BRBotBody statics removed — they fed ApplyCharacterCosmetics
+    // only and kept the old unresolvable paths).
     if (!BRBotPawnClass || !BRBotCtrlClass || !BRBotStateClass) {
         LOG("[BR] bot classes missing p=%p c=%p s=%p — disabling roster", BRBotPawnClass, BRBotCtrlClass, BRBotStateClass);
         br.bots_target = br.bots_spawned;
@@ -4510,6 +4598,20 @@ static void BRSpawnBotBatch(int n) {
 
     void* aliveProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
     int spawned = 0;
+    // [F74-d] cosmetic assets resolve once per batch (logged on first batch)
+    static void* headPart = nullptr;
+    static void* bodyPart = nullptr;
+    static void* backpackPart = nullptr;
+    if (!headPart) headPart = LoadAsset("/Game/Athena/Heroes/Meshes/Heads/F_Med_Head1_ATH.F_Med_Head1_ATH", "/Script/FortniteGame.CustomCharacterPart");
+    if (!bodyPart) bodyPart = LoadAsset("/Game/Athena/Heroes/Meshes/Bodies/CP_001_Athena_Body.CP_001_Athena_Body", "/Script/FortniteGame.CustomCharacterPart");
+    if (!headPart) headPart = ByShortName("CP_Head_Med_Soldier_M_DesertOps");
+    if (!bodyPart) bodyPart = ByShortName("CP_Athena_Body_M_Fallback");
+    if (!backpackPart) backpackPart = ByShortName("NoBackpack");
+    static bool partsLogged = false;
+    if (!partsLogged && (headPart || bodyPart)) {
+        partsLogged = true;
+        LOG("[BR] bot parts head=%p body=%p backpack=%p", headPart, bodyPart, backpackPart);
+    }
     for (int k = 0; k < n && br.bots_spawned < br.bots_target; ++k) {
         Vector loc{0, 0, 500};
         bool haveLoc = false;
@@ -4575,26 +4677,60 @@ static void BRSpawnBotBatch(int n) {
         }
         SetBool(st, "/Script/FortniteGame.FortPlayerState.bIsABot", true);
 
-        // cosmetics (Erbium: HeroType + CharacterParts + ApplyCharacterCustomization)
-        if (BRBotHeroType) {
-            if (void* htProp = GetProp("/Script/FortniteGame.FortPlayerState.HeroType"))
-                Write<void*>(GetField(st, htProp), 0, BRBotHeroType);
-            Call rht("/Script/FortniteGame.FortPlayerState.OnRep_HeroType");
-            if (rht.ok()) rht.run(st);
-        }
-        if (BRBotHead && BRBotBody) {
-            void* parts[2] = {BRBotHead, BRBotBody};
-            Array partsArr{parts, 2, 2};
-            void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
-            Call apply("/Script/FortniteGame.FortKismetLibrary.ApplyCharacterCosmetics");
-            if (apply.ok() && klib && apply.set("WorldContextObject", session.world) &&
-                apply.set("CharacterParts", partsArr) && apply.set("PlayerState", st))
-                apply.run(klib);
-            Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
-            if (upd.ok() && klib && upd.set("PlayerState", st)) upd.run(klib);
+        // [F74-d] cosmetics — the exact chain that gave the LOCAL player a
+        // working body (Erbium spawnbot: HeroType + parts + visualization).
+        // F73 only set HeroType + ApplyCharacterCosmetics with parts that do
+        // not resolve in 21.30 — bots stayed Default. Now:
+        //   1) FortPlayerPawn.ServerChoosePart(0=Head, 1=Body) on the bot pawn
+        //   2) SetCharacterBodyVisibilityForPossession(true)
+        //   3) PlayerState.LocalCharacterParts[0/1/3] (Erbium spawnbot array)
+        //   4) HeroType + OnRep_HeroType + ApplyCharacterCosmetics +
+        //      OnRep_CharacterData + UpdatePlayerCustomCharacterPartsVisualization
+        {
+            int partsApplied = 0;
+            if (headPart)  { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+                             if (choose.ok() && choose.set("Part", (uint8_t)0) && choose.set("ChosenCharacterPart", headPart)) { choose.run(pawn); ++partsApplied; } }
+            if (bodyPart)  { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+                             if (choose.ok() && choose.set("Part", (uint8_t)1) && choose.set("ChosenCharacterPart", bodyPart)) { choose.run(pawn); ++partsApplied; } }
+            if (partsApplied) {
+                Call vis("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
+                if (vis.ok()) { bool show = true; if (vis.set("bVisible", show)) vis.run(pawn); }
+            }
+            // Erbium spawnbot fallback array: LocalCharacterParts[0/1/3]
+            // (UCustomCharacterPart* [7] — fixed C-array on FortPlayerState).
+            if (void* lcp = GetProp("/Script/FortniteGame.FortPlayerState.LocalCharacterParts")) {
+                void* base = GetField(st, lcp);
+                if (headPart) Write<void*>(base, 0 * 8, headPart);
+                if (bodyPart) Write<void*>(base, 1 * 8, bodyPart);
+                if (backpackPart) Write<void*>(base, 3 * 8, backpackPart);
+            }
+            if (BRBotHeroType) {
+                if (void* htProp = GetProp("/Script/FortniteGame.FortPlayerState.HeroType"))
+                    Write<void*>(GetField(st, htProp), 0, BRBotHeroType);
+                Call rht("/Script/FortniteGame.FortPlayerState.OnRep_HeroType");
+                if (rht.ok()) rht.run(st);
+            }
+            if (headPart && bodyPart) {
+                void* parts[2] = {headPart, bodyPart};
+                Array partsArr{parts, 2, 2};
+                void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+                Call apply("/Script/FortniteGame.FortKismetLibrary.ApplyCharacterCosmetics");
+                if (apply.ok() && klib && apply.set("WorldContextObject", session.world) &&
+                    apply.set("CharacterParts", partsArr) && apply.set("PlayerState", st))
+                    apply.run(klib);
+            }
             Call rcd("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData");
             if (rcd.ok()) rcd.run(st);
+            void* klib2 = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+            if (klib2) {
+                Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
+                if (upd.ok() && upd.set("PlayerState", st)) upd.run(klib2);
+            }
         }
+
+        // [F74-e] movement driver registration (bots wander, see BRBotMoveTick)
+        br.bot_pawns.push_back(pawn);
+        g_bot_motors.push_back({pawn, (float)(BRRand01() * 360.0), 0.0});
 
         // ability sets (Erbium: GiveAbilitySet per AbilitySets entry)
         for (void* set : session.granted_ability_sets) ApplyAbilitySet(pawn, set);
@@ -4615,8 +4751,53 @@ static void BRSpawnBotBatch(int n) {
             Call rpl("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
             if (rpl.ok()) rpl.run(session.state);
         }
-        LOG("[BR] +%d bots — roster %d/%d, PlayersLeft=%d", spawned, br.bots_spawned, br.bots_target, 1 + br.bots_spawned);
+        LOG("[BR] +%d bots — roster %d/%d, PlayersLeft=%d, motors=%zu", spawned, br.bots_spawned, br.bots_target, 1 + br.bots_spawned, g_bot_motors.size());
     }
+}
+
+// ----------------------------------------------------------------------------
+// [F74-e] Bot movement — the roster was rendered mannequins: a
+// PlayerController-possessed pawn has no input source. Each bot gets a wander
+// motor: re-roll a heading every 2.5-4.5s (SetControlRotation so the pawn
+// faces it — Athena pawns use bUseControllerRotationYaw) and drive the
+// CharacterMovement with AddMovementInput pulses. Cached UFunctions; dead
+// pawns drop out of the motor list.
+// ----------------------------------------------------------------------------
+static void BRBotMoveTick() {
+    if (g_bot_motors.empty()) return;
+    double now = Monotonic();
+    static Call* rot = nullptr;
+    static Call* move = nullptr;
+    static void* ctrlProp = nullptr;     // [F74-e] resolve once — hot path (99 bots/frame)
+    if (!rot) rot = new Call("/Script/Engine.Controller.SetControlRotation");
+    if (!move) move = new Call("/Script/Engine.Pawn.AddMovementInput");
+    if (!ctrlProp) ctrlProp = GetProp("/Script/Engine.Pawn.Controller");
+    int ctrlOff = ctrlProp ? Read<int>(ctrlProp, profile::PropOffset) : -1;
+    size_t w = 0;
+    for (size_t i = 0; i < g_bot_motors.size(); ++i) {
+        BRBotMotor& m = g_bot_motors[i];
+        void* pawn = m.pawn;
+        if (!pawn || IsBadPtr(pawn)) continue;                 // destroyed (storm/edit)
+        // controller = pawn's owner controller (direct field read, no lookup)
+        void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
+        if (now >= m.next_heading) {
+            m.yaw = (float)(BRRand01() * 360.0);
+            m.next_heading = now + 2.5 + BRRand01() * 2.0;
+            if (ctrl && !IsBadPtr(ctrl) && rot && rot->ok()) {
+                Rotator r{}; r.Pitch = 0; r.Yaw = m.yaw; r.Roll = 0;
+                if (rot->set("NewRotation", r)) rot->run(ctrl);
+            }
+        }
+        if (move && move->ok()) {
+            float rad = m.yaw * 3.14159265f / 180.0f;
+            Vector dir{std::cos(rad), std::sin(rad), 0};
+            float scale = 1.0f; uint8_t force = 0;
+            if (move->set("WorldDirection", dir) && move->set("ScaleValue", scale) && move->set("bForce", force))
+                move->run(pawn);
+        }
+        g_bot_motors[w++] = m;
+    }
+    g_bot_motors.resize(w);
 }
 
 // ----------------------------------------------------------------------------
@@ -4711,6 +4892,9 @@ static void BRStormTick() {
             snprintf(name, sizeof(name), "ErbiumBot(#%d)", i);
             Call d("/Script/Engine.Actor.K2_DestroyActor");
             if (d.ok()) d.run(pawn);
+            // [F74-e] drop the elimination from the movement roster too
+            for (auto& m : g_bot_motors)
+                if (m.pawn == pawn) { m.pawn = nullptr; break; }
             if (plProp) {
                 int left = Read<int>(GetField(session.state, plProp), 0);
                 if (left > 1) Write<int>(GetField(session.state, plProp), 0, left - 1);
@@ -4802,10 +4986,16 @@ void Athena::BRTick() {
         br.next_bot_wave = mono + 2.0;
         BRSpawnBotBatch(10);
     }
+    // [F74-e] keep the roster alive — wander motors (cheap: cached UFunctions)
+    BRBotMoveTick();
 
     float now = BRWorldTime();
 
     if (br.phase <= 2) { // Warmup (None/Setup/Warmup)
+        // [F74-f] Erbium Tick machine: WarmupEarlyCountdownDuration (end-10s)
+        // flips the step to GetReady before the aircraft launches.
+        if (br.step < 3 && br.warmup_end >= 0 && now >= br.warmup_end - 10.0f)
+            BRSetGamePhaseStep(3); // EAthenaGamePhaseStep::GetReady
         if (br.warmup_end >= 0 && now >= br.warmup_end) BRStartAircraftPhase();
         return;
     }
@@ -6529,17 +6719,36 @@ static void pe_hook(void* obj, void* func, void* params) {
                 if (bcC) isContainer = SubclassOfFast(cls, bcC);
             }
         }
+        // [F74-a] DEAD-SERVER RPCs — SWALLOW FOR ANY RECEIVER. These run the
+        // server-side implementation locally in standalone, which crashes
+        // (the F58 ServerAttemptInventoryDrop class). At warmup countdown
+        // zero the game auto-activates quickbar slot 0 (Erbium's
+        // StartAircraftPhase does ClientActivateSlot(0,0) server-side at this
+        // exact moment), the client fires ServerExecuteInventoryItem, the
+        // local equip succeeds, and the ORIGINAL server path killed the
+        // process — every match died at bus zero. The gate below is skipped
+        // so even a bot controller receiving these never reaches the native
+        // body (bots have no WorldInventory — guaranteed null deref).
+        // Erbium never calls the original either: it implements these server
+        // RPCs itself because there is no upstream server.
+        if (fn == "ServerExecuteInventoryItem" || fn == "ServerExecuteInventoryWeapon") {
+            Guard g;
+            if (isPC) {
+                if (fn == "ServerExecuteInventoryItem") {
+                    if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid))
+                        Athena::OnServerExecuteInventoryItem(Read<Guid>(params));
+                } else {
+                    Athena::OnServerExecuteInventoryWeapon(Read<void*>(params));
+                }
+            }
+            return;   // [F74-a] local equip done — never reach the crashing native path
+        }
         if (isPC || isPawn || isWeapon || isInteraction || isBuildSM || isContainer) {
             Guard g;
-            if (fn == "ServerExecuteInventoryItem") {
-                if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid))
-                    Athena::OnServerExecuteInventoryItem(Read<Guid>(params));
-            }
-            else if (fn == "ServerExecuteInventoryWeapon") Athena::OnServerExecuteInventoryWeapon(Read<void*>(params));
             // [F06] ServerHandlePickup(PickUp, InFlyTime, InStartDirection,
             // bPlayPickupSound) and ServerHandlePickupInfo(PickUp, Info) —
             // the pickup pointer is the first parameter in both.
-            else if ((fn == "ServerHandlePickupInfo" || fn == "ServerHandlePickup") && isPawn) {
+            if ((fn == "ServerHandlePickupInfo" || fn == "ServerHandlePickup") && isPawn) {
                 void* arg = incoming(func, params, "PickUp", 8);
                 if (!arg) arg = incoming(func, params, "Pickup", 8);
                 if (!arg) arg = params;   // PickUp is the first parameter
