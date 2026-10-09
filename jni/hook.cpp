@@ -66,6 +66,7 @@
 #include <link.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <cstring>
 #include <cstdint>
@@ -152,6 +153,11 @@ constexpr unsigned BoolByteOffset  = 0x81;
 constexpr unsigned BoolFieldMask   = 0x82;
 constexpr unsigned FFieldName = 0x28;
 constexpr unsigned FFieldNext = 0x20;
+
+// [F28-F33] Streaming / vehicles / wildlife / minimap (SDK 21.30 verified)
+constexpr unsigned World_StreamingLevels        = 0x0088;   // UWorld.StreamingLevels TArray<ULevelStreaming*>
+constexpr unsigned VehicleSpawner_CachedItemDef = 0x02B8;   // AFortAthenaVehicleSpawner.CachedFortVehicleItemDef (696)
+constexpr unsigned VehicleItemDef_ActorClass    = 0x0A38;   // UFortVehicleItemDefinition.VehicleActorClass (2616)
 
 // CPF flags
 constexpr uint64_t CPF_Parm       = 0x00000080ULL;
@@ -266,6 +272,51 @@ static std::atomic<int> g_status{0};
 static std::atomic<int> g_gameTid{0};
 static thread_local bool g_internal = false;
 
+// [F34] Crash logger — SIGSEGV/SIGBUS/SIGILL/SIGABRT mini-backtrace with
+// libUnreal.so module offsets, written async-signal-safe to
+// /data/local/tmp/era_crash.txt. Converts an opaque "game crashed" into a
+// fixable function offset on the next run.
+static void EraCrashHandler(int sig, siginfo_t* info, void* ctx) {
+    char buf[2048]; int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                  "CRASH sig=%d addr=%p base=%p\n", sig,
+                  info ? info->si_addr : nullptr, (void*)g_base);
+    ucontext_t* uc = (ucontext_t*)ctx;
+    if (uc) {
+#if defined(__aarch64__) && defined(__BIONIC__)
+        uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+        uintptr_t sp = (uintptr_t)uc->uc_mcontext.sp;
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "PC=0x%lx (lib+0x%lx)\n",
+                      (unsigned long)pc, g_base ? (unsigned long)(pc - g_base) : 0ul);
+        if (sp) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, "ret scan (libUnreal):\n");
+            for (uintptr_t p = sp & ~(uintptr_t)0xF; p < sp + 0x600 && n < (int)sizeof(buf) - 64; p += 8) {
+                uintptr_t v = *(uintptr_t*)p;
+                if (g_base && v > g_base && v < g_base + 0xE000000)
+                    n += snprintf(buf + n, sizeof(buf) - (size_t)n, "  lib+0x%lx\n",
+                                  (unsigned long)(v - g_base));
+            }
+        }
+#else
+        (void)uc;
+#endif
+    }
+    int fd = open("/data/local/tmp/era_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) { ssize_t w = write(fd, buf, (size_t)n); (void)w; close(fd); }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void InstallCrashLogger() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = EraCrashHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+    sigaction(SIGILL,  &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+}
+
 struct Guard { bool s = g_internal; Guard() { g_internal = true; } ~Guard() { g_internal = s; } };
 template<class F> static F Fn(uintptr_t rva) { return reinterpret_cast<F>(g_base + rva); }
 
@@ -327,6 +378,7 @@ static void* LoadClass(const char* path, const char* base_path);
 static void* GetPC(void* world, int index);
 static void* incoming(void* function, void* data, const char* key, int expected_size = 0);
 static GObjects_t* GObjectArray();
+static void RotatorToQuat(const Rotator& r, double out[4]);   // [F28-F33] forward decl
 
 // ============================================================================
 // TYPE CHECKS
@@ -415,6 +467,41 @@ static void* ByShortName(const std::string& wanted) {
             return object;
     }
     return nullptr;
+}
+
+// [F29/F30] Enumerate live instances of a class through GObjects (Erbium
+// Utils::GetAll port). One-shot scans; caller caps the result size.
+static std::vector<void*> FindAllInstances(void* baseClass, int limit = 64) {
+    std::vector<void*> out;
+    GObjects_t* go = GObjectArray();
+    if (!go || !baseClass) return out;
+    out.reserve(16);
+    for (int32 i = 0; i < go->NumElements && (int)out.size() < limit; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (IsA(object, baseClass)) out.push_back(object);
+    }
+    return out;
+}
+
+// [F30] Enumerate loaded *classes* deriving from baseClass whose name matches
+// one of the lowercase keywords (nullptr-terminated). Skips the base itself.
+static std::vector<void*> FindAllClassesNamed(void* baseClass, const char* const* keywords, int limit = 32) {
+    std::vector<void*> out;
+    GObjects_t* go = GObjectArray();
+    void* classClass = FindObj("/Script/CoreUObject.Class");
+    if (!go || !baseClass || !classClass) return out;
+    for (int32 i = 0; i < go->NumElements && (int)out.size() < limit; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object) || object == baseClass) continue;
+        if (!IsA(object, classClass)) continue;
+        if (!SubclassOfFast(object, baseClass)) continue;
+        std::string n = ObjName(object);
+        if (n.size() < 3) continue;
+        for (int k = 0; keywords[k]; ++k)
+            if (n.find(keywords[k]) != std::string::npos) { out.push_back(object); break; }
+    }
+    return out;
 }
 
 // ============================================================================
@@ -719,6 +806,18 @@ static void* SpawnActor(void* world, void* klass, void* owner, const Transform& 
         profile::BeginSpawn)(world, klass, &t, 1, owner);
     return actor ? Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t) : nullptr;
 }
+// [F31] Erbium building order: BeginSpawn → InitializeKismetSpawnedBuildingActor
+// → FinishSpawn. Initializing only AFTER FinishSpawn re-runs component state
+// on a live actor (crash on build placement).
+static void* SpawnActorUnfinished(void* world, void* klass, void* owner, const Transform& t) {
+    if (!world || !klass) return nullptr;
+    return Fn<void*(*)(void*, void*, const Transform*, uint8_t, void*)>(
+        profile::BeginSpawn)(world, klass, &t, 1, owner);
+}
+static void FinishSpawnActor(void* actor, const Transform& t) {
+    if (!actor) return;
+    Fn<void*(*)(void*, const Transform*)>(profile::FinishSpawn)(actor, &t);
+}
 static void* ResolveInterface(void* object, void* ifaceClass) {
     if (!object || !ifaceClass) return nullptr;
     using Fn_t = void*(*)(void*, void*);
@@ -762,7 +861,11 @@ struct Session {
     bool  quickbars_initialized = false;
     bool  movement_enabled = false;
     bool  lobby_requested = false;      // [F24]
+    bool  vehicles_spawned = false;     // [F29]
+    bool  wildlife_spawned = false;     // [F30]
+    bool  maps_forced = false;          // [F33]
     int   last_phase = -1;              // [F24] GamePhase tracking
+    double finalized_at = 0;            // [F29/F30] auto-spawn timers
     // [F21] local build dedup + touch polling
     void*  held_build_class = nullptr;
     void*  last_build_class = nullptr;
@@ -882,6 +985,12 @@ namespace Athena {
     // [F18] pickups / [movement]
     void ServerHandlePickup(void* pickup);
     void EnableMovementFeatures();
+
+    // [F28-F33] Erbium-parity world systems
+    void ForceLevelStreaming();        // [F28] stream in unloaded map regions
+    int  SpawnVehiclesNear(int max);   // [F29] cars/bikes from map spawners
+    int  SpawnWildlifeNear(int max);   // [F30] boars/chickens/wolves/…
+    void ForceMapsVisible();           // [F33] minimap + full map
 }
 
 // ============================================================================
@@ -1832,6 +1941,9 @@ void Athena::FinalizePlayer() {
     ForcePlayerVisible();
     SetPawnHealth(100.0f);
     RefreshHUD();
+    session.finalized_at = Monotonic();
+    ForceMapsVisible();       // [F33] minimap + full map
+    ForceLevelStreaming();    // [F28] first stream-in pass
     LOG("Finalize: complete");
 }
 
@@ -1851,7 +1963,27 @@ void Athena::Tick() {
     static double lastSprintCheck = 0;
     static double lastQBCheck = 0;
     static double lastMovementCheck = 0;
+    static double lastStreamForce = 0;   // [F28]
     static int qbRetries = 0;
+
+    // [F28] Keep forcing streaming levels while the match is young — the
+    // engine re-evaluates streaming on its own schedule and may re-hide.
+    if (session.finalized && now - lastStreamForce > 8.0 && now - session.finalized_at < 150.0) {
+        lastStreamForce = now;
+        ForceLevelStreaming();
+    }
+    // [F29] Auto vehicle pass once, ~12s after finalize (Erbium parity).
+    if (session.finalized && !session.vehicles_spawned && now - session.finalized_at > 12.0) {
+        session.vehicles_spawned = true;
+        SpawnVehiclesNear(12);
+    }
+    // [F30] Auto wildlife pass once, ~16s after finalize.
+    if (session.finalized && !session.wildlife_spawned && now - session.finalized_at > 16.0) {
+        session.wildlife_spawned = true;
+        SpawnWildlifeNear(8);
+    }
+    // [F33] Retry the map flags a couple of times — the manager may spawn late.
+    if (session.finalized && !session.maps_forced && now - session.finalized_at > 20.0) ForceMapsVisible();
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
     if (session.finalized && session.pawn && now - lastAbilityCheck > 10.0) {
@@ -2041,6 +2173,7 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
     if (slot >= 0 && slot < 6) {
         (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot] = inst;
         BindSlot(inst, slot, bar);
+        ForceUpdateQuickBars();   // [F32] refresh the bar on every pickup/give
     }
     LOG("Inventory inserted %s count=%d slot=%d bar=%u indices=%d/%d",
         ObjName(def).c_str(), count, slot, bar, idx, entryIdx);
@@ -2349,6 +2482,154 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, 
     }
 }
 
+// ============================================================================
+// WORLD SYSTEMS — [F28-F33] Erbium parity (streaming / vehicles / wildlife /
+// minimap). All offsets and function paths verified against the 21.30 SDK.
+// ============================================================================
+
+// [F28] Standalone clients never receive the server's level-streaming
+// visibility updates, so distant map regions stay unloaded. Force every
+// UWorld.StreamingLevels (@0x88) entry to load+show. Reflected in 21.30:
+// ULevelStreaming.SetShouldBeLoaded(bInShouldBeLoaded) / SetShouldBeVisible.
+void Athena::ForceLevelStreaming() {
+    if (!session.world) return;
+    Array levels = Read<Array>((char*)session.world + profile::World_StreamingLevels);
+    if (levels.Count < 0 || levels.Count > 4096 || !levels.Data) return;
+    Call load("/Script/Engine.LevelStreaming.SetShouldBeLoaded");
+    Call vis ("/Script/Engine.LevelStreaming.SetShouldBeVisible");
+    int forced = 0;
+    for (int i = 0; i < levels.Count; ++i) {
+        void* level = Read<void*>(levels.Data, (size_t)i * 8);
+        if (!level || IsBadPtr(level)) continue;
+        bool okL = false, okV = false;
+        if (load.ok()) { bool b = true; okL = load.set("bInShouldBeLoaded", b) && load.run(level); }
+        if (vis.ok())  { bool b = true; okV = vis.set("bInShouldBeVisible", b) && vis.run(level); }
+        if (okL || okV) ++forced;
+    }
+    LOG("[Stream] forced %d/%d streaming levels (load+visible)", forced, levels.Count);
+}
+
+// [F29] Vehicles — Erbium port. The map's own AFortAthenaVehicleSpawner
+// actors carry CachedFortVehicleItemDef (@0x2B8) whose VehicleActorClass
+// (@0xA38) is the exact 21.30 vehicle class (Erbium notes spawners are
+// automatic on s20/s21/s22 — we mirror that server logic locally).
+int Athena::SpawnVehiclesNear(int max) {
+    if (!session.world || max < 1) return 0;
+    void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
+    void* vehicleCls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+    if (!spawnerCls || !vehicleCls) { LOG("[Veh] base classes missing"); return 0; }
+    Call loc("/Script/Engine.Actor.K2_GetActorLocation");
+    Rotator identity{};
+    int spawned = 0;
+
+    auto spawn_at = [&](void* vclass, const Vector& at) -> bool {
+        if (!vclass || IsBadPtr(vclass) || !SubclassOfFast(vclass, vehicleCls)) return false;
+        Transform t{};
+        t.Location[0] = at.X; t.Location[1] = at.Y; t.Location[2] = at.Z + 150.0;
+        RotatorToQuat(identity, t.Rotation);
+        void* veh = SpawnActor(session.world, vclass, session.controller, t);
+        if (!veh) return false;
+        LOG("[Veh] spawned %s", ObjName(vclass).c_str());
+        return true;
+    };
+
+    auto spawners = FindAllInstances(spawnerCls, 48);
+    LOG("[Veh] %zu spawner actors on map", spawners.size());
+    for (void* sp : spawners) {
+        if (spawned >= max) break;
+        if (!sp || IsBadPtr(sp)) continue;
+        Vector at{};
+        if (!loc.ok() || !loc.run(sp)) continue;
+        at = loc.result<Vector>();
+        if (!std::isfinite(at.X) || !std::isfinite(at.Y) || !std::isfinite(at.Z)) continue;
+        void* itemDef = Read<void*>(sp, profile::VehicleSpawner_CachedItemDef);
+        void* vclass  = (itemDef && !IsBadPtr(itemDef)) ? Read<void*>(itemDef, profile::VehicleItemDef_ActorClass) : nullptr;
+        if (spawn_at(vclass, at)) ++spawned;
+    }
+
+    if (spawned < max) {
+        // Fallback: park a few of every loaded BP vehicle class near the player.
+        // Prefer generated BP classes ("*_C") — native intermediates are often
+        // abstract and spawn nothing.
+        static const char* const veh_kws[] = {"vehicle", "car", "truck", "bike", "motorcycle", nullptr};
+        Vector origin{};
+        if (ActorLocation(session.pawn, origin)) {
+            auto classes = FindAllClassesNamed(vehicleCls, veh_kws, 32);
+            std::vector<void*> bp, native;
+            for (void* c : classes) {
+                std::string n = ObjName(c);
+                if (n.find("_C") != std::string::npos) bp.push_back(c); else native.push_back(c);
+            }
+            auto& ordered = !bp.empty() ? bp : native;
+            int ring = 0;
+            for (void* cls : ordered) {
+                if (spawned >= max) break;
+                static const double offs[8][2] = {{700,0},{-700,0},{0,700},{0,-700},{700,700},{-700,-700},{700,-700},{-700,700}};
+                Vector at = origin;
+                at.X += offs[ring % 8][0]; at.Y += offs[ring % 8][1]; at.Z += 150.0;
+                ++ring;
+                if (spawn_at(cls, at)) ++spawned;
+            }
+        }
+    }
+    LOG("[Veh] total spawned=%d", spawned);
+    return spawned;
+}
+
+// [F30] Wildlife — spawn loaded BP animal pawns (deriving from FortAIPawn).
+// The map load pulls in the wildlife BPs referenced by its own spawners, so a
+// GObjects scan finds the exact 21.30 animal classes without hardcoded paths.
+int Athena::SpawnWildlifeNear(int max) {
+    if (!session.world || !session.pawn || max < 1) return 0;
+    void* aiPawn = FindObj("/Script/FortniteGame.FortAIPawn");
+    if (!aiPawn) { LOG("[Wild] FortAIPawn missing"); return 0; }
+    static const char* const animal_kws[] = {"boar", "chicken", "wolf", "frog", "raptor",
+                                             "crow", "bird", "boar_", "wildlife", nullptr};
+    auto classes = FindAllClassesNamed(aiPawn, animal_kws, 24);
+    LOG("[Wild] %zu animal classes loaded", classes.size());
+    if (classes.empty()) return 0;
+    Vector origin{};
+    if (!ActorLocation(session.pawn, origin)) return 0;
+    static const double offs[12][2] = {{600,0},{-600,0},{0,600},{0,-600},{600,600},{-600,-600},
+                                       {600,-600},{-600,600},{900,0},{-900,0},{0,900},{0,-900}};
+    Rotator identity{};
+    int spawned = 0;
+    for (int i = 0; i < max; ++i) {
+        void* cls = classes[(size_t)i % classes.size()];
+        Transform t{};
+        t.Location[0] = origin.X + offs[i % 12][0];
+        t.Location[1] = origin.Y + offs[i % 12][1];
+        t.Location[2] = origin.Z + 100.0;
+        RotatorToQuat(identity, t.Rotation);
+        void* animal = SpawnActor(session.world, cls, session.controller, t);
+        if (animal) { ++spawned; LOG("[Wild] spawned %s", ObjName(cls).c_str()); }
+    }
+    LOG("[Wild] total spawned=%d", spawned);
+    return spawned;
+}
+
+// [F33] Minimap / full map — AFortInGameMapManager is reflected in 21.30:
+// GetCurrent(WorldContextObject) + AllowShowMiniMap(bAllowShow) +
+// AllowShowMainMap(bAllowShow). Some HUDs start with both flags cleared when
+// no server drives them; force them on after the player is finalized.
+void Athena::ForceMapsVisible() {
+    if (!session.world || session.maps_forced) return;
+    void* cdo = FindObj("/Script/FortniteGame.Default__AFortInGameMapManager");
+    Call cur("/Script/FortniteGame.AFortInGameMapManager.GetCurrent");
+    if (!cur.ok()) { LOG("[Map] InGameMapManager reflection missing"); return; }
+    void* receiver = cdo ? cdo : session.world;
+    if (!cur.set("WorldContextObject", session.world) || !cur.run(receiver)) return;
+    void* mgr = cur.result<void*>();
+    if (!mgr || IsBadPtr(mgr)) { LOG("[Map] manager instance null"); return; }
+    int shown = 0;
+    Call mini("/Script/FortniteGame.AFortInGameMapManager.AllowShowMiniMap");
+    if (mini.ok()) { bool b = true; if (mini.set("bAllowShow", b) && mini.run(mgr)) ++shown; }
+    Call full("/Script/FortniteGame.AFortInGameMapManager.AllowShowMainMap");
+    if (full.ok()) { bool b = true; if (full.set("bAllowShow", b) && full.run(mgr)) ++shown; }
+    session.maps_forced = shown > 0;
+    LOG("[Map] AllowShow calls applied=%d (mgr=%p)", shown, mgr);
+}
+
 void Athena::DropInventoryItem(Guid guid, int count) {
     if (!session.inventory) return;
     void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
@@ -2634,6 +2915,24 @@ static void RotatorToQuat(const Rotator& r, double out[4]) {
     out[3] = cr * cp * cy + sr * sp * sy;
 }
 
+// [F31] Shared building placement (Erbium FortPlayerControllerAthena order):
+// BeginSpawn → InitializeKismetSpawnedBuildingActor → FinishSpawn → flags.
+static void* PlaceBuildingActor(void* klass, const Transform& t, bool mirrored) {
+    if (!session.world || !klass) return nullptr;
+    void* actor = SpawnActorUnfinished(session.world, klass, session.controller, t);
+    if (!actor) return nullptr;
+    Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
+    bool anims = true;
+    if (init.ok() && init.set("BuildingOwner", actor) && init.set("SpawningController", session.controller) &&
+        init.set("bUsePlayerBuildAnimations", anims))
+        init.run(actor);
+    FinishSpawnActor(actor, t);
+    SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayerPlaced", true);
+    Call mirror("/Script/FortniteGame.BuildingSMActor.SetMirrored");
+    if (mirror.ok()) { bool m = mirrored; if (mirror.set("bIsMirrored", m)) mirror.run(actor); }
+    return actor;
+}
+
 // [F21] Build from the controller's local preview state — the mobile client
 // keeps LastBuildPreviewGridSnapLoc/Rot + CurrentBuildableClass updated while
 // the build marker is visible, so no server payload is required.
@@ -2673,26 +2972,12 @@ bool Athena::LocalBuild() {
     Transform t{};
     t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
     RotatorToQuat(rot, t.Rotation);
-    void* actor = SpawnActor(session.world, klass, session.controller, t);
+    void* actor = PlaceBuildingActor(klass, t, mirrored);   // [F31] Erbium order
     if (!actor) { LOG("[Build] spawn returned null"); return true; }
     session.last_build_class = klass;
     session.last_build_time = now;
     for (int i = 0; i < 6; ++i) session.last_build_pose[(size_t)i] = pose[i];
-
-    SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayerPlaced", true);
-    // [F03] SetMirrored lives on BuildingSMActor in 21.30.
-    Call mirror("/Script/FortniteGame.BuildingSMActor.SetMirrored");
-    if (mirror.ok()) { bool m = mirrored; if (mirror.set("bIsMirrored", m)) mirror.run(actor); }
-    Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
-    bool animations = true;
-    if (init.ok() && init.set("BuildingOwner", actor) && init.set("SpawningController", session.controller) &&
-        init.set("bUsePlayerBuildAnimations", animations) && init.run(actor)) {
-        LOG("[Build] ✅ local build initialized %s", ObjName(klass).c_str());
-    } else {
-        LOG("[Build] init failed — destroying piece");
-        Call d("/Script/Engine.Actor.K2_DestroyActor");
-        if (d.ok()) d.run(actor);
-    }
+    LOG("[Build] ✅ local build placed %s", ObjName(klass).c_str());
     return true;
 }
 
@@ -2744,17 +3029,9 @@ void Athena::OnServerCreateBuildingActor(void* params) {
         Transform t{};
         t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
         RotatorToQuat(rot, t.Rotation);
-        void* actor = SpawnActor(session.world, cls, session.controller, t);
+        void* actor = PlaceBuildingActor(cls, t, mirrored);   // [F31] Erbium order
         if (!actor) return;
-        SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayerPlaced", true);
-        Call mirror("/Script/FortniteGame.BuildingSMActor.SetMirrored");
-        if (mirror.ok()) { bool m = mirrored; if (mirror.set("bIsMirrored", m)) mirror.run(actor); }
-        Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
-        bool bUse = true;
-        if (init.ok()) {
-            init.set("BuildingOwner", actor); init.set("SpawningController", session.controller);
-            init.set("bUsePlayerBuildAnimations", bUse); init.run(actor);
-        }
+        LOG("[Build] RPC build placed %s", ObjName(cls).c_str());
     } else {
         LOG("[Build] unexpected ServerCreateBuildingActor size %u — using local preview", total);
         LocalBuild();
@@ -2791,6 +3068,14 @@ void Athena::OnBeginEditActor(void* piece) {
 
 void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored) {
     if (!actor) return;
+    // [F31] Preserve the original piece transform for the edited replacement
+    // (the old code respawned at world origin).
+    Vector keepLoc{};
+    Rotator keepRot{};
+    { Call l("/Script/Engine.Actor.K2_GetActorLocation");
+      if (l.ok() && l.run(actor)) keepLoc = l.result<Vector>(); }
+    { Call r("/Script/Engine.Actor.K2_GetActorRotation");
+      if (r.ok() && r.run(actor)) keepRot = r.result<Rotator>(); }
     SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayDestructionEffects", false);
     Vector zero{0.0, 0.0, 0.0};
     Call s("/Script/Engine.Actor.SetActorScale3D");
@@ -2799,16 +3084,14 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
     if (d.ok()) d.run(actor);
     if (!newClass) return;
     Transform t{};
-    void* edited = SpawnActor(session.world, newClass, session.controller, t);
+    t.Location[0] = std::isfinite(keepLoc.X) ? keepLoc.X : 0.0;
+    t.Location[1] = std::isfinite(keepLoc.Y) ? keepLoc.Y : 0.0;
+    t.Location[2] = std::isfinite(keepLoc.Z) ? keepLoc.Z : 0.0;
+    RotatorToQuat(keepRot, t.Rotation);
+    void* edited = PlaceBuildingActor(newClass, t, mirrored);   // [F31]
     if (!edited) return;
     Call m("/Script/FortniteGame.BuildingSMActor.SetMirrored");                 // [F03]
     if (m.ok()) { bool mm = mirrored != 0; if (m.set("bIsMirrored", mm)) m.run(edited); }
-    Call init("/Script/FortniteGame.BuildingActor.InitializeKismetSpawnedBuildingActor");
-    bool bUse = true;
-    if (init.ok()) {
-        init.set("BuildingOwner", edited); init.set("SpawningController", session.controller);
-        init.set("bUsePlayerBuildAnimations", bUse); init.run(edited);
-    }
     LOG("[Edit] replaced with %s", ObjName(newClass).c_str());
 }
 
@@ -3310,7 +3593,19 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                 if (!def) LOG("Give: asset not found: %s", asset);
                 else LOG("Give result=%d", (int)Athena::GiveItem(def, count, slot, slot >= 0 && slot < 6 ? 0 : (uint8_t)-1, false));
             }
-        } else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | fly | walk | ghost | god | teleport | era.lobby");
+        }
+        // [F28-F33] world systems
+        else if (normalized.rfind("era.vehicles", 0) == 0) {
+            int n = 12; sscanf(normalized.c_str(), "era.vehicles %d", &n);
+            LOG("[Veh] command -> spawned %d", Athena::SpawnVehiclesNear(n < 1 ? 1 : (n > 40 ? 40 : n)));
+        }
+        else if (normalized.rfind("era.animals", 0) == 0) {
+            int n = 8; sscanf(normalized.c_str(), "era.animals %d", &n);
+            LOG("[Wild] command -> spawned %d", Athena::SpawnWildlifeNear(n < 1 ? 1 : (n > 24 ? 24 : n)));
+        }
+        else if (normalized == "era.stream") Athena::ForceLevelStreaming();
+        else if (normalized == "era.hud") { Athena::ForceMapsVisible(); Athena::RefreshHUD(); }
+        else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles [n] | era.animals [n] | era.stream | era.hud | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
@@ -3365,6 +3660,7 @@ static void* Worker(void*) {
         if (g_status.load() == 0) usleep(100000);
     }
     if (g_status.load() != 1) { LOG("Timeout"); return nullptr; }
+    InstallCrashLogger();   // [F34] capture crash offsets from now on
     usleep(300000);
     InstallHooks();
     LOG("=== Ready ===");
