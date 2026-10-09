@@ -381,6 +381,8 @@ static void* incoming(void* function, void* data, const char* key, int expected_
 static GObjects_t* GObjectArray();
 static void RotatorToQuat(const Rotator& r, double out[4]);   // [F28-F33] forward decl
 static bool IsCDO(void* obj);                                 // [F39] forward decl
+static uint32_t BRRand();                                     // [F75-c] forward decl (wildlife)
+static float BRRand01();                                      // [F75-c] forward decl (wildlife)
 // static void ZoneMonitor(); // [F35] removed — see [F73] note near BRTick
 static double Monotonic();                                    // [F54] forward decl (GObjectArray probe)
 
@@ -1109,6 +1111,9 @@ struct Session {
     std::vector<Vector> near_pickup_locs;    // [F65]
     std::map<void*, double> pickup_last_at;  // [F65] per-pickup collect cooldown
     int   hud_phase_kick = 0;                // [F69] ClientOnPawnSpawned re-kick
+    Guid  last_equip_guid{};                 // [F75] dedupe — skip re-equip of the held item
+    void* bot_inventory_cls = nullptr;       // [F75] AFortInventory for bot WorldInventory
+    std::set<void*> interact_logged;         // [F75-d] one-shot per interact candidate
 } session;
 
 static double Monotonic() {
@@ -1178,11 +1183,16 @@ struct BRCtx {
 };
 static BRCtx br;
 
-// [F74-e] bot movement motor state — one entry per live bot pawn (Erbium bots
-// are static props of the roster; the user wants a living match, so each bot
-// wanders: SetControlRotation heading + AddMovementInput drive pulses).
+// [F74-e/F75-b] bot + wildlife movement motor state. The F74 motors only sent
+// AddMovementInput pulses — on this build the pulses never translated into
+// movement (the CharacterMovement never consumed ControlInputVector for our
+// raw-spawned pawns), so the roster stayed mannequins. F75 drives the
+// CharacterMovementComponent's Velocity directly every tick (the same channel
+// LaunchCharacter uses) plus AddMovementInput as a secondary, with a
+// SetControlRotation heading re-roll. Dead pawns drop out of the lists.
 struct BRBotMotor { void* pawn; float yaw; double next_heading; };
 static std::vector<BRBotMotor> g_bot_motors;
+static std::vector<BRBotMotor> g_wild_motors;   // [F75-c] animals roam too
 
 // ============================================================================
 // ATHENA NAMESPACE
@@ -1264,6 +1274,7 @@ namespace Athena {
     void ForceLevelStreaming();        // [F28] stream in unloaded map regions
     int  SpawnVehiclesNear(int max);   // [F29] cars/bikes from map spawners
     int  SpawnWildlifeNear(int max);   // [F30] boars/chickens/wolves/…
+    int  SpawnWildlifeScattered(int max); // [F75-c] animals across the whole map
     void ForceMapsVisible();           // [F33] minimap + full map
 
     // [F35-F45] world systems v2
@@ -2435,13 +2446,17 @@ void Athena::Tick() {
     }
     // [F30/F38/F54] Wildlife pass — the Irwin animal BPs stream in late, so
     // retry every 20s (max 10) instead of the one-shot that fired too early.
+    // [F75-c] once the near ring lands, also scatter animals across the map.
     if (session.finalized && !session.wildlife_spawned && session.wildlife_attempts < 10 &&
         now - session.finalized_at > 16.0) {
         static double lastWild = 0;
         if (now - lastWild > 20.0) {
             lastWild = now;
             ++session.wildlife_attempts;
-            if (SpawnWildlifeNear(8) > 0) session.wildlife_spawned = true;
+            if (SpawnWildlifeNear(8) > 0) {
+                session.wildlife_spawned = true;
+                SpawnWildlifeScattered(12);
+            }
         }
     }
     // [F33] Retry the map flags a couple of times — the manager may spawn late.
@@ -2867,11 +2882,29 @@ void Athena::EquipSlot(int slot) {
     if (eq.run(session.pawn)) {
         void* weapon = eq.result<void*>();
         LOG("Equip %s -> %p", ObjName(weaponDef).c_str(), weapon);
+        session.last_equip_guid = guid;   // [F75] dedupe marker
     }
 }
 
 void Athena::OnServerExecuteInventoryItem(Guid guid) {
     if (!session.inventory || !session.pawn) return;
+    // [F75-a] dedupe — the native warmup-end transition re-fires the pickaxe
+    // equip at T-0 while the pickaxe is ALREADY the held weapon. Re-running
+    // EquipWeaponDefinition on the held actor mid-phase-change is a crash
+    // window on this build. Only the truly-held item is skipped; switching
+    // back to it from another slot (weapon not in hand) still equips.
+    if (void* curW = Read<void*>(session.pawn, profile::FortPawn_CurrentWeapon)) {
+        if (!IsBadPtr(curW)) {
+            if (void* gProp = GetProp("/Script/FortniteGame.FortWeapon.ItemEntryGuid")) {
+                Guid held = Read<Guid>(GetField(curW, gProp));
+                if (!memcmp(&held, &guid, sizeof(Guid))) {
+                    static bool once = false;
+                    if (!once) { once = true; LOG("[Equip] duplicate equip skipped (item already in hand)"); }
+                    return;
+                }
+            }
+        }
+    }
     void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
     void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
     if (!instProp || !invProp) return;
@@ -3378,22 +3411,11 @@ void Athena::VehicleRetry() {
     (void)spawned;
 }
 
-// [F30/F38] Wildlife — field fix: the first device run found "0 animal
-// classes loaded" because the keyword list (boar/chicken/wolf/…) doesn't
-// match 21.30's real BP names. In 21.30 the wildlife pawns are the Irwin
-// modules (Dumper-7 BP headers confirm): NPC_Pawn_Irwin_Prey_Burt_C (boar,
-// rideable — BoarRidableComponent ships in this build), Nug (chicken),
-// Smackie, with NPC_Wildlife_Controller_Parent_C as their AIController.
-// Strategy: (1) scan ALL loaded FortAIPawn subclasses and pick concrete ones;
-// (2) fall back to StaticLoadClass on the Irwin modules; (3) spawn an
-// AIController per animal (from Pawn.AIControllerClass) and possess, so the
-// BP locomotion/wander logic actually runs instead of statues.
-int Athena::SpawnWildlifeNear(int max) {
-    if (!session.world || !session.pawn || max < 1) return 0;
+// [F75-c] shared wildlife class resolution — loaded FortAIPawn subclasses
+// (Irwin modules first) + the static-load fallback.
+static void WildClasses(std::vector<void*>& classes) {
     void* aiPawn = FindObj("/Script/FortniteGame.FortAIPawn");
-    if (!aiPawn) { LOG("[Wild] FortAIPawn missing"); return 0; }
-
-    std::vector<void*> classes;
+    if (!aiPawn) { LOG("[Wild] FortAIPawn missing"); return; }
     {
         static const char* const prefer[] = {"irwin", "burt", "nug", "smackie", "wildlife", nullptr};
         static const char* const skip[]   = {"parent", "base", "controller", "loot", "spawner", nullptr};
@@ -3417,7 +3439,6 @@ int Athena::SpawnWildlifeNear(int max) {
             }
         }
     }
-
     // Static-load fallback — Irwin modules (paths unknown, try common mounts).
     if (classes.empty()) {
         static const char* const pkgs[] = {
@@ -3442,43 +3463,84 @@ int Athena::SpawnWildlifeNear(int max) {
         }
         LOG("[Wild] static-load fallback resolved %zu classes", classes.size());
     }
+}
 
+// [F75-c] spawn + prepare one animal (AI controller, survival flags, motor).
+static void WildSpawnOne(void* cls, const Vector& at) {
+    Transform t{};
+    t.Location[0] = at.X; t.Location[1] = at.Y; t.Location[2] = at.Z;
+    Rotator identity{};
+    RotatorToQuat(identity, t.Rotation);
+    void* animal = SpawnActor(session.world, cls, session.controller, t);
+    if (!animal) return;
+    // Give the animal its AI controller so BP wander/agro logic runs.
+    {
+        void* aiCls = GetObjField(animal, "/Script/Engine.Pawn.AIControllerClass");
+        if (aiCls && !IsBadPtr(aiCls) && SubclassOfFast(aiCls, FindObj("/Script/Engine.AIController"))) {
+            Transform ct{}; ct.Location[0] = at.X; ct.Location[1] = at.Y; ct.Location[2] = at.Z;
+            RotatorToQuat(identity, ct.Rotation);
+            if (void* aic = SpawnActor(session.world, aiCls, animal, ct)) Possess(aic, animal);
+        }
+    }
+    // [F71] wildlife must survive: the field log showed spawned animals
+    // dying (spawn/fall damage). Disable damage, full health, force shown.
+    SetBool(animal, "/Script/Engine.Actor.bCanBeDamaged", false);
+    { Call hp("/Script/FortniteGame.FortPawn.SetMaxHealth"); if (hp.ok()) { float v = 100.0f; if (hp.set_at(0, v)) hp.run(animal); } }
+    { Call hp("/Script/FortniteGame.FortPawn.SetHealth");     if (hp.ok()) { float v = 100.0f; if (hp.set_at(0, v)) hp.run(animal); } }
+    { Call sh("/Script/Engine.Actor.SetActorHiddenInGame");   if (sh.ok()) { bool h = false; if (sh.set("bNewHidden", h)) sh.run(animal); } }
+    // [F75-c] roam motor — animals drift around their spawn area (the AI
+    // controllers alone do not drive them on this build).
+    g_wild_motors.push_back({animal, (float)(BRRand01() * 360.0), 0.0});
+}
+
+int Athena::SpawnWildlifeNear(int max) {
+    if (!session.world || !session.pawn || max < 1) return 0;
+    std::vector<void*> classes;
+    WildClasses(classes);
     LOG("[Wild] %zu animal classes available", classes.size());
     if (classes.empty()) return 0;
     Vector origin{};
     if (!ActorLocation(session.pawn, origin)) return 0;
     static const double offs[12][2] = {{600,0},{-600,0},{0,600},{0,-600},{600,600},{-600,-600},
                                        {600,-600},{-600,600},{900,0},{-900,0},{0,900},{0,-900}};
-    Rotator identity{};
     int spawned = 0;
     for (int i = 0; i < max; ++i) {
         void* cls = classes[(size_t)i % classes.size()];
-        Transform t{};
-        t.Location[0] = origin.X + offs[i % 12][0];
-        t.Location[1] = origin.Y + offs[i % 12][1];
-        t.Location[2] = origin.Z + 100.0;
-        RotatorToQuat(identity, t.Rotation);
-        void* animal = SpawnActor(session.world, cls, session.controller, t);
-        if (!animal) continue;
-        // Give the animal its AI controller so BP wander/agro logic runs.
-        {
-            void* aiCls = GetObjField(animal, "/Script/Engine.Pawn.AIControllerClass");
-            if (aiCls && !IsBadPtr(aiCls) && SubclassOfFast(aiCls, FindObj("/Script/Engine.AIController"))) {
-                Transform ct{}; ct.Location[0] = t.Location[0]; ct.Location[1] = t.Location[1]; ct.Location[2] = t.Location[2];
-                RotatorToQuat(identity, ct.Rotation);
-                if (void* aic = SpawnActor(session.world, aiCls, animal, ct)) Possess(aic, animal);
-            }
-        }
-        // [F71] wildlife must survive: the field log showed spawned animals
-        // dying (spawn/fall damage). Disable damage, full health, force shown.
-        SetBool(animal, "/Script/Engine.Actor.bCanBeDamaged", false);
-        { Call hp("/Script/FortniteGame.FortPawn.SetMaxHealth"); if (hp.ok()) { float v = 100.0f; if (hp.set_at(0, v)) hp.run(animal); } }
-        { Call hp("/Script/FortniteGame.FortPawn.SetHealth");     if (hp.ok()) { float v = 100.0f; if (hp.set_at(0, v)) hp.run(animal); } }
-        { Call sh("/Script/Engine.Actor.SetActorHiddenInGame");   if (sh.ok()) { bool h = false; if (sh.set("bNewHidden", h)) sh.run(animal); } }
+        Vector at{ origin.X + offs[i % 12][0], origin.Y + offs[i % 12][1], origin.Z + 100.0 };
+        WildSpawnOne(cls, at);
         ++spawned;
         LOG("[Wild] spawned %s", ObjName(cls).c_str());
     }
     LOG("[Wild] total spawned=%d", spawned);
+    return spawned;
+}
+
+// [F75-c] map-wide wildlife — the user wants animals "in their places"
+// (transl: spread across the island like the native lifecycle does), not
+// just a ring around the player. The map's own wildlife spawner actors are
+// not discoverable on 21.30 (the lobby dump holds no such class and the
+// runtime scan only surfaces vehicle spawners), so the nearest faithful
+// approximation is a uniform scatter over the playable bounds with the same
+// Irwin classes. They drop in from Z+600 and land (fall damage disabled).
+int Athena::SpawnWildlifeScattered(int max) {
+    if (!session.world || !session.pawn || max < 1) return 0;
+    std::vector<void*> classes;
+    WildClasses(classes);
+    if (classes.empty()) { LOG("[Wild] scattered — no classes"); return 0; }
+    Vector center{0, 0, 0};
+    if (!br.zone_centers.empty()) center = br.zone_centers[0];
+    int spawned = 0;
+    for (int i = 0; i < max; ++i) {
+        float ang = BRRand01() * 6.2831853f;
+        float dist = 12000.0f + BRRand01() * 68000.0f;   // 120m..800m from center
+        Vector at{ center.X + std::cos(ang) * dist,
+                   center.Y + std::sin(ang) * dist,
+                   600.0 };
+        void* cls = classes[(size_t)(BRRand() % classes.size())];
+        WildSpawnOne(cls, at);
+        ++spawned;
+    }
+    LOG("[Wild] scattered %d animals across the map (motors=%zu)", spawned, g_wild_motors.size());
     return spawned;
 }
 
@@ -4377,7 +4439,19 @@ static void BRStartAircraftPhase() {
     }
 
     void* aircraft = nullptr;
-    if (acCls && !IsBadPtr(acCls)) {
+    // [F75-a] adopt-first — the native warmup-end transition may have already
+    // spawned the aircraft at this exact tick (it fires at the same moment we
+    // do). GameState.Aircraft/Aircrafts[0] non-null means the real native bus
+    // exists: adopt it (Erbium 1:1 — the real server always has exactly one)
+    // instead of spawning a duplicate.
+    if (void* ac1Prop = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircraft")) {
+        void* existing = Read<void*>(GetField(session.state, ac1Prop), 0);
+        if (existing && !IsBadPtr(existing)) {
+            aircraft = existing;
+            LOG("[BR] native aircraft already present — adopting %p (no duplicate spawn)", existing);
+        }
+    }
+    if (!aircraft && acCls && !IsBadPtr(acCls)) {
         // [F74-c] resolve the bus skin BEFORE the spawn — the native
         // SpawnAircraft reads GameState->DefaultBattleBus while building the
         // cosmetic bus actor (Erbium sets it in HandleMatchHasStarted, i.e.
@@ -4735,6 +4809,55 @@ static void BRSpawnBotBatch(int n) {
         // ability sets (Erbium: GiveAbilitySet per AbilitySets entry)
         for (void* set : session.granted_ability_sets) ApplyAbilitySet(pawn, set);
 
+        // [F75-a] WorldInventory — the F74 crash at bus-zero died inside the
+        // NATIVE warmup-end transition (evidence: the pickaxe
+        // ServerExecuteInventoryItem fired by the game itself right before the
+        // crash, plus no [BR] StartAircraftPhase log). That transition walks
+        // every controller in AlivePlayers and dereferences WorldInventory —
+        // our bots had none (Erbium's own spawnbot spawns one but it is
+        // commented out there because the real server never touches it; our
+        // standalone native paths do). Spawn a real empty inventory per bot.
+        if (!session.bot_inventory_cls) session.bot_inventory_cls = FindObj("/Script/FortniteGame.FortInventory");
+        if (session.bot_inventory_cls) {
+            Transform it{};   // zero transform — inventories are non-world actors
+            void* inv = SpawnActor(session.world, session.bot_inventory_cls, ctrl, it);
+            if (inv) {
+                if (void* wiProp = GetProp("/Script/FortniteGame.FortPlayerController.WorldInventory"))
+                    Write<void*>(GetField(ctrl, wiProp), 0, inv);
+                SetBool(ctrl, "/Script/FortniteGame.FortPlayerController.bHasInitializedWorldInventory", true);
+                SetBool(ctrl, "/Script/FortniteGame.FortPlayerController.bIsWorldInventoryInitialized", true);
+                if (void* itProp = GetProp("/Script/FortniteGame.FortInventory.InventoryType"))
+                    Write<uint8_t>(GetField(inv, itProp), 0, 0);   // EFortInventoryType::World
+            }
+        }
+
+        // [F75-a] GameMemberInfoArray — Erbium spawnbot registers every bot
+        // (FGameMemberInfo{SquadId,TeamIndex} + array add). Native code
+        // (team screens, PlayerArray walks) reads this list; leaving bots out
+        // makes the roster invisible to it.
+        {
+            void* gma = GetObjField(session.state, "/Script/FortniteGame.FortGameStateAthena.GameMemberInfoArray");
+            void* membersProp = GetProp("/Script/FortniteGame.GameMemberInfoArray.Members");
+            if (gma && membersProp) {
+                int elem = Read<int>(membersProp, profile::PropElementSize);
+                if (elem >= 0x10 && elem <= 0x80) {
+                    std::vector<uint8_t> member((size_t)elem, 0);
+                    // FFastArraySerializerItem head: keys are -1 pre-replication
+                    Write<int32>(member.data(), 0, -1);
+                    Write<int32>(member.data(), 4, -1);
+                    Write<int32>(member.data(), 8, -1);
+                    void* sqProp = GetProp("/Script/FortniteGame.GameMemberInfo.SquadId");
+                    void* tiProp = GetProp("/Script/FortniteGame.GameMemberInfo.TeamIndex");
+                    int sqOff = sqProp ? Read<int>(sqProp, profile::PropOffset) : 0x0C;
+                    int tiOff = tiProp ? Read<int>(tiProp, profile::PropOffset) : 0x0D;
+                    if (sqOff >= 0 && sqOff < elem) member[(size_t)sqOff] = (uint8_t)(team - 3);
+                    if (tiOff >= 0 && tiOff < elem) member[(size_t)tiOff] = team;
+                    Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(
+                        GetField(gma, membersProp), membersProp, member.data());
+                }
+            }
+        }
+
         // AlivePlayers (storm/zone natives iterate this)
         if (aliveProp)
             Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(GetField(session.mode, aliveProp), aliveProp, &ctrl);
@@ -4756,49 +4879,79 @@ static void BRSpawnBotBatch(int n) {
 }
 
 // ----------------------------------------------------------------------------
-// [F74-e] Bot movement — the roster was rendered mannequins: a
-// PlayerController-possessed pawn has no input source. Each bot gets a wander
-// motor: re-roll a heading every 2.5-4.5s (SetControlRotation so the pawn
-// faces it — Athena pawns use bUseControllerRotationYaw) and drive the
-// CharacterMovement with AddMovementInput pulses. Cached UFunctions; dead
-// pawns drop out of the motor list.
+// [F74-e/F75-b] Movement motors — velocity-driven. F74's AddMovementInput
+// pulses were verified live in the SDK (Engine.Pawn.AddMovementInput exists
+// with WorldDirection/ScaleValue/bForce) but never moved the raw-spawned
+// pawns: without a full possession/input pipeline the ControlInputVector is
+// not consumed on this build. F75 writes CharacterMovement->Velocity directly
+// every tick (reflection offsets resolved once) — the exact channel
+// LaunchCharacter uses — so the CMC integrates real movement and the anim BP
+// sees Speed > 0 (walk/run cycles play). SetControlRotation keeps the pawn
+// facing the heading (Athena pawns use bUseControllerRotationYaw).
 // ----------------------------------------------------------------------------
-static void BRBotMoveTick() {
-    if (g_bot_motors.empty()) return;
+static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* tag) {
+    if (list.empty()) return;
     double now = Monotonic();
     static Call* rot = nullptr;
     static Call* move = nullptr;
-    static void* ctrlProp = nullptr;     // [F74-e] resolve once — hot path (99 bots/frame)
+    static void* ctrlProp = nullptr;      // hot path — resolve once
+    static void* charMoveProp = nullptr;  // [F75-b] Character.CharacterMovement
+    static void* velProp = nullptr;       // [F75-b] MovementComponent.Velocity
     if (!rot) rot = new Call("/Script/Engine.Controller.SetControlRotation");
     if (!move) move = new Call("/Script/Engine.Pawn.AddMovementInput");
     if (!ctrlProp) ctrlProp = GetProp("/Script/Engine.Pawn.Controller");
+    if (!charMoveProp) charMoveProp = GetProp("/Script/Engine.Character.CharacterMovement");
+    if (!velProp) velProp = GetProp("/Script/Engine.MovementComponent.Velocity");
     int ctrlOff = ctrlProp ? Read<int>(ctrlProp, profile::PropOffset) : -1;
+    int cmOff   = charMoveProp ? Read<int>(charMoveProp, profile::PropOffset) : -1;
+    int vOff    = velProp ? Read<int>(velProp, profile::PropOffset) : -1;
+    static double lastBeat = 0;
+    if (now - lastBeat > 5.0) {
+        lastBeat = now;
+        LOG("[Motor] %s n=%zu rot=%d move=%d cmOff=%d vOff=%d", tag, list.size(),
+            (int)(rot && rot->ok()), (int)(move && move->ok()), cmOff, vOff);
+    }
     size_t w = 0;
-    for (size_t i = 0; i < g_bot_motors.size(); ++i) {
-        BRBotMotor& m = g_bot_motors[i];
+    for (size_t i = 0; i < list.size(); ++i) {
+        BRBotMotor& m = list[i];
         void* pawn = m.pawn;
         if (!pawn || IsBadPtr(pawn)) continue;                 // destroyed (storm/edit)
-        // controller = pawn's owner controller (direct field read, no lookup)
-        void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
+        void* cls = Read<void*>(pawn, profile::ObjectClass);
+        if (!cls || IsBadPtr(cls)) continue;                   // half-freed actor
         if (now >= m.next_heading) {
             m.yaw = (float)(BRRand01() * 360.0);
             m.next_heading = now + 2.5 + BRRand01() * 2.0;
+            void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
             if (ctrl && !IsBadPtr(ctrl) && rot && rot->ok()) {
                 Rotator r{}; r.Pitch = 0; r.Yaw = m.yaw; r.Roll = 0;
                 if (rot->set("NewRotation", r)) rot->run(ctrl);
             }
         }
+        float rad = m.yaw * 3.14159265f / 180.0f;
+        Vector dir{std::cos(rad), std::sin(rad), 0};
+        // [F75-b] primary drive: write CharacterMovement->Velocity (keep the
+        // current Z so gravity still owns vertical motion).
+        if (cmOff > 0 && vOff > 0) {
+            void* cm = Read<void*>(pawn, (size_t)cmOff);
+            if (cm && !IsBadPtr(cm)) {
+                Vector v = Read<Vector>(cm, (size_t)vOff);
+                if (std::isfinite(v.Z)) {
+                    v.X = dir.X * speed; v.Y = dir.Y * speed;
+                    Write<Vector>(cm, (size_t)vOff, v);
+                }
+            }
+        }
+        // secondary: the input pulse (harmless, feeds BP logic that reads it)
         if (move && move->ok()) {
-            float rad = m.yaw * 3.14159265f / 180.0f;
-            Vector dir{std::cos(rad), std::sin(rad), 0};
             float scale = 1.0f; uint8_t force = 0;
             if (move->set("WorldDirection", dir) && move->set("ScaleValue", scale) && move->set("bForce", force))
                 move->run(pawn);
         }
-        g_bot_motors[w++] = m;
+        list[w++] = m;
     }
-    g_bot_motors.resize(w);
+    list.resize(w);
 }
+static void BRBotMoveTick() { MotorTick(g_bot_motors, 320.0f, "Bot"); }
 
 // ----------------------------------------------------------------------------
 // [F73-h] Storm pass — Erbium's GamePhaseLogic Tick tail: bIsInsideSafeZone /
@@ -4986,8 +5139,10 @@ void Athena::BRTick() {
         br.next_bot_wave = mono + 2.0;
         BRSpawnBotBatch(10);
     }
-    // [F74-e] keep the roster alive — wander motors (cheap: cached UFunctions)
+    // [F74-e/F75-b] keep the roster alive — velocity motors (cheap: cached
+    // UFunctions + direct Velocity writes), animals share the same driver
     BRBotMoveTick();
+    MotorTick(g_wild_motors, 200.0f, "Wild");
 
     float now = BRWorldTime();
 
@@ -4996,7 +5151,22 @@ void Athena::BRTick() {
         // flips the step to GetReady before the aircraft launches.
         if (br.step < 3 && br.warmup_end >= 0 && now >= br.warmup_end - 10.0f)
             BRSetGamePhaseStep(3); // EAthenaGamePhaseStep::GetReady
-        if (br.warmup_end >= 0 && now >= br.warmup_end) BRStartAircraftPhase();
+        // [F75-a] GetReady heartbeat — shows exactly how close the crash is
+        if (br.step == 3 && br.warmup_end >= 0) {
+            static double lastReady = 0;
+            double mono2 = mono;
+            if (mono2 - lastReady > 4.0 && now < br.warmup_end) {
+                lastReady = mono2;
+                LOG("[BR] GetReady — bus in %.0fs", (double)br.warmup_end - (double)now);
+            }
+        }
+        if (br.warmup_end >= 0 && now >= br.warmup_end) {
+            // [F75-a] named milestone — if the next log line is missing, the
+            // crash happened inside the native warmup-end transition that
+            // fires at this exact tick (see [PETRACE] + era_crash.txt).
+            LOG("[BR] warmup elapsed (t=%.0f) — launching aircraft (native transition may also fire here)", now);
+            BRStartAircraftPhase();
+        }
         return;
     }
 
@@ -5993,12 +6163,36 @@ void Athena::InteractTick() {
     }
     session.nearest_interact = best;
     session.nearest_kind = bestKind;
+    // [F75-d] one-shot per candidate — proves the scan actually sees world
+    // objects near the player (the user reported zero interaction response;
+    // this line names every interactable the system finds, at what distance).
+    if (best && session.interact_logged.insert(best).second) {
+        std::string cn = ObjName(Read<void*>(best, profile::ObjectClass));
+        LOG("[Interact] candidate: %s (%.1fm, kind=%d)", cn.c_str(), std::sqrt(bestD2) / 100.0, bestKind);
+        if (session.interact_logged.size() > 64) session.interact_logged.clear();
+    }
 
     if (best) {
         // Expose the candidate so the native HUD interact button can appear.
         if (void* comp = GetInteractionComp()) {
             if (void* p = GetProp("/Script/FortniteGame.FortControllerComponent_Interaction.InteractActor"))
                 Write<void*>(GetField(comp, p), 0, best);
+            // [F75-d] the mobile interact prompt also reads the component's
+            // highlighted list — mirror the candidate into it (the native
+            // trace scan never populates it on this offline setup). Keep the
+            // list tiny: drop the oldest entry at 4.
+            if (void* chProp = GetProp("/Script/FortniteGame.FortControllerComponent_Interaction.CurrentlyHighlightedActors")) {
+                void* arr = GetField(comp, chProp);
+                Array cur = Read<Array>(arr);
+                bool already = false;
+                for (int i = 0; i < cur.Count; ++i)
+                    if (Read<void*>(cur.Data, (size_t)i * 8) == best) { already = true; break; }
+                if (!already) {
+                    if (cur.Count >= 4 && cur.Data)
+                        Fn<void(*)(void*, void*, int)>(profile::GenericArrayRemove)(arr, chProp, cur.Count - 1);
+                    Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, chProp, &best);
+                }
+            }
             // once: let the component open swinging doors by itself
             static bool doorsAutoSet = false;
             if (!doorsAutoSet) {
@@ -6668,6 +6862,21 @@ static void pe_hook(void* obj, void* func, void* params) {
         if (session.lobby_requested) { orig_PE(obj, func, params); return; }
 
         std::string fn = ObjName(func);
+        // [F75-a] flight recorder — the bus-zero crash happens inside the
+        // NATIVE warmup-end transition, between our log lines. During the
+        // GetReady window (step 3) record the first occurrence of each
+        // external ProcessEvent name; whatever the native transition calls
+        // will name itself here, and the entry after the last one is the
+        // crash site. Capped at 120 unique names.
+        if (br.started && br.step >= 3 && br.phase <= 2) {
+            static std::set<std::string> seen;
+            static int logged = 0;
+            if (logged < 120 && seen.insert(fn).second) {
+                ++logged;
+                std::string rc = obj ? ObjName(Read<void*>(obj, profile::ObjectClass)) : std::string("<null>");
+                LOG("[PETRACE] %s on %s", fn.c_str(), rc.c_str());
+            }
+        }
         bool isPC   = (obj == session.controller);
         bool isPawn = (obj == session.pawn);
         void* currentWeapon = nullptr;
@@ -6719,18 +6928,25 @@ static void pe_hook(void* obj, void* func, void* params) {
                 if (bcC) isContainer = SubclassOfFast(cls, bcC);
             }
         }
-        // [F74-a] DEAD-SERVER RPCs — SWALLOW FOR ANY RECEIVER. These run the
+        // [F74-a/F75-a] DEAD-SERVER RPCs — SWALLOW FOR ANY RECEIVER. These run the
         // server-side implementation locally in standalone, which crashes
         // (the F58 ServerAttemptInventoryDrop class). At warmup countdown
-        // zero the game auto-activates quickbar slot 0 (Erbium's
-        // StartAircraftPhase does ClientActivateSlot(0,0) server-side at this
-        // exact moment), the client fires ServerExecuteInventoryItem, the
-        // local equip succeeds, and the ORIGINAL server path killed the
-        // process — every match died at bus zero. The gate below is skipped
-        // so even a bot controller receiving these never reaches the native
-        // body (bots have no WorldInventory — guaranteed null deref).
-        // Erbium never calls the original either: it implements these server
-        // RPCs itself because there is no upstream server.
+        // zero the NATIVE warmup-end transition fires the pickaxe equip chain
+        // (ClientActivateSlot -> ServerExecuteInventoryItem) — the F74 log
+        // proved the equip is game-originated (it fired without any of our
+        // calls) and the crash followed it. F75 additionally swallows
+        // ClientActivateSlot for external callers: it is a server->client
+        // notify (the only declaration in 21.30 is on FortPlayerController),
+        // player taps never route through it, and our own calls bypass this
+        // hook entirely (Call::run invokes orig_PE directly). Erbium never
+        // calls the originals either: it implements these server RPCs itself
+        // because there is no upstream server.
+        if (fn == "ClientActivateSlot") {
+            Guard g;
+            static bool once = false;
+            if (!once) { once = true; LOG("[Equip] external ClientActivateSlot swallowed (native phase-change equip)"); }
+            return;   // the native continuation of this chain crashes standalone
+        }
         if (fn == "ServerExecuteInventoryItem" || fn == "ServerExecuteInventoryWeapon") {
             Guard g;
             if (isPC) {
