@@ -928,6 +928,33 @@ static void* incoming(void* function, void* data, const char* key, int expected_
     return nullptr;
 }
 
+// [F76-a] Force a bool-returning ProcessEvent verdict to false after the
+// native ran. The frame layout is not "params then return": a zero-param
+// bool function (Engine.GameMode.ReadyToEndMatch) keeps its return value at
+// offset 0, so the return property is located by reflection instead of
+// guessing an offset.
+namespace Athena { void ForceReturnFalse(void* func, void* params); }
+void Athena::ForceReturnFalse(void* func, void* params) {
+    if (!func || !params || IsBadPtr(func)) return;
+    int total = Read<uint16_t>(func, profile::FunctionParamSize);
+    if (total <= 0 || total > 8192) return;
+    void* p = Read<void*>(func, profile::StructChildren);
+    for (int i = 0; p && !IsBadPtr(p) && i < 128; ++i, p = Read<void*>(p, profile::FieldNext)) {
+        if (!(Read<uint64_t>(p, profile::PropFlags) & profile::CPF_ReturnParm)) continue;
+        int off = Read<int>(p, profile::PropOffset);
+        if (off >= 0 && off < total) Write<uint8_t>(params, (size_t)off, 0);
+        return;
+    }
+    void* fp = Read<void*>(func, profile::StructChildProps);
+    for (int i = 0; fp && !IsBadPtr(fp) && i < 128; ++i, fp = Read<void*>(fp, profile::FFieldNext)) {
+        if (!(Read<uint64_t>(fp, profile::PropFlags) & profile::CPF_ReturnParm)) continue;
+        int off = Read<int>(fp, profile::PropOffset);
+        if (off >= 0 && off < total) Write<uint8_t>(params, (size_t)off, 0);
+        return;
+    }
+    Write<uint8_t>(params, 0, 0);   // no reflected return — zero-param bool frame
+}
+
 // ============================================================================
 // ASSET LOADING / SPAWN
 // ============================================================================
@@ -1180,17 +1207,27 @@ struct BRCtx {
     double last_storm_tick = 0;
     int    last_logged_zone = -1;
     bool   alive_added = false;       // local PC in GameMode->AlivePlayers
+    bool   bot_skins_logged = false;  // [F76-b] sample skin line printed
 };
 static BRCtx br;
 
-// [F74-e/F75-b] bot + wildlife movement motor state. The F74 motors only sent
-// AddMovementInput pulses — on this build the pulses never translated into
-// movement (the CharacterMovement never consumed ControlInputVector for our
-// raw-spawned pawns), so the roster stayed mannequins. F75 drives the
-// CharacterMovementComponent's Velocity directly every tick (the same channel
-// LaunchCharacter uses) plus AddMovementInput as a secondary, with a
-// SetControlRotation heading re-roll. Dead pawns drop out of the lists.
-struct BRBotMotor { void* pawn; float yaw; double next_heading; };
+// [F74-e/F75-b/F76-c] bot + wildlife movement motor state. F75 drove the
+// CharacterMovementComponent Velocity directly (works but dumb: straight
+// lines into walls). F76 upgrades the driver to the game's own navmesh
+// pathing — UAIBlueprintHelperLibrary.SimpleMoveToLocation (native, static,
+// verified 0x70fb715070) creates a PathFollowingComponent on ANY controller
+// and walks real paths around obstacles. Velocity writes stay as the
+// fallback for pawns whose stuck-check shows the navmesh never moved them
+// (2.2s window, <40 units displacement -> velocity window with a new
+// heading). Wildlife keeps the same hybrid at walk speed.
+struct BRBotMotor {
+    void*  pawn;
+    float  yaw;
+    double next_heading;      // next retarget (move request or heading roll)
+    float  lastX = 0, lastY = 0;   // stuck detection anchor
+    double last_check = 0;         // last stuck-check time
+    uint8_t vel_mode = 0;          // 0 = try navmesh move, 1 = velocity drive
+};
 static std::vector<BRBotMotor> g_bot_motors;
 static std::vector<BRBotMotor> g_wild_motors;   // [F75-c] animals roam too
 
@@ -1241,6 +1278,7 @@ namespace Athena {
     void SpawnBuildPreviews();
     bool LocalPickup(void* pickup);    // [F18]
     void Loot(void* actor);
+    void ForceReturnFalse(void* func, void* params);  // [F76-a] defang native bool verdicts
     void HandleDoor(void* door);
     void OnServerCreateBuildingActor(void* params);
     bool LocalBuild();                 // [F21]
@@ -1758,6 +1796,10 @@ void Athena::PokeQuickbarWidgets() {
 
     int32 slots[6] = {0, 1, 2, 3, 4, 5};
     Array changed{ slots, 6, 6 };
+    // [F76-f] the BP event's enum param is spelled differently across widget
+    // generations — try the known spellings per receiver instead of failing
+    // the whole widget on one name.
+    static const char* const barNames[] = {"QuickBarType", "QuickbarType", "QuickBarIndex", "QuickBar", nullptr};
     int poked = 0;
     for (void* w : widgets) {
         bool done = false;
@@ -1766,8 +1808,10 @@ void Athena::PokeQuickbarWidgets() {
             if (!c.ok()) continue;
             bool ran = true;
             for (uint8_t bar : {(uint8_t)0, (uint8_t)1}) {
-                if (!c.set("QuickBarType", bar) ||
-                    !c.set_bytes("ChangedSlots", &changed, sizeof(Array)) || !c.run(w)) { ran = false; break; }
+                bool setOk = false;
+                for (int bn = 0; barNames[bn] && !setOk; ++bn)
+                    setOk = c.set(barNames[bn], bar);
+                if (!setOk || !c.set_bytes("ChangedSlots", &changed, sizeof(Array)) || !c.run(w)) { ran = false; break; }
             }
             if (ran) { done = true; break; }
         }
@@ -3515,21 +3559,61 @@ int Athena::SpawnWildlifeNear(int max) {
     return spawned;
 }
 
-// [F75-c] map-wide wildlife — the user wants animals "in their places"
-// (transl: spread across the island like the native lifecycle does), not
-// just a ring around the player. The map's own wildlife spawner actors are
-// not discoverable on 21.30 (the lobby dump holds no such class and the
-// runtime scan only surfaces vehicle spawners), so the nearest faithful
-// approximation is a uniform scatter over the playable bounds with the same
-// Irwin classes. They drop in from Z+600 and land (fall damage disabled).
+// [F75-c/F76-e] map-wide wildlife — animals "in their places". First scan
+// GObjects for the map's own loaded wildlife/NPC spawner ACTORS (class-name
+// contains wildlife/animal/npc AND spawner/spawn — e.g. BGA_Athena_Wildlife-
+// Spawn, the flopper-style world spawners that stream with the terrain) and
+// drop the animals exactly on those points — that is where the game's own
+// lifecycle puts them. Fallback: the uniform playable-bounds scatter (the
+// native spawners may not be streamed yet at match start).
 int Athena::SpawnWildlifeScattered(int max) {
     if (!session.world || !session.pawn || max < 1) return 0;
     std::vector<void*> classes;
     WildClasses(classes);
     if (classes.empty()) { LOG("[Wild] scattered — no classes"); return 0; }
+    int spawned = 0;
+    // [F76-e] natural spawner positions — loaded level actors first.
+    {
+        GObjects_t* go = GObjectArray();
+        void* actorCls = FindObj("/Script/Engine.Actor");
+        if (go && actorCls) {
+            std::vector<Vector> spots;
+            for (int32 i = 0; i < go->NumElements && spots.size() < 24; ++i) {
+                void* object = go->GetById((uint32)i);
+                if (!object || IsBadPtr(object) || IsCDO(object)) continue;
+                void* oc = Read<void*>(object, profile::ObjectClass);
+                if (!oc || IsBadPtr(oc)) continue;
+                if (!SubclassOfFast(oc, actorCls)) continue;    // world actor only
+                std::string cn = ObjName(oc);
+                std::transform(cn.begin(), cn.end(), cn.begin(), ::tolower);
+                if (cn.find("wildlife") == std::string::npos &&
+                    cn.find("npcspawn") == std::string::npos &&
+                    cn.find("animalspawn") == std::string::npos) continue;
+                if (cn.find("spawn") == std::string::npos &&
+                    cn.find("spawner") == std::string::npos) continue;
+                Vector l{};
+                if (!ActorLocation(object, l)) continue;
+                if (std::fabs(l.X) < 1.0 && std::fabs(l.Y) < 1.0) continue;  // origin stub
+                spots.push_back(l);
+            }
+            if (!spots.empty()) {
+                LOG("[Wild] ✅ %zu natural spawner positions found — spawning there", spots.size());
+                for (int i = 0; i < max; ++i) {
+                    const Vector& s = spots[(size_t)i % spots.size()];
+                    Vector at{ s.X + (BRRand01() - 0.5f) * 300.0f,
+                               s.Y + (BRRand01() - 0.5f) * 300.0f, s.Z + 120.0f };
+                    void* cls = classes[(size_t)(BRRand() % classes.size())];
+                    WildSpawnOne(cls, at);
+                    ++spawned;
+                }
+                LOG("[Wild] natural pass: %d animals at spawner positions", spawned);
+                return spawned;
+            }
+            LOG("[Wild] no natural spawner actors streamed yet — uniform scatter");
+        }
+    }
     Vector center{0, 0, 0};
     if (!br.zone_centers.empty()) center = br.zone_centers[0];
-    int spawned = 0;
     for (int i = 0; i < max; ++i) {
         float ang = BRRand01() * 6.2831853f;
         float dist = 12000.0f + BRRand01() * 68000.0f;   // 120m..800m from center
@@ -4101,9 +4185,34 @@ static void BRSetGamePhase(uint8_t p) {
 // step broadcast lives on AFortGameStateAthena.GamePhaseStepChanged and its
 // registered handlers: FortGameModeAthena.OnGamePhaseStepChanged +
 // FortPlayerPawnAthena.GamePhaseStepChanged (both take
-// {TScriptInterface<IFortSafeZoneInterface>, EEAthenaGamePhaseStep}). We call
-// them with the SafeZoneIndicator as the interface once it exists (storm
-// steps — the real server flow); aircraft steps notify via OnRep_GamePhase.
+// {TScriptInterface<IFortSafeZoneInterface>, EEAthenaGamePhaseStep}).
+// [F76-a] CRASH FIX — the F75 device log proved that calling the GameMode
+// handler directly kills the process seconds later (its native continuation
+// is the whole server-side aircraft transition). The set is now:
+//   1) write GameState.GamePhaseStep (replicated field — every reader),
+//   2) BROADCAST the AFortGameStateAthena.GamePhaseStepChanged multicast via
+//      OnGamePhaseStepChanged__DelegateSignature (0x70fb023b60 — params
+//      SafeZoneInterface@0x0 + GamePhaseStep@0x10): every CLIENT binding
+//      (PC.HandleGamePhaseStepChanged, widgets, music) fires natively while
+//      the server-side GameMode binding is swallowed in pe_hook, exactly
+//      like Erbium where the client never runs the server transition,
+//   3) Pawn.GamePhaseStepChanged (client pawn visuals) as before.
+static void BRBroadcastStepChanged(uint8_t s) {
+    if (!session.state || !orig_PE) return;
+    void* sig = FindObj("/Script/FortniteGame.OnGamePhaseStepChanged__DelegateSignature");
+    if (!sig) {
+        static bool once = false;
+        if (!once) { once = true; LOG("[BR] GamePhaseStepChanged delegate signature missing — visuals skipped"); }
+        return;
+    }
+    uint8_t params[32];
+    memset(params, 0, sizeof(params));
+    uint64_t iface[2] = { (uint64_t)(uintptr_t)(br.indicator && !IsBadPtr(br.indicator) ? br.indicator : nullptr),
+                          (uint64_t)(uintptr_t)(br.indicator && !IsBadPtr(br.indicator) ? br.indicator : nullptr) };
+    memcpy(params, iface, sizeof(iface));
+    params[0x10] = s;
+    orig_PE(session.state, sig, params);
+}
 static void BRSetGamePhaseStep(uint8_t s) {
     br.step = s;
     if (BRGetComponent()) {
@@ -4116,12 +4225,10 @@ static void BRSetGamePhaseStep(uint8_t s) {
         void* prop = GetProp("/Script/FortniteGame.FortGameStateAthena.GamePhaseStep");
         if (prop) Write<uint8_t>(GetField(session.state, prop), 0, s);
     }
-    if (br.indicator && !IsBadPtr(br.indicator)) {
-        uint64_t iface[2] = {(uint64_t)(uintptr_t)br.indicator, (uint64_t)(uintptr_t)br.indicator};
-        Call gm("/Script/FortniteGame.FortGameModeAthena.OnGamePhaseStepChanged");
-        if (gm.ok() && session.mode &&
-            gm.set_bytes("SafeZoneInterface", iface, 16) && gm.set("GamePhaseStep", s))
-            gm.run(session.mode);
+    BRBroadcastStepChanged(s);
+    if (!IsBadPtr(session.pawn)) {
+        uint64_t iface[2] = {(uint64_t)(uintptr_t)(br.indicator && !IsBadPtr(br.indicator) ? br.indicator : nullptr),
+                             (uint64_t)(uintptr_t)(br.indicator && !IsBadPtr(br.indicator) ? br.indicator : nullptr)};
         Call pp("/Script/FortniteGame.FortPlayerPawnAthena.GamePhaseStepChanged");
         if (pp.ok() && session.pawn &&
             pp.set_bytes("SafeZoneInterface", iface, 16) && pp.set("GamePhaseStep", s))
@@ -4643,6 +4750,40 @@ static void* BRBotCtrlClass = nullptr;
 static void* BRBotStateClass = nullptr;
 static void* BRBotHeroType = nullptr;
 
+// ----------------------------------------------------------------------------
+// [F76-b] Random bot cosmetics — the 21.30 GObjects dump holds 4,853 loaded
+// CustomCharacterPart instances (583 CP_Head_* + 1,157 CP_Body_*) — the whole
+// cooked locker of this build. Erbium gives every bot the same F_Med_Head1
+// trio (its server just needs A body); the user asked for "different random
+// skins, everything random". One GObjects pass builds head/body pools, every
+// bot rolls a random (head, body) pair and runs the same full F74-d chain
+// (ServerChoosePart + LocalCharacterParts + HeroType + OnReps +
+// ApplyCharacterCosmetics + UpdatePlayerCustomCharacterPartsVisualization).
+// ----------------------------------------------------------------------------
+static std::vector<void*> g_head_pool;
+static std::vector<void*> g_body_pool;
+static void BRPartPools() {
+    if (!g_head_pool.empty() || !g_body_pool.empty()) return;
+    GObjects_t* go = GObjectArray();
+    void* ccpCls = FindObj("/Script/FortniteGame.CustomCharacterPart");
+    if (!go || !ccpCls) { LOG("[BR] cosmetic pool scan unavailable (ccp=%p)", ccpCls); return; }
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        if (g_head_pool.size() >= 256 && g_body_pool.size() >= 256) break;
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object) || IsCDO(object)) continue;
+        if (!IsA(object, ccpCls)) continue;
+        std::string n = ObjName(object);
+        if (n.find("Empty") != std::string::npos) continue;
+        if (n.rfind("CP_Head_", 0) == 0 || n.find("_Head_") != std::string::npos) {
+            if (g_head_pool.size() < 256) g_head_pool.push_back(object);
+        } else if (n.rfind("CP_Body_", 0) == 0 || n.rfind("CP_Athena_Body", 0) == 0 ||
+                   n.find("_Body_") != std::string::npos) {
+            if (g_body_pool.size() < 256) g_body_pool.push_back(object);
+        }
+    }
+    LOG("[BR] cosmetic pools: heads=%zu bodies=%zu (F76 random skins)", g_head_pool.size(), g_body_pool.size());
+}
+
 static void BRSpawnBotBatch(int n) {
     if (!session.world || !session.mode || !session.state) return;
     if (!BRBotPawnClass) BRBotPawnClass = LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
@@ -4672,7 +4813,10 @@ static void BRSpawnBotBatch(int n) {
 
     void* aliveProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
     int spawned = 0;
-    // [F74-d] cosmetic assets resolve once per batch (logged on first batch)
+    // [F76-b] random cosmetic pools (583 heads / 1,157 bodies in this build).
+    // The F74 statics stay as the guaranteed fallback when the pool scan
+    // finds nothing (Erbium trio).
+    BRPartPools();
     static void* headPart = nullptr;
     static void* bodyPart = nullptr;
     static void* backpackPart = nullptr;
@@ -4681,11 +4825,6 @@ static void BRSpawnBotBatch(int n) {
     if (!headPart) headPart = ByShortName("CP_Head_Med_Soldier_M_DesertOps");
     if (!bodyPart) bodyPart = ByShortName("CP_Athena_Body_M_Fallback");
     if (!backpackPart) backpackPart = ByShortName("NoBackpack");
-    static bool partsLogged = false;
-    if (!partsLogged && (headPart || bodyPart)) {
-        partsLogged = true;
-        LOG("[BR] bot parts head=%p body=%p backpack=%p", headPart, bodyPart, backpackPart);
-    }
     for (int k = 0; k < n && br.bots_spawned < br.bots_target; ++k) {
         Vector loc{0, 0, 500};
         bool haveLoc = false;
@@ -4751,21 +4890,23 @@ static void BRSpawnBotBatch(int n) {
         }
         SetBool(st, "/Script/FortniteGame.FortPlayerState.bIsABot", true);
 
-        // [F74-d] cosmetics — the exact chain that gave the LOCAL player a
-        // working body (Erbium spawnbot: HeroType + parts + visualization).
-        // F73 only set HeroType + ApplyCharacterCosmetics with parts that do
-        // not resolve in 21.30 — bots stayed Default. Now:
-        //   1) FortPlayerPawn.ServerChoosePart(0=Head, 1=Body) on the bot pawn
-        //   2) SetCharacterBodyVisibilityForPossession(true)
-        //   3) PlayerState.LocalCharacterParts[0/1/3] (Erbium spawnbot array)
-        //   4) HeroType + OnRep_HeroType + ApplyCharacterCosmetics +
-        //      OnRep_CharacterData + UpdatePlayerCustomCharacterPartsVisualization
+        // [F74-d + F76-b] cosmetics — the exact chain that gave the LOCAL
+        // player a working body, now with a RANDOM (head, body) pair per bot
+        // from the loaded CustomCharacterPart pools (every bot a different
+        // skin — the user's ask). Fallback: the Erbium trio statics.
         {
+            void* botHead = !g_head_pool.empty() ? g_head_pool[(size_t)(BRRand() % g_head_pool.size())] : headPart;
+            void* botBody = !g_body_pool.empty() ? g_body_pool[(size_t)(BRRand() % g_body_pool.size())] : bodyPart;
+            if (k == 0 && !br.bot_skins_logged) {
+                br.bot_skins_logged = true;
+                LOG("[BR] bot skins: head=%s body=%s", botHead ? ObjName(botHead).c_str() : "<fallback>",
+                    botBody ? ObjName(botBody).c_str() : "<fallback>");
+            }
             int partsApplied = 0;
-            if (headPart)  { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
-                             if (choose.ok() && choose.set("Part", (uint8_t)0) && choose.set("ChosenCharacterPart", headPart)) { choose.run(pawn); ++partsApplied; } }
-            if (bodyPart)  { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
-                             if (choose.ok() && choose.set("Part", (uint8_t)1) && choose.set("ChosenCharacterPart", bodyPart)) { choose.run(pawn); ++partsApplied; } }
+            if (botHead) { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+                             if (choose.ok() && choose.set("Part", (uint8_t)0) && choose.set("ChosenCharacterPart", botHead)) { choose.run(pawn); ++partsApplied; } }
+            if (botBody) { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+                             if (choose.ok() && choose.set("Part", (uint8_t)1) && choose.set("ChosenCharacterPart", botBody)) { choose.run(pawn); ++partsApplied; } }
             if (partsApplied) {
                 Call vis("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
                 if (vis.ok()) { bool show = true; if (vis.set("bVisible", show)) vis.run(pawn); }
@@ -4774,8 +4915,8 @@ static void BRSpawnBotBatch(int n) {
             // (UCustomCharacterPart* [7] — fixed C-array on FortPlayerState).
             if (void* lcp = GetProp("/Script/FortniteGame.FortPlayerState.LocalCharacterParts")) {
                 void* base = GetField(st, lcp);
-                if (headPart) Write<void*>(base, 0 * 8, headPart);
-                if (bodyPart) Write<void*>(base, 1 * 8, bodyPart);
+                if (botHead) Write<void*>(base, 0 * 8, botHead);
+                if (botBody) Write<void*>(base, 1 * 8, botBody);
                 if (backpackPart) Write<void*>(base, 3 * 8, backpackPart);
             }
             if (BRBotHeroType) {
@@ -4784,8 +4925,8 @@ static void BRSpawnBotBatch(int n) {
                 Call rht("/Script/FortniteGame.FortPlayerState.OnRep_HeroType");
                 if (rht.ok()) rht.run(st);
             }
-            if (headPart && bodyPart) {
-                void* parts[2] = {headPart, bodyPart};
+            if (botHead && botBody) {
+                void* parts[2] = {botHead, botBody};
                 Array partsArr{parts, 2, 2};
                 void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
                 Call apply("/Script/FortniteGame.FortKismetLibrary.ApplyCharacterCosmetics");
@@ -4879,26 +5020,34 @@ static void BRSpawnBotBatch(int n) {
 }
 
 // ----------------------------------------------------------------------------
-// [F74-e/F75-b] Movement motors — velocity-driven. F74's AddMovementInput
-// pulses were verified live in the SDK (Engine.Pawn.AddMovementInput exists
-// with WorldDirection/ScaleValue/bForce) but never moved the raw-spawned
-// pawns: without a full possession/input pipeline the ControlInputVector is
-// not consumed on this build. F75 writes CharacterMovement->Velocity directly
-// every tick (reflection offsets resolved once) — the exact channel
-// LaunchCharacter uses — so the CMC integrates real movement and the anim BP
-// sees Speed > 0 (walk/run cycles play). SetControlRotation keeps the pawn
-// facing the heading (Athena pawns use bUseControllerRotationYaw).
+// [F74-e/F75-b/F76-c] Movement motors — the game's own navmesh pathing.
+// F75's raw Velocity writes moved the pawns but "stupidly" (user's words):
+// straight lines into walls, constant slide-on-obstacle, animals fighting
+// their own native AI. F76 issues UAIBlueprintHelperLibrary.SimpleMoveTo-
+// Location(Controller, Goal) — the native that creates a PathFollowing-
+// Component on any controller and walks real navmesh paths — on a staggered
+// wander schedule. A 2.2s stuck-check measures actual displacement: a pawn
+// the navmesh never moved (<40 units) flips to the velocity drive for that
+// window (fresh heading + SetControlRotation so it still faces where it
+// walks), then retries the navmesh on the next retarget. Dead pawns drop
+// out of the lists.
 // ----------------------------------------------------------------------------
 static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* tag) {
     if (list.empty()) return;
     double now = Monotonic();
+    static Call* smove = nullptr;       // [F76-c] navmesh move (static on AIBlueprintHelperLibrary)
+    static void*  aiLib = nullptr;
     static Call* rot = nullptr;
     static Call* move = nullptr;
+    static Call* getLoc = nullptr;
     static void* ctrlProp = nullptr;      // hot path — resolve once
     static void* charMoveProp = nullptr;  // [F75-b] Character.CharacterMovement
     static void* velProp = nullptr;       // [F75-b] MovementComponent.Velocity
+    if (!smove) smove = new Call("/Script/AIModule.AIBlueprintHelperLibrary.SimpleMoveToLocation");
+    if (!aiLib) aiLib = FindObj("/Script/AIModule.Default__AIBlueprintHelperLibrary");
     if (!rot) rot = new Call("/Script/Engine.Controller.SetControlRotation");
     if (!move) move = new Call("/Script/Engine.Pawn.AddMovementInput");
+    if (!getLoc) getLoc = new Call("/Script/Engine.Actor.K2_GetActorLocation");
     if (!ctrlProp) ctrlProp = GetProp("/Script/Engine.Pawn.Controller");
     if (!charMoveProp) charMoveProp = GetProp("/Script/Engine.Character.CharacterMovement");
     if (!velProp) velProp = GetProp("/Script/Engine.MovementComponent.Velocity");
@@ -4906,11 +5055,15 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
     int cmOff   = charMoveProp ? Read<int>(charMoveProp, profile::PropOffset) : -1;
     int vOff    = velProp ? Read<int>(velProp, profile::PropOffset) : -1;
     static double lastBeat = 0;
+    static int navmesh_moves = 0, vel_moves = 0;
     if (now - lastBeat > 5.0) {
         lastBeat = now;
-        LOG("[Motor] %s n=%zu rot=%d move=%d cmOff=%d vOff=%d", tag, list.size(),
-            (int)(rot && rot->ok()), (int)(move && move->ok()), cmOff, vOff);
+        LOG("[Motor] %s n=%zu navmesh=%d vel=%d smove=%d cmOff=%d vOff=%d", tag, list.size(),
+            navmesh_moves, vel_moves, (int)(smove && smove->ok()), cmOff, vOff);
+        navmesh_moves = 0; vel_moves = 0;
     }
+    bool navOk = smove && smove->ok() && aiLib && !IsBadPtr(aiLib);
+    bool isWild = !std::strcmp(tag, "Wild");
     size_t w = 0;
     for (size_t i = 0; i < list.size(); ++i) {
         BRBotMotor& m = list[i];
@@ -4918,34 +5071,74 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
         if (!pawn || IsBadPtr(pawn)) continue;                 // destroyed (storm/edit)
         void* cls = Read<void*>(pawn, profile::ObjectClass);
         if (!cls || IsBadPtr(cls)) continue;                   // half-freed actor
+        // current location (stuck-check anchor + wander center)
+        Vector at{};
+        bool haveAt = false;
+        if (getLoc && getLoc->ok() && getLoc->run(pawn)) { at = getLoc->result<Vector>(); haveAt = true; }
+        // ---- retarget window: new wander goal ----
         if (now >= m.next_heading) {
             m.yaw = (float)(BRRand01() * 360.0);
-            m.next_heading = now + 2.5 + BRRand01() * 2.0;
+            m.next_heading = now + 4.0 + BRRand01() * 4.0;
+            if (navOk) {
+                // [F76-c] primary: native navmesh wander — real pathing around
+                // obstacles instead of straight lines into walls.
+                float wander = isWild ? 500.0f + BRRand01() * 900.0f
+                                      : 900.0f + BRRand01() * 1700.0f;
+                float ang = BRRand01() * 6.2831853f;
+                Vector goal{ at.X + std::cos(ang) * wander, at.Y + std::sin(ang) * wander, at.Z };
+                void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
+                if (ctrl && !IsBadPtr(ctrl) &&
+                    smove->set("Controller", ctrl) && smove->set("Goal", goal) && smove->run(aiLib)) {
+                    m.vel_mode = 0;                       // trust the navmesh this window
+                    m.lastX = haveAt ? at.X : 0; m.lastY = haveAt ? at.Y : 0;
+                    m.last_check = now + 2.2;
+                    ++navmesh_moves;
+                    if (navmesh_moves == 1)
+                        LOG("[Motor] %s navmesh move -> (%.0f, %.0f)", tag, goal.X, goal.Y);
+                } else {
+                    m.vel_mode = 1;                       // request refused — velocity window
+                }
+            } else {
+                m.vel_mode = 1;
+            }
+        }
+        // ---- stuck check 2.2s after each navmesh request ----
+        if (!m.vel_mode && haveAt && now >= m.last_check) {
+            double dx = at.X - m.lastX, dy = at.Y - m.lastY;
+            if (dx * dx + dy * dy < 40.0 * 40.0) {
+                m.vel_mode = 1;                           // navmesh silent — velocity window
+                m.next_heading = now + 1.0 + BRRand01();  // re-roll soon
+            }
+            m.last_check = now + 2.2;
+            m.lastX = at.X; m.lastY = at.Y;
+        }
+        // ---- velocity fallback (navmesh failed or stuck) ----
+        if (m.vel_mode) {
+            float rad = m.yaw * 3.14159265f / 180.0f;
+            Vector dir{std::cos(rad), std::sin(rad), 0};
+            // [F75-b] primary drive: write CharacterMovement->Velocity (keep
+            // the current Z so gravity still owns vertical motion).
+            if (cmOff > 0 && vOff > 0) {
+                void* cm = Read<void*>(pawn, (size_t)cmOff);
+                if (cm && !IsBadPtr(cm)) {
+                    Vector v = Read<Vector>(cm, (size_t)vOff);
+                    if (std::isfinite(v.Z)) {
+                        v.X = dir.X * speed; v.Y = dir.Y * speed;
+                        Write<Vector>(cm, (size_t)vOff, v);
+                    }
+                }
+            }
             void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
             if (ctrl && !IsBadPtr(ctrl) && rot && rot->ok()) {
                 Rotator r{}; r.Pitch = 0; r.Yaw = m.yaw; r.Roll = 0;
                 if (rot->set("NewRotation", r)) rot->run(ctrl);
             }
-        }
-        float rad = m.yaw * 3.14159265f / 180.0f;
-        Vector dir{std::cos(rad), std::sin(rad), 0};
-        // [F75-b] primary drive: write CharacterMovement->Velocity (keep the
-        // current Z so gravity still owns vertical motion).
-        if (cmOff > 0 && vOff > 0) {
-            void* cm = Read<void*>(pawn, (size_t)cmOff);
-            if (cm && !IsBadPtr(cm)) {
-                Vector v = Read<Vector>(cm, (size_t)vOff);
-                if (std::isfinite(v.Z)) {
-                    v.X = dir.X * speed; v.Y = dir.Y * speed;
-                    Write<Vector>(cm, (size_t)vOff, v);
-                }
+            if (move && move->ok()) {
+                float scale = 1.0f; uint8_t force = 0;
+                if (move->set("WorldDirection", dir) && move->set("ScaleValue", scale) && move->set("bForce", force))
+                    move->run(pawn);
             }
-        }
-        // secondary: the input pulse (harmless, feeds BP logic that reads it)
-        if (move && move->ok()) {
-            float scale = 1.0f; uint8_t force = 0;
-            if (move->set("WorldDirection", dir) && move->set("ScaleValue", scale) && move->set("bForce", force))
-                move->run(pawn);
+            ++vel_moves;
         }
         list[w++] = m;
     }
@@ -6010,6 +6203,18 @@ bool Athena::DoInteract(void* actor) {
             }
         }
     }
+    // [F76] generic BP interaction — vending/SC machines, forage plants,
+    // hiding props, NPC pawns: everything that implements its OWN
+    // BlueprintOnInteract outside the BuildingActor tree. The override walk
+    // resolves the function on the target's own class and the receiver
+    // validation rejects targets that never implemented it (silent no-op).
+    {
+        Call bi("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", actor);
+        if (bi.ok() && bi.set("InteractingPawn", session.pawn) && bi.run(actor)) {
+            LOG("[Interact] ✅ BP interact on %s", cn.c_str());
+            return true;
+        }
+    }
     return false;
 }
 
@@ -6177,19 +6382,18 @@ void Athena::InteractTick() {
         if (void* comp = GetInteractionComp()) {
             if (void* p = GetProp("/Script/FortniteGame.FortControllerComponent_Interaction.InteractActor"))
                 Write<void*>(GetField(comp, p), 0, best);
-            // [F75-d] the mobile interact prompt also reads the component's
-            // highlighted list — mirror the candidate into it (the native
-            // trace scan never populates it on this offline setup). Keep the
-            // list tiny: drop the oldest entry at 4.
+            // [F75-d/F76] the mobile interact prompt also reads the
+            // component's highlighted list — mirror the candidate into it,
+            // but ONLY when the native scan has not populated the list
+            // itself: the F75 log proved the native interaction system IS
+            // alive at phase 3 (AthenaInteractionIndicator + BlueprintCan-
+            // Interact traces) and our writes would then fight it (the
+            // "stupid interaction" feel). Empty native list -> we fill it;
+            // native list -> we stand down.
             if (void* chProp = GetProp("/Script/FortniteGame.FortControllerComponent_Interaction.CurrentlyHighlightedActors")) {
                 void* arr = GetField(comp, chProp);
                 Array cur = Read<Array>(arr);
-                bool already = false;
-                for (int i = 0; i < cur.Count; ++i)
-                    if (Read<void*>(cur.Data, (size_t)i * 8) == best) { already = true; break; }
-                if (!already) {
-                    if (cur.Count >= 4 && cur.Data)
-                        Fn<void(*)(void*, void*, int)>(profile::GenericArrayRemove)(arr, chProp, cur.Count - 1);
+                if (cur.Count <= 0) {
                     Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, chProp, &best);
                 }
             }
@@ -6229,10 +6433,18 @@ void Athena::InteractTick() {
         }
     }
 
-    // [F65] auto pickup — ground loot collects itself when walked over
-    // (ServerHandlePickup never fires offline: the targeting component cannot
-    // pick pickup candidates, so the Era local_pickup path runs here).
+    // [F65/F76-d] auto pickup — Erbium's collection flow: the pickup first
+    // FLIES to the player (AFortPickup.BlueprintSetPickupTarget = the native
+    // fly + pickup-sound path the real client uses), and the item transfer
+    // runs when it arrives (~0.6s). When the fly call is unavailable the
+    // transfer runs immediately (F65 behaviour). Ground loot collects
+    // itself when walked over — no dead pickups on the ground.
     if (session.auto_interact) {
+        static Call* spt = nullptr;
+        static void* sptCls = nullptr;
+        if (!spt) spt = new Call("/Script/FortniteGame.FortPickup.BlueprintSetPickupTarget");
+        if (!sptCls) sptCls = FindObj("/Script/FortniteGame.FortPickup");
+        static std::map<void*, double> pending;   // pickup -> arrival time
         for (size_t i = 0; i < session.near_pickups.size() && i < session.near_pickup_locs.size(); ++i) {
             void* pk = session.near_pickups[i];
             if (!pk || IsBadPtr(pk)) continue;
@@ -6240,9 +6452,27 @@ void Athena::InteractTick() {
             double dx = at.X - origin.X, dy = at.Y - origin.Y, dz = at.Z - origin.Z;
             double d2 = dx*dx + dy*dy + dz*dz;
             if (d2 > 300.0 * 300.0) continue;
+            auto pend = pending.find(pk);
+            if (pend != pending.end()) {
+                if (now < pend->second) continue;         // still flying
+                pending.erase(pend);
+                LocalPickup(pk);                          // arrived — transfer
+                continue;
+            }
             auto& last = session.pickup_last_at[pk];
             if (now - last < 1.5) continue;
             last = now;
+            bool flew = false;
+            if (spt && spt->ok() && sptCls && IsA(pk, sptCls)) {
+                flew = spt->set("PickupTarget", session.pawn) &&
+                       spt->set("bPlayPickupSound", true) && spt->run(pk);
+                if (flew) {
+                    pending[pk] = now + 0.6;
+                    static bool once = false;
+                    if (!once) { once = true; LOG("[Loot] ✅ pickup fly-collect live (BlueprintSetPickupTarget)"); }
+                    continue;
+                }
+            }
             LocalPickup(pk);   // stacks into inventory / destroys on success
         }
     }
@@ -6862,13 +7092,14 @@ static void pe_hook(void* obj, void* func, void* params) {
         if (session.lobby_requested) { orig_PE(obj, func, params); return; }
 
         std::string fn = ObjName(func);
-        // [F75-a] flight recorder — the bus-zero crash happens inside the
-        // NATIVE warmup-end transition, between our log lines. During the
-        // GetReady window (step 3) record the first occurrence of each
-        // external ProcessEvent name; whatever the native transition calls
-        // will name itself here, and the entry after the last one is the
-        // crash site. Capped at 120 unique names.
-        if (br.started && br.step >= 3 && br.phase <= 2) {
+        // [F75-a/F76] flight recorder — the bus-zero crash happens inside the
+        // NATIVE transition paths, between our log lines. Record the first
+        // occurrence of each external ProcessEvent name from GetReady until
+        // the aircraft phase completes (F76 extended the window through
+        // phase 3: the native warmup-end machinery runs at T-0 even after
+        // the swallows — if it still kills the process the last PETRACE
+        // entry names the killer). Capped at 120 unique names.
+        if (br.started && br.step >= 3 && br.phase <= 3) {
             static std::set<std::string> seen;
             static int logged = 0;
             if (logged < 120 && seen.insert(fn).second) {
@@ -6941,6 +7172,31 @@ static void pe_hook(void* obj, void* func, void* params) {
         // hook entirely (Call::run invokes orig_PE directly). Erbium never
         // calls the originals either: it implements these server RPCs itself
         // because there is no upstream server.
+        // [F76-a] NATIVE PHASE MACHINERY — SWALLOW. The F75 device log proved
+        // the bus-zero crash: our own BRSetGamePhaseStep called
+        // FortGameModeAthena.OnGamePhaseStepChanged (the native SERVER
+        // handler) at warmup_end-10s and the process died seconds later,
+        // mid PETRACE, before zero. That handler runs the whole native
+        // aircraft transition (StartAircraftPhase machinery + walking every
+        // controller) which needs the server infra the standalone lacks.
+        // Erbium never lets the client game mode drive phases either — its
+        // GamePhaseLogic component owns them. On 21.30 WE are the phase
+        // engine (F73): BRSetGamePhaseStep writes the replicated field and
+        // broadcasts the AFortGameStateAthena.GamePhaseStepChanged multicast
+        // (client visuals: HUD/music/pawn) — the GameMode binding inside that
+        // broadcast lands HERE and dies quietly. ReadyToEndMatch is defanged
+        // too: the native match-state poll fired during GetReady ([PETRACE])
+        // and a stray true would end the match natively.
+        if (fn == "OnGamePhaseStepChanged") {
+            static bool once = false;
+            if (!once) { once = true; LOG("[BR] native OnGamePhaseStepChanged swallowed (phase engine is ours, F76)"); }
+            return;
+        }
+        if (fn == "ReadyToEndMatch") {
+            orig_PE(obj, func, params);   // let the native run, then force the verdict false
+            Athena::ForceReturnFalse(func, params);
+            return;
+        }
         if (fn == "ClientActivateSlot") {
             Guard g;
             static bool once = false;
