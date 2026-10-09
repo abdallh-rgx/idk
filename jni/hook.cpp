@@ -1215,6 +1215,16 @@ struct BRCtx {
     int    last_logged_zone = -1;
     bool   alive_added = false;       // local PC in GameMode->AlivePlayers
     bool   bot_skins_logged = false;  // [F76-b] sample skin line printed
+    // [F78-a] real flight route — from MapInfo FlightInfos or synthesized from
+    // the map's own bounds/height/speed (FlightInfos is EMPTY on 21.30
+    // standalone — the F77 log's bus parked at (0,0,0) with no countdown).
+    bool   have_route = false;
+    Vector route_start{};             // FlightStartLocation (world)
+    float  route_yaw = 0;             // degrees, direction of travel
+    float  route_speed = 4500;        // units/s
+    float  route_dur = 60;            // seconds start -> end
+    float  bus_flight_start = -1;     // world time the flight began
+    bool   bots_boarded = false;      // boarding assigned exactly once
 };
 static BRCtx br;
 
@@ -1237,6 +1247,12 @@ struct BRBotMotor {
     // [F77-c] engagement — face a nearby enemy and hold ground for a beat
     void*  face = nullptr;
     double face_until = 0;
+    // [F78-c] bus boarding + staggered jump + descent state machine
+    // 0 ground AI, 1 riding the bus (hidden), 2 skydiving, 3 parachute
+    uint8_t bus_state = 0;
+    float   jump_alpha = 0;      // route fraction to jump at (0.08..0.86)
+    Vector  drop_target{};
+    float   land_z = 0;
 };
 static std::vector<BRBotMotor> g_bot_motors;
 static std::vector<BRBotMotor> g_wild_motors;   // [F75-c] animals roam too
@@ -4508,6 +4524,249 @@ static void BRStartNewSafeZonePhase(int p, bool bInitial) {
 }
 
 // ----------------------------------------------------------------------------
+// [F78-a] THE BUS FLIGHT — the F77 device log nailed the failure: MapInfo->
+// FlightInfos is EMPTY on 21.30 standalone (the playlist/match-init server
+// flow that fills it never runs here), so the aircraft spawned with a zero
+// FlightInfo — nothing to fly, the HUD had no countdown data ("EVERYBODY OFF!
+// LAST STOP IN 0s" forever) and jumping dropped the player at the bus position
+// (0,0,0) — under the map. Erbium never hits this (its server fills
+// FlightInfos via CalcAircraftFlightPath before StartAircraftPhase).
+//
+// F78 ports that flow: build a REAL FAircraftFlightInfo from the map's own
+// data — playable bounds (CachedPlayableBoundsForClients), AircraftHeight,
+// AircraftSpeed (FScalableFloat.Value) — push it into MapInfo->FlightInfos[0]
+// exactly like the native match-init does, spawn on it, write the Erbium time
+// fields, then fire the native StartFlightPath (21.30's own flight starter).
+// A route-based manual pilot covers the case where the native aircraft tick
+// stays silent.
+// ----------------------------------------------------------------------------
+static float BRMapScalable(const char* path, float fallback) {
+    void* prop = GetProp(path);
+    if (!prop || !br.mapinfo || IsBadPtr(br.mapinfo)) return fallback;
+    int off = Read<int>(prop, profile::PropOffset);
+    if (off <= 0 || off + 4 > 0x1000) return fallback;
+    float v = Read<float>(br.mapinfo, (size_t)off);
+    return (std::isfinite(v) && v > 1.0f && v < 100000.0f) ? v : fallback;
+}
+
+// FBoxSphereBounds { Origin vec3d@0, Extent vec3d@0x18, SphereRadius f@0x30 }
+static bool BRPlayableBounds(Vector& center, float& radius) {
+    center = Vector{0, 0, 0}; radius = 150000;
+    if (!br.mapinfo || IsBadPtr(br.mapinfo)) return false;
+    void* prop = GetProp("/Script/FortniteGame.FortAthenaMapInfo.CachedPlayableBoundsForClients");
+    if (!prop) return false;
+    int off = Read<int>(prop, profile::PropOffset);
+    if (off <= 0 || off + 0x38 > 0x1000) return false;
+    Vector o = Read<Vector>(br.mapinfo, (size_t)off);
+    float r = Read<float>(br.mapinfo, (size_t)(off + 0x30));
+    if (!std::isfinite(o.X) || !std::isfinite(o.Y) ||
+        std::fabs(o.X) > 1e7 || std::fabs(o.Y) > 1e7) return false;
+    if (!std::isfinite(r) || r < 50000 || r > 2e6) r = 150000;
+    center = o; radius = r;
+    return true;
+}
+
+// FAircraftFlightInfo (0x48): StartLoc vec3d@0x00, StartRot rot3d@0x18,
+// Speed f@0x30, TillFlightEnd f@0x34, TillDropStart f@0x38, TillDropEnd f@0x3C,
+// bEjectPlayersAtDropZoneExit @0x40 (21.30 dump — no end-point field: the bus
+// flies along the rotation direction at FlightSpeed).
+static bool BRBuildFlightInfo(uint8_t out[0x48], Vector& start, float& yaw,
+                              float& speed, float& dur) {
+    Vector center{}; float radius = 0;
+    if (!BRPlayableBounds(center, radius)) {
+        if (session.pawn && !IsBadPtr(session.pawn) && ActorLocation(session.pawn, center)) {
+            center.Z = 0;
+            radius = 150000;
+        } else return false;
+    }
+    float height = BRMapScalable("/Script/FortniteGame.FortAthenaMapInfo.AircraftHeight", 10500.0f);
+    float spd = BRMapScalable("/Script/FortniteGame.FortAthenaMapInfo.AircraftSpeed", 4500.0f);
+    if (spd < 2000) spd = 2000;
+    if (spd > 9000) spd = 9000;
+    float ang = BRRand01() * 6.2831853f;      // random route through the island
+    float half = radius * 0.85f;
+    start = Vector{ center.X - std::cos(ang) * half, center.Y - std::sin(ang) * half, height };
+    yaw = (float)(std::atan2(std::sin(ang), std::cos(ang)) * 57.2957795);
+    float dist = 2.0f * half;
+    dur = dist / spd;
+    if (dur < 45) { dur = 45; spd = dist / dur; }
+    if (dur > 95) { dur = 95; spd = dist / dur; }
+    std::memset(out, 0, 0x48);
+    std::memcpy(out + 0x00, &start, 24);
+    Rotator r{}; r.Pitch = -6; r.Yaw = yaw;   // slight nose-down like the real bus
+    std::memcpy(out + 0x18, &r, 24);
+    std::memcpy(out + 0x30, &spd, 4);
+    float tfe = dur, tds = dur * 0.08f, tde = dur * 0.88f;
+    std::memcpy(out + 0x34, &tfe, 4);
+    std::memcpy(out + 0x38, &tds, 4);
+    std::memcpy(out + 0x3C, &tde, 4);
+    out[0x40] = 1;                             // bEjectPlayersAtDropZoneExit
+    speed = spd;                               // [F78] the pilot + logs fly THIS speed
+    return true;
+}
+
+// [F78-c] ground height under a drop point (native LineTraceSingle, F42
+// pattern; the FHitResult.Location offset is probed and self-validated).
+static bool BRGroundZ(float x, float y, float& z) {
+    if (!session.world) return false;
+    Call t("/Script/Engine.KismetSystemLibrary.LineTraceSingle");
+    if (!t.ok() || !t.set("WorldContextObject", session.world)) return false;
+    Vector start{x, y, 20000.0}, end{x, y, -20000.0};
+    Array ignore{};
+    uint8_t channel = 1, debug = 0;
+    bool complex = false, ignoreSelf = true;
+    uint8_t hit[224] = {};
+    t.set("Start", start);
+    t.set("End", end);
+    t.set("TraceChannel", channel);
+    t.set("bTraceComplex", complex);
+    t.set_bytes("ActorsToIgnore", &ignore, sizeof(Array));
+    t.set("DrawDebugType", debug);
+    t.set_bytes("OutHit", hit, sizeof(hit));
+    t.set("bIgnoreSelf", ignoreSelf);
+    if (!t.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"))) return false;
+    if (!(hit[0] & 0x01)) return false;        // no blocking hit — void column
+    for (int off = 0x10; off <= 0x40; off += 8) {
+        Vector v = Read<Vector>(hit, (size_t)off);
+        if (std::isfinite(v.X) && std::isfinite(v.Y) && std::isfinite(v.Z) &&
+            std::fabs(v.X - x) < 500.0 && std::fabs(v.Y - y) < 500.0 &&
+            std::fabs(v.Z) < 50000.0) { z = v.Z; return true; }
+    }
+    return false;
+}
+
+// [F78-c] board every bot on the bus — ride hidden, staggered jumps along the
+// route ("pull the players onto the aircraft with me"), real descent to a
+// random POI, then the normal smart motor resumes on landing.
+static void BRBoardBots() {
+    if (br.bots_boarded) return;
+    br.bots_boarded = true;
+    Vector center{}; float radius = 150000;
+    if (!BRPlayableBounds(center, radius)) {
+        if (session.pawn && !IsBadPtr(session.pawn) && ActorLocation(session.pawn, center)) center.Z = 0;
+    }
+    Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+    int boarded = 0;
+    for (auto& m : g_bot_motors) {
+        if (!m.pawn || IsBadPtr(m.pawn)) continue;
+        m.bus_state = 1;
+        m.jump_alpha = 0.08f + BRRand01() * 0.78f;
+        float ang = BRRand01() * 6.2831853f;
+        float rr = radius * 0.72f * BRRand01();
+        m.drop_target = Vector{ center.X + std::cos(ang) * rr, center.Y + std::sin(ang) * rr, 0 };
+        m.land_z = 0;
+        if (!BRGroundZ(m.drop_target.X, m.drop_target.Y, m.land_z)) m.land_z = 300;
+        if (hid.ok()) { bool b = true; if (hid.set("bNewHidden", b)) hid.run(m.pawn); }
+        ++boarded;
+    }
+    LOG("[BR] %d bots boarded — staggered drops (alpha 0.08..0.86)", boarded);
+}
+
+// [F78-c] per-tick bus-riders machine — jump at the assigned route fraction,
+// skydive toward the target, deploy, land, resume the ground AI.
+static void BRBusBotsTick(float alpha) {
+    if (g_bot_motors.empty()) return;
+    static Call* setLoc = nullptr;
+    static Call* sky = nullptr;
+    static Call* unSky = nullptr;
+    static void* cmProp = nullptr;
+    static void* velProp = nullptr;
+    if (!setLoc) setLoc = new Call("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+    if (!sky) sky = new Call("/Script/FortniteGame.FortPlayerPawn.BeginSkydiving");
+    if (!unSky) unSky = new Call("/Script/FortniteGame.FortPlayerPawn.EndSkydiving");
+    if (!cmProp) cmProp = GetProp("/Script/Engine.Character.CharacterMovement");
+    if (!velProp) velProp = GetProp("/Script/Engine.MovementComponent.Velocity");
+    int cmOff = cmProp ? Read<int>(cmProp, profile::PropOffset) : -1;
+    int vOff = velProp ? Read<int>(velProp, profile::PropOffset) : -1;
+    Vector busAt{};
+    bool haveBus = br.aircraft && !IsBadPtr(br.aircraft) && ActorLocation(br.aircraft, busAt);
+    static int jumps = 0, landed = 0;
+    for (auto& m : g_bot_motors) {
+        if (m.bus_state == 0 || !m.pawn || IsBadPtr(m.pawn)) continue;
+        void* cls = Read<void*>(m.pawn, profile::ObjectClass);
+        if (!cls || IsBadPtr(cls)) continue;
+        if (m.bus_state == 1) {
+            if (!haveBus) { m.bus_state = 0; continue; }   // bus gone — ground AI
+            if (alpha < m.jump_alpha) continue;            // still riding (hidden)
+            m.bus_state = 2;
+            Vector p{ busAt.X + (BRRand01() - 0.5f) * 500.0f,
+                      busAt.Y + (BRRand01() - 0.5f) * 500.0f,
+                      busAt.Z - 250.0f };
+            if (setLoc && setLoc->ok()) {
+                Rotator rot{}; Vector vloc = p;
+                setLoc->set("NewLocation", vloc);
+                setLoc->set("NewRotation", rot);
+                bool sweep = false, tp = true;
+                setLoc->set("bSweep", sweep);
+                setLoc->set("bTeleport", tp);
+                setLoc->run(m.pawn);
+            }
+            Call unh("/Script/Engine.Actor.SetActorHiddenInGame");
+            if (unh.ok()) { bool b = false; if (unh.set("bNewHidden", b)) unh.run(m.pawn); }
+            if (sky && sky->ok()) { bool bFromBus = true; if (sky->set("bFromBus", bFromBus)) sky->run(m.pawn); }
+            if (++jumps == 1)
+                LOG("[Bus] first bot jump (alpha=%.2f) — target (%.0f, %.0f)",
+                    (double)m.jump_alpha, m.drop_target.X, m.drop_target.Y);
+        } else {
+            Vector at{};
+            if (!ActorLocation(m.pawn, at)) continue;
+            float agl = at.Z - m.land_z;
+            if (m.bus_state == 2 && agl < 2600) m.bus_state = 3;   // deploy chute
+            if (m.bus_state == 3 && agl < 160) {                   // landed
+                m.bus_state = 0;
+                m.jump_alpha = 1.0f;
+                if (unSky && unSky->ok()) unSky->run(m.pawn);
+                if (cmOff > 0 && vOff > 0) {
+                    void* cm = Read<void*>(m.pawn, (size_t)cmOff);
+                    if (cm && !IsBadPtr(cm)) { Vector v{}; Write<Vector>(cm, (size_t)vOff, v); }
+                }
+                m.next_heading = Monotonic();
+                if (++landed == 1 || landed % 25 == 0)
+                    LOG("[Bus] bot landed #%d at (%.0f, %.0f)", landed, m.drop_target.X, m.drop_target.Y);
+                continue;
+            }
+            Vector v{};
+            v.Z = (m.bus_state == 2) ? -3800.0f : -680.0f;
+            float dx = m.drop_target.X - at.X, dy = m.drop_target.Y - at.Y;
+            float d = std::sqrt(dx * dx + dy * dy);
+            float spd = (m.bus_state == 2) ? 750.0f : 420.0f;
+            if (d > 300.0f && d > 0.01f) { v.X = dx / d * spd; v.Y = dy / d * spd; }
+            if (cmOff > 0 && vOff > 0) {
+                void* cm = Read<void*>(m.pawn, (size_t)cmOff);
+                if (cm && !IsBadPtr(cm)) Write<Vector>(cm, (size_t)vOff, v);
+            }
+        }
+    }
+}
+
+// [F78-a4] manual pilot — flies the exact route the native StartFlightPath
+// would; engaged only when two consecutive beats show the native aircraft
+// tick is silent (the F77 fallback drove toward an empty zone centre and
+// never moved — the bus stayed parked at (0,0,0) under the map).
+static void BRBusPilot(float now) {
+    if (!br.have_route || !br.aircraft || IsBadPtr(br.aircraft)) return;
+    float t = now - br.bus_flight_start;
+    if (t < 0) t = 0;
+    if (t > br.route_dur) t = br.route_dur;
+    float rad = br.route_yaw * 3.14159265f / 180.0f;
+    Vector p{ br.route_start.X + std::cos(rad) * br.route_speed * t,
+              br.route_start.Y + std::sin(rad) * br.route_speed * t,
+              br.route_start.Z };
+    static Call* sl = nullptr;
+    if (!sl) sl = new Call("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+    if (sl && sl->ok()) {
+        Rotator rot{}; rot.Yaw = br.route_yaw;
+        sl->set("NewLocation", p);
+        sl->set("NewRotation", rot);
+        bool sweep = false, tp = true;
+        sl->set("bSweep", sweep);
+        sl->set("bTeleport", tp);
+        sl->run(br.aircraft);
+    }
+    BRWriteFloat(br.aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightElapsedTime", t);
+}
+
+// ----------------------------------------------------------------------------
 // [F73-e/F74] Erbium StartAircraftPhase — 21.30 correction: SpawnAircraft is
 // a STATIC on AFortAthenaAircraft (UFunction verified in the 21.30 dump:
 // World + AircraftClass + FAircraftFlightInfo InFlightInfo@0x10 0x48 bytes;
@@ -4516,6 +4775,9 @@ static void BRStartNewSafeZonePhase(int p, bool bInitial) {
 // (aircraft/cosmetic actor) from BBID_DefaultBus — Erbium FortGameMode.cpp
 // sets these right after the aircraft exists.
 // [F74] every step logs BEFORE running so any residual crash names itself.
+// [F78] flight path guaranteed (synthesized into MapInfo->FlightInfos[0] when
+// the map arrives without one), native StartFlightPath fired, HUD aircraft
+// binding (CurrentAircraft), bots boarded for staggered drops.
 // ----------------------------------------------------------------------------
 static void BRStartAircraftPhase() {
     if (br.phase >= 3) return;
@@ -4553,6 +4815,55 @@ static void BRStartAircraftPhase() {
         }
         LOG("[BR] FlightInfos[0]: speed=%.0f (ok=%d) drop %.0f->%.0f flight %.0f",
             speed, (int)haveSpeed, tds, tde, tfe);
+    }
+
+    // [F78-a1] No map flight data — synthesize the route from the map's OWN
+    // bounds/height/speed and push it into MapInfo->FlightInfos[0] (the native
+    // match-init flow Erbium relies on; 21.30 standalone never fills it).
+    if (!haveFI) {
+        uint8_t fiBuf[0x48] = {};
+        Vector rs{}; float ry = 0, rspd = 4500, rdur = 60;
+        if (BRBuildFlightInfo(fiBuf, rs, ry, rspd, rdur)) {
+            if (br.mapinfo && !IsBadPtr(br.mapinfo) && arrProp) {
+                Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(
+                    GetField(br.mapinfo, arrProp), arrProp, fiBuf);
+            }
+            fi = arrProp ? (Array*)GetField(br.mapinfo, arrProp) : nullptr;
+            if (fi && fi->Count > 0 && fi->Data && !IsBadPtr(fi->Data)) { fiElem = 0x48; haveFI = true; }
+            br.have_route = true;
+            br.route_start = rs; br.route_yaw = ry;
+            br.route_speed = rspd; br.route_dur = rdur;
+            br.drop_start = now + rdur * 0.08f;
+            br.drop_end = now + rdur * 0.88f;
+            br.flight_end = now + rdur;
+            LOG("[BR] synthesized flight path: start=(%.0f,%.0f,%.0f) yaw=%.0f speed=%.0f dur=%.0f (MapInfo bounds+height+speed)",
+                rs.X, rs.Y, rs.Z, (double)ry, (double)rspd, (double)rdur);
+        }
+    } else {
+        // real MapInfo data — extract the route for the pilot fallback + bots
+        Vector rs{};
+        float ryaw = 0, rspd = 0;
+        if (void* lp = GetProp("/Script/FortniteGame.AthenaAircraftFlightInfo.FlightStartLocation")) {
+            int off = Read<int>(lp, profile::PropOffset);
+            if (off >= 0 && off + 24 <= fiElem) rs = Read<Vector>(fi->Data, off);
+        }
+        if (void* rp = GetProp("/Script/FortniteGame.AthenaAircraftFlightInfo.FlightStartRotation")) {
+            int off = Read<int>(rp, profile::PropOffset);
+            if (off >= 0 && off + 24 <= fiElem) {
+                Rotator rr = Read<Rotator>(fi->Data, off);
+                ryaw = (float)rr.Yaw;
+            }
+        }
+        if (void* sp2 = GetProp("/Script/FortniteGame.AthenaAircraftFlightInfo.FlightSpeed")) {
+            int off = Read<int>(sp2, profile::PropOffset);
+            if (off >= 0 && off + 4 <= fiElem) rspd = Read<float>(fi->Data, off);
+        }
+        br.have_route = true;
+        br.route_start = rs; br.route_yaw = ryaw;
+        br.route_speed = (rspd > 500) ? rspd : 4500;
+        br.route_dur = (br.flight_end > now) ? (br.flight_end - now) : 60;
+        LOG("[BR] real flight path: start=(%.0f,%.0f,%.0f) yaw=%.0f speed=%.0f",
+            rs.X, rs.Y, rs.Z, (double)ryaw, (double)br.route_speed);
     }
 
     void* aircraft = nullptr;
@@ -4596,10 +4907,17 @@ static void BRStartAircraftPhase() {
             }
         }
         if (!aircraft) {
-            // Manual fallback — the real class, empty transform (its own Tick
-            // interpolates FlightInfo fields we write next).
+            // Manual fallback — the real class, spawned ON THE ROUTE (the F77
+            // identity spawn parked the bus at (0,0,0) under the map).
             LOG("[BR] manual aircraft spawn...");
             Transform t{};
+            if (br.have_route) {
+                t.Location[0] = br.route_start.X;
+                t.Location[1] = br.route_start.Y;
+                t.Location[2] = br.route_start.Z;
+                Rotator rr{}; rr.Pitch = -6; rr.Yaw = br.route_yaw;
+                RotatorToQuat(rr, t.Rotation);
+            }
             aircraft = SpawnActor(session.world, acCls, session.state, t);
             LOG("[BR] manual aircraft -> %p", aircraft);
             if (aircraft)
@@ -4653,6 +4971,23 @@ static void BRStartAircraftPhase() {
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightStartTime", now);
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightEndTime", br.flight_end);
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.ReplicatedFlightTimestamp", now);
+        // [F78-a2] THE native flight starter — 21.30's StartFlightPath consumes
+        // FlightInfo and flies the bus (on the real server the phase machine
+        // fires it; standalone nothing starts the flight except us).
+        Call sfp("/Script/FortniteGame.FortAthenaAircraft.StartFlightPath");
+        if (sfp.ok()) { float st = now; if (sfp.set("StartTime", st)) sfp.run(aircraft); }
+        else LOG("[BR] StartFlightPath UFunction not found — pilot fallback owns the route");
+        Call rts("/Script/FortniteGame.FortAthenaAircraft.OnRep_ReplicatedFlightTimestamp");
+        if (rts.ok()) rts.run(aircraft);
+        // [F78-a3] HUD aircraft binding — the bus bar reads the controller's
+        // aircraft component; leaving CurrentAircraft null left the bar in its
+        // zero state ("EVERYBODY OFF! LAST STOP IN 0s" forever).
+        void* acc = GetAircraftComponent(session.controller);
+        if (acc && !IsBadPtr(acc)) {
+            BRWritePtr(acc, "/Script/FortniteGame.FortControllerComponent_Aircraft.CurrentAircraft", aircraft);
+            LOG("[BR] aircraft component bound (CurrentAircraft)");
+        }
+        br.bus_flight_start = now;
 
         // [F74-c] BattleBus skin — post-spawn half (Erbium FortGameMode.cpp
         // :1043-1109): DefaultBusSkin on the aircraft + ActiveSkin on the
@@ -4700,6 +5035,12 @@ static void BRStartAircraftPhase() {
         }
         LOG("[BR] player boarded (pawn hidden, camera on bus)");
     }
+
+    // [F78-c] Erbium's StartAircraftPhase boards EVERY AlivePlayer — the user
+    // asked for exactly that: the bots ride the bus with the player, jump at
+    // their own staggered route fractions, skydive to random POIs and land
+    // aware (the smart ground AI resumes).
+    BRBoardBots();
 
     // Erbium StartAircraftPhase tail: ClientActivateSlot(0,0) re-arms the
     // pickaxe for landing. The [F74-a] swallow makes this safe standalone.
@@ -5022,6 +5363,24 @@ static void BRSpawnBotBatch(int n) {
         // [F74-e] movement driver registration (bots wander, see BRBotMoveTick)
         br.bot_pawns.push_back(pawn);
         g_bot_motors.push_back({pawn, (float)(BRRand01() * 360.0), 0.0});
+        // [F78-c] a bot that finishes spawning while the bus is already flying
+        // boards it mid-route (delayed roster fill during the aircraft phase)
+        if (br.phase >= 3 && br.have_route && !br.flight_done && !g_bot_motors.empty()) {
+            BRBotMotor& mm = g_bot_motors.back();
+            mm.bus_state = 1;
+            mm.jump_alpha = 0.30f + BRRand01() * 0.50f;
+            Vector center{}; float radius = 150000;
+            if (!BRPlayableBounds(center, radius)) {
+                if (session.pawn && !IsBadPtr(session.pawn) && ActorLocation(session.pawn, center)) center.Z = 0;
+            }
+            float ang = BRRand01() * 6.2831853f;
+            float rrad = radius * 0.72f * BRRand01();
+            mm.drop_target = Vector{ center.X + std::cos(ang) * rrad, center.Y + std::sin(ang) * rrad, 0 };
+            mm.land_z = 0;
+            if (!BRGroundZ(mm.drop_target.X, mm.drop_target.Y, mm.land_z)) mm.land_z = 300;
+            Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+            if (hid.ok()) { bool b = true; if (hid.set("bNewHidden", b)) hid.run(mm.pawn); }
+        }
 
         // ability sets (Erbium: GiveAbilitySet per AbilitySets entry)
         for (void* set : session.granted_ability_sets) ApplyAbilitySet(pawn, set);
@@ -5153,6 +5512,9 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
         if (!pawn || IsBadPtr(pawn)) continue;                 // destroyed (storm/edit)
         void* cls = Read<void*>(pawn, profile::ObjectClass);
         if (!cls || IsBadPtr(cls)) continue;                   // half-freed actor
+        // [F78-c] bus riders / skydivers are BRBusBotsTick's job — the ground
+        // AI must not fight the descent (or walk them out of the bus).
+        if (m.bus_state != 0) { list[w++] = m; continue; }
         // current location (stuck-check anchor + wander center)
         Vector at{};
         bool haveAt = false;
@@ -5487,6 +5849,12 @@ void Athena::BRTick() {
 
     float now = BRWorldTime();
 
+    // [F78-a5] HUD clock — the bus countdown / storm timer widgets compute
+    // FlightEndTime - GetServerWorldTimeSeconds(); standalone the replicated
+    // clock is never delivered, so the bar stayed in its zero state. Feed it
+    // our own world clock (AGameStateBase.ReplicatedWorldTimeSeconds).
+    BRWriteFloat(session.state, "/Script/Engine.GameStateBase.ReplicatedWorldTimeSeconds", now);
+
     if (br.phase <= 2) { // Warmup (None/Setup/Warmup)
         // [F77-a] STARVE THE NATIVE TRANSITION — the F76 device log proved the
         // crash at countdown zero is the NATIVE warmup-end machinery (its pawn
@@ -5531,11 +5899,21 @@ void Athena::BRTick() {
         BRWriteFloat(session.state, "/Script/FortniteGame.FortGameStateAthena.WarmupCountdownEndTime", now + 6.0f);
         if (br.component)
             BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupCountdownEndTime", now + 6.0f);
+        // [F78-c] bus riders — staggered jumps + descent run every tick
+        {
+            float denom = br.flight_end - br.bus_flight_start;
+            if (denom < 1) denom = 1;
+            float alpha = (now - br.bus_flight_start) / denom;
+            if (alpha < 0) alpha = 0;
+            if (alpha > 1) alpha = 1;
+            BRBusBotsTick(alpha);
+        }
         void* ac = br.aircraft;
         if (ac && !IsBadPtr(ac)) {
-            // [F77] bus flight heartbeat — names a dead bus immediately, and
-            // drives it manually (straight line to the map centre) if the
-            // native aircraft tick stays silent for two consecutive beats.
+            // [F78] bus flight heartbeat — names a dead bus immediately; if
+            // the native aircraft tick stays silent for two beats our own
+            // pilot flies the real route (the F77 fallback drove toward an
+            // empty zone centre and never moved — the bus stayed at (0,0,0)).
             static double lastBusBeat = 0; static Vector lastBusAt{}; static int stillBeats = 0;
             Vector bl{};
             bool haveBus = ActorLocation(ac, bl);
@@ -5550,24 +5928,7 @@ void Athena::BRTick() {
             }
             if (haveBus && stillBeats >= 2) {
                 static double lastDrive = 0;
-                double dt = now - lastDrive;
-                lastDrive = now;
-                if (dt > 0.001 && dt < 0.25) {
-                    Vector c{0, 0, 0};
-                    if (!br.zone_centers.empty()) c = br.zone_centers[0];
-                    float ddx = c.X - bl.X, ddy = c.Y - bl.Y;
-                    float len = std::sqrt(ddx * ddx + ddy * ddy);
-                    if (len > 1000.0f) {
-                        Vector nl{ bl.X + ddx / len * 1500.0f * (float)dt,
-                                   bl.Y + ddy / len * 1500.0f * (float)dt, bl.Z };
-                        Call sl("/Script/Engine.Actor.K2_SetActorLocation");
-                        if (sl.ok()) {
-                            bool sweep = false, tp = true;
-                            if (sl.set("NewLocation", nl) && sl.set("bSweep", sweep) && sl.set("bTeleport", tp))
-                                sl.run(ac);
-                        }
-                    }
-                }
+                if (now - lastDrive > 0.05) { lastDrive = now; BRBusPilot(now); }
             }
             if (!br.bus_unlocked && br.drop_start > 0 && now >= br.drop_start) {
                 br.bus_unlocked = true;
@@ -5590,6 +5951,14 @@ void Athena::BRTick() {
                 if (d.ok()) d.run(ac);
                 br.aircraft = nullptr;
                 LOG("[BR] aircraft destroyed (flight over)");
+                // [F78-a6] Erbium Tick: after the flight the match moves on —
+                // phase SafeZones, storm forming. F77 left the phase parked
+                // here, which is exactly the frozen "EVERYBODY OFF! LAST STOP
+                // IN 0s" bar the F77 device log ended with.
+                br.safezones_start = now + 12.0f;
+                BRSetGamePhase(4);     // SafeZones
+                BRSetGamePhaseStep(6); // StormForming
+                LOG("[BR] flight over — SafeZones in 12s (storm forming)");
             }
             // [F73] failsafe — flight over but the jump chain never landed:
             // restore the pawn so the player is never stuck hidden.
