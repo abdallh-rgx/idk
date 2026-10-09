@@ -3193,10 +3193,25 @@ static void tick_hook(void* world, int type, float delta) {
     int expected = 0;
     if (g_gameTid.compare_exchange_strong(expected, (int)gettid())) LOG("WorldTick first: tid=%d", (int)gettid());
     if (g_gameTid.load() != (int)gettid()) return;
-    // [F14] Never mutate state while the engine is saving or collecting.
-    if (Read<uint8_t>((const void*)(g_base + profile::IsSavingPackage)) ||
-        Fn<bool(*)()>(profile::IsGarbageCollecting)()) return;
+    // [F27] The old [F14] guard read libUnreal.so CODE bytes at
+    // profile::IsSavingPackage (0x0760A59C is an EXEC RVA in 21.30 — it was
+    // defined-but-never-used in the original hook.cpp). First byte there is
+    // 0xFD, so the check was always true and tick_hook returned before ANY
+    // world detection ran (no controller binding, no spawn). game.cpp's
+    // reference used a real .bss bool there, but this build has no known data
+    // address for it — both probes are dropped (the original hook.cpp never
+    // used them either). Re-entrancy is still guarded below.
     Guard g;
+
+    // [F27] One-shot diagnostics: proves world pointer + name resolution work
+    // on-device (appears once, right after the first game-thread tick).
+    static bool diag_logged = false;
+    if (!diag_logged) {
+        diag_logged = true;
+        void* wcls = Read<void*>(world, profile::ObjectClass);
+        LOG("DIAG world=%p class=%p ('%s') name='%s'",
+            world, wcls, ObjName(wcls).c_str(), ObjName(world).c_str());
+    }
 
     // [F24] Lobby travel was dispatched inside ReturnToLobby; while it is in
     // flight, ignore the departing world so the session does not resurrect.
