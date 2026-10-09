@@ -443,6 +443,8 @@ struct Session {
     bool  gm_hook_fired = false;
     bool  inventory_populated = false;
     bool  equip_done = false;
+    bool  vehicles_attempted = false;    // ← أضف هذا
+    bool  wildlife_attempted = false;    // ← أضف هذا
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
