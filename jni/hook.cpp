@@ -888,9 +888,16 @@ public:
         // [F16] Receiver validation — refuse cross-class execution.
         void* owner = Read<void*>(m_func, profile::ObjectOuter);
         if (owner && !IsBadPtr(owner) && !IsA(object, owner)) {
-            LOG("[Call] rejected %s: receiver=%s owner=%s", ObjName(m_func).c_str(),
-                ObjName(Read<void*>(object, profile::ObjectClass)).c_str(), ObjName(owner).c_str());
-            return false;
+            // [F77-e] widget-layer reflection quirk: the Bacchus quickbar
+            // widgets report a broken inheritance chain against QuickbarBase_C,
+            // so every HandleQuickbarContentChanged poke was rejected and the
+            // quickbar UI stayed dead. Poke targets are collected BY class —
+            // the receiver is right by construction, so allowlist this one.
+            if (ObjName(m_func) != "HandleQuickbarContentChanged") {
+                LOG("[Call] rejected %s: receiver=%s owner=%s", ObjName(m_func).c_str(),
+                    ObjName(Read<void*>(object, profile::ObjectClass)).c_str(), ObjName(owner).c_str());
+                return false;
+            }
         }
         Guard g;
         orig_PE(object, m_func, m_data.data());
@@ -1227,6 +1234,9 @@ struct BRBotMotor {
     float  lastX = 0, lastY = 0;   // stuck detection anchor
     double last_check = 0;         // last stuck-check time
     uint8_t vel_mode = 0;          // 0 = try navmesh move, 1 = velocity drive
+    // [F77-c] engagement — face a nearby enemy and hold ground for a beat
+    void*  face = nullptr;
+    double face_until = 0;
 };
 static std::vector<BRBotMotor> g_bot_motors;
 static std::vector<BRBotMotor> g_wild_motors;   // [F75-c] animals roam too
@@ -4762,26 +4772,62 @@ static void* BRBotHeroType = nullptr;
 // ----------------------------------------------------------------------------
 static std::vector<void*> g_head_pool;
 static std::vector<void*> g_body_pool;
-static void BRPartPools() {
-    if (!g_head_pool.empty() || !g_body_pool.empty()) return;
+// [F77-b] complete outfits — resident AthenaCharacterItemDefinition objects
+// carry HeroDefinition->Specializations->CharacterParts: a full (head, body)
+// pair from ONE skin, exactly how the local player's locker renders Lancelot.
+struct BRCidOutfit { void* head; void* body; void* cid; };
+static std::vector<BRCidOutfit> g_cid_outfits;
+static double g_pool_scan_at = 0;
+static void BRPartPools(bool force = false) {
     GObjects_t* go = GObjectArray();
     void* ccpCls = FindObj("/Script/FortniteGame.CustomCharacterPart");
-    if (!go || !ccpCls) { LOG("[BR] cosmetic pool scan unavailable (ccp=%p)", ccpCls); return; }
+    void* cidCls = FindObj("/Script/FortniteGame.AthenaCharacterItemDefinition");
+    if (!go || (!ccpCls && !cidCls)) { LOG("[BR] cosmetic pool scan unavailable (ccp=%p)", ccpCls); return; }
+    // [F77-b] parts stream in over time — the F76 one-shot scan at the first
+    // bot wave saw only 12 resident parts (heads=4 bodies=8). Rescan while the
+    // pools are thin, at most once per 5s.
+    double nowM = Monotonic();
+    bool thin = g_head_pool.size() < 24 || g_body_pool.size() < 24 || g_cid_outfits.size() < 8;
+    if (!force && (!thin || nowM - g_pool_scan_at < 5.0)) return;
+    g_pool_scan_at = nowM;
+    size_t heads0 = g_head_pool.size(), bodies0 = g_body_pool.size(), outfits0 = g_cid_outfits.size();
     for (int32 i = 0; i < go->NumElements; ++i) {
-        if (g_head_pool.size() >= 256 && g_body_pool.size() >= 256) break;
+        if (g_head_pool.size() >= 512 && g_body_pool.size() >= 512 && g_cid_outfits.size() >= 512) break;
         void* object = go->GetById((uint32)i);
         if (!object || IsBadPtr(object) || IsCDO(object)) continue;
-        if (!IsA(object, ccpCls)) continue;
-        std::string n = ObjName(object);
-        if (n.find("Empty") != std::string::npos) continue;
-        if (n.rfind("CP_Head_", 0) == 0 || n.find("_Head_") != std::string::npos) {
-            if (g_head_pool.size() < 256) g_head_pool.push_back(object);
-        } else if (n.rfind("CP_Body_", 0) == 0 || n.rfind("CP_Athena_Body", 0) == 0 ||
-                   n.find("_Body_") != std::string::npos) {
-            if (g_body_pool.size() < 256) g_body_pool.push_back(object);
+        void* cls = Read<void*>(object, profile::ObjectClass);
+        if (!cls || IsBadPtr(cls)) continue;
+        if (cidCls && IsA(object, cidCls)) {
+            bool dup = false;
+            for (auto& o : g_cid_outfits) if (o.cid == object) { dup = true; break; }
+            if (dup) continue;
+            void* heroDef = GetObjField(object, "/Script/FortniteGame.AthenaCharacterItemDefinition.HeroDefinition");
+            if (!heroDef || IsBadPtr(heroDef)) continue;
+            void* head = nullptr; void* body = nullptr;
+            for (void* spec : SoftAssetArray(heroDef, "/Script/FortniteGame.FortHeroType.Specializations")) {
+                if (!spec || IsBadPtr(spec)) continue;
+                for (void* part : SoftAssetArray(spec, "/Script/FortniteGame.FortHeroSpecialization.CharacterParts")) {
+                    if (!part || IsBadPtr(part)) continue;
+                    std::string pn = ObjName(part);
+                    if (!head && pn.find("Head") != std::string::npos) head = part;
+                    else if (!body && pn.find("Body") != std::string::npos) body = part;
+                }
+            }
+            if (head && body) g_cid_outfits.push_back({head, body, object});
+        } else if (ccpCls && IsA(object, ccpCls)) {
+            std::string n = ObjName(object);
+            if (n.find("Empty") != std::string::npos) continue;
+            if (n.find("Head") != std::string::npos) {
+                if (g_head_pool.size() < 512) g_head_pool.push_back(object);
+            } else if (n.find("Body") != std::string::npos) {
+                if (g_body_pool.size() < 512) g_body_pool.push_back(object);
+            }
         }
     }
-    LOG("[BR] cosmetic pools: heads=%zu bodies=%zu (F76 random skins)", g_head_pool.size(), g_body_pool.size());
+    if (g_head_pool.size() != heads0 || g_body_pool.size() != bodies0 || g_cid_outfits.size() != outfits0)
+        LOG("[BR] cosmetic pools: heads=%zu(+%zu) bodies=%zu(+%zu) outfits=%zu(+%zu) (F77 — resident locker scan)",
+            g_head_pool.size(), g_head_pool.size() - heads0, g_body_pool.size(), g_body_pool.size() - bodies0,
+            g_cid_outfits.size(), g_cid_outfits.size() - outfits0);
 }
 
 static void BRSpawnBotBatch(int n) {
@@ -4890,17 +4936,47 @@ static void BRSpawnBotBatch(int n) {
         }
         SetBool(st, "/Script/FortniteGame.FortPlayerState.bIsABot", true);
 
-        // [F74-d + F76-b] cosmetics — the exact chain that gave the LOCAL
-        // player a working body, now with a RANDOM (head, body) pair per bot
-        // from the loaded CustomCharacterPart pools (every bot a different
-        // skin — the user's ask). Fallback: the Erbium trio statics.
+        // [F74-d + F77-b] cosmetics — the exact chain that gave the LOCAL
+        // player a working body, now with a RANDOM outfit per bot: prefer a
+        // complete resident skin (CID outfit — head+body from ONE skin), then
+        // independent random parts, then the Erbium trio statics.
         {
-            void* botHead = !g_head_pool.empty() ? g_head_pool[(size_t)(BRRand() % g_head_pool.size())] : headPart;
-            void* botBody = !g_body_pool.empty() ? g_body_pool[(size_t)(BRRand() % g_body_pool.size())] : bodyPart;
-            if (k == 0 && !br.bot_skins_logged) {
+            void* botHead = nullptr; void* botBody = nullptr; void* botCid = nullptr;
+            if (!g_cid_outfits.empty()) {
+                const BRCidOutfit& o = g_cid_outfits[(size_t)(BRRand() % g_cid_outfits.size())];
+                botHead = o.head; botBody = o.body; botCid = o.cid;
+            } else {
+                if (!g_head_pool.empty()) botHead = g_head_pool[(size_t)(BRRand() % g_head_pool.size())];
+                if (!g_body_pool.empty()) botBody = g_body_pool[(size_t)(BRRand() % g_body_pool.size())];
+            }
+            if (!botHead) botHead = headPart;
+            if (!botBody) botBody = bodyPart;
+            if (k < 3 && !br.bot_skins_logged) {
                 br.bot_skins_logged = true;
-                LOG("[BR] bot skins: head=%s body=%s", botHead ? ObjName(botHead).c_str() : "<fallback>",
-                    botBody ? ObjName(botBody).c_str() : "<fallback>");
+                LOG("[BR] bot skins: %s | %s | %s",
+                    botCid ? ObjName(botCid).c_str() : "<parts>",
+                    botHead ? ObjName(botHead).c_str() : "<null>",
+                    botBody ? ObjName(botBody).c_str() : "<null>");
+            }
+            // [F77-b] the LOCAL player's skin works because SyncLockerLoadout
+            // mirrors the whole FFortAthenaLoadout onto the pawn
+            // (FortPlayerPawn.CosmeticLoadout) — every bot gets the same
+            // mirror with its own random CID.
+            void* pawnLoProp = GetProp("/Script/FortniteGame.FortPlayerPawn.CosmeticLoadout");
+            if (pawnLoProp) {
+                int loSize = Read<int>(pawnLoProp, profile::PropElementSize);
+                if (loSize > 8 && loSize <= 1024) {
+                    std::vector<uint8_t> shadow((size_t)loSize, 0);
+                    if (botCid) {
+                        void* chProp = GetProp("/Script/FortniteGame.FortAthenaLoadout.Character");
+                        if (chProp) {
+                            int chOff = Read<int>(chProp, profile::PropOffset);
+                            if (chOff >= 0 && chOff + 8 <= loSize)
+                                memcpy(shadow.data() + chOff, &botCid, 8);
+                        }
+                    }
+                    memcpy(GetField(pawn, pawnLoProp), shadow.data(), (size_t)loSize);
+                }
             }
             int partsApplied = 0;
             if (botHead) { Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
@@ -5064,6 +5140,12 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
     }
     bool navOk = smove && smove->ok() && aiLib && !IsBadPtr(aiLib);
     bool isWild = !std::strcmp(tag, "Wild");
+    // [F77-c/d] the player's position — one PE call per tick feeds both the
+    // bot engagement check and the wildlife flee check.
+    Vector playerAt{}; bool havePlayer = false;
+    if (session.pawn && !IsBadPtr(session.pawn) && getLoc && getLoc->ok() && getLoc->run(session.pawn)) {
+        playerAt = getLoc->result<Vector>(); havePlayer = true;
+    }
     size_t w = 0;
     for (size_t i = 0; i < list.size(); ++i) {
         BRBotMotor& m = list[i];
@@ -5075,19 +5157,63 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
         Vector at{};
         bool haveAt = false;
         if (getLoc && getLoc->ok() && getLoc->run(pawn)) { at = getLoc->result<Vector>(); haveAt = true; }
-        // ---- retarget window: new wander goal ----
+        // ---- retarget window: flee / storm discipline / engage / wander ----
         if (now >= m.next_heading) {
             m.yaw = (float)(BRRand01() * 360.0);
             m.next_heading = now + 4.0 + BRRand01() * 4.0;
-            if (navOk) {
-                // [F76-c] primary: native navmesh wander — real pathing around
-                // obstacles instead of straight lines into walls.
-                float wander = isWild ? 500.0f + BRRand01() * 900.0f
-                                      : 900.0f + BRRand01() * 1700.0f;
-                float ang = BRRand01() * 6.2831853f;
-                Vector goal{ at.X + std::cos(ang) * wander, at.Y + std::sin(ang) * wander, at.Z };
+            Vector goal{ at.X, at.Y, at.Z };
+            bool   haveGoal = false;
+            bool   engage   = false;
+            if (isWild) {
+                // [F77-d] prey instinct — the player within 22m scatters the
+                // animal AWAY from them (wildlife that ignores you is dead).
+                if (havePlayer) {
+                    float ddx = at.X - playerAt.X, ddy = at.Y - playerAt.Y;
+                    float pd2 = ddx * ddx + ddy * ddy;
+                    if (pd2 < 2200.0f * 2200.0f && pd2 > 1.0f) {
+                        float inv = 1.0f / std::sqrt(pd2);
+                        goal = Vector{ at.X + ddx * inv * 1400.0f, at.Y + ddy * inv * 1400.0f, at.Z };
+                        haveGoal = true;
+                    }
+                }
+            } else {
+                // [F77-c] storm discipline — outside the first safe circle the
+                // bot walks back in (no more bots staring at the storm wall).
+                if (br.phase >= 4 && !br.zone_centers.empty()) {
+                    Vector c = br.zone_centers[0];
+                    float zr = br.radius.empty() ? 25600.0f : br.radius[0];
+                    float ddx = at.X - c.X, ddy = at.Y - c.Y;
+                    if (std::sqrt(ddx * ddx + ddy * ddy) > zr * 0.92f) {
+                        float ang = BRRand01() * 6.2831853f, rr = zr * 0.25f * BRRand01();
+                        goal = Vector{ c.X + std::cos(ang) * rr, c.Y + std::sin(ang) * rr, at.Z };
+                        haveGoal = true;
+                    }
+                }
+                // [F77-c] engagement — the player within 30m: face them and
+                // hold ground for 1-3s (a bot that notices you is alive).
+                if (!haveGoal && havePlayer) {
+                    float ddx = at.X - playerAt.X, ddy = at.Y - playerAt.Y;
+                    if (ddx * ddx + ddy * ddy < 3000.0f * 3000.0f) {
+                        m.face = session.pawn;
+                        m.face_until = now + 1.2 + BRRand01() * 2.5;
+                        m.next_heading = m.face_until + 0.5;
+                        engage = true;
+                    }
+                }
+            }
+            if (engage) {
+                m.lastX = haveAt ? at.X : 0; m.lastY = haveAt ? at.Y : 0;
+            } else if (haveGoal || navOk) {
+                if (!haveGoal) {
+                    // [F76-c] primary: native navmesh wander — real pathing
+                    // around obstacles instead of straight lines into walls.
+                    float wander = isWild ? 500.0f + BRRand01() * 900.0f
+                                          : 900.0f + BRRand01() * 1700.0f;
+                    float ang = BRRand01() * 6.2831853f;
+                    goal = Vector{ at.X + std::cos(ang) * wander, at.Y + std::sin(ang) * wander, at.Z };
+                }
                 void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
-                if (ctrl && !IsBadPtr(ctrl) &&
+                if (navOk && ctrl && !IsBadPtr(ctrl) &&
                     smove->set("Controller", ctrl) && smove->set("Goal", goal) && smove->run(aiLib)) {
                     m.vel_mode = 0;                       // trust the navmesh this window
                     m.lastX = haveAt ? at.X : 0; m.lastY = haveAt ? at.Y : 0;
@@ -5101,6 +5227,28 @@ static void MotorTick(std::vector<BRBotMotor>& list, float speed, const char* ta
             } else {
                 m.vel_mode = 1;
             }
+        }
+        // [F77-c] engaged — hold ground and track the player every tick
+        if (m.face && now < m.face_until) {
+            Vector fat{};
+            if (getLoc && getLoc->ok() && getLoc->run(m.face)) {
+                fat = getLoc->result<Vector>();
+                void* ctrl = ctrlOff > 0 ? Read<void*>(pawn, (size_t)ctrlOff) : nullptr;
+                if (ctrl && !IsBadPtr(ctrl) && rot && rot->ok() && haveAt) {
+                    Rotator r{}; r.Yaw = std::atan2(fat.Y - at.Y, fat.X - at.X) * 57.2957795f;
+                    if (rot->set("NewRotation", r)) rot->run(ctrl);
+                }
+                if (cmOff > 0 && vOff > 0) {
+                    void* cm = Read<void*>(pawn, (size_t)cmOff);
+                    if (cm && !IsBadPtr(cm)) {
+                        Vector v = Read<Vector>(cm, (size_t)vOff);
+                        if (std::isfinite(v.Z)) { v.X = 0; v.Y = 0; Write<Vector>(cm, (size_t)vOff, v); }
+                    }
+                }
+                list[w++] = m;
+                continue;
+            }
+            m.face = nullptr;   // target gone — back to the wander machine
         }
         // ---- stuck check 2.2s after each navmesh request ----
         if (!m.vel_mode && haveAt && now >= m.last_check) {
@@ -5340,6 +5488,21 @@ void Athena::BRTick() {
     float now = BRWorldTime();
 
     if (br.phase <= 2) { // Warmup (None/Setup/Warmup)
+        // [F77-a] STARVE THE NATIVE TRANSITION — the F76 device log proved the
+        // crash at countdown zero is the NATIVE warmup-end machinery (its pawn
+        // teardown ran: ReceiveDestroyed -> OnAvatarActorDestroyed ->
+        // ClientForceWorldInventoryUpdate -> death). It reads GameState.
+        // WarmupCountdownEndTime — so while GetReady runs we hold that value
+        // permanently 6s from zero. The visible counter parks at 0:06 until
+        // OUR phase broadcast flips the HUD to the bus (Erbium never lets the
+        // native game mode drive phases either).
+        if (br.step >= 3 && br.warmup_end >= 0) {
+            BRWriteFloat(session.state, "/Script/FortniteGame.FortGameStateAthena.WarmupCountdownEndTime", now + 6.0f);
+            if (br.component)
+                BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupCountdownEndTime", now + 6.0f);
+            static bool froze = false;
+            if (!froze) { froze = true; LOG("[BR] native warmup countdown held at T-6 (F77 — native zero-transition starved)"); }
+        }
         // [F74-f] Erbium Tick machine: WarmupEarlyCountdownDuration (end-10s)
         // flips the step to GetReady before the aircraft launches.
         if (br.step < 3 && br.warmup_end >= 0 && now >= br.warmup_end - 10.0f)
@@ -5364,8 +5527,48 @@ void Athena::BRTick() {
     }
 
     if (br.phase == 3) { // Aircraft
+        // [F77-a] keep the native countdown parked while our bus flies.
+        BRWriteFloat(session.state, "/Script/FortniteGame.FortGameStateAthena.WarmupCountdownEndTime", now + 6.0f);
+        if (br.component)
+            BRWriteFloat(br.component, "/Script/FortniteGame.FortGameStateComponent_BattleRoyaleGamePhaseLogic.WarmupCountdownEndTime", now + 6.0f);
         void* ac = br.aircraft;
         if (ac && !IsBadPtr(ac)) {
+            // [F77] bus flight heartbeat — names a dead bus immediately, and
+            // drives it manually (straight line to the map centre) if the
+            // native aircraft tick stays silent for two consecutive beats.
+            static double lastBusBeat = 0; static Vector lastBusAt{}; static int stillBeats = 0;
+            Vector bl{};
+            bool haveBus = ActorLocation(ac, bl);
+            if (haveBus && now - lastBusBeat > 3.0) {
+                lastBusBeat = now;
+                float moved = std::sqrt((bl.X - lastBusAt.X) * (bl.X - lastBusAt.X) +
+                                        (bl.Y - lastBusAt.Y) * (bl.Y - lastBusAt.Y) +
+                                        (bl.Z - lastBusAt.Z) * (bl.Z - lastBusAt.Z));
+                LOG("[BUS] (%.0f, %.0f, %.0f) moved=%.0f", bl.X, bl.Y, bl.Z, (double)moved);
+                stillBeats = moved < 30.0f ? stillBeats + 1 : 0;
+                lastBusAt = bl;
+            }
+            if (haveBus && stillBeats >= 2) {
+                static double lastDrive = 0;
+                double dt = now - lastDrive;
+                lastDrive = now;
+                if (dt > 0.001 && dt < 0.25) {
+                    Vector c{0, 0, 0};
+                    if (!br.zone_centers.empty()) c = br.zone_centers[0];
+                    float ddx = c.X - bl.X, ddy = c.Y - bl.Y;
+                    float len = std::sqrt(ddx * ddx + ddy * ddy);
+                    if (len > 1000.0f) {
+                        Vector nl{ bl.X + ddx / len * 1500.0f * (float)dt,
+                                   bl.Y + ddy / len * 1500.0f * (float)dt, bl.Z };
+                        Call sl("/Script/Engine.Actor.K2_SetActorLocation");
+                        if (sl.ok()) {
+                            bool sweep = false, tp = true;
+                            if (sl.set("NewLocation", nl) && sl.set("bSweep", sweep) && sl.set("bTeleport", tp))
+                                sl.run(ac);
+                        }
+                    }
+                }
+            }
             if (!br.bus_unlocked && br.drop_start > 0 && now >= br.drop_start) {
                 br.bus_unlocked = true;
                 SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bAircraftIsLocked", false);
@@ -6366,6 +6569,15 @@ void Athena::InteractTick() {
         if (!ActorLocation(v, at)) continue;
         consider(v, at, 2, 320.0);
     }
+    // [F77-e] wildlife answers proximity too — every tracked animal becomes a
+    // candidate (DoInteract's per-class BlueprintOnInteract override walk;
+    // classes without their own handler fail the receiver check silently).
+    for (auto& wm : g_wild_motors) {
+        if (!wm.pawn || IsBadPtr(wm.pawn)) continue;
+        Vector l{};
+        if (!ActorLocation(wm.pawn, l)) continue;
+        consider(wm.pawn, l, 3, 260.0);
+    }
     session.nearest_interact = best;
     session.nearest_kind = bestKind;
     // [F75-d] one-shot per candidate — proves the scan actually sees world
@@ -7202,6 +7414,31 @@ static void pe_hook(void* obj, void* func, void* params) {
             static bool once = false;
             if (!once) { once = true; LOG("[Equip] external ClientActivateSlot swallowed (native phase-change equip)"); }
             return;   // the native continuation of this chain crashes standalone
+        }
+        // [F77-a] GetReady->Bus seatbelt — the F76 crash tail (the native
+        // warmup-end transition) ran exactly these calls on its way to death:
+        // ServerClientPawnLoaded, the pawn teardown cascade and
+        // ClientForceWorldInventoryUpdate. The countdown freeze (BRTick F77-a)
+        // is the primary fix — these swallows are the seatbelt in case any
+        // other trigger ever fires the transition. ClientGotoState
+        // ("Spectating") would strand the hidden-pawn bus design. Everything
+        // reopens at phase 4 (normal gameplay inventory refresh).
+        if (br.started && br.phase <= 3 &&
+            (fn == "ServerClientPawnLoaded" || fn == "ClientGotoState" ||
+             fn == "ClientForceWorldInventoryUpdate")) {
+            Guard g;
+            static bool once77 = false;
+            if (!once77) { once77 = true; LOG("[BR] phase-window seatbelt: %s swallowed (F77-a)", fn.c_str()); }
+            return;
+        }
+        // [F77-a] the other warmup-zero trigger — the native match-start
+        // poll. Defang exactly like ReadyToEndMatch (F76-a3): let the native
+        // run, then force the verdict false so the native GameMode can never
+        // StartMatch behind our phase engine's back.
+        if (fn == "ReadyToStartMatch") {
+            orig_PE(obj, func, params);
+            Athena::ForceReturnFalse(func, params);
+            return;
         }
         if (fn == "ServerExecuteInventoryItem" || fn == "ServerExecuteInventoryWeapon") {
             Guard g;
