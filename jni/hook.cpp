@@ -245,6 +245,7 @@ constexpr unsigned AFortGameState_GamePhase         = 0x2150;
 constexpr unsigned AFortGameState_SafeZoneIndicator = 0x19A8;
 constexpr unsigned AFortGameState_PlaylistInfo      = 0x2170;   // FPlaylistPropertyArray
 constexpr unsigned EditingTool_EditActor            = 0x1020;
+constexpr unsigned EditingTool_bEditConfirmed       = 0x1028;   // [F49] AFortWeap_EditingTool.bEditConfirmed
 constexpr unsigned Pickaxe_WeaponDefinition         = 0x0790;
 }
 
@@ -524,6 +525,42 @@ static void* FindLoadedObjectOfType(const char* type_path, const std::string& wa
     return nullptr;
 }
 
+// [F50] Enumerate UFunctions by name across all packages — BP widget events
+// (HandleQuickbarContentChanged) live under widget BP classes whose mount
+// paths are unknown, so the only way in is a name scan. The receiver check
+// inside Call::run() keeps a wrong-package match from executing.
+static std::vector<void*> FindAllFunctionsNamed(const char* fname, int limit = 8) {
+    std::vector<void*> out;
+    GObjects_t* go = GObjectArray();
+    void* funcType = FindObj("/Script/CoreUObject.Function");
+    if (!go || !funcType) return out;
+    for (int32 i = 0; i < go->NumElements && (int)out.size() < limit; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (!IsA(object, funcType)) continue;
+        if (ObjName(object) == fname) out.push_back(object);
+    }
+    return out;
+}
+
+// [F52] Find a GameplayAbility CLASS by exact name (classes must be matched
+// with SubclassOfFast — IsA() on a UClass object walks the meta-class chain
+// and never reaches the ability hierarchy).
+static void* FindAbilityClassNamed(const std::string& wanted) {
+    GObjects_t* go = GObjectArray();
+    void* gaCls = FindObj("/Script/GameplayAbilities.GameplayAbility");
+    void* classClass = FindObj("/Script/CoreUObject.Class");
+    if (!go || !gaCls || !classClass) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (!IsA(object, classClass)) continue;
+        if (!SubclassOfFast(object, gaCls)) continue;
+        if (ObjName(object) == wanted) return object;
+    }
+    return nullptr;
+}
+
 // [F39] CDO filter — class default objects live in GObjects and would pass
 // IsA(instance) checks; they must never be treated as live map actors.
 static bool IsCDO(void* obj) {
@@ -670,8 +707,16 @@ public:
             }
             if (derived) m_func = derived;
         }
+        init();
+    }
+    // [F50] Direct UFunction construction — for BP events that cannot be
+    // reached by path (widget BPs whose package mount is unknown).
+    explicit Call(void* funcPtr) { m_func = funcPtr; init(); }
+private:
+    void init() {
+        if (!m_func || IsBadPtr(m_func)) { m_func = nullptr; return; }
         int total = Read<uint16_t>(m_func, profile::FunctionParamSize);
-        if (total < 0 || total > (int)m_data.size()) return;
+        if (total < 0 || total > (int)m_data.size()) { m_valid = false; return; }
         void* p = Read<void*>(m_func, profile::StructChildren);
         for (int i = 0; p && !IsBadPtr(p) && i < 128; ++i) {
             add_param(p, Read<uint64_t>(p, profile::PropFlags), total, false);
@@ -684,6 +729,7 @@ public:
         }
         m_valid = (total == 0) || !m_params.empty();
     }
+public:
     bool ok() const { return m_valid; }
     void* func() const { return m_func; }
     void dump(const char* label) const {
@@ -936,6 +982,26 @@ struct Session {
     std::set<void*>    doors_ever_open; // [F40] keep these doors open
     void* vehicle_cache[32] = {};       // [F39] resolved vehicle BP classes
     int   vehicle_cache_n = 0;          // [F39]
+    // [F46-F53] interaction / world-content / edit / NPC round
+    std::vector<void*> containers;      // [F46] discovered map containers
+    std::vector<Vector> container_locs; // [F46] cached locations (no per-tick reflection)
+    std::vector<uint8_t> container_done;// [F46] already-searched flags
+    std::vector<void*> vehicles;        // [F47] live vehicle actors (ours + map)
+    void* interact_comp = nullptr;      // [F47] FortControllerComponent_Interaction
+    void* nearest_interact = nullptr;   // [F47] current interaction candidate
+    int   nearest_kind = 0;             // [F47] 1=container 2=vehicle
+    bool  auto_interact = true;         // [F47] proximity auto-search / auto-enter
+    std::map<void*, double> auto_interact_at; // [F47] per-actor cooldown
+    double last_interact_scan = 0;      // [F47]
+    bool  map_scan_done = false;        // [F46] one-time world-content scan
+    bool  world_abilities_granted = false; // [F52] slide + enter-vehicle GAS
+    bool  qb_widgets_poked = false;     // [F50] HandleQuickbarContentChanged poke
+    bool  npcs_spawned = false;         // [F52] ambient NPC bots
+    double last_edit_check = 0;         // [F49] edit-tool watcher
+    uint8_t last_edit_confirmed = 0;    // [F49] bEditConfirmed edge detect
+    void* last_edit_actor = nullptr;    // [F49] tool-bound edit target
+    std::set<uint64_t> build_cells;     // [F49] occupied grid cells
+    std::vector<void*> placed_builds;   // [F49] pieces we placed (occupancy)
 } session;
 
 static double Monotonic() {
@@ -1051,6 +1117,21 @@ namespace Athena {
     void FixBodyAndAnimations();       // [F41] pawn body + locomotion anims
     void ClimbTick();                  // [F42] hold-jump wall climb boost
     void SpawnFloorLootRetry();        // [F45] floor loot once levels stream in
+
+    // [F46-F53] interaction / world-content / edit / NPC round
+    void ScanMapContent();             // [F46] discover containers/spawners/sharks/saplings
+    void InteractTick();               // [F47] candidate scan + HUD prompt + auto-interact
+    bool DoInteract(void* actor);      // [F47] route chest/vehicle/door/prop interact
+    void* GetInteractionComp();        // [F47] FortControllerComponent_Interaction
+    bool EnterVehicle(void* veh);      // [F48] ForceSeatSinglePawn entry
+    void PokeQuickbarWidgets();        // [F50] force-refresh QuickbarBase widgets
+    bool StackRemove(void* def, int count); // [F49] build resource cost
+    void SpendBuildResources(void* klass);  // [F49] -10 wood/stone/metal on place
+    bool BuildCellOccupied(uint64_t key, const Vector& loc); // [F49] no build-overlap
+    void EditAssist();                 // [F49] EditingPlayer + bEditConfirmed watcher
+    void GrantWorldAbilities();        // [F52] slide + GA_AthenaEnterVehicle
+    int  SpawnNPCs(int max);           // [F52] ambient NPC pawns
+    void HarvestGrantFor(void* actor, float damage); // [F49] shared harvest grant
 }
 
 // ============================================================================
@@ -1438,6 +1519,47 @@ void Athena::ForceUpdateQuickBars() {
     }
 }
 
+// [F50] Widget-level quickbar refresh — the QuickbarBase widget's slots only
+// rebuild when its HandleQuickbarContentChanged BP event fires. On this
+// offline setup that event may never arrive after our manual slot fill, so
+// we poke every resident quickbar widget directly: resolve all UFunctions
+// named HandleQuickbarContentChanged (widget BP package mounts are unknown)
+// and run the ones whose owner matches the widget (Call::run guards this).
+void Athena::PokeQuickbarWidgets() {
+    if (!session.world) return;
+    void* base = FindObj("/Script/FortniteUI.FortQuickbarBase");
+    void* wb   = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
+    if (!base || !wb) { LOG("[QBW] FortQuickbarBase/WidgetBlueprintLibrary missing"); return; }
+    Call gac("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
+    if (!gac.ok() || !gac.set("WorldContextObject", session.world) || !gac.set("WidgetClass", base)) return;
+    if (!gac.run(wb)) return;
+    Array widgets = gac.result<Array>();
+    if (widgets.Count <= 0 || !widgets.Data) { LOG("[QBW] no quickbar widgets resident"); return; }
+    static std::vector<void*> funcs;
+    if (funcs.empty()) funcs = FindAllFunctionsNamed("HandleQuickbarContentChanged");
+    if (funcs.empty()) { LOG("[QBW] HandleQuickbarContentChanged not found in any widget BP"); return; }
+    int32 slots[6] = {0, 1, 2, 3, 4, 5};
+    Array changed{ slots, 6, 6 };
+    int poked = 0;
+    for (int i = 0; i < widgets.Count && i < 8; ++i) {
+        void* w = Read<void*>(widgets.Data, (size_t)i * 8);
+        if (!w || IsBadPtr(w)) continue;
+        bool done = false;
+        for (void* f : funcs) {
+            Call c(f);
+            if (!c.ok()) continue;
+            bool ran = true;
+            for (uint8_t bar : {(uint8_t)0, (uint8_t)1}) {
+                if (!c.set("QuickBarType", bar) ||
+                    !c.set_bytes("ChangedSlots", &changed, sizeof(Array)) || !c.run(w)) { ran = false; break; }
+            }
+            if (ran) { done = true; break; }
+        }
+        if (done) ++poked;
+    }
+    LOG("[QBW] poked %d/%d quickbar widgets (functions=%zu)", poked, widgets.Count, funcs.size());
+}
+
 // ============================================================================
 // MOVEMENT FEATURES
 // ============================================================================
@@ -1454,8 +1576,8 @@ void Athena::EnableMovementFeatures() {
         }
     } else LOG("[Movement] SetCanSlide not found");
 
-    SetBool(session.pawn, "/Script/FortniteGame.FortPawn.bWantsToSlide", true);
-
+    // [F52] bWantsToSlide is game-driven (sprint + crouch) — forcing it on
+    // permanently caused broken slide behaviour. Only SetCanSlide stays.
     void* movement = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
     if (movement && !IsBadPtr(movement)) {
         const char* swimPaths[] = {
@@ -1470,16 +1592,15 @@ void Athena::EnableMovementFeatures() {
         }
     }
 
-    // [F13] Slide ability rides in the ability set delivery path — activate
-    // it directly if the class is available (K2_GiveAbility is gone in 21.30).
-    void* slideAbility = LoadClass(
-        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_Athena_Player_Slide.GA_Athena_Player_Slide_C",
-        "/Script/GameplayAbilities.GameplayAbility");
+    // [F13/F52] Slide ability rides in the ability set delivery path — the
+    // 21.30 class is GA_Athena_Player_Slide (name scan; the old hardcoded
+    // mount path was wrong and never loaded).
+    void* slideAbility = FindAbilityClassNamed("GA_Athena_Player_Slide_C");
     if (slideAbility) {
-        LOG("[Movement] Found slide ability — activating through ASC");
+        LOG("[Movement] Found slide ability (GA_Athena_Player_Slide_C) — activating through ASC");
         GrantAbility(slideAbility);
     } else {
-        LOG("[Movement] Slide ability class not found");
+        LOG("[Movement] Slide ability class not resident yet (GrantWorldAbilities retries)");
     }
 
     session.movement_enabled = true;
@@ -2131,6 +2252,33 @@ void Athena::Tick() {
         lastMovementCheck = now;
         if (!session.movement_enabled) EnableMovementFeatures();
     }
+    // [F52] Slide + enter-vehicle abilities (name-scan, retried until resident).
+    static double lastWorldAbilities = 0;
+    if (session.finalized && !session.world_abilities_granted && now - lastWorldAbilities > 8.0) {
+        lastWorldAbilities = now;
+        GrantWorldAbilities();
+    }
+    // [F46] One-shot world-content discovery (chests/floorloot/spawners/
+    // sharks/saplings — names unknown until the terrain has streamed in).
+    if (session.finalized && !session.map_scan_done && now - session.finalized_at > 22.0) {
+        session.map_scan_done = true;
+        ScanMapContent();
+    }
+    // [F47] Interaction candidate + auto-interact (chest/vehicle proximity).
+    if (session.finalized) InteractTick();
+    // [F49] Edit tool watcher (EditingPlayer keep-alive + confirm edge).
+    if (session.finalized) EditAssist();
+    // [F50] Quickbar widget poke — force HandleQuickbarContentChanged on the
+    // HUD widgets ~18s in (they may construct after our manual slot fill).
+    if (session.finalized && !session.qb_widgets_poked && now - session.finalized_at > 18.0) {
+        session.qb_widgets_poked = true;
+        PokeQuickbarWidgets();
+    }
+    // [F52] Ambient NPCs once the world has settled.
+    if (session.finalized && !session.npcs_spawned && now - session.finalized_at > 35.0) {
+        session.npcs_spawned = true;
+        SpawnNPCs(2);
+    }
     if (session.finalized) PollTouchBuild();
 }
 
@@ -2685,6 +2833,10 @@ int Athena::SpawnVehiclesNear(int max) {
         RotatorToQuat(identity, t.Rotation);
         void* veh = SpawnActor(session.world, vclass, session.controller, t);
         if (!veh) return false;
+        // [F47] register for the interaction/entry system
+        if (std::find(session.vehicles.begin(), session.vehicles.end(), veh) == session.vehicles.end() &&
+            session.vehicles.size() < 32)
+            session.vehicles.push_back(veh);
         // Erbium: Dagwood (valet) vehicles spawn with empty tanks — fill the
         // fuel component (SetFuel lives on UFortVehicleFuelComponent, with
         // the vehicle holding CachedFuelComponent @0x1058).
@@ -2714,6 +2866,47 @@ int Athena::SpawnVehiclesNear(int max) {
         }
     } else {
         LOG("[Veh] FortAthenaVehicleSpawner class not loaded");
+    }
+
+    // 1b) [F46] Generic spawner scan — 21.30 may place vehicles through BP
+    // spawner classes whose names differ from the native one (the native
+    // scan above found 0). Any actor class named *VehicleSpawn*/*BoatLaunch*
+    // counts; each instance gets the cached fallback vehicle class.
+    if (spawned < max && session.vehicle_cache_n > 0) {
+        void* actorCls = FindObj("/Script/Engine.Actor");
+        if (actorCls) {
+            static const char* const kw[] = {"vehiclespawner", "vehiclespawn", "boatlaunch", "boatspawn", nullptr};
+            std::vector<void*> spawnerClasses;
+            GObjects_t* go = GObjectArray();
+            void* classClass = FindObj("/Script/CoreUObject.Class");
+            if (go && classClass) {
+                for (int32 i = 0; i < go->NumElements && spawnerClasses.size() < 8; ++i) {
+                    void* o = go->GetById((uint32)i);
+                    if (!o || IsBadPtr(o) || !IsA(o, classClass)) continue;
+                    if (!SubclassOfFast(o, actorCls) || SubclassOfFast(o, vehicleCls)) continue;
+                    std::string n = ObjName(o);
+                    std::transform(n.begin(), n.end(), n.begin(), ::tolower);
+                    if (n.find("_c") == std::string::npos) continue;
+                    for (int k = 0; kw[k]; ++k)
+                        if (n.find(kw[k]) != std::string::npos) { spawnerClasses.push_back(o); break; }
+                }
+            }
+            if (!spawnerClasses.empty()) {
+                LOG("[Veh] generic spawner classes found: %zu", spawnerClasses.size());
+                for (void* k : spawnerClasses) {
+                    if (spawned >= max) break;
+                    auto inst = FindAllInstances(k, 24);
+                    for (void* s : inst) {
+                        if (spawned >= max) break;
+                        Vector at{};
+                        if (!ActorLocation(s, at)) continue;
+                        if (!std::isfinite(at.X) || !std::isfinite(at.Y) || !std::isfinite(at.Z)) continue;
+                        if (spawn_at(session.vehicle_cache[spawned % session.vehicle_cache_n], at)) ++spawned;
+                    }
+                }
+                LOG("[Veh] spawned %d from generic spawner points", spawned);
+            }
+        }
     }
 
     // 2) Static-load fallback — exact Ch3 BP mounts, cached on first success.
@@ -2850,6 +3043,265 @@ int Athena::SpawnWildlifeNear(int max) {
         LOG("[Wild] spawned %s", ObjName(cls).c_str());
     }
     LOG("[Wild] total spawned=%d", spawned);
+    return spawned;
+}
+
+// ============================================================================
+// [F46] WORLD-CONTENT DISCOVERY — the 21.30 SDK dump was taken in the lobby,
+// so map BP classes (chests, floor loot, vehicle spawners, sharks, saplings)
+// never appear in the headers: their real names only exist once the terrain
+// has streamed in. This one-shot scans GObjects for classes matching the
+// keywords, logs what it finds (diagnosis for future rounds) and drives the
+// systems that previously depended on hardcoded class paths.
+void Athena::ScanMapContent() {
+    if (!session.world || !session.pawn) return;
+    GObjects_t* go = GObjectArray();
+    void* classClass = FindObj("/Script/CoreUObject.Class");
+    void* bcCls   = FindObj("/Script/FortniteGame.BuildingContainer");
+    void* actorCls = FindObj("/Script/Engine.Actor");
+    void* aiPawn  = FindObj("/Script/FortniteGame.FortAIPawn");
+    if (!go || !classClass || !bcCls || !actorCls) return;
+
+    std::vector<void*> containerClasses, spawnerClasses, sharkClasses, saplingClasses;
+    static const char* const contKw[]  = {"tiered", "chest", "floorloot", "ammobox", nullptr};
+    static const char* const spawnKw[] = {"vehiclespawner", "vehiclespawn", "boatlaunch", "boatspawn", nullptr};
+    static const char* const skipKw[]  = {"component", "parent", "data", "definition", "default", "hud", "ui", nullptr};
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o) || o == bcCls) continue;
+        if (!IsA(o, classClass)) continue;
+        std::string n = ObjName(o);
+        if (n.find("_C") == std::string::npos) continue;
+        std::string low = n;
+        std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+        bool skip = false;
+        for (int k = 0; skipKw[k]; ++k) if (low.find(skipKw[k]) != std::string::npos) { skip = true; break; }
+        if (SubclassOfFast(o, bcCls)) {
+            for (int k = 0; contKw[k]; ++k)
+                if (low.find(contKw[k]) != std::string::npos) { containerClasses.push_back(o); break; }
+        } else if (!skip && SubclassOfFast(o, actorCls)) {
+            for (int k = 0; spawnKw[k]; ++k)
+                if (low.find(spawnKw[k]) != std::string::npos) { spawnerClasses.push_back(o); break; }
+            if (low.find("shark") != std::string::npos && (!aiPawn || SubclassOfFast(o, aiPawn)))
+                sharkClasses.push_back(o);
+            else if (low.find("sapling") != std::string::npos && saplingClasses.size() < 4)
+                saplingClasses.push_back(o);
+        }
+    }
+    LOG("[Scan] classes: containers=%zu spawners=%zu sharks=%zu saplings=%zu",
+        containerClasses.size(), spawnerClasses.size(), sharkClasses.size(), saplingClasses.size());
+    for (size_t i = 0; i < containerClasses.size() && i < 10; ++i) LOG("[Scan]   container: %s", ObjName(containerClasses[i]).c_str());
+    for (size_t i = 0; i < spawnerClasses.size() && i < 10; ++i)   LOG("[Scan]   spawner: %s",  ObjName(spawnerClasses[i]).c_str());
+    for (size_t i = 0; i < sharkClasses.size() && i < 6; ++i)      LOG("[Scan]   shark: %s",    ObjName(sharkClasses[i]).c_str());
+    for (size_t i = 0; i < saplingClasses.size() && i < 6; ++i)    LOG("[Scan]   sapling: %s",  ObjName(saplingClasses[i]).c_str());
+
+    // Containers + spawners + vehicles — ONE unified instance pass with a
+    // per-class verdict cache (each class costs one hierarchy walk, not one
+    // full GObjects scan — N full scans would freeze the game thread).
+    session.containers.clear();
+    session.container_locs.clear();
+    session.container_done.clear();
+    int autoLooted = 0;
+    void* vehCls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+    struct Target { void* cls; int kind; bool isFloor; };   // 0 container | 1 spawner | 2 vehicle
+    std::vector<Target> targets;
+    for (void* k : containerClasses) {
+        std::string kn = ObjName(k);
+        std::transform(kn.begin(), kn.end(), kn.begin(), ::tolower);
+        targets.push_back({k, 0, kn.find("floorloot") != std::string::npos});
+    }
+    for (void* k : spawnerClasses) targets.push_back({k, 1, false});
+    if (vehCls) targets.push_back({vehCls, 2, false});
+
+    std::vector<std::pair<std::vector<void*>, int>> found;   // (instances, kind)
+    std::map<void*, int> verdict;                            // class -> targets idx (-1 none)
+    if (!targets.empty()) {
+        GObjects_t* go2 = go;
+        std::vector<std::vector<void*>> buckets(targets.size());
+        for (int32 i = 0; i < go2->NumElements; ++i) {
+            void* o = go2->GetById((uint32)i);
+            if (!o || IsBadPtr(o) || IsCDO(o)) continue;
+            void* oc = Read<void*>(o, profile::ObjectClass);
+            if (!oc || IsBadPtr(oc)) continue;
+            auto v = verdict.find(oc);
+            int idx = -1;
+            if (v != verdict.end()) {
+                idx = v->second;
+            } else {
+                for (size_t t = 0; t < targets.size(); ++t)
+                    if (SubclassOfFast(oc, targets[t].cls)) { idx = (int)t; break; }
+                verdict[oc] = idx;
+            }
+            if (idx < 0) continue;
+            if (buckets[idx].size() < 256) buckets[idx].push_back(o);
+        }
+        for (size_t t = 0; t < targets.size(); ++t)
+            found.push_back({std::move(buckets[t]), targets[t].kind});
+    }
+
+    // register containers (kind 0)
+    for (auto& bucket : found) {
+        if (bucket.second != 0) continue;
+        for (void* c : bucket.first) {
+            if (session.containers.size() >= 512) break;
+            Vector l{};
+            bool haveLoc = ActorLocation(c, l);
+            session.containers.push_back(c);
+            session.container_locs.push_back(haveLoc ? l : Vector{});
+            session.container_done.push_back((uint8_t)(haveLoc ? GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched") : 1));
+            // floor-loot family auto-rolls (that is what floor loot IS)
+            if (!session.container_done.back()) {
+                bool isFloor = false;
+                for (auto& t : targets)
+                    if (t.cls == Read<void*>(c, profile::ObjectClass) && t.isFloor) { isFloor = true; break; }
+                if (isFloor && haveLoc && SearchContainer(c, l)) { ++autoLooted; session.container_done.back() = 1; }
+            }
+        }
+    }
+    LOG("[Scan] containers=%zu auto-looted (floor loot)=%d", session.containers.size(), autoLooted);
+    if ((int)session.containers.size() > session.loot_found_total)
+        session.loot_found_total = (int)session.containers.size();   // stop the [F45] retry loop
+
+    // Vehicle spawners (kind 1) — spawn a vehicle at each discovered point.
+    int fromSpawners = 0;
+    for (auto& bucket : found) {
+        if (bucket.second != 1) continue;
+        for (void* s : bucket.first) {
+            if (fromSpawners >= 10) break;
+            Vector at{};
+            if (!ActorLocation(s, at)) continue;
+            if (!std::isfinite(at.X) || !std::isfinite(at.Y) || !std::isfinite(at.Z)) continue;
+            void* itemDef = Read<void*>(s, profile::VehicleSpawner_CachedItemDef);
+            void* vclass  = (itemDef && !IsBadPtr(itemDef)) ? Read<void*>(itemDef, profile::VehicleItemDef_ActorClass) : nullptr;
+            if (!vclass && session.vehicle_cache_n > 0) vclass = session.vehicle_cache[0];
+            if (!vclass || !vehCls || !SubclassOfFast(vclass, vehCls)) continue;
+            Transform t{};
+            t.Location[0] = at.X; t.Location[1] = at.Y; t.Location[2] = at.Z + 150.0;
+            Rotator identity{};
+            RotatorToQuat(identity, t.Rotation);
+            if (void* veh = SpawnActor(session.world, vclass, session.controller, t)) {
+                if (session.vehicles.size() < 32) session.vehicles.push_back(veh);
+                ++fromSpawners;
+                LOG("[Scan] vehicle spawned at spawner: %s", ObjName(vclass).c_str());
+            }
+        }
+    }
+
+    // Track every live vehicle (kind 2 — map-spawned or ours) for interaction.
+    for (auto& bucket : found) {
+        if (bucket.second != 2) continue;
+        for (void* v : bucket.first)
+            if (v && !IsBadPtr(v) && session.vehicles.size() < 32 &&
+                std::find(session.vehicles.begin(), session.vehicles.end(), v) == session.vehicles.end())
+                session.vehicles.push_back(v);
+    }
+
+    // Sharks — spawn if their classes surfaced with the map (they are
+    // water-bound in the real game; here they get a spot near the player).
+    int sharks = 0;
+    for (void* k : sharkClasses) {
+        if (sharks >= 2) break;
+        Vector origin{};
+        if (!ActorLocation(session.pawn, origin)) break;
+        Transform t{};
+        t.Location[0] = origin.X + 700.0 * (sharks ? -1.0 : 1.0);
+        t.Location[1] = origin.Y + 300.0;
+        t.Location[2] = origin.Z - 60.0;
+        Rotator identity{};
+        RotatorToQuat(identity, t.Rotation);
+        if (SpawnActor(session.world, k, session.controller, t)) ++sharks;
+    }
+    if (sharkClasses.empty()) LOG("[Scan] no shark classes on this map (may not exist in 21.30)");
+    else if (sharks > 0) LOG("[Scan] spawned %d shark(s)", sharks);
+
+    // Reality saplings (Ch3 S3 plants with loot).
+    int saplings = 0;
+    for (void* k : saplingClasses) {
+        if (saplings >= 3) break;
+        Vector origin{};
+        if (!ActorLocation(session.pawn, origin)) break;
+        Transform t{};
+        t.Location[0] = origin.X + 500.0 + 250.0 * saplings;
+        t.Location[1] = origin.Y - 400.0;
+        t.Location[2] = origin.Z + 80.0;
+        Rotator identity{};
+        RotatorToQuat(identity, t.Rotation);
+        if (SpawnActor(session.world, k, session.controller, t)) ++saplings;
+    }
+    if (saplings > 0) LOG("[Scan] spawned %d reality sapling(s)", saplings);
+}
+
+// ============================================================================
+// [F52] WORLD ABILITIES — 21.30 ships GA_Athena_Player_Slide (tactical-sprint
+// slide, anims included) and GA_AthenaEnterVehicle. The old slide path
+// StaticLoadClass'ed a wrong mount path; a name scan over resident classes
+// needs no path at all.
+void Athena::GrantWorldAbilities() {
+    if (session.world_abilities_granted || !session.pawn) return;
+    bool all = true;
+    static const char* const names[] = {"GA_Athena_Player_Slide_C", "GA_AthenaEnterVehicle_C", nullptr};
+    for (int i = 0; names[i]; ++i) {
+        if (void* k = FindAbilityClassNamed(names[i])) GrantAbility(k);
+        else { all = false; LOG("[World] ability class not resident yet: %s", names[i]); }
+    }
+    session.world_abilities_granted = all;
+    if (all) LOG("[World] ✅ slide + enter-vehicle abilities granted");
+}
+
+// ============================================================================
+// [F52] NPC — ambient human pawns (FortPlayerPawnAthena + AIController) so
+// the world is not empty. Bots keep the default body; cosmetics are applied
+// where the assets are resident (same path as the local player's fallback).
+int Athena::SpawnNPCs(int max) {
+    if (!session.world || !session.pawn || max < 1) return 0;
+    void* pawnCls = FindObj("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
+    if (!pawnCls) pawnCls = FindObj("/Script/FortniteGame.FortPlayerPawnAthena");
+    if (!pawnCls) { LOG("[NPC] pawn class missing"); return 0; }
+    Vector origin{};
+    if (!ActorLocation(session.pawn, origin)) return 0;
+    static const double offs[6][2] = {{600,300},{-600,300},{600,-300},{-600,-300},{0,800},{0,-800}};
+    // [F52] resolve the fallback body/anim once (each lookup is a full
+    // GObjects pass — doing it per-NPC would hitch the game thread).
+    static void* npcBody   = nullptr;
+    static void* npcAnimBP = nullptr;
+    if (!npcBody)   npcBody   = FindLoadedObjectOfType("/Script/Engine.SkeletalMesh", "M_MED_Lancelot");
+    if (!npcAnimBP) npcAnimBP = FindLoadedObjectOfType("/Script/Engine.AnimBlueprintGeneratedClass", "M_MED_Lancelot_AnimBP_C");
+    Rotator identity{};
+    int spawned = 0;
+    for (int i = 0; i < max; ++i) {
+        Transform t{};
+        t.Location[0] = origin.X + offs[i % 6][0];
+        t.Location[1] = origin.Y + offs[i % 6][1];
+        t.Location[2] = origin.Z + 80.0;
+        RotatorToQuat(identity, t.Rotation);
+        void* npc = SpawnActor(session.world, pawnCls, session.controller, t);
+        if (!npc) continue;
+        // AI controller so the pawn is a real controller-owned actor (no
+        // Fortnite bot logic — plain Engine.AIController keeps it stable).
+        {
+            void* aiCls = FindObj("/Script/Engine.AIController");
+            if (aiCls) {
+                Transform ct{};
+                ct.Location[0] = t.Location[0]; ct.Location[1] = t.Location[1]; ct.Location[2] = t.Location[2];
+                RotatorToQuat(identity, ct.Rotation);
+                if (void* aic = SpawnActor(session.world, aiCls, npc, ct)) Possess(aic, npc);
+            }
+        }
+        // Body so the NPC is visible (same fallback mesh as the local player).
+        if (void* mesh = GetObjField(npc, "/Script/Engine.Character.Mesh")) {
+            if (npcBody) {
+                Call s("/Script/Engine.SkinnedMeshComponent.SetSkeletalMesh");
+                if (s.ok()) { bool reinit = true; if (s.set("NewMesh", npcBody) && s.set("bReinitPose", reinit)) s.run(mesh); }
+            }
+            if (npcAnimBP) {
+                Call a("/Script/Engine.SkeletalMeshComponent.SetAnimClass");
+                if (a.ok() && a.set("NewClass", npcAnimBP)) a.run(mesh);
+            }
+        }
+        ++spawned;
+        LOG("[NPC] spawned %p (%d/%d)", npc, spawned, max);
+    }
+    LOG("[NPC] total spawned=%d", spawned);
     return spawned;
 }
 
@@ -2998,6 +3450,103 @@ bool Athena::StackAdd(void* def, int count) {
     return false;
 }
 
+// [F49] Mirror of StackAdd for build resource COST (wood/stone/metal).
+// Decrements the instance entry + the replicated entry, floors at 0.
+bool Athena::StackRemove(void* def, int count) {
+    if (!def || !session.inventory || count < 1) return false;
+    void* invProp   = GetProp("/Script/FortniteGame.FortInventory.Inventory");
+    void* instProp  = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+    void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
+    void* worldItemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
+    void* countProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
+    if (!invProp || !instProp || !entryProp || !worldItemEntryProp || !countProp) return false;
+    void* list = GetField(session.inventory, invProp);
+    void* instArr  = GetField(list, instProp);
+    void* entryArr = GetField(list, entryProp);
+    Array insts = Read<Array>(instArr);
+    Array reps  = Read<Array>(entryArr);
+    int entryStride = Read<int>(entryProp, profile::PropElementSize);
+    if (entryStride < 0x80 || entryStride > 0x400) return false;
+    void* guidProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
+    if (!guidProp) return false;
+
+    for (int i = 0; i < insts.Count; ++i) {
+        void* item = Read<void*>(insts.Data, (size_t)i * 8);
+        if (!item || IsBadPtr(item) || ItemDefinitionOf(item) != def) continue;
+        void* entry = GetField(item, worldItemEntryProp);
+        if (!entry) return false;
+        int32 cur = Read<int32>(GetField(entry, countProp), 0);
+        int32 nv = cur - count; if (nv < 0) nv = 0;
+        int taken = cur - nv;
+        if (taken <= 0) return false;
+        Write<int32>(GetField(entry, countProp), 0, nv);
+        Guid g = ItemGuidOf(item);
+        for (int j = 0; j < reps.Count; ++j) {
+            uint8_t* re = (uint8_t*)reps.Data + (size_t)j * entryStride;
+            Guid rg = Read<Guid>(re + Read<int>(guidProp, profile::PropOffset), 0);
+            if (memcmp(&rg, &g, sizeof(Guid)) == 0) {
+                int32 rc = Read<int32>(re + Read<int>(countProp, profile::PropOffset), 0);
+                int32 rn = rc - taken; if (rn < 0) rn = 0;
+                Write<int32>(re + Read<int>(countProp, profile::PropOffset), 0, rn);
+                break;
+            }
+        }
+        InventoryUpdate();
+        LOG("[Build] - %d %s (left %d)", taken, ObjName(def).c_str(), nv);
+        return true;
+    }
+    return false;
+}
+
+// [F49] Shared harvest grant — resolve the actor's resource item, scale the
+// yield by damage/max-health (curve override when resolvable), then stack it
+// into the player's inventory. Used by both the health-delta watcher (world
+// builds) and the OnDamageServer ProcessEvent interception (player builds).
+void Athena::HarvestGrantFor(void* actor, float damage) {
+    if (!actor || IsBadPtr(actor) || damage < 1.0f || !session.controller) return;
+    uint8_t rtype = 0;
+    if (void* rtProp = GetProp("/Script/FortniteGame.BuildingSMActor.ResourceType"))
+        rtype = Read<uint8_t>(GetField(actor, rtProp), 0);
+    void* def = nullptr;
+    { Call kr("/Script/FortniteGame.FortKismetLibrary.K2_GetResourceItemDefinition");
+      if (kr.ok()) { uint8_t in = rtype; if (kr.set("ResourceType", in) &&
+          kr.run(FindObj("/Script/FortniteGame.Default__FortKismetLibrary"))) def = kr.result<void*>(); } }
+    if (!def) return;
+    // Yield per full object: curve override if resolvable, else 60.
+    float fullYield = 60.0f;
+    {
+        void* overrideProp = GetProp("/Script/FortniteGame.BuildingSMActor.BuildingResourceAmountOverride");
+        if (overrideProp) {
+            uint8_t* handle = (uint8_t*)GetField(actor, overrideProp);
+            void* curveTable = Read<void*>(handle, 0);
+            int32_t rowIdx = Read<int32_t>(handle, 8);
+            if (curveTable && !IsBadPtr(curveTable) && rowIdx != 0) {
+                Call ev("/Script/Engine.DataTableFunctionLibrary.EvaluateCurveTableRow");
+                if (ev.ok()) {
+                    uint8_t rowName[8] = {};
+                    memcpy(rowName, &rowIdx, 4);
+                    ev.set("CurveTable", curveTable);
+                    ev.set_bytes("RowName", rowName, 8);
+                    float xy = 0.0f;
+                    ev.set("InXY", xy);
+                    if (ev.run(FindObj("/Script/Engine.Default__DataTableFunctionLibrary"))) {
+                        float outXY = ev.get<float>("OutXY");
+                        if (outXY > 0.0f && outXY < 2000.0f) fullYield = outXY;
+                    }
+                }
+            }
+        }
+    }
+    void* maxProp = GetProp("/Script/FortniteGame.BuildingActor.MaxHealth");
+    float maxhp = maxProp ? Read<float>(GetField(actor, maxProp), 0) : 0.0f;
+    if (maxhp < 1.0f) maxhp = 500.0f;
+    int resCount = (int)std::lround(fullYield * damage / maxhp);
+    if (resCount < 1) resCount = 1;
+    if (resCount > 60) resCount = 60;
+    if (!StackAdd(def, resCount))
+        GiveItem(def, resCount, -1, 0, true);   // first pick: introduce into inventory
+}
+
 void Athena::HarvestTick() {
     if (!session.harvest_enabled || !session.pawn || !session.world) return;
     double now = Monotonic();
@@ -3032,7 +3581,6 @@ void Athena::HarvestTick() {
 
     // Watch health deltas — a drop between ticks = a pickaxe (or weapon) hit.
     void* healthProp = GetProp("/Script/FortniteGame.BuildingActor.Health");
-    void* maxProp    = GetProp("/Script/FortniteGame.BuildingActor.MaxHealth");
     if (!healthProp) return;
     for (void* actor : session.harvest_cache) {
         if (!actor || IsBadPtr(actor)) continue;
@@ -3043,49 +3591,8 @@ void Athena::HarvestTick() {
         it->second = hp;
         float damage = prev - hp;
         if (damage < 1.0f || damage > prev) continue;   // heal or one-shot destroy skip
-        // Resource item def from the actor's ResourceType.
-        uint8_t rtype = 0;
-        if (void* rtProp = GetProp("/Script/FortniteGame.BuildingSMActor.ResourceType"))
-            rtype = Read<uint8_t>(GetField(actor, rtProp), 0);
-        void* def = nullptr;
-        { Call kr("/Script/FortniteGame.FortKismetLibrary.K2_GetResourceItemDefinition");
-          if (kr.ok()) { uint8_t in = rtype; if (kr.set("ResourceType", in) &&
-              kr.run(FindObj("/Script/FortniteGame.Default__FortKismetLibrary"))) def = kr.result<void*>(); } }
-        if (!def) continue;
-        // Yield per full object: curve override if resolvable, else 60.
-        float fullYield = 60.0f;
-        {
-            void* overrideProp = GetProp("/Script/FortniteGame.BuildingSMActor.BuildingResourceAmountOverride");
-            if (overrideProp) {
-                uint8_t* handle = (uint8_t*)GetField(actor, overrideProp);
-                void* curveTable = Read<void*>(handle, 0);
-                int32_t rowIdx = Read<int32_t>(handle, 8);
-                if (curveTable && !IsBadPtr(curveTable) && rowIdx != 0) {
-                    Call ev("/Script/Engine.DataTableFunctionLibrary.EvaluateCurveTableRow");
-                    if (ev.ok()) {
-                        // RowName is an FName (index+number = 8 bytes).
-                        uint8_t rowName[8] = {};
-                        memcpy(rowName, &rowIdx, 4);
-                        ev.set("CurveTable", curveTable);
-                        ev.set_bytes("RowName", rowName, 8);
-                        float xy = 0.0f;
-                        ev.set("InXY", xy);
-                        // OutXY is an out-param (no ReturnParm) — read it back.
-                        if (ev.run(FindObj("/Script/Engine.Default__DataTableFunctionLibrary"))) {
-                            float outXY = ev.get<float>("OutXY");
-                            if (outXY > 0.0f && outXY < 2000.0f) fullYield = outXY;
-                        }
-                    }
-                }
-            }
-        }
-        float maxhp = maxProp ? Read<float>(GetField(actor, maxProp), 0) : 0.0f;
-        if (maxhp < 1.0f) maxhp = 500.0f;
-        int resCount = (int)std::lround(fullYield * damage / maxhp);
-        if (resCount < 1) resCount = 1;
-        if (resCount > 50) resCount = 50;
-        if (!StackAdd(def, resCount))
-            GiveItem(def, resCount, -1, 0, true);   // first pick: introduce into inventory
+        // [F49] shared grant path (resource def + curve + stack)
+        HarvestGrantFor(actor, damage);
     }
     // Drop destroyed actors from the map.
     if (session.harvest_hp.size() > 1024) session.harvest_hp.clear();
@@ -3166,7 +3673,17 @@ void Athena::FixBodyAndAnimations() {
     if (!mesh || IsBadPtr(mesh)) return;
     void* curMesh = GetObjField(mesh, "/Script/Engine.SkinnedMeshComponent.SkeletalMesh");
     void* animInst = GetObjField(mesh, "/Script/Engine.SkeletalMeshComponent.AnimScriptInstance");
-    if (curMesh && animInst) { session.body_fixed = true; return; }   // already animated
+    // [F52] v2: the old "any mesh + any anim instance" skip left the pawn on
+    // the class-default body/anim pair (the "bad running animation"). Accept
+    // the current setup only when it already looks like a character body
+    // (M_MED_* / M_MALE_*) WITH a real anim blueprint; otherwise apply the
+    // resident Lancelot set (the locker default cosmetic).
+    std::string meshName = curMesh && !IsBadPtr(curMesh) ? ObjName(curMesh) : std::string();
+    void* animCls = animInst && !IsBadPtr(animInst) ? Read<void*>(animInst, profile::ObjectClass) : nullptr;
+    std::string animName = animCls && !IsBadPtr(animCls) ? ObjName(animCls) : std::string();
+    bool meshOk = meshName.find("M_MED_") != std::string::npos || meshName.find("M_MALE_") != std::string::npos;
+    bool animOk = animName.find("AnimBP") != std::string::npos || animName.find("AnimBP_") != std::string::npos;
+    if (meshOk && animOk && animInst) { session.body_fixed = true; return; }   // already good
 
     static void* body = nullptr;
     static void* animBP = nullptr;
@@ -3178,13 +3695,18 @@ void Athena::FixBodyAndAnimations() {
         return;   // retry on next pass
     }
     bool ok = true;
-    { Call s("/Script/Engine.SkinnedMeshComponent.SetSkeletalMesh");
-      if (s.ok()) { bool reinit = true; ok &= s.set("NewMesh", body) && s.set("bReinitPose", reinit) && s.run(mesh); } else ok = false; }
-    { Call a("/Script/Engine.SkeletalMeshComponent.SetAnimClass");
-      if (a.ok()) { ok &= a.set("NewClass", animBP) && a.run(mesh); } else ok = false; }
+    if (!meshOk) {
+        Call s("/Script/Engine.SkinnedMeshComponent.SetSkeletalMesh");
+        if (s.ok()) { bool reinit = true; ok &= s.set("NewMesh", body) && s.set("bReinitPose", reinit) && s.run(mesh); } else ok = false;
+    }
+    if (!animOk || !animInst) {
+        Call a("/Script/Engine.SkeletalMeshComponent.SetAnimClass");
+        if (a.ok()) { ok &= a.set("NewClass", animBP) && a.run(mesh); } else ok = false;
+    }
     if (ok) {
         session.body_fixed = true;
-        LOG("[Body] ✅ pawn mesh -> M_MED_Lancelot + AnimBP (locomotion restored)");
+        LOG("[Body] ✅ pawn body/anim fixed (mesh='%s' anim='%s' -> Lancelot set) — locomotion restored",
+            meshName.c_str(), animName.c_str());
     }
 }
 
@@ -3551,6 +4073,186 @@ void Athena::SpawnFloorLoot() {
 }
 
 // ============================================================================
+// [F47/F48] INTERACTION — the mobile HUD prompt only appears when the
+// interaction component finds a candidate; on this offline setup it never
+// does, so the character "cannot interact with anything". We now:
+//   1. scan for the nearest chest/vehicle ourselves and write it into
+//      FortControllerComponent_Interaction.InteractActor (HUD can show it),
+//   2. auto-execute the interaction on close proximity (era.auto on|off),
+//   3. route real ServerAttemptInteract RPCs through the same table.
+bool Athena::DoInteract(void* actor) {
+    if (!actor || IsBadPtr(actor) || !session.pawn) return false;
+    void* cls = Read<void*>(actor, profile::ObjectClass);
+    std::string cn = ObjName(cls);
+    void* bcCls   = FindObj("/Script/FortniteGame.BuildingContainer");
+    void* vehCls  = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+    void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
+    void* bActCls = FindObj("/Script/FortniteGame.BuildingActor");
+    LOG("[Interact] -> %s (%s)", cn.c_str(), ObjName(actor).c_str());
+    if (bcCls && SubclassOfFast(cls, bcCls)) { Loot(actor); return true; }
+    if (vehCls && SubclassOfFast(cls, vehCls)) return EnterVehicle(actor);
+    if (wallCls && SubclassOfFast(cls, wallCls)) { HandleDoor(actor); return true; }
+    if (bActCls && SubclassOfFast(cls, bActCls)) {
+        // [F16] generic building interaction via BP override, then the native
+        // internal attempt (covers props with native-only interaction).
+        Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", actor);
+        if (interact.ok() && interact.set("InteractingPawn", session.pawn) && interact.run(actor)) return true;
+        if (void* comp = GetInteractionComp()) {
+            Call native("/Script/FortniteGame.FortControllerComponent_Interaction.BP_ServerAttemptInteractInternal", comp);
+            if (native.ok()) {
+                float dist = 200.0f;
+                uint8_t itype = 1, being = 0;
+                void* nullObj = nullptr;
+                if (native.set("InteractingPawn", session.pawn) && native.set("InInteractDistance", dist) &&
+                    native.set("ReceivingActor", actor) && native.set("InteractType", itype) &&
+                    native.set("OptionalObjectData", nullObj) && native.set("InteractionBeingAttempted", being) &&
+                    native.run(comp)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// [F47] Resolve the controller's interaction component (add it if the
+// offline-possessed controller never created one — same fallback as the
+// TacticalSprint component).
+void* Athena::GetInteractionComp() {
+    if (session.interact_comp && !IsBadPtr(session.interact_comp)) return session.interact_comp;
+    if (!session.controller) return nullptr;
+    void* cls = FindObj("/Script/FortniteGame.FortControllerComponent_Interaction");
+    if (!cls) return nullptr;
+    Call get("/Script/Engine.Actor.GetComponentByClass");
+    if (get.ok() && get.set("ComponentClass", cls) && get.run(session.controller))
+        session.interact_comp = get.result<void*>();
+    if (!session.interact_comp || IsBadPtr(session.interact_comp)) {
+        Call add("/Script/Engine.Actor.AddComponentByClass");
+        if (add.ok()) {
+            bool manualAttachment = false, deferred = false;
+            Transform rel{};
+            void* klass = cls;
+            if ((add.set("Class", klass) || add.set("Class_0", klass)) &&
+                add.set("bManualAttachment", manualAttachment) && add.set("RelativeTransform", rel) &&
+                add.set("bDeferredFinish", deferred) && add.run(session.controller)) {
+                session.interact_comp = add.result<void*>();
+                LOG("[Interact] interaction component added: %p", session.interact_comp);
+            }
+        }
+    }
+    if (session.interact_comp && !IsBadPtr(session.interact_comp)) return session.interact_comp;
+    session.interact_comp = nullptr;
+    return nullptr;
+}
+
+// [F48] Vehicle entry — ForceSeatSinglePawn is the authoritative seat logic
+// (occupancy check, attach, OnPawnEnterVehicle). Tries seats 0..3 so cargo
+// seats are used when the driver seat is taken.
+bool Athena::EnterVehicle(void* veh) {
+    if (!veh || IsBadPtr(veh) || !session.pawn) return false;
+    void* vehCls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+    if (!vehCls || !IsA(veh, vehCls)) { LOG("[Veh] not a vehicle"); return false; }
+    // GA_AthenaEnterVehicle drives the native input state once granted —
+    // harmless when it is not (the seat call below is authoritative).
+    if (void* ga = FindAbilityClassNamed("GA_AthenaEnterVehicle_C")) GrantAbility(ga);
+    for (int seat = 0; seat < 4; ++seat) {
+        Call f("/Script/FortniteGame.FortAthenaVehicle.ForceSeatSinglePawn");
+        if (!f.ok()) { LOG("[Veh] ForceSeatSinglePawn missing"); return false; }
+        int idx = seat;
+        if (!f.set("PawnToSeat", session.pawn) || !f.set("SeatIndex", idx)) break;
+        if (!f.run(veh)) continue;
+        if (f.result<bool>()) {
+            LOG("[Veh] ✅ seated in %s (seat %d)", ObjName(Read<void*>(veh, profile::ObjectClass)).c_str(), seat);
+            return true;
+        }
+    }
+    LOG("[Veh] all seats refused (occupied?)");
+    return false;
+}
+
+// [F47] Periodic candidate scan + HUD exposure + auto-interaction.
+void Athena::InteractTick() {
+    if (!session.pawn || !session.world) return;
+    double now = Monotonic();
+    if (now - session.last_interact_scan < 0.4) return;
+    session.last_interact_scan = now;
+
+    Vector origin{};
+    if (!ActorLocation(session.pawn, origin)) return;
+    void* bcCls  = FindObj("/Script/FortniteGame.BuildingContainer");
+    void* vehCls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+
+    void* best = nullptr; double bestD2 = 0; int bestKind = 0;
+    auto consider = [&](void* actor, int kind, double reach) {
+        if (!actor || IsBadPtr(actor)) return;
+        Vector at{};
+        if (!ActorLocation(actor, at)) return;
+        double dx = at.X - origin.X, dy = at.Y - origin.Y, dz = at.Z - origin.Z;
+        double d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 > reach * reach) return;
+        if (!best || d2 < bestD2) { best = actor; bestD2 = d2; bestKind = kind; }
+    };
+    if (bcCls) {
+        // [F46] cached locations — no reflection per tick (512 containers ×
+        // 0.4s would flood the game thread with K2_GetActorLocation calls).
+        size_t n = session.containers.size() < session.container_locs.size()
+                 ? session.containers.size() : session.container_locs.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (session.container_done[i]) continue;
+            const Vector& at = session.container_locs[i];
+            if (at.X == 0.0 && at.Y == 0.0 && at.Z == 0.0) continue;
+            double dx = at.X - origin.X, dy = at.Y - origin.Y, dz = at.Z - origin.Z;
+            double d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 > 420.0 * 420.0) continue;
+            if (!best || d2 < bestD2) { best = session.containers[i]; bestD2 = d2; bestKind = 1; }
+        }
+    }
+    if (vehCls) {
+        for (void* v : session.vehicles) consider(v, 2, 480.0);
+    }
+    session.nearest_interact = best;
+    session.nearest_kind = bestKind;
+
+    // Expose the candidate so the native HUD interact button can appear.
+    if (best) {
+        if (void* comp = GetInteractionComp()) {
+            if (void* p = GetProp("/Script/FortniteGame.FortControllerComponent_Interaction.InteractActor"))
+                Write<void*>(GetField(comp, p), 0, best);
+            // once: let the component open swinging doors by itself
+            static bool doorsAutoSet = false;
+            if (!doorsAutoSet) {
+                Call sod("/Script/FortniteGame.FortControllerComponent_Interaction.SetShouldAutoOpenSwingingDoors");
+                if (sod.ok()) { bool b = true; if (sod.set("bOpenSwingingDoorsAutomatically", b) && sod.run(comp)) doorsAutoSet = true; }
+            }
+        }
+        // [F47] auto-interact on close proximity (containers first)
+        if (session.auto_interact) {
+            // [F48] already driving? never re-enter the vehicle we are seated in
+            bool seated = false;
+            if (bestKind == 2) {
+                Call bp("/Script/FortniteGame.FortPlayerPawn.BP_GetVehicle");
+                if (bp.ok() && bp.run(session.pawn)) {
+                    void* curVeh = bp.result<void*>();
+                    seated = (curVeh && !IsBadPtr(curVeh) && curVeh == best);
+                }
+            }
+            double reach = bestKind == 1 ? 170.0 : 200.0;
+            if (!seated && bestD2 <= reach * reach) {
+                auto& last = session.auto_interact_at[best];
+                if (now - last > 2.5) {
+                    last = now;
+                    if (DoInteract(best) && bestKind == 1) {
+                        // mark searched so the candidate scan drops it
+                        size_t n = session.containers.size() < session.container_done.size()
+                                 ? session.containers.size() : session.container_done.size();
+                        for (size_t i = 0; i < n; ++i)
+                            if (session.containers[i] == best) { session.container_done[i] = 1; break; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // BUILDING — [F07/F21] local preview build (Era core) + fixed RPC parse
 // ============================================================================
 // Unreal FRotator (Pitch/Yaw/Roll degrees) → FQuat for the 21.30 scalar
@@ -3584,6 +4286,60 @@ static void* PlaceBuildingActor(void* klass, const Transform& t, bool mirrored) 
     return actor;
 }
 
+// [F49] Grid-cell key for the piece the player is placing. Fortnite snaps
+// builds to 512u horizontal / 384u vertical; walls sit on cell edges (256u
+// offsets), so 256u/384u quantization + yaw octant + piece kind is enough to
+// detect "same spot already built".
+static uint64_t BuildCellKey(void* klass, const Vector& loc, const Rotator& rot) {
+    int64_t cx = (int64_t)std::llround(loc.X / 256.0);
+    int64_t cy = (int64_t)std::llround(loc.Y / 256.0);
+    int64_t cz = (int64_t)std::llround(loc.Z / 384.0);
+    int64_t yawOct = (int64_t)(std::lround(rot.Yaw / 90.0) & 3);
+    std::string n = ObjName(klass);
+    int64_t kind = 0;   // 0 wall | 1 floor | 2 stairs | 3 roof
+    if (n.find("Floor") != std::string::npos) kind = 1;
+    else if (n.find("Stair") != std::string::npos) kind = 2;
+    else if (n.find("Roof") != std::string::npos) kind = 3;
+    return (uint64_t)(cx & 0xFFFFF)
+         | ((uint64_t)(cy & 0xFFFFF) << 20)
+         | ((uint64_t)(cz & 0x3FFFF) << 40)
+         | ((uint64_t)(yawOct & 3)  << 58)
+         | ((uint64_t)(kind & 3)    << 60);
+}
+
+// [F49] A cell is occupied when we placed something there, or when a nearby
+// world structure (harvest cache — refreshed every 8s) sits on the spot.
+bool Athena::BuildCellOccupied(uint64_t key, const Vector& loc) {
+    if (session.build_cells.count(key)) return true;
+    if (session.harvest_cache.empty()) return false;
+    Call locCall("/Script/Engine.Actor.K2_GetActorLocation");
+    if (!locCall.ok()) return false;
+    int checked = 0;
+    for (void* b : session.harvest_cache) {
+        if (!b || IsBadPtr(b) || checked >= 64) break;
+        if (!locCall.run(b)) continue;
+        Vector at = locCall.result<Vector>();
+        if (!std::isfinite(at.X) || !std::isfinite(at.Y) || !std::isfinite(at.Z)) continue;
+        double dx = at.X - loc.X, dy = at.Y - loc.Y, dz = at.Z - loc.Z;
+        if (dx*dx + dy*dy + dz*dz < 70.0 * 70.0) return true;
+        ++checked;
+    }
+    return false;
+}
+
+// [F49] Building costs resources (10/piece in BR). The material follows the
+// buildable class: _M1 → metal, _S/_Stone → stone, everything else → wood.
+void Athena::SpendBuildResources(void* klass) {
+    if (!klass) return;
+    std::string n = ObjName(klass);
+    const char* resName = "WoodItemData";
+    if (n.find("Metal") != std::string::npos || n.find("_M1") != std::string::npos || n.find("_M_") != std::string::npos)
+        resName = "MetalItemData";
+    else if (n.find("Stone") != std::string::npos || n.find("_S1") != std::string::npos || n.find("_S_") != std::string::npos)
+        resName = "StoneItemData";
+    if (void* def = ByShortName(resName)) StackRemove(def, 10);
+}
+
 // [F21] Build from the controller's local preview state — the mobile client
 // keeps LastBuildPreviewGridSnapLoc/Rot + CurrentBuildableClass updated while
 // the build marker is visible, so no server payload is required.
@@ -3603,6 +4359,13 @@ bool Athena::LocalBuild() {
     if (!klass || !smCls || !SubclassOfFast(klass, smCls) || !NearPlayer(loc, 2000.0f) ||
         !std::isfinite(rot.Pitch) || !std::isfinite(rot.Yaw) || !std::isfinite(rot.Roll)) {
         LOG("[Build] invalid selected class or preview transform");
+        return true;
+    }
+    // [F49] No building over an existing piece / map structure.
+    uint64_t cell = BuildCellKey(klass, loc, rot);
+    if (BuildCellOccupied(cell, loc)) {
+        LOG("[Build] spot already built (%s at %.0f %.0f %.0f) — skipped",
+            ObjName(klass).c_str(), loc.X, loc.Y, loc.Z);
         return true;
     }
     // Mirroring from the controller state (bBuildPreviewMirrored @0x1859).
@@ -3628,6 +4391,9 @@ bool Athena::LocalBuild() {
     session.last_build_class = klass;
     session.last_build_time = now;
     for (int i = 0; i < 6; ++i) session.last_build_pose[(size_t)i] = pose[i];
+    session.build_cells.insert(cell);                       // [F49] mark occupied
+    if (session.placed_builds.size() < 2048) session.placed_builds.push_back(actor);
+    SpendBuildResources(klass);                             // [F49] -10 material
     LOG("[Build] ✅ local build placed %s", ObjName(klass).c_str());
     return true;
 }
@@ -3677,11 +4443,20 @@ void Athena::OnServerCreateBuildingActor(void* params) {
         Rotator rot = Read<Rotator>(params, 0x20);
         bool mirrored = Read<uint8_t>(params, 0x38) != 0;
         if (!cls) { LOG("[Build] RPC class handle-only placement — using local preview"); LocalBuild(); return; }
+        // [F49] same occupancy rule as the local path
+        uint64_t cell = BuildCellKey(cls, loc, rot);
+        if (BuildCellOccupied(cell, loc)) {
+            LOG("[Build] RPC spot already built — skipped");
+            return;
+        }
         Transform t{};
         t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
         RotatorToQuat(rot, t.Rotation);
         void* actor = PlaceBuildingActor(cls, t, mirrored);   // [F31] Erbium order
         if (!actor) return;
+        session.build_cells.insert(cell);                     // [F49]
+        if (session.placed_builds.size() < 2048) session.placed_builds.push_back(actor);
+        SpendBuildResources(cls);                             // [F49]
         LOG("[Build] RPC build placed %s", ObjName(cls).c_str());
     } else {
         LOG("[Build] unexpected ServerCreateBuildingActor size %u — using local preview", total);
@@ -3714,7 +4489,62 @@ void Athena::OnBeginEditActor(void* piece) {
     else Write<void*>(editActor, profile::EditingTool_EditActor, piece);
     Call r("/Script/FortniteGame.FortWeap_EditingTool.OnRep_EditActor");        // [F10]
     if (r.ok()) r.run(editActor);
-    LOG("[Edit] editing tool bound to %s", ObjName(piece).c_str());
+    // [F49] The mobile edit grid UI only opens when the building's
+    // EditingPlayer is set (OnRep_EditingPlayer) — the old code skipped this
+    // so the edit UI never appeared and the finish RPC never fired.
+    if (void* ps = GetObjField(session.controller, "/Script/Engine.PlayerController.PlayerState")) {
+        if (void* epProp = GetProp("/Script/FortniteGame.BuildingSMActor.EditingPlayer")) {
+            Write<void*>(GetField(piece, epProp), 0, ps);
+            Call rep("/Script/FortniteGame.BuildingSMActor.OnRep_EditingPlayer");
+            if (rep.ok()) rep.run(piece);
+        }
+    }
+    if (void* ebp = GetProp("/Script/FortniteGame.FortPlayerController.EditBuildingActor"))
+        Write<void*>(GetField(session.controller, ebp), 0, piece);
+    session.last_edit_actor = piece;
+    LOG("[Edit] editing tool bound to %s (EditingPlayer set)", ObjName(piece).c_str());
+}
+
+// [F49] Edit watcher — keeps EditingPlayer/EditBuildingActor fresh while the
+// tool is out and detects the bEditConfirmed rising edge (the mobile confirm
+// gesture). If the game's own finish RPC does not fire, era.edit applies the
+// replacement manually.
+void Athena::EditAssist() {
+    if (!session.pawn || !session.controller) return;
+    double now = Monotonic();
+    if (now - session.last_edit_check < 0.3) return;
+    session.last_edit_check = now;
+    void* weapon = Read<void*>(session.pawn, profile::FortPawn_CurrentWeapon);
+    if (!weapon || IsBadPtr(weapon)) { session.last_edit_confirmed = 0; return; }
+    void* toolCls = FindObj("/Script/FortniteGame.FortWeap_EditingTool");
+    if (!toolCls || !IsA(weapon, toolCls)) { session.last_edit_confirmed = 0; return; }
+    void* editActor = nullptr;
+    if (void* p = GetProp("/Script/FortniteGame.FortWeap_EditingTool.EditActor"))
+        editActor = Read<void*>(GetField(weapon, p));
+    if (!editActor) editActor = Read<void*>(weapon, profile::EditingTool_EditActor);
+    if (editActor && !IsBadPtr(editActor)) {
+        session.last_edit_actor = editActor;
+        // keep the binding alive on both sides (building + controller)
+        if (void* ps = GetObjField(session.controller, "/Script/Engine.PlayerController.PlayerState")) {
+            if (void* epProp = GetProp("/Script/FortniteGame.BuildingSMActor.EditingPlayer")) {
+                void* cur = Read<void*>(GetField(editActor, epProp));
+                if (cur != ps) {
+                    Write<void*>(GetField(editActor, epProp), 0, ps);
+                    Call rep("/Script/FortniteGame.BuildingSMActor.OnRep_EditingPlayer");
+                    if (rep.ok()) rep.run(editActor);
+                }
+            }
+        }
+        if (void* ebp = GetProp("/Script/FortniteGame.FortPlayerController.EditBuildingActor")) {
+            void* curCtl = Read<void*>(GetField(session.controller, ebp));
+            if (curCtl != editActor) Write<void*>(GetField(session.controller, ebp), 0, editActor);
+        }
+    }
+    uint8_t confirmed = Read<uint8_t>(weapon, profile::EditingTool_bEditConfirmed);
+    if (confirmed && !session.last_edit_confirmed)
+        LOG("[Edit] bEditConfirmed rising (target=%s) — if the game UI does not finish, use era.edit wall|floor|stairs|roof",
+            editActor && !IsBadPtr(editActor) ? ObjName(editActor).c_str() : "?");
+    session.last_edit_confirmed = confirmed;
 }
 
 void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored) {
@@ -4048,7 +4878,17 @@ static void pe_hook(void* obj, void* func, void* params) {
             void* cls = Read<void*>(obj, profile::ObjectClass);
             isInteraction = SubclassOfFast(cls, g_interactionClass);
         }
-        if (isPC || isPawn || isWeapon || isInteraction) {
+        // [F49] harvest on player-placed builds: the OnDamageServer receiver is
+        // the building itself, not the pawn/controller — extend the gate.
+        bool isBuildSM = false;
+        if (fn == "OnDamageServer" && obj) {
+            void* smCls = FindObj("/Script/FortniteGame.BuildingSMActor");
+            if (smCls) {
+                void* cls = Read<void*>(obj, profile::ObjectClass);
+                isBuildSM = SubclassOfFast(cls, smCls);
+            }
+        }
+        if (isPC || isPawn || isWeapon || isInteraction || isBuildSM) {
             Guard g;
             if (fn == "ServerExecuteInventoryItem") {
                 if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid))
@@ -4067,17 +4907,10 @@ static void pe_hook(void* obj, void* func, void* params) {
             else if (fn == "ServerAttemptInteract" && params && isInteraction) {
                 void* target = Read<void*>(params, 0);
                 if (target && !IsBadPtr(target)) {
-                    void* bcCls   = FindObj("/Script/FortniteGame.BuildingContainer");
-                    void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
-                    void* actorCls = FindObj("/Script/FortniteGame.BuildingActor");
-                    void* targetCls = Read<void*>(target, profile::ObjectClass);
-                    LOG("[Interact] target=%p class=%s", target, ObjName(targetCls).c_str());
-                    if (bcCls && SubclassOfFast(targetCls, bcCls)) Athena::Loot(target);
-                    else if (wallCls && SubclassOfFast(targetCls, wallCls)) Athena::HandleDoor(target);
-                    else if (actorCls && SubclassOfFast(targetCls, actorCls)) {
-                        // [F16] generic building interaction via BP override.
-                        Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", target);
-                        if (interact.ok() && interact.set("InteractingPawn", session.pawn)) interact.run(target);
+                    // [F47] unified routing: chest / vehicle / door / prop
+                    if (!Athena::DoInteract(target)) {
+                        // last resort: hand it to the native server path
+                        LOG("[Interact] no local route for target — native path continues");
                     }
                 }
             }
@@ -4102,6 +4935,21 @@ static void pe_hook(void* obj, void* func, void* params) {
             }
             else if (fn == "ServerPlayEmoteItem" && isPC) Athena::PlayEmoteItem(Read<void*>(params));
             else if (fn == "ServerAttemptExitVehicle") Athena::OnExitVehicle();
+            // [F49] Harvest grant on player-placed builds (the health-delta
+            // watcher covers world structures; this covers our own walls).
+            else if (isBuildSM && fn == "OnDamageServer" && params) {
+                void* dmgP  = incoming(func, params, "Damage", 4);
+                void* instP = incoming(func, params, "InstigatedBy", 8);
+                float dmg = dmgP ? Read<float>(dmgP, 0) : 0.0f;
+                void* inst = instP ? Read<void*>(instP, 0) : nullptr;
+                if (dmg >= 1.0f && inst == session.controller &&
+                    GetBool(obj, "/Script/FortniteGame.BuildingActor.bPlayerPlaced"))
+                    Athena::HarvestGrantFor(obj, dmg);
+            }
+            // [F52] minimap marker diagnosis (era.mark + the map UI path).
+            else if (fn == "ServerSpawnMark" && isPC) {
+                LOG("[Mark] ServerSpawnMark arrived (map ping path works)");
+            }
             // [F24] ServerAttemptInventoryDrop(ItemGuid, Count, bTrash).
             else if (fn == "ServerAttemptInventoryDrop" && params) {
                 Guid gg = Read<Guid>(params);
@@ -4284,7 +5132,72 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
         }
         else if (normalized == "era.loot") { session.loot_attempts = 0; session.loot_found_total = -1; Athena::SpawnFloorLoot(); }
         else if (normalized == "era.body") { session.body_fixed = false; Athena::FixBodyAndAnimations(); }
-        else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles [n] | era.animals [n] | era.stream | era.hud | era.zone [i] | era.players [n] | era.harvest on|off | era.doors on|off | era.climb on|off | era.loot | era.body | fly | walk | ghost | god | teleport | era.lobby");
+        // [F46-F53] interaction / world-content / edit / NPC round
+        else if (normalized == "era.scan") { session.map_scan_done = false; Athena::ScanMapContent(); session.map_scan_done = true; }
+        else if (normalized.rfind("era.auto", 0) == 0) {
+            session.auto_interact = normalized.find("off") == std::string::npos;
+            LOG("[Interact] auto-interact enabled=%d", (int)session.auto_interact);
+        }
+        else if (normalized == "era.interact") {
+            void* t = session.nearest_interact;
+            if (t) LOG("[Interact] command -> %d", (int)Athena::DoInteract(t));
+            else   LOG("[Interact] no candidate nearby (walk closer)");
+        }
+        else if (normalized.rfind("era.enter", 0) == 0) {
+            void* best = session.nearest_kind == 2 ? session.nearest_interact : nullptr;
+            if (!best && !session.vehicles.empty()) best = session.vehicles.front();
+            if (best) LOG("[Veh] command -> %d", (int)Athena::EnterVehicle(best));
+            else LOG("[Veh] no vehicle nearby");
+        }
+        else if (normalized == "era.exit") { Athena::OnExitVehicle(); }
+        else if (normalized.rfind("era.edit", 0) == 0) {
+            char what[64] = {}; sscanf(cmd.c_str(), "%*s %63s", what);
+            std::string w = what;
+            std::transform(w.begin(), w.end(), w.begin(), ::tolower);
+            void* target = session.last_edit_actor;
+            if (void* ebp = GetProp("/Script/FortniteGame.FortPlayerController.EditBuildingActor"))
+                target = Read<void*>(GetField(session.controller, ebp));
+            if (!target || IsBadPtr(target)) { LOG("[Edit] no edit target — select a build with the edit tool first"); }
+            else {
+                const char* piece = "PBWA_W1_Solid";
+                if (w == "floor")              piece = "PBWA_W1_Floor";
+                else if (w == "stairs" || w == "ramp") piece = "PBWA_W1_StairW";
+                else if (w == "roof")          piece = "PBWA_W1_RoofC";
+                std::string path = std::string("/Game/Building/ActorBlueprints/Player/Wood/L1/") + piece + "." + piece;
+                void* nc = LoadAsset(path);
+                if (nc) {
+                    uint8_t rotIter = 0;
+                    if (void* rip = GetProp("/Script/FortniteGame.FortPlayerController.BuildingRotIterations")) {
+                        // field is uint8 at prop offset — read through reflection
+                        rotIter = Read<uint8_t>(GetField(session.controller, rip), 0);
+                    }
+                    Athena::OnFinishEditActor(target, nc, rotIter, false);
+                    session.last_edit_actor = nullptr;
+                } else LOG("[Edit] piece class not found: %s", path.c_str());
+            }
+        }
+        else if (normalized == "era.qb") { Athena::PokeQuickbarWidgets(); Athena::ForceUpdateQuickBars(); }
+        else if (normalized.rfind("era.npc", 0) == 0) {
+            int n = 2; sscanf(normalized.c_str(), "era.npc %d", &n);
+            LOG("[NPC] command -> spawned %d", Athena::SpawnNPCs(n < 1 ? 1 : (n > 12 ? 12 : n)));
+        }
+        else if (normalized == "era.sharks") { Athena::ScanMapContent(); }
+        else if (normalized == "era.mark") {
+            if (session.controller && session.pawn) {
+                Vector loc{};
+                if (ActorLocation(session.pawn, loc)) {
+                    Call m("/Script/FortniteGame.FortPlayerController.ServerSpawnMark");
+                    if (m.ok()) {
+                        void* nullActor = nullptr;
+                        // PreapprovedText stays zeroed (empty FText).
+                        if (m.set("ActorToAttachTo", nullActor) && m.set("AttachOffset", loc) && m.run(session.controller))
+                            LOG("[Mark] ServerSpawnMark sent at %.0f %.0f %.0f", loc.X, loc.Y, loc.Z);
+                        else LOG("[Mark] ServerSpawnMark bind/run failed");
+                    } else LOG("[Mark] ServerSpawnMark not found in 21.30");
+                }
+            }
+        }
+        else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles [n] | era.animals [n] | era.stream | era.hud | era.zone [i] | era.players [n] | era.harvest on|off | era.doors on|off | era.climb on|off | era.loot | era.body | era.scan | era.auto on|off | era.interact | era.enter | era.exit | era.edit wall|floor|stairs|roof | era.qb | era.npc [n] | era.sharks | era.mark | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
