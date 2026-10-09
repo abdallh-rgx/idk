@@ -382,6 +382,7 @@ static GObjects_t* GObjectArray();
 static void RotatorToQuat(const Rotator& r, double out[4]);   // [F28-F33] forward decl
 static bool IsCDO(void* obj);                                 // [F39] forward decl
 static void ZoneMonitor();                                    // [F35] forward decl
+static double Monotonic();                                    // [F54] forward decl (GObjectArray probe)
 
 // ============================================================================
 // TYPE CHECKS
@@ -403,12 +404,51 @@ static bool IsA(void* obj, void* type) {
     return SubclassOfFast(klass, type);
 }
 static GObjects_t* GObjectArray() {
+    // [F54] ROOT-CAUSE FIX — every GObjects scanner (containers, spawners,
+    // wildlife, ability classes, quickbar widgets, door/harvest caches) was
+    // silently dead on device: "[Loot] Total 0 containers", "[Veh] 0 spawner
+    // actors", "[Wild] 0 animal classes", ability classes "not resident yet"
+    // forever, build-over-map-buildings, no harvest resources. The old probe
+    // only accepted "the address holds a POINTER to FUObjectArray" — when the
+    // build stores the array directly there, the probe returned null and every
+    // scan collapsed to zero results with no log line. Probe both layouts and
+    // validate the chunked-array structure before trusting either.
+    static GObjects_t* cached = nullptr;
+    static bool attempted = false;
+    static double lastAttempt = 0;
+    if (attempted && cached) return cached;
+    double now = Monotonic();
+    if (attempted && now - lastAttempt < 10.0) return cached;   // allow re-probe after failure
+    attempted = true; lastAttempt = now;
     if (!g_base) return nullptr;
-    GObjects_t* go = Read<GObjects_t*>((void*)(g_base + profile::GObjects));
-    if (!go || IsBadPtr(go)) return nullptr;
-    if (go->NumElements < 0 || go->NumElements > 4000000) return nullptr;
-    if (go->NumChunks < 0 || go->NumChunks > 128) return nullptr;
-    return go;
+    auto valid = [](GObjects_t* go) -> bool {
+        if (!go || IsBadPtr(go)) return false;
+        int32 num = go->NumElements, chunks = go->NumChunks;
+        if (num < 1000 || num > 4000000) return false;      // 21.30 dump: 306793 in lobby
+        if (chunks < 1 || chunks > 512) return false;
+        if (IsBadPtr(go->Objects)) return false;
+        void* chunk0 = Read<void*>(go->Objects, 0);
+        if (IsBadPtr(chunk0)) return false;
+        void* first = Read<void*>(chunk0, 0);               // FUObjectItem.Object[0]
+        if (IsBadPtr(first)) return false;
+        if (IsBadPtr(Read<void*>(first, profile::ObjectClass))) return false;
+        return true;
+    };
+    GObjects_t* indirect = Read<GObjects_t*>((void*)(g_base + profile::GObjects));
+    if (valid(indirect)) {
+        cached = indirect;
+        LOG("[GObj] resolved (pointer) elements=%d chunks=%d", cached->NumElements, cached->NumChunks);
+        return cached;
+    }
+    GObjects_t* direct = reinterpret_cast<GObjects_t*>(g_base + profile::GObjects);
+    if (valid(direct)) {
+        cached = direct;
+        LOG("[GObj] resolved (direct) elements=%d chunks=%d", cached->NumElements, cached->NumChunks);
+        return cached;
+    }
+    LOG("[GObj] UNRESOLVED at RVA 0x%llX — all GObjects scans stay disabled",
+        (unsigned long long)profile::GObjects);
+    return nullptr;
 }
 
 // ============================================================================
@@ -459,15 +499,56 @@ static std::string ObjName(void* obj) {
 }
 // [F17/F20] Find an item definition by its short name through GObjects
 // (ported from the Era core by_short_name()).
+// [F54] memoized — auto-looting dozens of containers used to run a full
+// GObjects pass per loot row (~0.3 s each), freezing the game thread.
 static void* ByShortName(const std::string& wanted) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static std::map<std::string, void*> memo;
+    {
+        pthread_mutex_lock(&m);
+        auto it = memo.find(wanted);
+        void* hit = it != memo.end() ? it->second : nullptr;
+        pthread_mutex_unlock(&m);
+        if (hit) return hit;
+    }
     GObjects_t* go = GObjectArray();
     if (!go) return nullptr;
     void* definition_type = FindObj("/Script/FortniteGame.FortItemDefinition");
     if (!definition_type) return nullptr;
     for (int32 i = 0; i < go->NumElements; i += 1) {
         void* object = go->GetById((uint32)i);
-        if (object && !IsBadPtr(object) && IsA(object, definition_type) && ObjName(object) == wanted)
+        if (object && !IsBadPtr(object) && IsA(object, definition_type) && ObjName(object) == wanted) {
+            pthread_mutex_lock(&m);
+            if (memo.size() < 4096) memo[wanted] = object;
+            pthread_mutex_unlock(&m);
             return object;
+        }
+    }
+    return nullptr;
+}
+
+// [F55] UE-allocator allocation — the manual QuickBar slot arrays and GUID
+// buffers were malloc'ed while the engine reallocs/frees them through
+// FMemory on slot updates (mismatched allocator = the classic source of the
+// random build-mode/inventory crashes).
+static void* FMalloc(size_t size) {
+    using Realloc_t = void* (*)(void*, size_t, uint32_t);
+    return Fn<Realloc_t>(profile::Realloc)(nullptr, size, 0);
+}
+
+// [F54] Generic class-by-name scan (classes need IsA(Class) + SubclassOfFast,
+// the IsA-on-an-object form never reaches the class hierarchy — same rule as
+// FindAbilityClassNamed, generalized for markers/saplings/anything).
+static void* FindClassNamedLoose(void* baseClass, const std::string& exactName) {
+    GObjects_t* go = GObjectArray();
+    void* classClass = FindObj("/Script/CoreUObject.Class");
+    if (!go || !baseClass || !classClass) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (!IsA(object, classClass)) continue;
+        if (!SubclassOfFast(object, baseClass)) continue;
+        if (ObjName(object) == exactName) return object;
     }
     return nullptr;
 }
@@ -997,6 +1078,12 @@ struct Session {
     bool  world_abilities_granted = false; // [F52] slide + enter-vehicle GAS
     bool  qb_widgets_poked = false;     // [F50] HandleQuickbarContentChanged poke
     bool  npcs_spawned = false;         // [F52] ambient NPC bots
+    // [F54-F63] auto-world round 3 (root-cause scan fix + real spawner paths)
+    int   wildlife_attempts = 0;        // [F54] Irwin animals surface late — retry
+    int   qb_pokes = 0;                 // [F57] periodic quickbar widget refresh
+    int   scan_retries = 0;             // [F54] re-run ScanMapContent while empty
+    bool  reality_done = false;         // [F62] auto reality-sapling planting
+    std::vector<void*> npcs;            // [F63] live ambient NPCs (top-up)
     double last_edit_check = 0;         // [F49] edit-tool watcher
     uint8_t last_edit_confirmed = 0;    // [F49] bEditConfirmed edge detect
     void* last_edit_actor = nullptr;    // [F49] tool-bound edit target
@@ -1132,6 +1219,8 @@ namespace Athena {
     void GrantWorldAbilities();        // [F52] slide + GA_AthenaEnterVehicle
     int  SpawnNPCs(int max);           // [F52] ambient NPC pawns
     void HarvestGrantFor(void* actor, float damage); // [F49] shared harvest grant
+    int  SpawnRealitySaplings(int max); // [F62] Ch3 S3 reality-tree saplings
+    void SpawnLocalMarker();           // [F60] minimap marker actor (standalone)
 }
 
 // ============================================================================
@@ -1386,7 +1475,7 @@ void Athena::BuildQuickBarsManually() {
         void* slotsField = (char*)bar + profile::QuickBar_SlotsOffset;
         Array arr = Read<Array>(slotsField);
         if (arr.Count < want) {
-            void* newData = malloc(profile::QuickBarSlot_SlotSize * want);
+            void* newData = FMalloc(profile::QuickBarSlot_SlotSize * want);   // [F55] UE allocator
             if (newData) {
                 memset(newData, 0, profile::QuickBarSlot_SlotSize * want);
                 Write<void*>(slotsField, 0, newData);
@@ -1408,7 +1497,7 @@ void Athena::BuildQuickBarsManually() {
         void* slot = (char*)arr.Data + (size_t)e.idx * profile::QuickBarSlot_SlotSize;
         // Items array (TArray<FGuid>) at slot+0x00
         void* itemsField = (char*)slot + profile::QuickBarSlot_ItemsOffset;
-        Guid* guidData = (Guid*)malloc(16);
+        Guid* guidData = (Guid*)FMalloc(16);   // [F55] UE allocator (engine may realloc/free)
         if (!guidData) continue;
         *guidData = e.guid;
         Write<void*>(itemsField, 0, guidData);
@@ -1519,31 +1608,60 @@ void Athena::ForceUpdateQuickBars() {
     }
 }
 
-// [F50] Widget-level quickbar refresh — the QuickbarBase widget's slots only
-// rebuild when its HandleQuickbarContentChanged BP event fires. On this
-// offline setup that event may never arrive after our manual slot fill, so
-// we poke every resident quickbar widget directly: resolve all UFunctions
-// named HandleQuickbarContentChanged (widget BP package mounts are unknown)
-// and run the ones whose owner matches the widget (Call::run guards this).
+// [F50/F57] Widget-level quickbar refresh — the HUD quickbar slots only
+// rebuild when its content-changed BP event fires. On this offline setup the
+// event never arrives after our manual slot fill, so we poke every resident
+// quickbar widget directly. 21.30's HUD uses the Bacchus family:
+//   Quickbar.Quickbar_C : UBacchusQuickbar, QuickbarBase.QuickbarBase_C :
+//   UFortQuickbarBase (+ BacchusQuickbarPrimary/Secondary) — the old probe
+//   only asked for /Script/FortniteUI.FortQuickbarBase and never matched.
 void Athena::PokeQuickbarWidgets() {
     if (!session.world) return;
-    void* base = FindObj("/Script/FortniteUI.FortQuickbarBase");
-    void* wb   = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
-    if (!base || !wb) { LOG("[QBW] FortQuickbarBase/WidgetBlueprintLibrary missing"); return; }
+    void* wb = FindObj("/Script/UMG.Default__WidgetBlueprintLibrary");
+    if (!wb) { LOG("[QBW] WidgetBlueprintLibrary missing"); return; }
     Call gac("/Script/UMG.WidgetBlueprintLibrary.GetAllWidgetsOfClass");
-    if (!gac.ok() || !gac.set("WorldContextObject", session.world) || !gac.set("WidgetClass", base)) return;
-    if (!gac.run(wb)) return;
-    Array widgets = gac.result<Array>();
-    if (widgets.Count <= 0 || !widgets.Data) { LOG("[QBW] no quickbar widgets resident"); return; }
-    static std::vector<void*> funcs;
-    if (funcs.empty()) funcs = FindAllFunctionsNamed("HandleQuickbarContentChanged");
-    if (funcs.empty()) { LOG("[QBW] HandleQuickbarContentChanged not found in any widget BP"); return; }
+    if (!gac.ok()) { LOG("[QBW] GetAllWidgetsOfClass missing"); return; }
+
+    static const char* const bases[] = {
+        "/Script/FortniteUI.FortQuickbarBase",
+        "/Script/FortniteUI.BacchusQuickbarBase",
+        "/Script/FortniteUI.BacchusQuickbar",
+        "/Script/UMG.UserWidget",          // last resort — receiver check gates it
+        nullptr
+    };
+    std::vector<void*> widgets;
+    for (int b = 0; bases[b]; ++b) {
+        void* base = FindObj(bases[b]);
+        if (!base) continue;
+        gac.set("WorldContextObject", session.world);
+        gac.set("WidgetClass", base);
+        if (!gac.run(wb)) continue;
+        Array got = gac.result<Array>();
+        for (int i = 0; i < got.Count && widgets.size() < 16; ++i) {
+            void* w = Read<void*>(got.Data, (size_t)i * 8);
+            if (w && !IsBadPtr(w) &&
+                std::find(widgets.begin(), widgets.end(), w) == widgets.end())
+                widgets.push_back(w);
+        }
+    }
+    if (widgets.empty()) { LOG("[QBW] no quickbar widgets resident (Bacchus family absent)"); return; }
+
+    // [F57] event-name variants across widget BPs (Bacchus may rename the
+    // FortniteUI classic HandleQuickbarContentChanged).
+    static const char* const events[] = {
+        "HandleQuickbarContentChanged", "OnQuickbarContentChanged",
+        "HandleQuickBarContentChanged", "UpdateQuickbar", "RefreshQuickbar",
+        nullptr
+    };
+    std::vector<void*> funcs;
+    for (int e = 0; events[e] && funcs.empty(); ++e)
+        funcs = FindAllFunctionsNamed(events[e], 8);
+    if (funcs.empty()) { LOG("[QBW] no quickbar content-changed function found"); return; }
+
     int32 slots[6] = {0, 1, 2, 3, 4, 5};
     Array changed{ slots, 6, 6 };
     int poked = 0;
-    for (int i = 0; i < widgets.Count && i < 8; ++i) {
-        void* w = Read<void*>(widgets.Data, (size_t)i * 8);
-        if (!w || IsBadPtr(w)) continue;
+    for (void* w : widgets) {
         bool done = false;
         for (void* f : funcs) {
             Call c(f);
@@ -1557,7 +1675,7 @@ void Athena::PokeQuickbarWidgets() {
         }
         if (done) ++poked;
     }
-    LOG("[QBW] poked %d/%d quickbar widgets (functions=%zu)", poked, widgets.Count, funcs.size());
+    LOG("[QBW] poked %d/%d quickbar widgets (functions=%zu)", poked, (int)widgets.size(), funcs.size());
 }
 
 // ============================================================================
@@ -1887,6 +2005,10 @@ void Athena::SyncLockerLoadout() {
         if (heroDef) {
             Call ght("/Script/FortniteGame.FortHero.GetHeroTypeBP");
             if (ght.ok() && ght.run(heroDef)) heroType = ght.result<void*>();
+            // [F58] on 21.30 the HeroDefinition object IS a FortHeroType
+            // (the old GetHeroTypeBP call was rejected: receiver=FortHeroType
+            // owner=FortHero) — use it directly.
+            if (!heroType) heroType = heroDef;
         }
     }
     if (heroType && state && heroTypeProp && Read<int>(heroTypeProp, profile::PropElementSize) == 8) {
@@ -2193,10 +2315,16 @@ void Athena::Tick() {
         lastVehicleRetry = now;
         if (session.vehicles_attempts < 30) VehicleRetry();
     }
-    // [F30/F38] Wildlife pass — also retried: the Irwin animal BPs load late.
-    if (session.finalized && !session.wildlife_spawned && now - session.finalized_at > 16.0) {
-        session.wildlife_spawned = true;
-        SpawnWildlifeNear(8);
+    // [F30/F38/F54] Wildlife pass — the Irwin animal BPs stream in late, so
+    // retry every 20s (max 10) instead of the one-shot that fired too early.
+    if (session.finalized && !session.wildlife_spawned && session.wildlife_attempts < 10 &&
+        now - session.finalized_at > 16.0) {
+        static double lastWild = 0;
+        if (now - lastWild > 20.0) {
+            lastWild = now;
+            ++session.wildlife_attempts;
+            if (SpawnWildlifeNear(8) > 0) session.wildlife_spawned = true;
+        }
     }
     // [F33] Retry the map flags a couple of times — the manager may spawn late.
     if (session.finalized && !session.maps_forced && now - session.finalized_at > 20.0) ForceMapsVisible();
@@ -2258,26 +2386,46 @@ void Athena::Tick() {
         lastWorldAbilities = now;
         GrantWorldAbilities();
     }
-    // [F46] One-shot world-content discovery (chests/floorloot/spawners/
-    // sharks/saplings — names unknown until the terrain has streamed in).
+    // [F46/F54] World-content discovery (chests/floorloot/spawners/sharks/
+    // saplings). First pass at 22s, then re-scan every 60s while no containers
+    // surfaced (streaming levels land progressively) — max 5 re-runs.
     if (session.finalized && !session.map_scan_done && now - session.finalized_at > 22.0) {
         session.map_scan_done = true;
         ScanMapContent();
+    } else if (session.finalized && session.map_scan_done && session.containers.empty() &&
+               session.scan_retries < 5) {
+        static double lastRescan = 0;
+        if (now - lastRescan > 60.0) { lastRescan = now; ++session.scan_retries; ScanMapContent(); }
     }
     // [F47] Interaction candidate + auto-interact (chest/vehicle proximity).
     if (session.finalized) InteractTick();
     // [F49] Edit tool watcher (EditingPlayer keep-alive + confirm edge).
     if (session.finalized) EditAssist();
-    // [F50] Quickbar widget poke — force HandleQuickbarContentChanged on the
-    // HUD widgets ~18s in (they may construct after our manual slot fill).
-    if (session.finalized && !session.qb_widgets_poked && now - session.finalized_at > 18.0) {
-        session.qb_widgets_poked = true;
-        PokeQuickbarWidgets();
+    // [F50/F57] Quickbar widget poke — periodic for the first ~3 minutes (the
+    // HUD widgets construct after our manual slot fill; one early poke was
+    // not enough once the widgets appeared later).
+    if (session.finalized && session.qb_pokes < 8 && now - session.finalized_at > 18.0) {
+        static double lastQBW = 0;
+        if (now - lastQBW > 20.0) { lastQBW = now; ++session.qb_pokes; PokeQuickbarWidgets(); }
     }
-    // [F52] Ambient NPCs once the world has settled.
+    // [F52/F63] Ambient NPCs — first batch at 35s, then keep at least 2 alive.
     if (session.finalized && !session.npcs_spawned && now - session.finalized_at > 35.0) {
         session.npcs_spawned = true;
-        SpawnNPCs(2);
+        SpawnNPCs(4);
+    }
+    if (session.finalized && session.npcs_spawned && !session.npcs.empty()) {
+        static double lastNpcCheck = 0;
+        if (now - lastNpcCheck > 60.0) {
+            lastNpcCheck = now;
+            session.npcs.erase(std::remove_if(session.npcs.begin(), session.npcs.end(),
+                [](void* p) { return !p || IsBadPtr(p); }), session.npcs.end());
+            if (session.npcs.size() < 2) SpawnNPCs(1);
+        }
+    }
+    // [F62] Reality-tree saplings (Ch3 S3) — planted once the map settles.
+    if (session.finalized && !session.reality_done && now - session.finalized_at > 45.0) {
+        session.reality_done = true;
+        SpawnRealitySaplings(2);
     }
     if (session.finalized) PollTouchBuild();
 }
@@ -2817,6 +2965,36 @@ static const char* const kVehicleMounts[] = {
     nullptr
 };
 
+// [F55] Native 21.30 vehicle classes — always resident (no mount path
+// guessing). The SDK dump confirms CDOs for each; used as the last-mile
+// fallback so "cars at the game's spots" never depends on BP package names.
+static const char* const kNativeVehicles[] = {
+    "/Script/FortniteGame.FortAthenaSimpleCar",      // ordinary car
+    "/Script/FortniteGame.FortAthenaAntelopeVehicle",// sports car (Whiplash)
+    "/Script/FortniteGame.FortAthenaGoatVehicle",    // big rig / offroad truck
+    "/Script/FortniteGame.FortAthenaDoghouseVehicle",// motorboat
+    "/Script/FortniteGame.FortAthenaFerretVehicle",
+    "/Script/FortniteGame.FortAthenaJackalVehicle",
+    nullptr
+};
+
+// [F55] Ask the map's own spawner to do its job — AFortAthenaVehicleSpawner
+// carries SpawnVehicle()/SpawnVehicleWithConstruction() UFunctions (SDK
+// GObjects 36154-36158); this is the same call the warmup game mode makes,
+// so class/fuel/transform all come from the map data.
+static bool SpawnerNativeSpawn(void* spawner) {
+    if (!spawner || IsBadPtr(spawner)) return false;
+    {
+        Call sv("/Script/FortniteGame.FortAthenaVehicleSpawner.SpawnVehicle");
+        if (sv.ok() && sv.run(spawner)) return true;
+    }
+    {
+        Call sv2("/Script/FortniteGame.FortAthenaVehicleSpawner.SpawnVehicleWithConstruction");
+        if (sv2.ok() && sv2.run(spawner)) return true;
+    }
+    return false;
+}
+
 int Athena::SpawnVehiclesNear(int max) {
     if (!session.world || max < 1) return 0;
     void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
@@ -2850,8 +3028,13 @@ int Athena::SpawnVehiclesNear(int max) {
     };
 
     // 1) Authentic path — the map's own spawners (retried by VehicleRetry).
+    //    [F55] Prefer the spawner's OWN native SpawnVehicle — the exact path
+    //    the game mode uses during warmup (correct class, transform, fuel).
+    //    Fall back to CachedFortVehicleItemDef.VehicleActorClass, then to the
+    //    cached fallback classes.
+    bool nativeSpawnerUsed = false;
     if (spawnerCls) {
-        auto spawners = FindAllInstances(spawnerCls, 48);
+        auto spawners = FindAllInstances(spawnerCls, 96);
         LOG("[Veh] %zu spawner actors on map (attempt %d)", spawners.size(), session.vehicles_attempts);
         for (void* sp : spawners) {
             if (spawned >= max) break;
@@ -2860,9 +3043,27 @@ int Athena::SpawnVehiclesNear(int max) {
             if (!loc.ok() || !loc.run(sp)) continue;
             at = loc.result<Vector>();
             if (!std::isfinite(at.X) || !std::isfinite(at.Y) || !std::isfinite(at.Z)) continue;
-            void* itemDef = Read<void*>(sp, profile::VehicleSpawner_CachedItemDef);
-            void* vclass  = (itemDef && !IsBadPtr(itemDef)) ? Read<void*>(itemDef, profile::VehicleItemDef_ActorClass) : nullptr;
-            if (spawn_at(vclass, at)) ++spawned;
+            bool done = false;
+            if (SpawnerNativeSpawn(sp)) {
+                ++spawned; nativeSpawnerUsed = true; done = true;
+                LOG("[Veh] native spawner -> vehicle at %.0f %.0f %.0f", at.X, at.Y, at.Z);
+            }
+            if (!done) {
+                void* itemDef = Read<void*>(sp, profile::VehicleSpawner_CachedItemDef);
+                void* vclass  = (itemDef && !IsBadPtr(itemDef)) ? Read<void*>(itemDef, profile::VehicleItemDef_ActorClass) : nullptr;
+                if (spawn_at(vclass, at)) { ++spawned; done = true; }
+            }
+            if (!done && session.vehicle_cache_n > 0)
+                if (spawn_at(session.vehicle_cache[spawned % session.vehicle_cache_n], at)) ++spawned;
+        }
+        // [F55] track the vehicles the native spawners created (one scan).
+        if (nativeSpawnerUsed && vehicleCls) {
+            auto live = FindAllInstances(vehicleCls, 48);
+            for (void* v : live)
+                if (v && !IsBadPtr(v) && session.vehicles.size() < 32 &&
+                    std::find(session.vehicles.begin(), session.vehicles.end(), v) == session.vehicles.end())
+                    session.vehicles.push_back(v);
+            LOG("[Veh] tracked %zu live vehicles after native spawner pass", session.vehicles.size());
         }
     } else {
         LOG("[Veh] FortAthenaVehicleSpawner class not loaded");
@@ -2909,16 +3110,21 @@ int Athena::SpawnVehiclesNear(int max) {
         }
     }
 
-    // 2) Static-load fallback — exact Ch3 BP mounts, cached on first success.
+    // 2) Static-load fallback — native 21.30 vehicle classes first (always
+    //    resident), then the exact Ch3 BP mounts, cached on first success.
     //    Waits for attempt 3 (~15s) so the map's own spawners get first shot,
     //    then only re-probes every 5th attempt (StaticLoadClass hits disk).
     if (spawned < max && session.vehicle_cache_n == 0 && session.vehicles_attempts >= 3 &&
         ((session.vehicles_attempts % 5) == 0 || session.vehicles_attempts == 3)) {
+        for (int i = 0; kNativeVehicles[i] && session.vehicle_cache_n < 32; ++i) {
+            if (void* c = FindObj(kNativeVehicles[i]))
+                session.vehicle_cache[session.vehicle_cache_n++] = c;
+        }
         for (int i = 0; kVehicleMounts[i] && session.vehicle_cache_n < 32; ++i) {
             if (void* c = LoadVehicleClassByName(kVehicleMounts[i]))
                 session.vehicle_cache[session.vehicle_cache_n++] = c;
         }
-        LOG("[Veh] static-load fallback resolved %d vehicle classes", session.vehicle_cache_n);
+        LOG("[Veh] fallback resolved %d vehicle classes (native+BP)", session.vehicle_cache_n);
     }
     if (spawned < max && session.vehicle_cache_n > 0) {
         Vector origin{};
@@ -3103,15 +3309,17 @@ void Athena::ScanMapContent() {
     session.container_done.clear();
     int autoLooted = 0;
     void* vehCls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
-    struct Target { void* cls; int kind; bool isFloor; };   // 0 container | 1 spawner | 2 vehicle
+    struct Target { void* cls; int kind; };   // 0 container | 1 spawner | 2 vehicle
     std::vector<Target> targets;
-    for (void* k : containerClasses) {
-        std::string kn = ObjName(k);
-        std::transform(kn.begin(), kn.end(), kn.begin(), ::tolower);
-        targets.push_back({k, 0, kn.find("floorloot") != std::string::npos});
-    }
-    for (void* k : spawnerClasses) targets.push_back({k, 1, false});
-    if (vehCls) targets.push_back({vehCls, 2, false});
+    // [F56] EVERY BuildingContainer instance is a loot container — the map's
+    // chest/floorloot/ammo BP classes all derive from the native base. The
+    // old keyword filter missed whole families (0 containers on device).
+    // Floor-loot members are detected per-instance from their class name.
+    if (bcCls) targets.push_back({bcCls, 0});
+    for (void* k : containerClasses)
+        if (k != bcCls) targets.push_back({k, 0});
+    for (void* k : spawnerClasses) targets.push_back({k, 1});
+    if (vehCls) targets.push_back({vehCls, 2});
 
     std::vector<std::pair<std::vector<void*>, int>> found;   // (instances, kind)
     std::map<void*, int> verdict;                            // class -> targets idx (-1 none)
@@ -3133,32 +3341,44 @@ void Athena::ScanMapContent() {
                 verdict[oc] = idx;
             }
             if (idx < 0) continue;
-            if (buckets[idx].size() < 256) buckets[idx].push_back(o);
+            if (buckets[idx].size() < 768) buckets[idx].push_back(o);   // [F56] full map of chests
         }
         for (size_t t = 0; t < targets.size(); ++t)
             found.push_back({std::move(buckets[t]), targets[t].kind});
     }
 
     // register containers (kind 0)
+    int floorSeen = 0;
     for (auto& bucket : found) {
         if (bucket.second != 0) continue;
         for (void* c : bucket.first) {
-            if (session.containers.size() >= 512) break;
+            if (session.containers.size() >= 768) break;
             Vector l{};
             bool haveLoc = ActorLocation(c, l);
             session.containers.push_back(c);
             session.container_locs.push_back(haveLoc ? l : Vector{});
             session.container_done.push_back((uint8_t)(haveLoc ? GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched") : 1));
-            // floor-loot family auto-rolls (that is what floor loot IS)
             if (!session.container_done.back()) {
-                bool isFloor = false;
-                for (auto& t : targets)
-                    if (t.cls == Read<void*>(c, profile::ObjectClass) && t.isFloor) { isFloor = true; break; }
-                if (isFloor && haveLoc && SearchContainer(c, l)) { ++autoLooted; session.container_done.back() = 1; }
+                // [F56] floor-loot detection is per-INSTANCE (its class name),
+                // not per-keyword-class — floor loot IS these containers.
+                std::string cn = ObjName(Read<void*>(c, profile::ObjectClass));
+                std::transform(cn.begin(), cn.end(), cn.begin(), ::tolower);
+                bool isFloor = cn.find("floorloot") != std::string::npos;
+                if (!isFloor && haveLoc) ++floorSeen;
+                if (isFloor && haveLoc && autoLooted < 12) {   // cap per pass
+                    bool ok = false;
+                    {   // native first — the real cooked loot tables
+                        Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
+                        if (bp.ok() && bp.set("PlayerPawn", session.pawn) && bp.run(c) &&
+                            GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) ok = true;
+                    }
+                    if (!ok) ok = SearchContainer(c, l);
+                    if (ok) { ++autoLooted; session.container_done.back() = 1; }
+                }
             }
         }
     }
-    LOG("[Scan] containers=%zu auto-looted (floor loot)=%d", session.containers.size(), autoLooted);
+    LOG("[Scan] containers=%zu chests=%d floorloot-spawned=%d", session.containers.size(), floorSeen, autoLooted);
     if ((int)session.containers.size() > session.loot_found_total)
         session.loot_found_total = (int)session.containers.size();   // stop the [F45] retry loop
 
@@ -3232,20 +3452,36 @@ void Athena::ScanMapContent() {
 }
 
 // ============================================================================
-// [F52] WORLD ABILITIES — 21.30 ships GA_Athena_Player_Slide (tactical-sprint
-// slide, anims included) and GA_AthenaEnterVehicle. The old slide path
-// StaticLoadClass'ed a wrong mount path; a name scan over resident classes
-// needs no path at all.
+// [F52/F58] WORLD ABILITIES — 21.30 ships GA_Athena_Player_Slide (tactical-
+// sprint slide, anims included) and GA_AthenaEnterVehicle (EXACT spelling —
+// the package has no underscore between Athena and Enter). Exit/In-vehicle
+// and the emote input ability ride along when resident. The core pair must
+// resolve; the rest are best-effort and never block the retry loop.
 void Athena::GrantWorldAbilities() {
     if (session.world_abilities_granted || !session.pawn) return;
-    bool all = true;
-    static const char* const names[] = {"GA_Athena_Player_Slide_C", "GA_AthenaEnterVehicle_C", nullptr};
+    bool core = true;
+    static const char* const names[] = {
+        "GA_Athena_Player_Slide_C",     // core
+        "GA_AthenaEnterVehicle_C",      // core (exact 21.30 spelling)
+        "GA_AthenaExitVehicle_C",       // best-effort
+        "GA_AthenaInVehicle_C",         // best-effort
+        "GAB_Emote_Generic_C",          // best-effort (emote input)
+        nullptr
+    };
+    static bool bestLogged[4] = {};
     for (int i = 0; names[i]; ++i) {
-        if (void* k = FindAbilityClassNamed(names[i])) GrantAbility(k);
-        else { all = false; LOG("[World] ability class not resident yet: %s", names[i]); }
+        if (void* k = FindAbilityClassNamed(names[i])) {
+            GrantAbility(k);
+        } else if (i < 2) {
+            core = false;
+            LOG("[World] ability class not resident yet: %s", names[i]);
+        } else if (!bestLogged[i - 2]) {
+            bestLogged[i - 2] = true;
+            LOG("[World] optional ability not resident: %s (skipped)", names[i]);
+        }
     }
-    session.world_abilities_granted = all;
-    if (all) LOG("[World] ✅ slide + enter-vehicle abilities granted");
+    session.world_abilities_granted = core;
+    if (core) LOG("[World] ✅ slide + enter-vehicle abilities granted");
 }
 
 // ============================================================================
@@ -3299,10 +3535,70 @@ int Athena::SpawnNPCs(int max) {
             }
         }
         ++spawned;
+        if (session.npcs.size() < 16) session.npcs.push_back(npc);
         LOG("[NPC] spawned %p (%d/%d)", npc, spawned, max);
     }
-    LOG("[NPC] total spawned=%d", spawned);
+    LOG("[NPC] total spawned=%d (tracked=%zu)", spawned, session.npcs.size());
     return spawned;
+}
+
+// [F62] Reality-tree saplings — Ch3 S3's signature world feature. The native
+// RealitySeedGameplayRuntime.BuildingRealitySapling actor class ships in this
+// build (SDK GObjects 1565); the B_RealitySapling_* controller components
+// drive the full planting visuals when present.
+int Athena::SpawnRealitySaplings(int max) {
+    if (!session.world || !session.pawn || max < 1) return 0;
+    void* sapCls = FindObj("/Script/RealitySeedGameplayRuntime.BuildingRealitySapling");
+    if (!sapCls) sapCls = FindClassNamedLoose(FindObj("/Script/Engine.Actor"), "BuildingRealitySapling");
+    if (!sapCls) { LOG("[Reality] sapling class not resident"); return 0; }
+    Vector origin{};
+    if (!ActorLocation(session.pawn, origin)) return 0;
+    Rotator identity{};
+    int spawned = 0;
+    static const double offs[4][2] = {{500,-400},{-520,-420},{-80,-560},{760,-180}};
+    for (int i = 0; i < max; ++i) {
+        Transform t{};
+        t.Location[0] = origin.X + offs[i % 4][0];
+        t.Location[1] = origin.Y + offs[i % 4][1];
+        t.Location[2] = origin.Z + 80.0;
+        RotatorToQuat(identity, t.Rotation);
+        if (SpawnActor(session.world, sapCls, session.controller, t)) {
+            ++spawned;
+            LOG("[Reality] sapling planted (%d/%d)", spawned, max);
+        }
+    }
+    LOG("[Reality] total saplings=%d", spawned);
+    return spawned;
+}
+
+// [F60] Minimap marker — ServerSpawnMark is a server RPC and a standalone
+// session has no server to replicate the marker actor. Spawn the real marker
+// actor locally instead (B_AthenaPlayerMarker_WithCustomization_C, resident
+// per the SDK dump), falling back to the base marker BP.
+void Athena::SpawnLocalMarker() {
+    if (!session.world || !session.pawn) return;
+    void* markerCls = FindClassNamedLoose(FindObj("/Script/Engine.Actor"), "B_AthenaPlayerMarker_WithCustomization_C");
+    if (!markerCls) markerCls = FindClassNamedLoose(FindObj("/Script/Engine.Actor"), "B_AthenaMapMarkerBase_C");
+    if (!markerCls) { LOG("[Mark] no marker BP resident"); return; }
+    Vector loc{};
+    if (!ActorLocation(session.pawn, loc)) return;
+    Transform t{};
+    t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z + 100.0;
+    Rotator identity{};
+    RotatorToQuat(identity, t.Rotation);
+    void* marker = SpawnActor(session.world, markerCls, session.controller, t);
+    if (!marker) { LOG("[Mark] marker spawn failed"); return; }
+    // Point the marker at our player state so the HUD renders our colour/icon.
+    if (void* ps = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState")) {
+        const char* ownerPaths[] = {
+            "/Script/FortniteGame.FortPlayerMarkerBase.TeamOwner",
+            "/Script/FortniteGame.FortPlayerMarkerBase.MarkerOwner",
+            nullptr
+        };
+        for (int i = 0; ownerPaths[i]; ++i)
+            if (GetProp(ownerPaths[i])) { Write<void*>(GetField(marker, GetProp(ownerPaths[i])), 0, ps); break; }
+    }
+    LOG("[Mark] local marker spawned (%s)", ObjName(markerCls).c_str());
 }
 
 // [F33/F43] Minimap / full map — field fix: the first run spammed
@@ -3802,40 +4098,64 @@ void Athena::SpawnFloorLootRetry() {
     SpawnFloorLoot();
 }
 
+// [F24/F58] Inventory drop — the crash on device came from (a) the native
+// ServerAttemptInventoryDrop RPC running into the dead standalone server
+// path and (b) removing the ReplicatedEntry by INDEX while the two arrays
+// are not index-aligned. Now: the RPC is swallowed in pe_hook, the visual
+// pickup spawns FIRST, and both arrays are reconciled by GUID.
 void Athena::DropInventoryItem(Guid guid, int count) {
     if (!session.inventory) return;
+    if (!(guid.A | guid.B | guid.C | guid.D)) return;
     void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
     void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
     void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
-    if (!invProp || !instProp || !entryProp) return;
+    void* guidProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
+    if (!invProp || !instProp || !entryProp || !guidProp) return;
     void* list = GetField(session.inventory, invProp);
     void* instArr = GetField(list, instProp);
     void* entryArr = GetField(list, entryProp);
+    int entryStride = Read<int>(entryProp, profile::PropElementSize);
+    if (entryStride < 0x80 || entryStride > 0x400) return;
     Array arr = Read<Array>(instArr);
+    Array entries = Read<Array>(entryArr);
     for (int i = 0; i < arr.Count; ++i) {
         void* inst = Read<void*>(arr.Data, (size_t)i * 8);
         if (!inst) continue;
         Guid cand = ItemGuidOf(inst);
-        if (!memcmp(&cand, &guid, sizeof(Guid))) {
-            // Spawn the visual pickup before removing the item.
-            void* def = ItemDefinitionOf(inst);
-            Vector loc{};
-            if (session.pawn) ActorLocation(session.pawn, loc);
-            loc.Z += 60.0;
-            if (def) {
-                int dropped = count > 0 ? std::min(count, 9999) : 1;
-                SpawnPickup(def, dropped, loc, 16 /*Tossed*/, 10 /*TossedByPlayer*/, true);
-            }
-            Fn<void(*)(void*,void*,int)>(profile::GenericArrayRemove)(instArr, instProp, i);
-            Array entries = Read<Array>(entryArr);
-            if (i < entries.Count)
-                Fn<void(*)(void*,void*,int)>(profile::GenericArrayRemove)(entryArr, entryProp, i);
-            for (int s = 0; s < 6; ++s) if (session.slots[(size_t)s] == inst) session.slots[(size_t)s] = nullptr;
-            for (int s = 0; s < 6; ++s) if (session.secondary_slots[(size_t)s] == inst) session.secondary_slots[(size_t)s] = nullptr;
-            InventoryUpdate();
-            return;
+        if (memcmp(&cand, &guid, sizeof(Guid)) != 0) continue;
+        // 1) the visual pickup goes out before anything is mutated
+        void* def = ItemDefinitionOf(inst);
+        Vector loc{};
+        if (session.pawn) ActorLocation(session.pawn, loc);
+        loc.Z += 60.0;
+        int entryIdx = -1;
+        for (int j = 0; j < entries.Count; ++j) {
+            uint8_t* re = (uint8_t*)entries.Data + (size_t)j * entryStride;
+            Guid rg = Read<Guid>(re + Read<int>(guidProp, profile::PropOffset), 0);
+            if (!memcmp(&rg, &guid, sizeof(Guid))) { entryIdx = j; break; }
         }
+        int currentCount = 1;
+        if (void* wProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry"))
+            if (void* entry = GetField(inst, wProp))
+                if (void* cntProp = GetProp("/Script/FortniteGame.FortItemEntry.Count"))
+                    currentCount = Read<int32>(GetField(entry, cntProp), 0);
+        int dropped = count > 0 ? std::min(count, currentCount > 0 ? currentCount : count) : 1;
+        if (def) SpawnPickup(def, dropped, loc, 16 /*Tossed*/, 10 /*TossedByPlayer*/, true);
+        // 2) remove the instance and ITS OWN replicated entry (by GUID index)
+        Fn<void(*)(void*,void*,int)>(profile::GenericArrayRemove)(instArr, instProp, i);
+        if (entryIdx >= 0)
+            Fn<void(*)(void*,void*,int)>(profile::GenericArrayRemove)(entryArr, entryProp, entryIdx);
+        // 3) clear our slot bookkeeping; if it was equipped, go back to the pickaxe
+        bool wasEquipped = false;
+        for (int s = 0; s < 6; ++s) if (session.slots[(size_t)s] == inst) { session.slots[(size_t)s] = nullptr; wasEquipped = true; }
+        for (int s = 0; s < 6; ++s) if (session.secondary_slots[(size_t)s] == inst) session.secondary_slots[(size_t)s] = nullptr;
+        if (wasEquipped) ActivateQuickBarSlot(0, 0);
+        InventoryUpdate();
+        ForceUpdateQuickBars();
+        LOG("[Drop] item dropped count=%d (entry %d)", dropped, entryIdx);
+        return;
     }
+    LOG("[Drop] guid not found in inventory");
 }
 
 // ============================================================================
@@ -4014,62 +4334,67 @@ void Athena::Loot(void* actor) {
     Vector location{};
     bool haveLoc = ActorLocation(actor, location);
 
-    // Local roll first (offline-deterministic); fall back to the native
-    // BP_SpawnLoot when the group is not ported.
-    if (haveLoc && SearchContainer(actor, location)) return;
-    Call spawn("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
-    if (spawn.ok()) {
-        if (spawn.set("PlayerPawn", session.pawn)) {
+    // [F56] Native BP_SpawnLoot FIRST — it rolls the real cooked loot tables
+    // (correct items for the chest tier). Success is verified by the native
+    // flag it sets; only when that does not land do we fall back to the
+    // offline local roll.
+    {
+        Call spawn("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
+        if (spawn.ok() && spawn.set("PlayerPawn", session.pawn)) {
             if (spawn.run(actor)) {
-                SetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
-                Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched"); if (r1.ok()) r1.run(actor);
-                Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer"); if (r2.ok()) r2.run(actor);
-                LOG("[Loot] ✅ native BP_SpawnLoot path");
-                return;
+                if (GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) {
+                    Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer"); if (r2.ok()) r2.run(actor);
+                    LOG("[Loot] ✅ native BP_SpawnLoot path");
+                    return;
+                }
+                LOG("[Loot] native path ran without searching — local fallback");
             }
         }
     }
+    if (haveLoc && SearchContainer(actor, location)) return;
     LOG("[Loot] ❌ container search failed (local+native)");
 }
 
 void Athena::SpawnFloorLoot() {
     LOG("[Loot] Spawning floor loot...");
-    void* wb = FindObj("/Script/Engine.Default__GameplayStatics");
-    if (!wb) { LOG("[Loot] GameplayStatics missing"); return; }
-    const char* containers[] = {
-        "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C",
-        "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_Warmup.Tiered_Athena_FloorLoot_Warmup_C",
-        nullptr
-    };
-    int total = 0;
-    for (int i = 0; containers[i]; ++i) {
-        void* cls = FindObj(containers[i]);
-        if (!cls) cls = LoadClass(containers[i], "/Script/Engine.Actor");
-        if (!cls) continue;
-        Call gac("/Script/Engine.GameplayStatics.GetAllActorsOfClass");
-        if (!gac.ok()) break;
-        gac.set("WorldContextObject", session.world);
-        gac.set("ActorClass", cls);
-        if (!gac.run(wb)) continue;
-        Array actors = gac.result<Array>();
-        LOG("[Loot] Type %d: %d actors", i, actors.Count);
-        for (int j = 0; j < actors.Count; ++j) {
-            void* c = Read<void*>(actors.Data, (size_t)j * 8);
-            if (!c || IsBadPtr(c)) continue;
-            // Native BP path first (it rolls the real cooked tables).
+    GObjects_t* go = GObjectArray();
+    void* bcCls = FindObj("/Script/FortniteGame.BuildingContainer");
+    if (!go || !bcCls || !session.pawn) { LOG("[Loot] scanner unavailable"); return; }
+    // [F56] The hardcoded "/Game/.../Tiered_Athena_FloorLoot_01_C" names do
+    // not exist in 21.30 (dumper confirms: no FloorLoot package in the FName
+    // pool — mount paths differ). Find floor-loot containers by their CLASS
+    // NAME among live BuildingContainer instances instead, and roll them with
+    // the native BP_SpawnLoot (real cooked tables) first.
+    int total = 0, seen = 0;
+    for (int32 i = 0; i < go->NumElements && total < 40; ++i) {
+        void* c = go->GetById((uint32)i);
+        if (!c || IsBadPtr(c) || IsCDO(c)) continue;
+        void* oc = Read<void*>(c, profile::ObjectClass);
+        if (!oc || IsBadPtr(oc) || !SubclassOfFast(oc, bcCls)) continue;
+        std::string cn = ObjName(oc);
+        std::transform(cn.begin(), cn.end(), cn.begin(), ::tolower);
+        if (cn.find("floorloot") == std::string::npos) continue;
+        ++seen;
+        if (GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) continue;
+        Vector loc{};
+        if (!ActorLocation(c, loc)) continue;
+        bool ok = false;
+        {   // native first
             Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
-            bool ok = false;
-            if (bp.ok() && bp.set("PlayerPawn", session.pawn)) ok = bp.run(c);
-            if (!ok && session.pawn) {
-                // Fallback: local roll beside the container.
-                Vector loc{};
-                if (ActorLocation(c, loc)) ok = SearchContainer(c, loc);
-            }
-            if (ok) ++total;
+            if (bp.ok() && bp.set("PlayerPawn", session.pawn) && bp.run(c) &&
+                GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) ok = true;
+        }
+        if (!ok) ok = SearchContainer(c, loc);
+        if (ok) {
+            SetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
+            Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched"); if (r1.ok()) r1.run(c);
+            ++total;
         }
     }
-    LOG("[Loot] ✅ Total %d containers looted", total);
-    session.loot_found_total = total;   // [F45] retries stop on success
+    LOG("[Loot] ✅ floor loot pass: spawned=%d floorloot-containers=%zu", total, (size_t)seen);
+    // [F45] stop retrying once the map's floor-loot containers are accounted
+    // for (spawned or already searched) — but keep the number honest.
+    session.loot_found_total = (seen > 0) ? (total > 0 ? total : 1) : 0;
 }
 
 // ============================================================================
@@ -4878,17 +5203,22 @@ static void pe_hook(void* obj, void* func, void* params) {
             void* cls = Read<void*>(obj, profile::ObjectClass);
             isInteraction = SubclassOfFast(cls, g_interactionClass);
         }
-        // [F49] harvest on player-placed builds: the OnDamageServer receiver is
+        // [F49/F59] harvest on player-placed builds: the OnDamageServer receiver is
         // the building itself, not the pawn/controller — extend the gate.
+        // [F59] container receivers ride the same gate: hitting a chest must
+        // pop its loot (standalone never runs the native destroy->loot chain).
         bool isBuildSM = false;
+        bool isContainer = false;
         if (fn == "OnDamageServer" && obj) {
+            void* cls = Read<void*>(obj, profile::ObjectClass);
             void* smCls = FindObj("/Script/FortniteGame.BuildingSMActor");
-            if (smCls) {
-                void* cls = Read<void*>(obj, profile::ObjectClass);
-                isBuildSM = SubclassOfFast(cls, smCls);
+            if (smCls) isBuildSM = SubclassOfFast(cls, smCls);
+            if (!isBuildSM) {
+                void* bcC = FindObj("/Script/FortniteGame.BuildingContainer");
+                if (bcC) isContainer = SubclassOfFast(cls, bcC);
             }
         }
-        if (isPC || isPawn || isWeapon || isInteraction || isBuildSM) {
+        if (isPC || isPawn || isWeapon || isInteraction || isBuildSM || isContainer) {
             Guard g;
             if (fn == "ServerExecuteInventoryItem") {
                 if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid))
@@ -4946,15 +5276,44 @@ static void pe_hook(void* obj, void* func, void* params) {
                     GetBool(obj, "/Script/FortniteGame.BuildingActor.bPlayerPlaced"))
                     Athena::HarvestGrantFor(obj, dmg);
             }
+            // [F59] chest break -> loot pops (Erbium never needed this because
+            // its server sim handled it; standalone must do it locally).
+            else if (isContainer && fn == "OnDamageServer" && params) {
+                void* instP = incoming(func, params, "InstigatedBy", 8);
+                void* inst = instP ? Read<void*>(instP, 0) : nullptr;
+                if (inst == session.controller &&
+                    !GetBool(obj, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) {
+                    LOG("[Loot] container damaged by player — popping loot");
+                    Athena::Loot(obj);
+                }
+            }
             // [F52] minimap marker diagnosis (era.mark + the map UI path).
             else if (fn == "ServerSpawnMark" && isPC) {
                 LOG("[Mark] ServerSpawnMark arrived (map ping path works)");
             }
-            // [F24] ServerAttemptInventoryDrop(ItemGuid, Count, bTrash).
-            else if (fn == "ServerAttemptInventoryDrop" && params) {
+            // [F58] ServerAttemptInventoryDrop(ItemGuid, Count, bTrash) —
+            // SWALLOWED: the native RPC runs into the dead standalone server
+            // path (the device crash on every inventory drop). The full local
+            // drop (pickup + by-GUID array reconciliation) already ran above.
+            else if (fn == "ServerAttemptInventoryDrop" && isPC && params) {
                 Guid gg = Read<Guid>(params);
                 int cnt = Read<int>(params, sizeof(Guid));
                 Athena::DropInventoryItem(gg, cnt);
+                return;   // never reach the crashing native path
+            }
+            // [F58] Build-mode exit crash guard — the toggle-off RPC has no
+            // server on standalone; run the local state change only. The
+            // equip path (ServerExecuteInventoryItem) restores the weapon.
+            else if (fn == "ServerHandlingBuildMode" && isPC) {
+                LOG("[BuildCall] swallowed ServerHandlingBuildMode (standalone)");
+                return;
+            }
+            // [F58] one-shot per-name diagnosis of every other Build-related
+            // controller call — the next device log names the exact exit path.
+            else if (isPC && fn.find("Build") != std::string::npos) {
+                static std::set<std::string> seenBuildCalls;
+                if (seenBuildCalls.insert(fn).second)
+                    LOG("[BuildCall] %s (diag)", fn.c_str());
             }
         }
     }
@@ -5182,10 +5541,17 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
             LOG("[NPC] command -> spawned %d", Athena::SpawnNPCs(n < 1 ? 1 : (n > 12 ? 12 : n)));
         }
         else if (normalized == "era.sharks") { Athena::ScanMapContent(); }
+        else if (normalized == "era.reality" || normalized.rfind("era.reality ", 0) == 0) {
+            int n = 2; sscanf(normalized.c_str(), "era.reality %d", &n);
+            LOG("[Reality] command -> planted %d", Athena::SpawnRealitySaplings(n < 1 ? 1 : (n > 8 ? 8 : n)));
+        }
         else if (normalized == "era.mark") {
             if (session.controller && session.pawn) {
                 Vector loc{};
                 if (ActorLocation(session.pawn, loc)) {
+                    // [F60] standalone has no server — spawn the real marker
+                    // actor locally (this is what puts the icon on the map).
+                    Athena::SpawnLocalMarker();
                     Call m("/Script/FortniteGame.FortPlayerController.ServerSpawnMark");
                     if (m.ok()) {
                         void* nullActor = nullptr;
@@ -5197,7 +5563,7 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                 }
             }
         }
-        else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles [n] | era.animals [n] | era.stream | era.hud | era.zone [i] | era.players [n] | era.harvest on|off | era.doors on|off | era.climb on|off | era.loot | era.body | era.scan | era.auto on|off | era.interact | era.enter | era.exit | era.edit wall|floor|stairs|roof | era.qb | era.npc [n] | era.sharks | era.mark | fly | walk | ghost | god | teleport | era.lobby");
+        else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles [n] | era.animals [n] | era.stream | era.hud | era.zone [i] | era.players [n] | era.harvest on|off | era.doors on|off | era.climb on|off | era.loot | era.body | era.scan | era.auto on|off | era.interact | era.enter | era.exit | era.edit wall|floor|stairs|roof | era.qb | era.npc [n] | era.sharks | era.reality [n] | era.mark | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
