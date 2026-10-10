@@ -5158,7 +5158,27 @@ static void BRBusBotsTick(float alpha) {
         void* cls = Read<void*>(m.pawn, profile::ObjectClass);
         if (!cls || IsBadPtr(cls)) continue;
         if (m.bus_state == 1) {
-            if (!haveBus) { m.bus_state = 0; continue; }   // bus gone — ground AI
+            if (!haveBus) {
+                // [F80] bus gone while still aboard (late alpha, early destroy)
+                // — the F79 code left these bots HIDDEN forever ("NPCs and bots
+                // disappearing"): unhide + drop them at their target on the
+                // ground, then resume the ground AI.
+                m.bus_state = 0;
+                static Call* unhOnce = nullptr;
+                if (!unhOnce) unhOnce = new Call("/Script/Engine.Actor.SetActorHiddenInGame");
+                if (unhOnce && unhOnce->ok()) { bool b = false; if (unhOnce->set("bNewHidden", b)) unhOnce->run(m.pawn); }
+                Vector at{ m.drop_target.X, m.drop_target.Y, m.land_z + 150.0f };
+                if (setLoc && setLoc->ok()) {
+                    Rotator rot{};
+                    setLoc->set("NewLocation", at);
+                    setLoc->set("NewRotation", rot);
+                    bool sweep = false, tp = true;
+                    setLoc->set("bSweep", sweep);
+                    setLoc->set("bTeleport", tp);
+                    setLoc->run(m.pawn);
+                }
+                continue;
+            }
             if (alpha < m.jump_alpha) continue;            // still riding (hidden)
             m.bus_state = 2;
             Vector p{ busAt.X + (BRRand01() - 0.5f) * 500.0f,
