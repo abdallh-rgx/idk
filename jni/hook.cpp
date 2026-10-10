@@ -7733,7 +7733,7 @@ void Athena::NearbyScanRefresh() {
     // actually carry a door (bits 0-3 of the door byte) are kept.
     {
         size_t before = session.near_walls.size();
-        collect("/Script/FortniteGame.BuildingWall", session.near_walls, session.near_wall_locs, 384);
+        collect("/Script/FortniteGame.BuildingWall", session.near_walls, session.near_wall_locs, 2048);   // [F80] wide cap then door-bit filter (the first 384 could all be far walls)
         if (before != session.near_walls.size()) {
             constexpr uint8_t kDoorMask = 0x0F;   // swinging|sliding|auto|double
             std::vector<void*> keep; std::vector<Vector> keepLoc;
