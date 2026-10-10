@@ -45,11 +45,12 @@
 //        protection (ported from Era's give()).
 //  [F18] Pickups: stacking, max-stack transfer, weapon slot selection
 //        (ported from Era's local_pickup).
-//  [F19] Two-bar quickbar layout: weapons on Primary(0), build pieces on
-//        Secondary(1), binding through EquipItemToQuickBarSlot with
-//        GetItemInQuickbarSlot read-back verification.
-//  [F20] Local loot rolling for containers with rollback (replaces the
-//        dead BP-only path; exported-table style from the Era core).
+//  [F19] Two-bar layout: native FortPlayerController.AddItemToQuickBars,
+//        then GetItemInQuickbarSlot read-back verification; no raw QuickBar
+//        offsets, vtable calls, or manually allocated TArray storage.
+//  [F20] Native cooked loot only: BuildingContainer.BP_SpawnLoot followed by
+//        FortKismetLibrary.K2_SpawnPickupInWorldWithLootTier; no hardcoded
+//        local loot tables or raw AFortPickup entry writes.
 //  [F21] Building through the local preview (LastBuildPreviewGridSnapLoc/
 //        Rot + CurrentBuildableClass) with dedup + touch-build polling.
 //  [F22] Locker cosmetics via MCP (CosmeticLoadoutPC + GetLoadoutForPlayer)
@@ -61,39 +62,21 @@
 //  [F25] Prologue verification for every hooked RVA before DobbyHook.
 // ============================================================================
 // F80 (this round — the user's F79 device log, Arabic report):
-//  [F80-a] Inventory/QuickBars — 21.30 SDK audit removed a reflected
-//        ServerAddItemInternal call absent from this build and the impossible
-//        FortInventory.SetOwner call; quickbar assignment uses the validated
-//        BindSlot path, ClientEquipItem updates focus, and QuickBars uses the
-//        inherited Engine.Actor.SetOwner with its controller parameter.
-//  [F80-b] Loot — real floor loot: AFortPickupAthena actors tossed at
-//        PlayerStarts from the resident weapon pool (Erbium's SpawnPickup
-//        model) — visible guns everywhere the player lands, collected by the
-//        live fly-collect path.
+//  [F80-a] QuickBars — all slot mutation now goes through the 21.30 native
+//        FortPlayerController.AddItemToQuickBars + GetItemInQuickbarSlot APIs;
+//        no QuickBars offsets, vtable slot calls, manual TArray or flag writes.
+//  [F80-b] Loot — native FortKismetLibrary.K2_SpawnPickupInWorld for pickups;
+//        Erbium-style Tiered_Athena_FloorLoot actor cleanup; no random loot
+//        scattering or manual AFortPickup/FFortItemEntry memory writes.
 //  [F80-c] Doors — BuildingWall with door bits is now an interact candidate
 //        (kind 4); it was never in the candidate scan ("doors not finished").
 //        Rejected-call log spam rate-limited (one line per function name).
-//  [F80-d] Bus — the F79 defects killed one by one:
-//        (1) "cannot jump off": the native ServerAttemptAircraftJump never
-//            respawns standalone (needs the server passenger list) — the jump
-//            is now executed ENTIRELY locally: fresh pawn at the bus's current
-//            position + BeginSkydiving(from bus) + full system re-application
-//            (BRSpawnPlayerSkydiveAt), same path for the HUD button and the
-//            end-of-window force jump;
-//        (2) "camera never caught the bus": APlayerController.
-//            bAutoManageActiveCameraTarget re-asserts the (destroyed) pawn's
-//            view target every tick — parked during the ride, restored on
-//            respawn;
-//        (3) "ride outside the drawn bounds / too long": the bus parked on
-//            its default FlightInfo (start (0,0,0) Z=80000) and the native
-//            StartFlightPath flew garbage — the bus is now parked ON our
-//            synthesized route start, the native flight is neutralized
-//            (FlightSpeed=0, verified), OUR pilot flies the route every tick,
-//            duration clamped 40-70s inside the playable bounds;
-//        (4) "crashed after the bus vanished": the view target + GameState.
-//            Aircraft/Aircrafts[] + CurrentAircraft all pointed at the bus
-//            when it was destroyed — every reference is cleared and the
-//            camera moved to the pawn BEFORE K2_DestroyActor.
+//  [F80-d] Bus — native StartFlightPath receives a trusted 0x48-byte
+//        FAircraftFlightInfo buffer (the map's mutable TArray is not used as
+//        the synthesized source), the aircraft FlightInfo is corrected before
+//        StartFlightPath, and FlightSpeed is never forced to zero. Jump and
+//        camera lifecycle remain standalone-safe; aircraft references are
+//        cleared before destruction.
 //  [F80-e] Bots — headless bots killed at the root: the cosmetic pools were
 //        case-sensitive name-matched ("CP_Backpack_HeadbandKMale" entered the
 //        HEAD pool) and never deduplicated (heads=44 was ~11 parts ×4).
@@ -269,23 +252,6 @@ constexpr uint8_t TacticalSprint_Bit_Enabled   = 0x01;
 constexpr uint8_t TacticalSprint_Bit_WantsSprint = 0x02;
 constexpr uint8_t TacticalSprint_Bit_IsSprinting = 0x08;
 
-// ⭐ QuickBars (21.30 — libUnreal.so)
-constexpr uintptr_t InitializeAthenaQuickBars    = 0x056607ec;
-constexpr unsigned  QuickBars_VtableSlot         = 0x738;
-constexpr unsigned  QuickBars_PrimaryOffset      = 0x278;   // FQuickBar.PrimaryQuickBar
-constexpr unsigned  QuickBars_SecondaryOffset    = 0x308;   // FQuickBar.SecondaryQuickBar
-constexpr unsigned  QuickBars_CreativeOffset     = 0x398;   // FQuickBar.CreativeQuickBar
-constexpr unsigned  QuickBar_SlotsOffset         = 0x10;    // FQuickBar.Slots
-constexpr unsigned  QuickBarSlot_ItemsOffset     = 0x00;    // FQuickBarSlot.Items
-constexpr unsigned  QuickBarSlot_EnabledOffset   = 0x10;    // FQuickBarSlot.bEnabled (bit0)
-constexpr unsigned  QuickBarSlot_EnabledBit      = 0x01;
-constexpr unsigned  QuickBarSlot_OccupiedBit     = 0x08;    // bIsOccupied (bit3, same byte)
-constexpr unsigned  QuickBarSlot_SlotSize        = 0x28;
-constexpr unsigned  Controller_ClientQuickBars   = 0x1a60;
-constexpr unsigned  Controller_QuickBarReadyByte = 0x1a68;
-constexpr uintptr_t GetItemInQuickbarSlot_Gate   = 0x06673524;
-constexpr unsigned  QuickBars_VtableSlot_GetItemInSlot = 0x6f0;
-
 // ⭐ Local building / reticle / touch (AFortPlayerController, verified)
 constexpr unsigned Controller_CurrentBuildableClass = 0x1898;
 constexpr unsigned Controller_BuildPreviewRotIter   = 0x1858;
@@ -297,9 +263,6 @@ constexpr unsigned Controller_PreviewSnapRot        = 0x19C8;   // FRotator (LWC
 constexpr unsigned Controller_LocationUnderReticle  = 0x24C0;
 constexpr unsigned Controller_InteractionComponent  = 0x28D8;
 constexpr unsigned Controller_CosmeticLoadoutPC     = 0x1E70;   // FFortAthenaLoadout
-constexpr unsigned AFortPickup_PrimaryEntry         = 0x02F8;
-constexpr unsigned AFortPickup_SourceFlags          = 0x0540;
-constexpr unsigned AFortPickup_SpawnSource          = 0x0541;
 constexpr unsigned AFortGameState_GamePhase         = 0x2150;
 constexpr unsigned AFortGameState_SafeZoneIndicator = 0x19A8;
 constexpr unsigned AFortGameState_PlaylistInfo      = 0x2170;   // FPlaylistPropertyArray
@@ -586,15 +549,6 @@ static void* ByShortName(const std::string& wanted) {
         }
     }
     return nullptr;
-}
-
-// [F55] UE-allocator allocation — the manual QuickBar slot arrays and GUID
-// buffers were malloc'ed while the engine reallocs/frees them through
-// FMemory on slot updates (mismatched allocator = the classic source of the
-// random build-mode/inventory crashes).
-static void* FMalloc(size_t size) {
-    using Realloc_t = void* (*)(void*, size_t, uint32_t);
-    return Fn<Realloc_t>(profile::Realloc)(nullptr, size, 0);
 }
 
 // [F54] Generic class-by-name scan (classes need IsA(Class) + SubclassOfFast,
@@ -1425,11 +1379,10 @@ namespace Athena {
     bool BindSlot(void* item, int slot, uint8_t bar);
     void ActivateQuickBarSlot(uint8_t bar, int slot);
     void ForceUpdateQuickBars();
-    void BuildQuickBarsManually();
+    void ReconcileQuickBarsNative();
 
     // Loot [F20]
     void SpawnFloorLoot();
-    void SpawnFloorLootPickups();      // [F80-b] real ground pickups at PlayerStarts
     bool SearchContainer(void* actor, const Vector& location);
 
     // [F18] pickups / [movement]
@@ -1653,194 +1606,115 @@ void Athena::RefreshHUD() {
 // ============================================================================
 // QUICKBARS  — [F01/F02/F19] fixed layout + two-bar binding with read-back
 // ============================================================================
+static void* ItemDefinitionOf(void* item);
+static Guid ItemGuidOf(void* item);
 void Athena::InitializeQuickBarsNative() {
-    if (!session.quickbars || IsBadPtr(session.quickbars)) { LOG("[QB] No quickbar"); return; }
-    const uint32_t expected[] = {0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd};
-    if (memcmp(reinterpret_cast<void*>(g_base + profile::InitializeAthenaQuickBars), expected, sizeof(expected)) != 0)
-        LOG("[QB] ⚠️ prologue mismatch at 0x%llX", (unsigned long long)(g_base + profile::InitializeAthenaQuickBars));
-    void* vtable = Read<void*>(session.quickbars);
-    if (!vtable || IsBadPtr(vtable)) { LOG("[QB] vtable invalid"); return; }
-    uintptr_t init_slot = Read<uintptr_t>(vtable, profile::QuickBars_VtableSlot);
-    uintptr_t expected_fn = g_base + profile::InitializeAthenaQuickBars;
-    LOG("[QB] vtable=%p slot+0x%X=0x%llX expected=0x%llX", vtable, profile::QuickBars_VtableSlot, (unsigned long long)init_slot, (unsigned long long)expected_fn);
-    if (init_slot != expected_fn) { LOG("[QB] ❌ vtable mismatch — SKIPPING native call"); return; }
-    LOG("[QB] ✅ vtable match — calling native init");
-    void* primary = (char*)session.quickbars + profile::QuickBars_PrimaryOffset;
-    void* secondary = (char*)session.quickbars + profile::QuickBars_SecondaryOffset;
-    Array p_before = Read<Array>(primary, profile::QuickBar_SlotsOffset);
-    Array s_before = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
-    LOG("[QB] Before: Primary=%d Secondary=%d", p_before.Count, s_before.Count);
-    { Guard g; reinterpret_cast<void(*)(void*)>(init_slot)(session.quickbars); }
-    Array p_after = Read<Array>(primary, profile::QuickBar_SlotsOffset);
-    Array s_after = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
-    LOG("[QB] After: Primary=%d Secondary=%d", p_after.Count, s_after.Count);
-    if (p_after.Count >= 1 && s_after.Count >= 1) { LOG("[QB] ✅ Init succeeded"); session.quickbars_initialized = true; }
-    else LOG("[QB] native init left the bars empty (controller defaults not populated in standalone) — manual build follows");
+    // 21.30 standalone: do not call an RVA/vtable initializer or write
+    // FQuickBar/TArray storage. The controller's native AddItemToQuickBars
+    // owns initialization and the slot layout.
+    if (!session.controller || !session.quickbars || IsBadPtr(session.quickbars)) {
+        LOG("[QB] Native quickbar setup skipped: controller/actor unavailable");
+        return;
+    }
+    Call setOwner("/Script/Engine.Actor.SetOwner");
+    if (setOwner.ok() && setOwner.set_any(session.controller, "NewOwner", "Owner"))
+        setOwner.run(session.quickbars);
+    session.quickbars_initialized = true;
+    LOG("[QB] QuickBars actor ready; slot setup delegated to FortPlayerController native API");
 }
 
-// [F01] Manual QuickBar construction — the enable byte is at slot+0x10
-// (bEnabled bit0 | bIsDirty bit1 | bIsReserved bit2 | bIsOccupied bit3);
-// the old code wrote slot+0x18 which is UsedByItemGuid.
-void Athena::BuildQuickBarsManually() {
-    if (!session.quickbars) { LOG("[QB] No quickbars"); return; }
-    // [F44] Dedupe: if slot 0 of the primary bar already holds a GUID we are
-    // already filled — re-allocating would leak arrays and re-log noise.
-    {
-        void* barChk = GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
-        if (barChk) {
-            void* bar = GetField(session.quickbars, barChk);
-            Array arr = Read<Array>((char*)bar + profile::QuickBar_SlotsOffset);
-            if (arr.Count > 0 && arr.Data && !IsBadPtr(arr.Data)) {
-                Guid g0 = Read<Guid>((char*)arr.Data + 0x18, 0);   // UsedByItemGuid
-                if (g0.A | g0.B | g0.C | g0.D) {
-                    session.quickbars_initialized = true;
-                    return;   // already filled
-                }
-            }
+// Native QuickBar reconciliation — no manual slot layout or array writes.
+void Athena::ReconcileQuickBarsNative() {
+    // Kept as the existing lifecycle entry point, but no longer writes
+    // QuickBar structs, slot flags, GUID arrays, or TArray allocations.
+    // Reconcile the inventory mirror through the 21.30 controller API only.
+    if (!session.controller) return;
+    int assigned = 0;
+    for (int bar = 0; bar < 2; ++bar) {
+        auto& items = bar == 0 ? session.slots : session.secondary_slots;
+        for (int slot = 0; slot < 6; ++slot) {
+            void* item = items[(size_t)slot];
+            if (!item || IsBadPtr(item)) continue;
+            if (BindSlot(item, slot, (uint8_t)bar)) ++assigned;
         }
     }
-    LOG("[QB] Building QuickBars manually...");
-
-    struct SlotEntry { int idx; Guid guid; uint8_t bar; };
-    std::vector<SlotEntry> entries;
-
-    void* invProp = GetProp("/Script/FortniteGame.FortInventory.Inventory");
-    void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
-    if (!invProp || !instProp) return;
-
-    auto collect = [&](std::array<void*,6>& src, uint8_t bar) {
-        for (int i = 0; i < 6; ++i) {
-            void* inst = src[i];
-            if (!inst) continue;
-            Call g("/Script/FortniteGame.FortItem.GetItemGuid");
-            if (g.ok() && g.run(inst)) entries.push_back({i, g.result<Guid>(), bar});
-        }
-    };
-    collect(session.slots, 0);
-    collect(session.secondary_slots, 1);
-
-    LOG("[QB] Collected %zu item GUIDs", entries.size());
-
-    void* barProp = GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
-    void* secProp = GetProp("/Script/FortniteGame.FortQuickBars.SecondaryQuickBar");
-    void* slotsProp = GetProp("/Script/FortniteGame.QuickBar.Slots");   // [F02] struct name is QuickBar
-    if (!barProp || !secProp || !slotsProp) { LOG("[QB] QuickBar reflection missing"); return; }
-
-    auto ensure_slots = [&](void* bar, int want) -> Array {
-        void* slotsField = (char*)bar + profile::QuickBar_SlotsOffset;
-        Array arr = Read<Array>(slotsField);
-        if (arr.Count < want) {
-            void* newData = FMalloc(profile::QuickBarSlot_SlotSize * want);   // [F55] UE allocator
-            if (newData) {
-                memset(newData, 0, profile::QuickBarSlot_SlotSize * want);
-                Write<void*>(slotsField, 0, newData);
-                Write<int32>(slotsField, 8, want);
-                Write<int32>(slotsField, 12, want);
-                arr = Read<Array>(slotsField);
-                LOG("[QB] Allocated %d slots at %p", want, newData);
-            }
-        }
-        return arr;
-    };
-
-    Array primArr = ensure_slots(GetField(session.quickbars, barProp), 6);
-    Array secArr  = ensure_slots(GetField(session.quickbars, secProp), 5);
-
-    for (auto& e : entries) {
-        Array& arr = e.bar == 0 ? primArr : secArr;
-        if (e.idx < 0 || e.idx >= arr.Count || !arr.Data) continue;
-        void* slot = (char*)arr.Data + (size_t)e.idx * profile::QuickBarSlot_SlotSize;
-        // Items array (TArray<FGuid>) at slot+0x00
-        void* itemsField = (char*)slot + profile::QuickBarSlot_ItemsOffset;
-        Guid* guidData = (Guid*)FMalloc(16);   // [F55] UE allocator (engine may realloc/free)
-        if (!guidData) continue;
-        *guidData = e.guid;
-        Write<void*>(itemsField, 0, guidData);
-        Write<int32>(itemsField, 8, 1);
-        Write<int32>(itemsField, 12, 1);
-        // [F01] bEnabled bit0 + bIsOccupied bit3 on the flags byte at +0x10
-        uint8_t* flags = (uint8_t*)((char*)slot + profile::QuickBarSlot_EnabledOffset);
-        *flags |= profile::QuickBarSlot_EnabledBit | profile::QuickBarSlot_OccupiedBit;
-        LOG("[QB] Bar%u slot %d -> GUID %08X:%08X", e.bar, e.idx, e.guid.A, e.guid.B);
-    }
-
     session.quickbars_initialized = true;
-    LOG("[QB] ✅ Manual initialization done");
+    ForceUpdateQuickBars();
+    LOG("[QB] native reconciliation complete: %d/12 requested slots verified", assigned);
 }
 
 void Athena::SetQuickBarReady() {
-    if (!session.controller) return;
-    void* qp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
-    if (!qp) { LOG("[QB] ClientQuickBars property not found"); return; }
-    int propOff = Read<int>(qp, profile::PropOffset);
-    LOG("[QB] ClientQuickBars offset = 0x%X (expect 0x%X)", propOff, profile::Controller_ClientQuickBars);
-    if (propOff != (int)profile::Controller_ClientQuickBars) { LOG("[QB] ❌ offset mismatch — SKIPPING"); return; }
-    if (!session.quickbars_initialized) { LOG("[QB] ❌ QuickBars not initialized — SKIPPING"); return; }
-    uint8_t before = Read<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte);
-    if (before > 1) { LOG("[QB] Unexpected byte=%u", before); return; }
-    Write<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte, 1);
-    LOG("[QB] ✅ Readiness byte: %u -> 1", before);
+    // There is no reflected QuickBarReady property in the 21.30 SDK.
+    // Readiness is determined by native slot queries, not a guessed byte.
+    if (!session.controller || !session.quickbars) return;
+    Call query("/Script/FortniteGame.FortPlayerController.GetItemInQuickbarSlot");
+    if (!query.ok()) { session.quickbars_initialized = false; return; }
+    bool any = false;
+    for (uint8_t bar : {(uint8_t)0, (uint8_t)1}) {
+        for (int slot = 0; slot < 6; ++slot) {
+            if (!query.set("QuickBarType", bar) || !query.set("SlotIndex", slot) || !query.run(session.controller)) continue;
+            void* item = query.result<void*>();
+            if (item && !IsBadPtr(item)) { any = true; break; }
+        }
+        if (any) break;
+    }
+    session.quickbars_initialized = any;
+    LOG("[QB] native readiness: %s", any ? "at least one item verified" : "empty; will retry after inventory population");
 }
 
-// [F19] Bind through the native Kismet helper, then verify by reading the
-// slot back. EquipItemToQuickBarSlot(WorldContextObject, ItemDefinition,
-// ItemVariantGuid, QuickBarType, SlotIndex) exists in 21.30.
+// [F19] Bind through the 21.30 controller API, then verify the native slot.
 bool Athena::BindSlot(void* item, int slot, uint8_t bar) {
-    if (!item || !session.controller || bar > 1 || slot < 0) return false;
-    void* definition = nullptr;
-    { Call d("/Script/FortniteGame.FortItem.GetItemDefinitionBP"); if (d.ok() && d.run(item)) definition = d.result<void*>(); }
-    if (!definition) return false;
-    Guid guid{};
-    { Call g("/Script/FortniteGame.FortItem.GetItemGuid"); if (g.ok() && g.run(item)) guid = g.result<Guid>(); }
-    if (!(guid.A | guid.B | guid.C | guid.D)) return false;
-
-    Call bind("/Script/FortniteGame.FortKismetLibrary.EquipItemToQuickBarSlot");
-    if (bind.ok() && bind.set("WorldContextObject", session.world) &&
-        bind.set("ItemDefinition", definition) && bind.set("ItemVariantGuid", guid) &&
-        bind.set("QuickBarType", bar) && bind.set("SlotIndex", slot))
-        bind.run(FindObj("/Script/FortniteGame.Default__FortKismetLibrary"));
-
-    // Verify through reflection layout checks before trusting anything.
-    // (21.30: FQuickBarSlot stride 0x28, Items is TArray<FGuid> — the
-    // definitive verification is the GetItemInQuickbarSlot read-back below.)
-    void* barProp = GetProp(bar == 0 ? "/Script/FortniteGame.FortQuickBars.PrimaryQuickBar"
-                                     : "/Script/FortniteGame.FortQuickBars.SecondaryQuickBar");
-    void* slotsProp = GetProp("/Script/FortniteGame.QuickBar.Slots");       // [F02]
-    void* itemsProp = GetProp("/Script/FortniteGame.QuickBarSlot.Items");   // [F02]
-    if (!barProp || !slotsProp || !itemsProp) return false;
-    void* quickbar = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.ClientQuickBars");
-    if (!quickbar) return false;
-    void* barField = GetField(quickbar, barProp);
-    Array slots = Read<Array>(GetField(barField, slotsProp));
-    if (!slots.Data || slots.Count < 1 || slot >= slots.Count) return false;
-    void* target = (char*)slots.Data + (size_t)slot * profile::QuickBarSlot_SlotSize;
-    Array values = Read<Array>(GetField(target, itemsProp));
-    bool matched = false;
-    for (int i = 0; i < values.Count; ++i)
-        if (!memcmp((char*)values.Data + (size_t)i * sizeof(Guid), &guid, sizeof(Guid))) matched = true;
-    if (!matched && values.Count == 1) {
-        Write<Guid>(values.Data, 0, guid);   // stale temporary GUID must not survive reconciliation
-        matched = true;
+    if (!item || IsBadPtr(item) || !session.controller || bar > 1 || slot < 0 || slot >= 6) return false;
+    void* definition = ItemDefinitionOf(item);
+    if (!definition || IsBadPtr(definition)) {
+        Call getDef("/Script/FortniteGame.FortItem.GetItemDefinitionBP");
+        if (getDef.ok() && getDef.run(item)) definition = getDef.result<void*>();
     }
-    if (!matched && values.Count == 0) {
-        void* itemsField = GetField(target, itemsProp);
-        Fn<int(*)(void*,void*,const void*)>(profile::GenericArrayAdd)(itemsField, itemsProp, &guid);
-        values = Read<Array>(itemsField);
-        matched = values.Count >= 1 && values.Data && !memcmp(values.Data, &guid, sizeof(Guid));
-        if (matched) {
-            uint8_t* flags = (uint8_t*)((char*)target + profile::QuickBarSlot_EnabledOffset);
-            *flags |= profile::QuickBarSlot_EnabledBit | profile::QuickBarSlot_OccupiedBit;
-        }
-        LOG("[QB] Standalone slot repair bar=%u slot=%d guid_verified=%d", bar, slot, (int)matched);
-    }
-    // [F19] Read back through the controller API for a definitive answer.
+    if (!definition || IsBadPtr(definition)) return false;
+    const Guid wanted = ItemGuidOf(item);
+
+    // First accept an already-correct slot; this makes retries idempotent.
     Call query("/Script/FortniteGame.FortPlayerController.GetItemInQuickbarSlot");
-    void* actual = nullptr;
-    if (query.ok() && query.set("QuickBarType", bar) && query.set("SlotIndex", slot) && query.run(session.controller))
-        actual = query.result<void*>();
-    if (actual) matched = matched || (actual == item);
-    LOG("[QB] Slot bar=%u slot=%d verified=%d", bar, slot, (int)matched);
-    return matched;
+    if (!query.ok()) return false;
+    if (query.set("QuickBarType", bar) && query.set("SlotIndex", slot) && query.run(session.controller)) {
+        void* existing = query.result<void*>();
+        if (existing && !IsBadPtr(existing)) {
+            Guid current = ItemGuidOf(existing);
+            if (memcmp(&current, &wanted, sizeof(Guid)) == 0) return true;
+        }
+    }
+
+    // This is the native 21.30 API; no QuickBars offsets, slot writes, or
+    // Kismet GUID-array surgery. Erbium's ServerAddItemInternal is absent
+    // from this client's SDK and is deliberately not emulated by raw memory.
+    Call add("/Script/FortniteGame.FortPlayerController.AddItemToQuickBars");
+    if (!add.ok() || !add.set("ItemDefinition", definition) ||
+        !add.set("QuickBarType", bar) || !add.set("SlotIndex", slot) ||
+        !add.run(session.controller)) {
+        LOG("[QB] AddItemToQuickBars failed bar=%u slot=%d def=%s", bar, slot, ObjName(definition).c_str());
+        return false;
+    }
+
+    bool verified = false;
+    if (query.set("QuickBarType", bar) && query.set("SlotIndex", slot) && query.run(session.controller)) {
+        void* actual = query.result<void*>();
+        if (actual && !IsBadPtr(actual)) {
+            Guid got = ItemGuidOf(actual);
+            verified = memcmp(&got, &wanted, sizeof(Guid)) == 0;
+            if (!verified) verified = ItemDefinitionOf(actual) == definition;
+        }
+    }
+    if (verified) {
+        ForceUpdateQuickBars();
+        Call equip("/Script/FortniteGame.FortPlayerController.ClientEquipItem");
+        if (equip.ok() && equip.set("ItemGuid", wanted)) {
+            bool relocate = true;
+            equip.set("bRelocateExistingIfPossible", relocate);
+            equip.run(session.controller);
+        }
+    }
+    LOG("[QB] native slot bar=%u slot=%d verified=%d", bar, slot, (int)verified);
+    return verified;
 }
 
 void Athena::ActivateQuickBarSlot(uint8_t bar, int slot) {
@@ -2576,7 +2450,7 @@ void Athena::FinalizePlayer() {
     if (!session.movement_enabled) EnableMovementFeatures();
     if (!session.quickbars_initialized) {
         InitializeQuickBarsNative();
-        if (!session.quickbars_initialized) BuildQuickBarsManually();
+        if (!session.quickbars_initialized) ReconcileQuickBarsNative();
         SetQuickBarReady();
         ForceUpdateQuickBars();
         ActivateQuickBarSlot(0, 0);
@@ -2722,7 +2596,7 @@ void Athena::Tick() {
         if (!session.quickbars_initialized && qbRetries++ < 5) {
             LOG("Tick: QuickBars retry #%d", qbRetries);
             InitializeQuickBarsNative();
-            if (!session.quickbars_initialized) BuildQuickBarsManually();
+            if (!session.quickbars_initialized) ReconcileQuickBarsNative();
             if (session.quickbars_initialized) SetQuickBarReady();
         }
     }
@@ -2962,21 +2836,8 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
 
     if (slot >= 0 && slot < 6) {
         (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot] = inst;
-        // The 21.30 SDK has no reflected FortQuickBars.ServerAddItemInternal
-        // function; Erbium's call belongs to another build. Use the validated
-        // 21.30 QuickBar binding path instead of attempting a guaranteed miss.
-        bool nativeAssigned = false;
-        if (nativeAssigned) {
-            // [F80] the native put the item in ITS chosen slot — re-sync our
-            // mirror so taps at that slot resolve the instance (the requested
-            // slot binding above may now point elsewhere).
-            auto& mirror = (bar == 0 ? session.slots : session.secondary_slots);
-            for (int s2 = 0; s2 < 6; ++s2)
-                if (mirror[(size_t)s2] == inst && s2 != slot) mirror[(size_t)s2] = nullptr;
-            if (slot >= 0 && slot < 6) mirror[(size_t)slot] = inst;
-        } else {
-            BindSlot(inst, slot, bar);
-        }
+        // Native 21.30 assignment and read-back; no direct slot storage edits.
+        BindSlot(inst, slot, bar);
         // [F80] the client equip notification — Erbium's flow ends with
         // ClientEquipItem(Guid, true) after every give/equip; this is what
         // tells the HUD which slot is focused (the F79 taps arrived with
@@ -3039,10 +2900,9 @@ void Athena::InitializeInventory() {
             }
         }
         if (session.quickbars) {
-            Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
-            // [F80] SetOwner actually bound this time (the no-arg call wrote
-            // Owner=null and native InitializeAthenaQuickBars bailed — the
-            // F79 "Before: Primary=0 Secondary=0" after a vtable match).
+            // [F80] SetOwner is the only owner assignment; no raw actor-field write.
+            // SetOwner actually bound this time (the no-arg call wrote
+            // Native slot setup is delegated to AddItemToQuickBars below.
             Call soQB("/Script/Engine.Actor.SetOwner");
             if (soQB.ok()) {
                 if (soQB.set_any(session.controller, "NewOwner", "Owner")) soQB.run(session.quickbars);
@@ -3104,7 +2964,7 @@ void Athena::InitializeInventory() {
     // right after possession; slots present before construction render on
     // first draw (the old flow only filled them in FinalizePlayer, after the
     // HUD had already rendered an empty bar).
-    BuildQuickBarsManually();
+    ReconcileQuickBarsNative();
     SetQuickBarReady();
     session.inventory_ready = true;
     EquipSlot(0);
@@ -3293,36 +3153,45 @@ void Athena::ServerHandlePickup(void* pickup) { LocalPickup(pickup); }
 // [F06] SpawnPickup writes the FFortPickup entry (ItemDefinition/Count no
 // longer exist on AFortPickup in 21.30) and tags source flags so the pickup
 // widget/despawn behave like native loot.
-void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, uint8_t spawnSource, bool toss) {
-    if (!def || !session.world) return;
-    void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
-    if (!klass) return;
-    Transform t{};
-    t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
-    void* pickup = SpawnActor(session.world, klass, session.pawn, t);
-    if (!pickup) return;
-    void* entry = PickupEntry(pickup);
-    void* defProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition");
-    void* cntProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
-    if (entry && defProp) Write<void*>(GetField(entry, defProp), 0, def);
-    if (entry && cntProp) Write<int>(GetField(entry, cntProp), 0, count);
-    Write<uint8_t>(pickup, profile::AFortPickup_SourceFlags, sourceFlags);
-    Write<uint8_t>(pickup, profile::AFortPickup_SpawnSource, spawnSource);
-    Call rep("/Script/FortniteGame.FortPickup.OnRep_PrimaryPickupItemEntry"); if (rep.ok()) rep.run(pickup);
-    if (toss) {
-        Call c("/Script/FortniteGame.FortPickup.TossPickup");
-        if (c.ok()) {
-            c.set("FinalLocation", loc);
-            c.set("ItemOwner", session.pawn);
-            int overrideMax = -1; c.set("OverrideMaxStackCount", overrideMax);
-            bool bToss = true; c.set("bToss", bToss);
-            bool combine = true; c.set("bShouldCombinePickupsWhenTossCompletes", combine);
-            // EEFortPickupSourceTypeFlag (uint8) / EEFortPickupSpawnSource (uint8)
-            c.set_any((uint8_t)sourceFlags, "InPickupSourceTypeFlags");
-            c.set_any((uint8_t)spawnSource, "InPickupSpawnSource");
-            c.run(pickup);
-        }
+static void* SpawnPickupNative(void* def, int count, Vector loc, uint8_t sourceFlags,
+                               uint8_t spawnSource, bool toss) {
+    if (!def || IsBadPtr(def) || !session.world || count < 1) return nullptr;
+    void* library = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    if (!library || IsBadPtr(library)) return nullptr;
+    Call spawn("/Script/FortniteGame.FortKismetLibrary.K2_SpawnPickupInWorld");
+    if (!spawn.ok()) return nullptr;
+    Vector direction{};
+    int overrideMax = -1;
+    bool randomRotation = true;
+    bool blocked = false;
+    int instigatorHandle = 0;
+    bool ownerOnly = false;
+    bool bound = spawn.set("WorldContextObject", session.world) &&
+                 spawn.set("ItemDefinition", def) && spawn.set("NumberToSpawn", count) &&
+                 spawn.set("Position", loc) && spawn.set("Direction", direction) &&
+                 spawn.set("OverrideMaxStackCount", overrideMax) &&
+                 spawn.set("bToss", toss) && spawn.set("bRandomRotation", randomRotation) &&
+                 spawn.set("bBlockedFromAutoPickup", blocked) &&
+                 spawn.set("PickupInstigatorHandle", instigatorHandle) &&
+                 spawn.set_any(sourceFlags, "SourceType") &&
+                 spawn.set_any(spawnSource, "Source") &&
+                 spawn.set("OptionalOwnerPC", session.controller) &&
+                 spawn.set("bPickupOnlyRelevantToOwner", ownerOnly);
+    if (!bound || !spawn.run(library)) return nullptr;
+    void* pickup = spawn.result<void*>();
+    return pickup && !IsBadPtr(pickup) ? pickup : nullptr;
+}
+
+void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags,
+                         uint8_t spawnSource, bool toss) {
+    void* pickup = SpawnPickupNative(def, count, loc, sourceFlags, spawnSource, toss);
+    if (!pickup) {
+        LOG("[Loot] native K2_SpawnPickupInWorld failed for %s x%d",
+            def ? ObjName(def).c_str() : "<null>", count);
+        return;
     }
+    LOG("[Loot] native pickup spawned: %s x%d at (%.0f,%.0f,%.0f)",
+        ObjName(def).c_str(), count, loc.X, loc.Y, loc.Z);
 }
 
 // ============================================================================
@@ -4587,7 +4456,7 @@ static void BRPawnRespawned(void* pawn) {
     Athena::GrantWorldAbilities();
     // Erbium StartAircraftPhase tail: ClientActivateSlot(0,0) re-arms the
     // pickaxe on the fresh pawn.
-    Athena::BuildQuickBarsManually();
+    Athena::ReconcileQuickBarsNative();
     Athena::SetQuickBarReady();
     Athena::ActivateQuickBarSlot(0, 0);
     Athena::RefreshHUD();
@@ -5194,33 +5063,6 @@ static void BRBusBotsTick(float alpha) {
     }
 }
 
-// [F78-a4] manual pilot — flies the exact route the native StartFlightPath
-// would; engaged only when two consecutive beats show the native aircraft
-// tick is silent (the F77 fallback drove toward an empty zone centre and
-// never moved — the bus stayed parked at (0,0,0) under the map).
-static void BRBusPilot(float now) {
-    if (!br.have_route || !br.aircraft || IsBadPtr(br.aircraft)) return;
-    float t = now - br.bus_flight_start;
-    if (t < 0) t = 0;
-    if (t > br.route_dur) t = br.route_dur;
-    float rad = br.route_yaw * 3.14159265f / 180.0f;
-    Vector p{ br.route_start.X + std::cos(rad) * br.route_speed * t,
-              br.route_start.Y + std::sin(rad) * br.route_speed * t,
-              br.route_start.Z };
-    static Call* sl = nullptr;
-    if (!sl) sl = new Call("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
-    if (sl && sl->ok()) {
-        Rotator rot{}; rot.Yaw = br.route_yaw;
-        sl->set("NewLocation", p);
-        sl->set("NewRotation", rot);
-        bool sweep = false, tp = true;
-        sl->set("bSweep", sweep);
-        sl->set("bTeleport", tp);
-        sl->run(br.aircraft);
-    }
-    BRWriteFloat(br.aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightElapsedTime", t);
-}
-
 // ----------------------------------------------------------------------------
 // [F73-e/F74] Erbium StartAircraftPhase — 21.30 correction: SpawnAircraft is
 // a STATIC on AFortAthenaAircraft (UFunction verified in the 21.30 dump:
@@ -5249,6 +5091,8 @@ static void BRStartAircraftPhase() {
     Array* fi = arrProp ? (Array*)GetField(br.mapinfo, arrProp) : nullptr;
     int fiElem = BRInnerSize(arrProp);
     bool haveFI = fi && fi->Count > 0 && fi->Data && !IsBadPtr(fi->Data) && fiElem > 0;
+    uint8_t synthesizedFI[0x48] = {};
+    bool synthesizedFIValid = false;
     if (haveFI) {
         auto fif = [&](const char* n, float& out) {
             void* p = GetProp((std::string("/Script/FortniteGame.AircraftFlightInfo.") + n).c_str());
@@ -5276,12 +5120,12 @@ static void BRStartAircraftPhase() {
     // bounds/height/speed and push it into MapInfo->FlightInfos[0] (the native
     // match-init flow Erbium relies on; 21.30 standalone never fills it).
     if (!haveFI) {
-        uint8_t fiBuf[0x48] = {};
         Vector rs{}; float ry = 0, rspd = 4500, rdur = 60;
-        if (BRBuildFlightInfo(fiBuf, rs, ry, rspd, rdur)) {
+        if (BRBuildFlightInfo(synthesizedFI, rs, ry, rspd, rdur)) {
+            synthesizedFIValid = true;
             if (br.mapinfo && !IsBadPtr(br.mapinfo) && arrProp) {
                 Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(
-                    GetField(br.mapinfo, arrProp), arrProp, fiBuf);
+                    GetField(br.mapinfo, arrProp), arrProp, synthesizedFI);
             }
             fi = arrProp ? (Array*)GetField(br.mapinfo, arrProp) : nullptr;
             if (fi && fi->Count > 0 && fi->Data && !IsBadPtr(fi->Data)) { fiElem = 0x48; haveFI = true; }
@@ -5352,8 +5196,10 @@ static void BRStartAircraftPhase() {
                 LOG("[BR] SpawnAircraft (static) elem=%d", fiElem);
                 bool w = sp.set_any(session.world, "World", "WorldContextObject", "InWorld");
                 bool k = sp.set_any(acCls, "InAircraftClass", "AircraftClass", "Aircraft");
-                bool f = sp.set_bytes("InFlightInfo", fi->Data, fiElem) ||
-                         sp.set_bytes("FlightInfo", fi->Data, fiElem);
+                const void* flightData = synthesizedFIValid ? (const void*)synthesizedFI : (const void*)fi->Data;
+                int flightSize = synthesizedFIValid ? 0x48 : fiElem;
+                bool f = sp.set_bytes("InFlightInfo", flightData, flightSize) ||
+                         sp.set_bytes("FlightInfo", flightData, flightSize);
                 void* cdo = FindObj("/Script/FortniteGame.Default__FortAthenaAircraft");
                 if (w && k && f && sp.run(cdo ? cdo : session.state)) aircraft = sp.result<void*>();
                 LOG("[BR] SpawnAircraft -> %p (w=%d k=%d f=%d)", aircraft, (int)w, (int)k, (int)f);
@@ -5393,8 +5239,11 @@ static void BRStartAircraftPhase() {
         if (haveFI) {
             if (void* fiProp = GetProp("/Script/FortniteGame.FortAthenaAircraft.FlightInfo")) {
                 int psz = Read<int>(fiProp, profile::PropElementSize);
-                if (psz > 0 && psz <= 0x400)
-                    memcpy(GetField(aircraft, fiProp), fi->Data, (size_t)(psz < fiElem ? psz : fiElem));
+                void* destination = GetField(aircraft, fiProp);
+                const void* source = synthesizedFIValid ? (const void*)synthesizedFI : (const void*)fi->Data;
+                int sourceSize = synthesizedFIValid ? 0x48 : fiElem;
+                if (destination && source && psz >= 0x48 && psz <= 0x400 && sourceSize >= 0x48)
+                    memcpy(destination, source, 0x48);
             }
             Vector startLoc{};
             // [F80] the struct class is "AthenaAircraftFlightInfo" in 21.30 —
@@ -5405,24 +5254,35 @@ static void BRStartAircraftPhase() {
                 if (!p) p = GetProp((std::string("/Script/FortniteGame.AircraftFlightInfo.") + leaf).c_str());
                 return p;
             };
-            if (void* lp = fiProp2("FlightStartLocation")) {
-                int off = Read<int>(lp, profile::PropOffset);
-                if (off >= 0 && off + 24 <= fiElem) startLoc = Read<Vector>(fi->Data, off);
+            const void* routeData = synthesizedFIValid ? (const void*)synthesizedFI : (const void*)fi->Data;
+            int routeSize = synthesizedFIValid ? 0x48 : fiElem;
+            if (routeData && routeSize >= 0x48) {
+                startLoc = Read<Vector>(routeData, 0x00);
             }
-            float spd = (float)br.route_speed, tfe = br.route_dur, tds = (float)(br.drop_start - now), tde = (float)(br.drop_end - now);
-            { void* p = fiProp2("FlightSpeed");
-              if (p) { int off = Read<int>(p, profile::PropOffset);
-                       if (off >= 0 && off + 4 <= fiElem) spd = Read<float>(fi->Data, off); } }
-            { void* p = fiProp2("TimeTillFlightEnd");
-              if (p) { int off = Read<int>(p, profile::PropOffset);
-                       if (off >= 0 && off + 4 <= fiElem) tfe = Read<float>(fi->Data, off); } }
-            { void* p = fiProp2("TimeTillDropStart");
-              if (p) { int off = Read<int>(p, profile::PropOffset);
-                       if (off >= 0 && off + 4 <= fiElem) tds = Read<float>(fi->Data, off); } }
-            { void* p = fiProp2("TimeTillDropEnd");
-              if (p) { int off = Read<int>(p, profile::PropOffset);
-                       if (off >= 0 && off + 4 <= fiElem) tde = Read<float>(fi->Data, off); } }
+            float spd = (float)br.route_speed, tfe = br.route_dur;
+            float tds = (float)(br.drop_start - now), tde = (float)(br.drop_end - now);
+            if (routeData && routeSize >= 0x48) {
+                spd = Read<float>(routeData, 0x30);
+                tfe = Read<float>(routeData, 0x34);
+                tds = Read<float>(routeData, 0x38);
+                tde = Read<float>(routeData, 0x3C);
+            }
             LOG("[BR] flight path: start=(%.0f,%.0f,%.0f) speed=%.0f", startLoc.X, startLoc.Y, startLoc.Z, spd);
+        }
+        // Apply the trusted route before StartFlightPath, so native ticking
+        // never sees the aircraft's default (0,0,80000) FlightInfo.
+        if (br.have_route) {
+            Call setTransform("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+            if (setTransform.ok()) {
+                Vector routePos = br.route_start;
+                Rotator routeRot{}; routeRot.Pitch = -6; routeRot.Yaw = br.route_yaw;
+                bool sweep = false, teleport = true;
+                setTransform.set("NewLocation", routePos);
+                setTransform.set("NewRotation", routeRot);
+                setTransform.set("bSweep", sweep);
+                setTransform.set("bTeleport", teleport);
+                setTransform.run(aircraft);
+            }
         }
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightElapsedTime", 0);
         BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.DropStartTime", br.drop_start);
@@ -5486,44 +5346,7 @@ static void BRStartAircraftPhase() {
             ObjName(Read<void*>(aircraft, profile::ObjectClass)).c_str(),
             br.drop_start - now, br.drop_end - now, br.flight_end - now);
 
-        // [F80] ROUTE TAKEOVER — three defects fixed at the source:
-        //  1) the native SpawnAircraft parks the bus on its own default
-        //     FlightInfo (start (0,0,0) at Z=80000, "outside the drawn bounds");
-        //  2) our flight-path field writes failed read-back because the flight
-        //     info struct class is "AthenaAircraftFlightInfo" — the reader
-        //     below only asked for "FortAthenaAircraftFlightInfo" (the same
-        //     mismatch the F79 log shows: start=(0,0,0) speed=1500);
-        //  3) StartFlightPath then flew the garbage route. Neutralize it.
-        if (br.have_route) {
-            // (1) park the bus ON our route start, nose along the route yaw
-            {
-                static Call* sl = nullptr;
-                if (!sl) sl = new Call("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
-                if (sl && sl->ok()) {
-                    Vector p0{ br.route_start.X, br.route_start.Y, br.route_start.Z };
-                    Rotator rot{}; rot.Pitch = -6; rot.Yaw = br.route_yaw;
-                    sl->set("NewLocation", p0);
-                    sl->set("NewRotation", rot);
-                    bool sweep = false, tp = true;
-                    sl->set("bSweep", sweep);
-                    sl->set("bTeleport", tp);
-                    sl->run(aircraft);
-                    Vector chk{};
-                    if (ActorLocation(aircraft, chk))
-                        LOG("[BR] bus parked on route start (%.0f, %.0f, %.0f) — readback (%.0f, %.0f, %.0f)",
-                            p0.X, p0.Y, p0.Z, chk.X, chk.Y, chk.Z);
-                }
-            }
-            // (2) native flight neutralized inside the nested FlightInfo struct;
-            // there is no aircraft-level FlightSpeed property in 21.30.
-            float spdChk = -1.0f;
-            if (void* flightInfoProp = GetProp("/Script/FortniteGame.FortAthenaAircraft.FlightInfo")) {
-                void* flightInfo = GetField(aircraft, flightInfoProp);
-                Write<float>(flightInfo, profile::AircraftFlightInfo_FlightSpeed, 0.0f);
-                spdChk = Read<float>(flightInfo, profile::AircraftFlightInfo_FlightSpeed);
-            }
-            LOG("[BR] native FlightInfo speed neutralized: %.0f (pilot owns the route)", spdChk);
-        }
+
     }
 
     // [F79-a] Board the player — ERBIUM 1:1 (BattleRoyaleGamePhaseLogic.cpp
@@ -6621,16 +6444,9 @@ void Athena::BRTick() {
                 LOG("[BUS] (%.0f, %.0f, %.0f) moved=%.0f", bl.X, bl.Y, bl.Z, (double)moved);
                 lastBusAt = bl;
             }
-            // [F80] OUR ROUTE, ALWAYS — the F79 log proved the native aircraft
-            // flies its own default FlightInfo (start (0,0,0), Z=80000, outside
-            // the island) when the field writes fail read-back. The still-beats
-            // gate never engaged the pilot because the native bus was moving.
-            // The pilot now owns the route every tick from the moment the bus
-            // exists (the native flight was neutralized at spawn: FlightSpeed=0).
-            if (haveBus) {
-                static double lastDrive = 0;
-                if (now - lastDrive > 0.05) { lastDrive = now; BRBusPilot(now); }
-            }
+            // Native StartFlightPath is the sole movement owner. Do not run
+            // BRBusPilot concurrently: it fights the actor's native tick and
+            // can pin the bus to conflicting transforms.
             if (!br.bus_unlocked && br.drop_start > 0 && now >= br.drop_start) {
                 br.bus_unlocked = true;
                 SetBool(session.state, "/Script/FortniteGame.FortGameStateAthena.bAircraftIsLocked", false);
@@ -7171,66 +6987,11 @@ void Athena::ClimbTick() {
 }
 
 // ============================================================================
-// [F45] FLOOR LOOT — the map's Tiered_Athena_FloorLoot containers live in
-// streaming levels that load async; the first one-shot ran too early and
-// found 0 actors. Retry until containers actually surface (max 8 attempts).
+// [F45] Erbium floor-loot cleanup, retried while streaming levels load.
 void Athena::SpawnFloorLootRetry() {
     if (session.loot_attempts >= 8) return;
     ++session.loot_attempts;
     SpawnFloorLoot();
-    SpawnFloorLootPickups();   // [F80] visible ground guns ride the same retries
-}
-
-// [F80-b] REAL FLOOR LOOT — Erbium's loot model is AFortPickupAthena actors
-// lying on the ground (SpawnPickup + TossPickup), not containers. The F79
-// build only filled the map's own floorloot CONTAINERS, so the player landing
-// anywhere saw zero loot ("اللوت لم يعمل"). Now: every PlayerStart (the
-// game's own ground-verified playable points) gets 1-2 pickups rolled from
-// the resident weapon pool + ammo/materials — visible loot everywhere the
-// player can be, collected by the live fly-collect path.
-void Athena::SpawnFloorLootPickups() {
-    if (!session.world || !session.pawn) return;
-    static int totalSpawned = 0;
-    if (totalSpawned >= 64) return;                 // bounded across all retries
-    static std::vector<void*> starts;
-    if (starts.empty()) {
-        void* psCls = FindObj("/Script/Engine.PlayerStart");
-        if (psCls) starts = FindAllInstances(psCls, 128);
-        LOG("[Loot] pickups: %zu PlayerStart sites available", starts.size());
-    }
-    if (starts.empty()) return;
-    BRWeaponPool();
-    if (g_weapon_defs.empty()) return;
-    // ammo + material defs for the secondary rolls (same set the starter
-    // loadout uses)
-    void* ammoDef = LoadAsset("/Game/Athena/Items/Ammo/AmmoDataBulletsLight.AmmoDataBulletsLight");
-    if (!ammoDef) ammoDef = ByShortName("AthenaAmmoDataBulletsLight");
-    void* woodDef = LoadAsset("/Game/Items/ResourcePickups/WoodItemData.WoodItemData");
-    if (!woodDef) woodDef = ByShortName("WoodItemData");
-    Vector origin{};
-    ActorLocation(session.pawn, origin);
-    int spawned = 0;
-    // spread deterministically over the starts, biased toward the player's
-    // region first (the user sees loot right where they are)
-    size_t begin = (size_t)(session.loot_attempts * 8) % starts.size();
-    for (size_t i = 0; i < starts.size() && totalSpawned < 64 && spawned < 16; ++i) {
-        void* s = starts[(begin + i) % starts.size()];
-        if (!s || IsBadPtr(s)) continue;
-        Vector at{};
-        if (!ActorLocation(s, at)) continue;
-        if (at.Z < -1000.0) continue;               // under-void start
-        at.Z += 80.0;
-        // roll: 60% weapon, 25% ammo, 15% materials
-        uint32_t r = (uint32_t)(BRRand() % 100);
-        void* def = nullptr; int count = 1;
-        if (r < 60) def = g_weapon_defs[(size_t)(BRRand() % g_weapon_defs.size())];
-        else if (r < 85 && ammoDef) { def = ammoDef; count = 30; }
-        else if (woodDef) { def = woodDef; count = 100; }
-        if (!def) continue;
-        SpawnPickup(def, count, at, 0, 0, true);
-        ++spawned; ++totalSpawned;
-    }
-    if (spawned) LOG("[Loot] ✅ floor pickups spawned=%d (total=%d, Erbium SpawnPickup model)", spawned, totalSpawned);
 }
 
 // [F24/F58] Inventory drop — the crash on device came from (a) the native
@@ -7294,251 +7055,124 @@ void Athena::DropInventoryItem(Guid guid, int count) {
 }
 
 // ============================================================================
-// LOOT — [F20] local rolling (Era core search_container ported to 21.30)
+// LOOT — [F20] native cooked loot (Erbium-aligned, 21.30 SDK)
 // ============================================================================
-namespace local_loot {
-    struct Row  { const char* name; float weight; int count; };
-    struct Tier { const char* group; int weaponsMin, weaponsMax, ammoMin, ammoMax, resources; float rarityBoost; };
-
-    // Weapon short names — every row is resolved through ByShortName and
-    // silently skipped when the asset is absent, so the table is safe to
-    // extend for other seasons.
-    static const Row weapons[] = {
-        {"WID_Assault_Auto_Athena_C_Ore_T03",        30, 1},
-        {"WID_Shotgun_Standard_Athena_C_Ore_T03",    25, 1},
-        {"WID_Shotgun_SemiAuto_Athena_C_Ore_T03",    20, 1},
-        {"WID_Sniper_Standard_Athena_C_Ore_T03",     12, 1},
-        {"WID_Assault_Semi_Athena_C_Ore_T03",        12, 1},
-        {"WID_SMG_Tactical_Athena_C_Ore_T03",        12, 1},
-        {"WID_Launcher_Rocket_Athena_C_Ore_T03",      4, 1},
-        {"WID_Minigun_Athena_C_Ore_T03",              3, 1},
-    };
-    static const Row ammo[] = {
-        {"AthenaAmmoDataBulletsLight",   30, 60},
-        {"AthenaAmmoDataBulletsMedium",  34, 60},
-        {"AthenaAmmoDataBulletsHeavy",   14, 30},
-        {"AthenaAmmoDataShells",         18, 24},
-        {"AmmoDataRockets",               4, 4},
-    };
-    static const Row resources[] = {
-        {"WoodItemData",  40, 50},
-        {"StoneItemData", 34, 50},
-        {"MetalItemData", 26, 50},
-    };
-    // Loot-tier-group → package mapping (21.30 SearchLootTierGroup names).
-    static const Tier tiers[] = {
-        {"Loot_AthenaTreasure",       2, 3, 2, 3, 1, 1.6f},
-        {"Loot_Treasure",             2, 3, 2, 3, 1, 1.6f},   // legacy alias
-        {"Loot_AthenaAmmoLarge",      0, 0, 3, 4, 0, 0.0f},
-        {"Loot_AthenaAmmoSmall",      0, 0, 2, 3, 0, 0.0f},
-        {"Loot_AthenaFloorLoot",      1, 1, 1, 2, 1, 0.0f},
-    };
-
-    static float random01() {
-        static uint32_t state = 0;
-        if (!state) state = (uint32_t)(Monotonic() * 1000000.0) | 1;
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        return float(state >> 8) / 16777216.0f;
-    }
-    static void* resolve(const Row& row) {
-        std::string shortName(row.name);
-        void* def = ByShortName(shortName);
-        if (def) return def;
-        // Try the classic content paths before giving up.
-        const char* prefixes[] = {
-            "/Game/Athena/Items/Weapons/",
-            "/Game/Athena/Items/Ammo/",
-            "/Game/Items/ResourcePickups/",
-            nullptr
-        };
-        for (int i = 0; prefixes[i]; ++i) {
-            std::string path = std::string(prefixes[i]) + shortName + "." + shortName;
-            def = LoadAsset(path);
-            if (def) return def;
-        }
-        return nullptr;
-    }
-    static void* pickWeapon(float boost) {
-        float total = 0;
-        for (auto& w : weapons) total += w.weight * (1.0f + boost * (w.weight < 10.0f ? 2.0f : 0.0f));
-        float pick = random01() * total;
-        for (auto& w : weapons) {
-            float weight = w.weight * (1.0f + boost * (w.weight < 10.0f ? 2.0f : 0.0f));
-            pick -= weight;
-            if (pick < 0) return resolve(w);
-        }
-        return nullptr;
-    }
-    static void* pickRow(const Row* table, size_t n) {
-        float total = 0;
-        for (size_t i = 0; i < n; ++i) total += table[i].weight;
-        float pick = random01() * total;
-        for (size_t i = 0; i < n; ++i) {
-            pick -= table[i].weight;
-            if (pick < 0) return resolve(table[i]);
-        }
-        return nullptr;
-    }
-    static int rollBetween(int lo, int hi) { return lo + (int)(random01() * float(hi - lo + 1)); }
-}
-
 bool Athena::SearchContainer(void* actor, const Vector& location) {
-    void* searchedProp = GetProp("/Script/FortniteGame.BuildingContainer.bAlreadySearched");
-    if (!actor || !searchedProp) return false;
+    if (!actor || IsBadPtr(actor)) return false;
     if (GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) return true;
 
-    // Read the container's loot tier group (FName).
-    std::string group;
-    void* groupProp = GetProp("/Script/FortniteGame.BuildingContainer.SearchLootTierGroup");
-    if (groupProp) {
-        FStringNative text{};
-        Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)(GetField(actor, groupProp), &text);
-        group = Narrow(text.Data, 128);
-        if (text.Data) Fn<void(*)(void*)>(profile::Free)(text.Data);
-    }
-    if (group == "Loot_Treasure") group = "Loot_AthenaTreasure";
-    if (group == "Loot_Ammo") group = "Loot_AthenaAmmoLarge";
-
-    const local_loot::Tier* tier = nullptr;
-    for (auto& t : local_loot::tiers)
-        if (group == t.group) { tier = &t; break; }
-    // [F65] Erbium never refuses a search: an unknown 21.30 group (faction
-    // chests, coolers, custom map containers…) falls back to the treasure
-    // tier so EVERY container type opens. The old "group not ported" refusal
-    // was one of the "no type of them responds" causes.
-    if (!tier) {
-        LOG("[Loot] group '%s' not tabled — treasure fallback", group.c_str());
-        for (auto& t : local_loot::tiers)
-            if (!strcmp(t.group, "Loot_AthenaTreasure")) { tier = &t; break; }
-        if (!tier) return false;
+    // Erbium's cooked loot path: the Blueprint first gets a chance to run its
+    // native container search. If it does not consume the container in this
+    // standalone client, use the SDK's native LootTier Kismet function, which
+    // consults the build's real loot tables instead of a hand-written list.
+    Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
+    if (bp.ok() && session.pawn && bp.set("PlayerPawn", session.pawn) && bp.run(actor) &&
+        GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) {
+        Call bounce("/Script/FortniteGame.BuildingContainer.BounceContainer");
+        if (bounce.ok()) bounce.run(actor);
+        LOG("[Loot] native BP_SpawnLoot consumed container");
+        return true;
     }
 
-    struct Drop { void* def; int count; };
-    std::vector<Drop> drops;
-    int weapons = tier->weaponsMax > tier->weaponsMin ? local_loot::rollBetween(tier->weaponsMin, tier->weaponsMax) : tier->weaponsMin;
-    int ammo = tier->ammoMax > tier->ammoMin ? local_loot::rollBetween(tier->ammoMin, tier->ammoMax) : tier->ammoMin;
-    for (int i = 0; i < weapons; ++i)
-        if (void* def = local_loot::pickWeapon(tier->rarityBoost)) drops.push_back({def, 1});
-    for (int i = 0; i < ammo; ++i)
-        if (void* def = local_loot::pickRow(local_loot::ammo, sizeof(local_loot::ammo) / sizeof(local_loot::Row))) {
-            int cnt = 30 + (int)(local_loot::random01() * 60.0f);
-            drops.push_back({def, cnt});
-        }
-    for (int i = 0; i < tier->resources; ++i)
-        if (void* def = local_loot::pickRow(local_loot::resources, sizeof(local_loot::resources) / sizeof(local_loot::Row)))
-            drops.push_back({def, 50});
-    if (drops.empty()) return false;
-
-    // Resolve/spawn every pickup first; roll back partial spawns so a retry
-    // cannot duplicate loot (Era core guarantee).
-    std::vector<void*> spawned;
-    for (size_t i = 0; i < drops.size(); ++i) {
-        Vector loc{location.X + 60.0 + double(i % 3) * 35.0,
-                   location.Y + double(i / 3) * 35.0,
-                   location.Z + 50.0};
-        // sourceFlags: Container(4) | Player(1); spawnSource: Chest(2)/AmmoBox(4)/FloorLoot? use LootDrop(9) for generic
-        uint8_t spawnSource = 9; // LootDrop
-        if (group == "Loot_AthenaTreasure") spawnSource = 2; // Chest
-        if (group.find("Ammo") != std::string::npos) spawnSource = 4; // AmmoBox
-        void* pickup = nullptr;
-        {
-            void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
-            Transform t{};
-            t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
-            pickup = klass ? SpawnActor(session.world, klass, nullptr, t) : nullptr;
-            if (pickup) {
-                void* entry = PickupEntry(pickup);
-                void* defProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition");
-                void* cntProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
-                if (entry && defProp) Write<void*>(GetField(entry, defProp), 0, drops[i].def);
-                if (entry && cntProp) Write<int>(GetField(entry, cntProp), 0, drops[i].count);
-                Write<uint8_t>(pickup, profile::AFortPickup_SourceFlags, 4);
-                Write<uint8_t>(pickup, profile::AFortPickup_SpawnSource, spawnSource);
-                Call rep("/Script/FortniteGame.FortPickup.OnRep_PrimaryPickupItemEntry");
-                if (rep.ok()) rep.run(pickup);
-            }
-        }
-        if (!pickup) {
-            for (void* previous : spawned) { Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(previous); }
-            LOG("Container pickup spawn failed; search not consumed");
-            return true;
-        }
-        spawned.push_back(pickup);
+    void* tierProp = GetProp("/Script/FortniteGame.BuildingContainer.SearchLootTierGroup");
+    if (!tierProp) {
+        LOG("[Loot] SearchLootTierGroup missing; leaving container searchable");
+        return false;
     }
+    void* tierValue = GetField(actor, tierProp);
+    int tierSize = Read<int>(tierProp, profile::PropElementSize);
+    if (!tierValue || tierSize < 4 || tierSize > 8) return false;
+
+    void* library = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    Call spawn("/Script/FortniteGame.FortKismetLibrary.K2_SpawnPickupInWorldWithLootTier");
+    if (!library || !spawn.ok()) {
+        LOG("[Loot] native K2_SpawnPickupInWorldWithLootTier unavailable");
+        return false;
+    }
+    int overrideMax = -1;
+    bool toss = false, tossVelocity = false;
+    Vector velocity{};
+    uint8_t sourceType = 4; // Container
+    uint8_t source = 2;     // Chest
+    int worldLevel = 1;
+    bool bound = spawn.set("WorldContextObject", session.world) &&
+                 spawn.set_bytes("LootTierName", tierValue, tierSize) &&
+                 spawn.set("Position", location) &&
+                 spawn.set("OverrideMaxStackCount", overrideMax) &&
+                 spawn.set("bToss", toss) &&
+                 spawn.set("bTossWithVelocity", tossVelocity) &&
+                 spawn.set("TossVelocity", velocity) &&
+                 spawn.set_any(sourceType, "SourceType") &&
+                 spawn.set_any(source, "Source") &&
+                 spawn.set("LootWorldLevel", worldLevel);
+    if (!bound || !spawn.run(library)) {
+        LOG("[Loot] native loot-tier call failed to bind/run");
+        return false;
+    }
+    Array pickups = spawn.result<Array>();
+    int valid = 0;
+    if (pickups.Data && pickups.Count > 0 && pickups.Count < 128) {
+        for (int i = 0; i < pickups.Count; ++i) {
+            void* pickup = Read<void*>(pickups.Data, (size_t)i * sizeof(void*));
+            if (pickup && !IsBadPtr(pickup)) ++valid;
+        }
+    }
+    if (valid <= 0) {
+        LOG("[Loot] native loot-tier returned no pickups; container remains searchable");
+        return false;
+    }
+
     SetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
-    Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched"); if (r1.ok()) r1.run(actor);
-    Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer"); if (r2.ok()) r2.run(actor);
-    LOG("[Loot] ✅ Container search %s spawned=%zu", group.c_str(), spawned.size());
+    Call rep("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched");
+    if (rep.ok()) rep.run(actor);
+    Call bounce("/Script/FortniteGame.BuildingContainer.BounceContainer");
+    if (bounce.ok()) bounce.run(actor);
+    LOG("[Loot] native cooked loot-tier spawned %d pickup(s)", valid);
     return true;
 }
 
 void Athena::Loot(void* actor) {
-    if (!actor || !session.pawn) return;
-    LOG("[Loot] Opening %s", ObjName(Read<void*>(actor, profile::ObjectClass)).c_str());
+    if (!actor || IsBadPtr(actor) || !session.pawn) return;
+    if (GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) return;
     Vector location{};
-    bool haveLoc = ActorLocation(actor, location);
-
-    // [F56] Native BP_SpawnLoot FIRST — it rolls the real cooked loot tables
-    // (correct items for the chest tier). Success is verified by the native
-    // flag it sets; only when that does not land do we fall back to the
-    // offline local roll.
-    {
-        Call spawn("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
-        if (spawn.ok() && spawn.set("PlayerPawn", session.pawn)) {
-            if (spawn.run(actor)) {
-                if (GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) {
-                    Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer"); if (r2.ok()) r2.run(actor);
-                    LOG("[Loot] ✅ native BP_SpawnLoot path");
-                    return;
-                }
-                LOG("[Loot] native path ran without searching — local fallback");
-            }
-        }
+    if (!ActorLocation(actor, location)) {
+        LOG("[Loot] cannot resolve container location; leaving searchable");
+        return;
     }
-    if (haveLoc && SearchContainer(actor, location)) return;
-    LOG("[Loot] ❌ container search failed (local+native)");
+    LOG("[Loot] opening %s via native cooked loot", ObjName(Read<void*>(actor, profile::ObjectClass)).c_str());
+    if (!SearchContainer(actor, location))
+        LOG("[Loot] native cooked loot failed; container remains searchable");
 }
 
 void Athena::SpawnFloorLoot() {
-    LOG("[Loot] Spawning floor loot...");
+    // Erbium UFortLootPackage::SpawnFloorLootForContainer (FN >= 11) destroys
+    // the map's Tiered_Athena_FloorLoot actors; it does NOT search them as
+    // chests or roll arbitrary weapons. The blueprint class may already be
+    // resident even when its full asset path is not, so identify live actor
+    // instances by their actual runtime class name.
     GObjects_t* go = GObjectArray();
-    void* bcCls = FindObj("/Script/FortniteGame.BuildingContainer");
-    if (!go || !bcCls || !session.pawn) { LOG("[Loot] scanner unavailable"); return; }
-    // [F56] The hardcoded "/Game/.../Tiered_Athena_FloorLoot_01_C" names do
-    // not exist in 21.30 (dumper confirms: no FloorLoot package in the FName
-    // pool — mount paths differ). Find floor-loot containers by their CLASS
-    // NAME among live BuildingContainer instances instead, and roll them with
-    // the native BP_SpawnLoot (real cooked tables) first.
-    int total = 0, seen = 0;
-    for (int32 i = 0; i < go->NumElements && total < 40; ++i) {
-        void* c = go->GetById((uint32)i);
-        if (!c || IsBadPtr(c) || IsCDO(c)) continue;
-        void* oc = Read<void*>(c, profile::ObjectClass);
-        if (!oc || IsBadPtr(oc) || !SubclassOfFast(oc, bcCls)) continue;
-        std::string cn = ObjName(oc);
-        std::transform(cn.begin(), cn.end(), cn.begin(), ::tolower);
-        if (cn.find("floorloot") == std::string::npos) continue;
-        ++seen;
-        if (GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) continue;
-        Vector loc{};
-        if (!ActorLocation(c, loc)) continue;
-        bool ok = false;
-        {   // native first
-            Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
-            if (bp.ok() && bp.set("PlayerPawn", session.pawn) && bp.run(c) &&
-                GetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) ok = true;
-        }
-        if (!ok) ok = SearchContainer(c, loc);
-        if (ok) {
-            SetBool(c, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
-            Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched"); if (r1.ok()) r1.run(c);
-            ++total;
-        }
+    void* actorClass = FindObj("/Script/Engine.Actor");
+    if (!go || !actorClass || !session.world) {
+        LOG("[Loot] floor-spawner scan deferred: object array/world unavailable");
+        session.loot_found_total = 0;
+        return;
     }
-    LOG("[Loot] ✅ floor loot pass: spawned=%d floorloot-containers=%zu", total, (size_t)seen);
-    // [F45] stop retrying once the map's floor-loot containers are accounted
-    // for (spawned or already searched) — but keep the number honest.
-    session.loot_found_total = (seen > 0) ? (total > 0 ? total : 1) : 0;
+    int found = 0, destroyed = 0;
+    Call destroy("/Script/Engine.Actor.K2_DestroyActor");
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object) || IsCDO(object)) continue;
+        void* klass = Read<void*>(object, profile::ObjectClass);
+        if (!klass || IsBadPtr(klass) || !IsA(object, actorClass)) continue;
+        std::string className = ObjName(klass);
+        std::transform(className.begin(), className.end(), className.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (className.find("tiered_athena_floorloot") == std::string::npos) continue;
+        ++found;
+        if (destroy.ok() && destroy.run(object)) ++destroyed;
+    }
+    session.loot_found_total = (found > 0 && destroyed == found) ? 1 : 0;
+    LOG("[Loot] Erbium floor-loot pass: spawner actors=%d destroyed=%d (no synthetic loot rolls)", found, destroyed);
 }
 
 // ============================================================================
@@ -9045,11 +8679,9 @@ static void InstallHooks() {
     // game with zero hooks: no controller binding, no respawn).
     static const uint32_t tick_words[]  = {0xd10503ff, 0x6d0d23e9, 0xa90e6ffc, 0xa90f67fa};
     static const uint32_t exec_words[]  = {0xd10183ff, 0xa9025ff8, 0xa90357f6, 0xa9044ff4};
-    static const uint32_t qb_words[]    = {0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd};
     bool pe_valid   = PrologueMatchPE("ProcessEvent",    profile::ProcessEvent);
     bool tick_valid = PrologueMatch("WorldTick",       profile::WorldTick,       tick_words, 4);
     bool exec_valid = PrologueMatch("EngineExec",      profile::EngineExec,      exec_words, 4);
-    bool qb_valid   = PrologueMatch("AthenaQuickBars", profile::InitializeAthenaQuickBars, qb_words, 4);
 
     int installed = 0, failed = 0;
     if (pe_valid) {
@@ -9064,7 +8696,6 @@ static void InstallHooks() {
         if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) == 0 && orig_Exec) { LOG("EngineExec hooked"); ++installed; }
         else { LOG("EngineExec FAILED"); ++failed; }
     } else { LOG("EngineExec skipped (prologue)"); ++failed; }
-    if (!qb_valid) LOG("[QB] initializer prologue mismatch — native init disabled, manual path only");
     LOG("InstallHooks done: installed=%d failed=%d", installed, failed);
 }
 
