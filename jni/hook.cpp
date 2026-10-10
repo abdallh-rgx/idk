@@ -60,6 +60,55 @@
 //        after tick) + fly/walk/ghost/god/teleport + era.* console commands.
 //  [F25] Prologue verification for every hooked RVA before DobbyHook.
 // ============================================================================
+// F80 (this round — the user's F79 device log, Arabic report):
+//  [F80-a] Inventory/QuickBars — the friend's directive "implement inventory":
+//        native ServerAddItemInternal (the real quickbar assignment, verified
+//        by slot read-back) + native ClientEquipItem (the client focus link
+//        the HUD never had — F79 taps arrived as slot=-1) + SetOwner actually
+//        binding (the no-arg SetOwner wrote Owner=NULL and native
+//        InitializeAthenaQuickBars bailed with Primary=0/Secondary=0) + the
+//        tap routing treats slot=-1 as the tracked focused slot.
+//  [F80-b] Loot — real floor loot: AFortPickupAthena actors tossed at
+//        PlayerStarts from the resident weapon pool (Erbium's SpawnPickup
+//        model) — visible guns everywhere the player lands, collected by the
+//        live fly-collect path.
+//  [F80-c] Doors — BuildingWall with door bits is now an interact candidate
+//        (kind 4); it was never in the candidate scan ("doors not finished").
+//        Rejected-call log spam rate-limited (one line per function name).
+//  [F80-d] Bus — the F79 defects killed one by one:
+//        (1) "cannot jump off": the native ServerAttemptAircraftJump never
+//            respawns standalone (needs the server passenger list) — the jump
+//            is now executed ENTIRELY locally: fresh pawn at the bus's current
+//            position + BeginSkydiving(from bus) + full system re-application
+//            (BRSpawnPlayerSkydiveAt), same path for the HUD button and the
+//            end-of-window force jump;
+//        (2) "camera never caught the bus": APlayerController.
+//            bAutoManageActiveCameraTarget re-asserts the (destroyed) pawn's
+//            view target every tick — parked during the ride, restored on
+//            respawn;
+//        (3) "ride outside the drawn bounds / too long": the bus parked on
+//            its default FlightInfo (start (0,0,0) Z=80000) and the native
+//            StartFlightPath flew garbage — the bus is now parked ON our
+//            synthesized route start, the native flight is neutralized
+//            (FlightSpeed=0, verified), OUR pilot flies the route every tick,
+//            duration clamped 40-70s inside the playable bounds;
+//        (4) "crashed after the bus vanished": the view target + GameState.
+//            Aircraft/Aircrafts[] + CurrentAircraft all pointed at the bus
+//            when it was destroyed — every reference is cleared and the
+//            camera moved to the pawn BEFORE K2_DestroyActor.
+//  [F80-e] Bots — headless bots killed at the root: the cosmetic pools were
+//        case-sensitive name-matched ("CP_Backpack_HeadbandKMale" entered the
+//        HEAD pool) and never deduplicated (heads=44 was ~11 parts ×4).
+//        Classification is now reflection PartType (Head=0/Body=1) + dedup,
+//        and every bot takes a DISTINCT pair by roster index (no more clones
+//        of the player). Bots landing without a held weapon re-arm the
+//        pickaxe before the random ranged weapon.
+//  [F80-f] Wildlife — the class filter compared lowercase skip-terms against
+//        CamelCase names, so the abstract PARENT classes spawned (no behavior
+//        tree = "animals not in their original logic"). Lowercased filter,
+//        concrete Irwin classes only, roam motors removed entirely — native
+//        AI owns the animals, and they are no longer interact candidates.
+// ============================================================================
 #include <jni.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -894,8 +943,15 @@ public:
             // quickbar UI stayed dead. Poke targets are collected BY class —
             // the receiver is right by construction, so allowlist this one.
             if (ObjName(m_func) != "HandleQuickbarContentChanged") {
-                LOG("[Call] rejected %s: receiver=%s owner=%s", ObjName(m_func).c_str(),
-                    ObjName(Read<void*>(object, profile::ObjectClass)).c_str(), ObjName(owner).c_str());
+                // [F80] the F79 log spammed "[Call] rejected BlueprintOnInteract"
+                // once per candidate per tick — rate-limit to one line per
+                // function name per session (the reject itself is unchanged).
+                static std::set<std::string> rejected_logged;
+                std::string fname = ObjName(m_func);
+                if (rejected_logged.insert(fname).second)
+                    LOG("[Call] rejected %s: receiver=%s owner=%s (further rejects silenced)",
+                        fname.c_str(),
+                        ObjName(Read<void*>(object, profile::ObjectClass)).c_str(), ObjName(owner).c_str());
                 return false;
             }
         }
@@ -1143,9 +1199,12 @@ struct Session {
     std::vector<Vector> near_container_locs; // [F65]
     std::vector<void*> near_pickups;         // [F65] live ground loot pickups
     std::vector<Vector> near_pickup_locs;    // [F65]
+    std::vector<void*> near_walls;           // [F80] door walls near the player
+    std::vector<Vector> near_wall_locs;      // [F80]
     std::map<void*, double> pickup_last_at;  // [F65] per-pickup collect cooldown
     int   hud_phase_kick = 0;                // [F69] ClientOnPawnSpawned re-kick
     Guid  last_equip_guid{};                 // [F75] dedupe — skip re-equip of the held item
+    int   focus_slot[2] = {0, 0};            // [F80] our own focused-slot mirror (HUD sends -1 when its state is empty)
     void* bot_inventory_cls = nullptr;       // [F75] AFortInventory for bot WorldInventory
     std::set<void*> interact_logged;         // [F75-d] one-shot per interact candidate
     bool  bot_pickaxe_warned = false;        // [F79-d] one-shot equip diagnostic
@@ -1188,6 +1247,8 @@ static void BRStormTick();            // Erbium zone flags + storm damage
 static float BRWorldTime();           // UGameplayStatics::GetTimeSeconds
 static void* BRGetComponent();        // BattleRoyaleGamePhaseLogic component
 static void BRPawnRespawned(void* pawn); // [F79-a] post-jump respawn setup
+static void BRSpawnPlayerSkydiveAt(float x, float y, float z); // [F80] local jump-off
+static void* BRBotPawnClass;             // [F80] defined with the roster (tentative decl)
 // [F79-e] reflection float read used by the death watcher (defined below); a
 // tiny inline twin avoids a forward-declaration ordering dependency.
 static bool BRReadFloatFwd(void* obj, const char* path, float& out) {
@@ -1352,6 +1413,7 @@ namespace Athena {
 
     // Loot [F20]
     void SpawnFloorLoot();
+    void SpawnFloorLootPickups();      // [F80-b] real ground pickups at PlayerStarts
     bool SearchContainer(void* actor, const Vector& location);
 
     // [F18] pickups / [movement]
@@ -2035,49 +2097,31 @@ void Athena::HandleJumpFromHudStart() {
     if (session.aircraft_jumped) return;
     Guard g;
     LOG("[Bus] JumpFromHudStart intercepted");
-    Vector rot{0, 0, 0};
-    void* rotProp = GetProp("/Script/Engine.Controller.ControlRotation");
-    if (rotProp && Read<int>(rotProp, profile::PropElementSize) == 24) {
-        void* addr = GetField(session.controller, rotProp);
-        if (addr) rot = Read<Vector>(addr);
-    }
-    // [F79-a] Erbium DropEndTime path — the pawn was destroyed at boarding, so
-    // the jump is the NATIVE respawn: ServerAttemptAircraftJump spawns a fresh
-    // pawn at the aircraft, puts it into the native skydive and hands it the
-    // camera. No manual teleport, no BeginSkydiving on a dead pawn (the F78
-    // "died without reason" was exactly that: our fallback chain ran on the
-    // pawn the native jump had already replaced).
-    void* aircraft = GetAircraftComponent(session.controller);
-    bool fired = false;
-    if (aircraft && !IsBadPtr(aircraft)) {
-        Call ac("/Script/FortniteGame.FortControllerComponent_Aircraft.ServerAttemptAircraftJump");
-        if (ac.ok()) {
-            Rotator r{rot.X, rot.Y, rot.Z};
-            if (ac.set("ClientRotation", r) && ac.run(aircraft)) fired = true;
+    // [F80] LOCAL-FIRST jump — the F79 device log proved the native
+    // ServerAttemptAircraftJump never respawns on this build (its
+    // preconditions need the real server's aircraft passenger list), so the
+    // player rode the bus until the forced end-of-window jump. Erbium's flow
+    // is "spawn the pawn at the aircraft, skydive from the bus" — do exactly
+    // that synchronously, from the bus's CURRENT position.
+    Vector busAt{};
+    bool haveBus = br.aircraft && !IsBadPtr(br.aircraft) && ActorLocation(br.aircraft, busAt);
+    if (haveBus) {
+        BRSpawnPlayerSkydiveAt(busAt.X, busAt.Y, busAt.Z - 250.0f);
+    } else {
+        // bus lost — drop at the route end (Erbium OnAircraftExitedDropZone
+        // position) instead of stranding the player with no pawn.
+        Vector end{ br.route_start.X, br.route_start.Y, br.route_start.Z };
+        if (br.have_route) {
+            float rad = br.route_yaw * 3.14159265f / 180.0f;
+            float t = br.route_dur;
+            end.X += std::cos(rad) * br.route_speed * t;
+            end.Y += std::sin(rad) * br.route_speed * t;
         }
-    }
-    if (!fired) {
-        // 21.30 also declares the jump on the controller itself (SDK
-        // AFortPlayerControllerAthena.ServerAttemptAircraftJump(FRotator)).
-        Call pc("/Script/FortniteGame.FortPlayerControllerAthena.ServerAttemptAircraftJump");
-        if (pc.ok()) {
-            Rotator r{rot.X, rot.Y, rot.Z};
-            if (pc.set("ClientRotation", r) && pc.run(session.controller)) fired = true;
-        }
-        if (!fired) {
-            Call pc2("/Script/FortniteGame.FortPlayerController.ServerAttemptAircraftJump");
-            if (pc2.ok()) {
-                Rotator r{rot.X, rot.Y, rot.Z};
-                if (pc2.set("ClientRotation", r) && pc2.run(session.controller)) fired = true;
-            }
-        }
+        BRSpawnPlayerSkydiveAt(end.X, end.Y, end.Z > 2000 ? end.Z - 250 : 3000);
     }
     session.aircraft_jumped = true;
     br.jump_requested_at = Monotonic();
-    LOG("[Bus] jump requested — native respawn pending (fired=%d)", (int)fired);
-    // If the native refuses (precondition fail) the BRTick respawn watcher
-    // respawns the pawn on the ground at the route end after 1.5s — the player
-    // is never left with no pawn.
+    LOG("[Bus] jump executed locally (F80) — skydive from the bus");
 }
 void Athena::OnAircraftJump() { BRJump(); } // [F79-a] native respawn jump
 
@@ -2909,7 +2953,48 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
 
     if (slot >= 0 && slot < 6) {
         (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot] = inst;
-        BindSlot(inst, slot, bar);
+        // [F80] THE REAL QUICKBAR ASSIGNMENT — the native server path the
+        // actual game uses. Erbium calls ServerAddItemInternal(Guid,
+        // bSecondary, -3) from GiveItem; its native body fills the slot,
+        // marks it enabled and fires the client quickbar notifications the
+        // HUD widgets listen to. Verified by slot read-back; the manual
+        // BindSlot below stays as the fallback.
+        bool nativeAssigned = false;
+        if (session.quickbars && !IsBadPtr(session.quickbars)) {
+            Call add("/Script/FortniteGame.FortQuickBars.ServerAddItemInternal");
+            if (add.ok() && add.set("ItemGuid", guid) && add.set("bSecondaryQuickBar", (bool)(bar != 0)) &&
+                add.set("SlotOverride", -3) && add.run(session.quickbars)) {
+                // verify: the GUID must now live in the bar's slot Items arrays
+                void* barProp = GetProp(bar == 0 ? "/Script/FortniteGame.FortQuickBars.PrimaryQuickBar"
+                                                 : "/Script/FortniteGame.FortQuickBars.SecondaryQuickBar");
+                void* slotsProp = GetProp("/Script/FortniteGame.QuickBar.Slots");
+                void* itemsProp = GetProp("/Script/FortniteGame.QuickBarSlot.Items");
+                if (barProp && slotsProp && itemsProp) {
+                    void* barField = GetField(session.quickbars, barProp);
+                    Array slots = Read<Array>(GetField(barField, slotsProp));
+                    for (int s = 0; s < slots.Count; ++s) {
+                        void* sl = (char*)slots.Data + (size_t)s * profile::QuickBarSlot_SlotSize;
+                        Array items = Read<Array>(GetField(sl, itemsProp));
+                        for (int g = 0; g < items.Count; ++g)
+                            if (!memcmp((char*)items.Data + (size_t)g * sizeof(Guid), &guid, sizeof(Guid))) {
+                                nativeAssigned = true; slot = s; break;
+                            }
+                        if (nativeAssigned) break;
+                    }
+                }
+                static bool onceAdd = false;
+                if (!onceAdd) { onceAdd = true;
+                    LOG("[QB] native ServerAddItemInternal %s (bar=%u)",
+                        nativeAssigned ? "✅ verified" : "ran without visible slot write", bar); }
+            }
+        }
+        if (!nativeAssigned) BindSlot(inst, slot, bar);
+        // [F80] the client equip notification — Erbium's flow ends with
+        // ClientEquipItem(Guid, true) after every give/equip; this is what
+        // tells the HUD which slot is focused (the F79 taps arrived with
+        // slot=-1 because nothing ever set the client-side focused slot).
+        { Call ce("/Script/FortniteGame.FortPlayerController.ClientEquipItem");
+          if (ce.ok() && ce.set("ItemGuid", guid)) { bool rs = true; ce.set("bRelocateExistingIfPossible", rs); ce.run(session.controller); } }
         ForceUpdateQuickBars();   // [F32] refresh the bar on every pickup/give
     }
     LOG("Inventory inserted %s count=%d slot=%d bar=%u indices=%d/%d",
@@ -2948,7 +3033,12 @@ void Athena::InitializeInventory() {
         if (session.inventory) Write<void*>(GetField(session.controller, invProp), 0, session.inventory);
     }
     if (!session.inventory) { LOG("[Inv] No inventory"); return; }
-    { Call so("/Script/FortniteGame.FortInventory.SetOwner"); if (so.ok()) so.run(session.inventory); }
+    // [F80] the previous calls ran SetOwner with NO param bound — Owner was
+    // written as NULL (the F79 log's native QuickBars init returning 0 slots
+    // reads Owner first). Bind the real parameter name.
+    { Call so("/Script/FortniteGame.FortInventory.SetOwner");
+      if (so.ok() && !so.set_any(session.controller, "NewOwner", "Owner")) so.run(session.inventory);
+      else if (so.ok()) so.run(session.inventory); }
 
     void* qbProp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
     if (qbProp) {
@@ -2966,8 +3056,16 @@ void Athena::InitializeInventory() {
         }
         if (session.quickbars) {
             Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
+            // [F80] SetOwner actually bound this time (the no-arg call wrote
+            // Owner=null and native InitializeAthenaQuickBars bailed — the
+            // F79 "Before: Primary=0 Secondary=0" after a vtable match).
             Call soQB("/Script/FortniteGame.FortQuickBars.SetOwner");
-            if (soQB.ok()) soQB.run(session.quickbars);
+            if (soQB.ok()) {
+                if (soQB.set_any(session.controller, "NewOwner", "Owner")) soQB.run(session.quickbars);
+                // hard guarantee via the reflected Owner property
+                if (void* op = GetProp("/Script/Engine.Actor.Owner"))
+                    Write<void*>(GetField(session.quickbars, op), 0, session.controller);
+            }
             LOG("[QB] Running native initialize...");
             InitializeQuickBarsNative();
         }
@@ -3590,7 +3688,7 @@ static void WildClasses(std::vector<void*>& classes) {
     if (!aiPawn) { LOG("[Wild] FortAIPawn missing"); return; }
     {
         static const char* const prefer[] = {"irwin", "burt", "nug", "smackie", "wildlife", nullptr};
-        static const char* const skip[]   = {"parent", "base", "controller", "loot", "spawner", nullptr};
+        static const char* const skip[]   = {"parent", "base", "controller", "spawner", nullptr};
         GObjects_t* go = GObjectArray();
         void* classClass = FindObj("/Script/CoreUObject.Class");
         if (go && classClass) {
@@ -3601,11 +3699,19 @@ static void WildClasses(std::vector<void*>& classes) {
                 if (!SubclassOfFast(object, aiPawn)) continue;
                 std::string n = ObjName(object);
                 if (n.find("_C") == std::string::npos) continue;
+                // [F80] the filters ran on the CamelCase name while every skip
+                // term is lowercase — "NPC_Pawn_Parent_C" sailed through
+                // ("parent" never matched "Parent") and the F79 log shows the
+                // abstract PARENT classes being spawned (no behavior tree, no
+                // native AI = "the animals are not in their original logic").
+                // Lowercase once, then filter.
+                std::string ln = n;
+                std::transform(ln.begin(), ln.end(), ln.begin(), ::tolower);
                 bool bad = false;
-                for (int k = 0; skip[k]; ++k) if (n.find(skip[k]) != std::string::npos) { bad = true; break; }
+                for (int k = 0; skip[k]; ++k) if (ln.find(skip[k]) != std::string::npos) { bad = true; break; }
                 if (bad) continue;
                 bool good = false;
-                for (int k = 0; prefer[k]; ++k) if (n.find(prefer[k]) != std::string::npos) { good = true; break; }
+                for (int k = 0; prefer[k]; ++k) if (ln.find(prefer[k]) != std::string::npos) { good = true; break; }
                 if (!good && classes.size() >= 8) continue;   // unknown names only as filler
                 classes.push_back(object);
             }
@@ -3660,9 +3766,11 @@ static void WildSpawnOne(void* cls, const Vector& at) {
     { Call hp("/Script/FortniteGame.FortPawn.SetMaxHealth"); if (hp.ok()) { float v = 100.0f; if (hp.set_at(0, v)) hp.run(animal); } }
     { Call hp("/Script/FortniteGame.FortPawn.SetHealth");     if (hp.ok()) { float v = 100.0f; if (hp.set_at(0, v)) hp.run(animal); } }
     { Call sh("/Script/Engine.Actor.SetActorHiddenInGame");   if (sh.ok()) { bool h = false; if (sh.set("bNewHidden", h)) sh.run(animal); } }
-    // [F75-c] roam motor — animals drift around their spawn area (the AI
-    // controllers alone do not drive them on this build).
-    g_wild_motors.push_back({animal, (float)(BRRand01() * 360.0), 0.0});
+    // [F80] NO ROAM MOTOR — the concrete classes carry their own
+    // AIController and behavior tree (spawned above). The F79 motors
+    // teleported animals on top of the native AI ("the animals are not in
+    // their original logic") and dragged them through bus/motor logic.
+    // Native AI owns the animals now.
 }
 
 int Athena::SpawnWildlifeNear(int max) {
@@ -3752,7 +3860,7 @@ int Athena::SpawnWildlifeScattered(int max) {
         WildSpawnOne(cls, at);
         ++spawned;
     }
-    LOG("[Wild] scattered %d animals across the map (motors=%zu)", spawned, g_wild_motors.size());
+    LOG("[Wild] scattered %d animals across the map (native AI, no motors — F80)", spawned);
     return spawned;
 }
 
@@ -4287,7 +4395,11 @@ static bool BRFindFNameByString(const char* want, FName& out) {
     GObjects_t* go = GObjectArray();
     if (!go || !want) return false;
     size_t wl = strlen(want);
-    int32 cap = go->NumElements < 150000 ? go->NumElements : 150000;
+    // [F80] the 150k cap missed it — "Spectating" lives on late-index objects
+    // (spectator/replay classes stream late). Scan the FULL array now; the
+    // exact-length filter keeps the pass cheap (~430k NameAppendString calls,
+    // once per session, pre-warmed before the bus).
+    int32 cap = go->NumElements;
     for (int32 i = 0; i < cap; ++i) {
         void* o = go->GetById((uint32)i);
         if (!o || IsBadPtr(o)) continue;
@@ -4429,10 +4541,19 @@ static bool BREquipForPawn(void* pawn, void* weaponDef) {
 }
 
 // [F79-d] bot landing armament — one random ranged weapon from the build's
-// OWN resident definitions (the pickaxe was already equipped at spawn; a
-// second equip here would just leak the first weapon actor).
+// OWN resident definitions. [F80] if the bot holds NOTHING (the spawn-time
+// pickaxe equip can be lost across the bus ride), the pickaxe is re-equipped
+// FIRST so every bot lands with the harvest tool in hand — the user's
+// "bots have no pickaxe" is the weapon replacing a failed pickaxe equip.
 static void BRBotLoadout(void* pawn) {
     if (!pawn || IsBadPtr(pawn)) return;
+    void* held = Read<void*>(pawn, profile::FortPawn_CurrentWeapon);
+    bool hasWeapon = held && !IsBadPtr(held);
+    if (!hasWeapon) {
+        void* pickDef = g_fallback_pickaxe;
+        if (!pickDef) pickDef = FindObj("/Game/Athena/Items/Weapons/WID_Harvest_Pickaxe_Athena_C_T01.WID_Harvest_Pickaxe_Athena_C_T01");
+        if (pickDef) { void* w = ResolveWeaponDefForEquip(pickDef); if (w) BREquipForPawn(pawn, w); }
+    }
     BRWeaponPool();
     if (!g_weapon_defs.empty()) {
         void* wdef = g_weapon_defs[(size_t)(BRRand() % g_weapon_defs.size())];
@@ -4480,8 +4601,38 @@ static void BRPawnRespawned(void* pawn) {
     if (session.controller) {
         Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
         if (cam.ok()) { cam.set("NewViewTarget", pawn); float blend = 0.0f; cam.set("BlendTime", blend); cam.run(session.controller); }
+        // [F80] the boarding flow disabled the engine's auto camera management
+        // (it re-asserted a null view target every tick and fought the bus
+        // follow). Re-enable it — the pawn is back, native possess owns the view.
+        if (void* amProp = GetProp("/Script/Engine.PlayerController.bAutoManageActiveCameraTarget"))
+            Write<uint8_t>(GetField(session.controller, amProp), 0, 1);
     }
     br.jump_requested_at = -1;
+}
+
+// [F80] the bus jump-off, executed entirely locally: fresh pawn at (x,y,z),
+// possess, skydive from the bus, every local system re-applied, camera bound.
+// Used by the HUD jump button AND the end-of-window force jump — one code
+// path, no native respawn dependency (the F79 precondition failure).
+static void BRSpawnPlayerSkydiveAt(float x, float y, float z) {
+    if (!session.world || !session.controller) return;
+    void* pcls = BRBotPawnClass ? BRBotPawnClass
+               : LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
+    if (!pcls) { LOG("[BR] skydive spawn refused — pawn class missing"); return; }
+    Transform t{};
+    t.Location[0] = x; t.Location[1] = y; t.Location[2] = z;
+    Rotator rr{}; rr.Yaw = br.have_route ? br.route_yaw : 0.0f;
+    RotatorToQuat(rr, t.Rotation);
+    void* p = SpawnActor(session.world, pcls, nullptr, t);
+    if (!p) { LOG("[BR] skydive pawn spawn FAILED"); return; }
+    Possess(session.controller, p);
+    if (void* mfp = GetProp("/Script/FortniteGame.FortPlayerController.MyFortPawn"))
+        Write<void*>(GetField(session.controller, mfp), 0, p);
+    BRPawnRespawned(p);
+    // skydive AFTER the systems (BRPawnRespawned's visibility path skips the
+    // skydiving flags while falling — the F79 note).
+    Athena::BeginPlayerSkydiving();
+    LOG("[BR] player skydive from (%.0f, %.0f, %.0f)", x, y, z);
 }
 
 // UFortGameStateComponent_BattleRoyaleGamePhaseLogic — [F74-f] does NOT exist
@@ -4910,8 +5061,8 @@ static bool BRBuildFlightInfo(uint8_t out[0x48], Vector& start, float& yaw,
     yaw = (float)(std::atan2(std::sin(ang), std::cos(ang)) * 57.2957795);
     float dist = 2.0f * half;
     dur = dist / spd;
-    if (dur < 45) { dur = 45; spd = dist / dur; }
-    if (dur > 95) { dur = 95; spd = dist / dur; }
+    if (dur < 40) { dur = 40; spd = dist / dur; }
+    if (dur > 70) { dur = 70; spd = dist / dur; }   // [F80] the F79 95s window rode past the island — 70s max
     std::memset(out, 0, 0x48);
     std::memcpy(out + 0x00, &start, 24);
     Rotator r{}; r.Pitch = -6; r.Yaw = yaw;   // slight nose-down like the real bus
@@ -5267,21 +5418,29 @@ static void BRStartAircraftPhase() {
                     memcpy(GetField(aircraft, fiProp), fi->Data, (size_t)(psz < fiElem ? psz : fiElem));
             }
             Vector startLoc{};
-            if (void* lp = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.FlightStartLocation")) {
+            // [F80] the struct class is "AthenaAircraftFlightInfo" in 21.30 —
+            // the F79 reader asked only for the "Fort"-prefixed name and every
+            // field read failed (start=(0,0,0) speed=1500). Try both.
+            auto fiProp2 = [&](const char* leaf) -> void* {
+                void* p = GetProp((std::string("/Script/FortniteGame.AthenaAircraftFlightInfo.") + leaf).c_str());
+                if (!p) p = GetProp((std::string("/Script/FortniteGame.FortAthenaAircraftFlightInfo.") + leaf).c_str());
+                return p;
+            };
+            if (void* lp = fiProp2("FlightStartLocation")) {
                 int off = Read<int>(lp, profile::PropOffset);
                 if (off >= 0 && off + 24 <= fiElem) startLoc = Read<Vector>(fi->Data, off);
             }
-            float spd = 1500, tfe = 0, tds = 0, tde = 0;
-            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.FlightSpeed");
+            float spd = (float)br.route_speed, tfe = br.route_dur, tds = (float)(br.drop_start - now), tde = (float)(br.drop_end - now);
+            { void* p = fiProp2("FlightSpeed");
               if (p) { int off = Read<int>(p, profile::PropOffset);
                        if (off >= 0 && off + 4 <= fiElem) spd = Read<float>(fi->Data, off); } }
-            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.TimeTillFlightEnd");
+            { void* p = fiProp2("TimeTillFlightEnd");
               if (p) { int off = Read<int>(p, profile::PropOffset);
                        if (off >= 0 && off + 4 <= fiElem) tfe = Read<float>(fi->Data, off); } }
-            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.TimeTillDropStart");
+            { void* p = fiProp2("TimeTillDropStart");
               if (p) { int off = Read<int>(p, profile::PropOffset);
                        if (off >= 0 && off + 4 <= fiElem) tds = Read<float>(fi->Data, off); } }
-            { void* p = GetProp("/Script/FortniteGame.FortAthenaAircraftFlightInfo.TimeTillDropEnd");
+            { void* p = fiProp2("TimeTillDropEnd");
               if (p) { int off = Read<int>(p, profile::PropOffset);
                        if (off >= 0 && off + 4 <= fiElem) tde = Read<float>(fi->Data, off); } }
             BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightSpeed", spd);
@@ -5345,6 +5504,42 @@ static void BRStartAircraftPhase() {
         LOG("[BR] aircraft %p class=%s drop=%.0f..%.0f flightEnd=%.0f", aircraft,
             ObjName(Read<void*>(aircraft, profile::ObjectClass)).c_str(),
             br.drop_start - now, br.drop_end - now, br.flight_end - now);
+
+        // [F80] ROUTE TAKEOVER — three defects fixed at the source:
+        //  1) the native SpawnAircraft parks the bus on its own default
+        //     FlightInfo (start (0,0,0) at Z=80000, "outside the drawn bounds");
+        //  2) our flight-path field writes failed read-back because the flight
+        //     info struct class is "AthenaAircraftFlightInfo" — the reader
+        //     below only asked for "FortAthenaAircraftFlightInfo" (the same
+        //     mismatch the F79 log shows: start=(0,0,0) speed=1500);
+        //  3) StartFlightPath then flew the garbage route. Neutralize it.
+        if (br.have_route) {
+            // (1) park the bus ON our route start, nose along the route yaw
+            {
+                static Call* sl = nullptr;
+                if (!sl) sl = new Call("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+                if (sl && sl->ok()) {
+                    Vector p0{ br.route_start.X, br.route_start.Y, br.route_start.Z };
+                    Rotator rot{}; rot.Pitch = -6; rot.Yaw = br.route_yaw;
+                    sl->set("NewLocation", p0);
+                    sl->set("NewRotation", rot);
+                    bool sweep = false, tp = true;
+                    sl->set("bSweep", sweep);
+                    sl->set("bTeleport", tp);
+                    sl->run(aircraft);
+                    Vector chk{};
+                    if (ActorLocation(aircraft, chk))
+                        LOG("[BR] bus parked on route start (%.0f, %.0f, %.0f) — readback (%.0f, %.0f, %.0f)",
+                            p0.X, p0.Y, p0.Z, chk.X, chk.Y, chk.Z);
+                }
+            }
+            // (2) native flight neutralized — FlightSpeed 0 (verified); our
+            // pilot drives the route every tick (BRTick F80).
+            BRWriteFloat(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightSpeed", 0.0f);
+            float spdChk = -1;
+            BRReadFloatFwd(aircraft, "/Script/FortniteGame.FortAthenaAircraft.FlightSpeed", spdChk);
+            LOG("[BR] native flight neutralized: FlightSpeed readback=%.0f (pilot owns the route)", spdChk);
+        }
     }
 
     // [F79-a] Board the player — ERBIUM 1:1 (BattleRoyaleGamePhaseLogic.cpp
@@ -5386,6 +5581,18 @@ static void BRStartAircraftPhase() {
         // Camera on the bus — the native Spectating state should own this, but
         // the explicit view target guarantees the follow from frame one.
         if (aircraft) {
+            // [F80] THE CAMERA-FOLLOW ROOT CAUSE: APlayerController.
+            // bAutoManageActiveCameraTarget re-asserts GetViewTarget(Pawn/
+            // SpectatorPawn) every tick — with the pawn destroyed that is a
+            // null/static target, so the F78/F79 camera "never caught the
+            // bus". Park the auto-management for the ride; BRPawnRespawned
+            // re-enables it when the fresh pawn lands.
+            if (void* amProp = GetProp("/Script/Engine.PlayerController.bAutoManageActiveCameraTarget")) {
+                int esz = Read<int>(amProp, profile::PropElementSize);
+                if (esz == 1) Write<uint8_t>(GetField(session.controller, amProp), 0, 0);
+                else if (esz == 4) Write<uint32_t>(GetField(session.controller, amProp), 0, 0);
+                LOG("[BR] bAutoManageActiveCameraTarget parked for the bus ride (F80)");
+            }
             Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
             if (cam.ok()) { cam.set("NewViewTarget", aircraft); float blend = 0; cam.set("BlendTime", blend); cam.run(session.controller); }
         }
@@ -5434,7 +5641,7 @@ void Athena::BRJump() {
 // [F74-e] every bot registers a movement motor (BRBotMoveTick) — a living
 // match instead of mannequins.
 // ----------------------------------------------------------------------------
-static void* BRBotPawnClass = nullptr;
+// [F80] BRBotPawnClass is defined (zero-init) at its forward declaration near the BR section top
 static void* BRBotCtrlClass = nullptr;
 static void* BRBotStateClass = nullptr;
 static void* BRBotHeroType = nullptr;
@@ -5494,11 +5701,36 @@ static void BRPartPools(bool force = false) {
             }
             if (head && body) g_cid_outfits.push_back({head, body, object});
         } else if (ccpCls && IsA(object, ccpCls)) {
-            std::string n = ObjName(object);
-            if (n.find("Empty") != std::string::npos) continue;
-            if (n.find("Head") != std::string::npos) {
+            // [F80] TWO pool-pollution bugs killed bot heads:
+            //  1) the name filter was case-sensitive — "CP_Backpack_Headband-
+            //     KMale" matched "Head" and entered the HEAD pool (the F79 log
+            //     literally shows `bot skins: <parts> | CP_Backpack_HeadbandK-
+            //     Male | CP_Body_Nug` → headless bots);
+            //  2) no dedup — the 5s rescan pushed the same objects again
+            //     (heads=44 was really ~11 unique parts ×4).
+            // Classification is now by the reflection PartType
+            // (EFortCustomPartType: Head=0, Body=1), name-match only as the
+            // fallback with Backpack/Headband excluded.
+            static std::set<void*> seenParts;
+            if (!seenParts.insert(object).second) continue;
+            uint8_t ptype = 0, gender = 0, btype = 0;
+            bool haveMeta = BRPartMeta(object, ptype, gender, btype);
+            std::string nLower = ObjName(object);
+            std::transform(nLower.begin(), nLower.end(), nLower.begin(), ::tolower);
+            if (nLower.find("empty") != std::string::npos) continue;
+            bool isHead = false, isBody = false;
+            if (haveMeta) {
+                isHead = (ptype == 0);
+                isBody = (ptype == 1);
+            } else {
+                isHead = nLower.find("head") != std::string::npos &&
+                         nLower.find("backpack") == std::string::npos &&
+                         nLower.find("headband") == std::string::npos;
+                isBody = nLower.find("body") != std::string::npos;
+            }
+            if (isHead) {
                 if (g_head_pool.size() < 512) g_head_pool.push_back(object);
-            } else if (n.find("Body") != std::string::npos) {
+            } else if (isBody) {
                 if (g_body_pool.size() < 512) g_body_pool.push_back(object);
             }
         }
@@ -5669,15 +5901,21 @@ static void BRSpawnBotBatch(int n) {
         {
             void* botHead = nullptr; void* botBody = nullptr; void* botCid = nullptr;
             BRPartPools();
+            // [F80] DISTINCT outfit per bot — the F79 "many copies of me"
+            // clones came from the same fallback pair applying to whole
+            // batches. The pool rotates by the global bot index: with a pool
+            // of N pairs, bots 0..N-1 all differ, and 99 bots over a pool of
+            // 6+ cycles look random. Randomness only as the tie-breaker.
+            size_t botIdx = (size_t)br.bots_spawned;
             if (!g_skin_pairs.empty()) {
-                const BRPair& p = g_skin_pairs[(size_t)(BRRand() % g_skin_pairs.size())];
+                const BRPair& p = g_skin_pairs[botIdx % g_skin_pairs.size()];
                 botHead = p.head; botBody = p.body;
             } else if (!g_verified_pairs.empty()) {
-                const BRPair& p = g_verified_pairs[(size_t)(BRRand() % g_verified_pairs.size())];
+                const BRPair& p = g_verified_pairs[botIdx % g_verified_pairs.size()];
                 botHead = p.head; botBody = p.body;
             } else {
-                if (!g_head_pool.empty()) botHead = g_head_pool[(size_t)(BRRand() % g_head_pool.size())];
-                if (!g_body_pool.empty()) botBody = g_body_pool[(size_t)(BRRand() % g_body_pool.size())];
+                if (!g_head_pool.empty()) botHead = g_head_pool[botIdx % g_head_pool.size()];
+                if (!g_body_pool.empty()) botBody = g_body_pool[(botIdx * 7 + 3) % g_body_pool.size()];
             }
             if (!botHead) botHead = headPart;
             if (!botBody) botBody = bodyPart;
@@ -6307,9 +6545,9 @@ void Athena::BRTick() {
         BRSpawnBotBatch(10);
     }
     // [F74-e/F75-b] keep the roster alive — velocity motors (cheap: cached
-    // UFunctions + direct Velocity writes), animals share the same driver
+    // UFunctions + direct Velocity writes).
+    // [F80] animals are NOT motor-driven anymore — native AI owns them.
     BRBotMoveTick();
-    MotorTick(g_wild_motors, 200.0f, "Wild");
 
     float now = BRWorldTime();
 
@@ -6400,7 +6638,7 @@ void Athena::BRTick() {
             // the native aircraft tick stays silent for two beats our own
             // pilot flies the real route (the F77 fallback drove toward an
             // empty zone centre and never moved — the bus stayed at (0,0,0)).
-            static double lastBusBeat = 0; static Vector lastBusAt{}; static int stillBeats = 0;
+            static double lastBusBeat = 0; static Vector lastBusAt{};
             Vector bl{};
             bool haveBus = ActorLocation(ac, bl);
             if (haveBus && now - lastBusBeat > 3.0) {
@@ -6409,10 +6647,15 @@ void Athena::BRTick() {
                                         (bl.Y - lastBusAt.Y) * (bl.Y - lastBusAt.Y) +
                                         (bl.Z - lastBusAt.Z) * (bl.Z - lastBusAt.Z));
                 LOG("[BUS] (%.0f, %.0f, %.0f) moved=%.0f", bl.X, bl.Y, bl.Z, (double)moved);
-                stillBeats = moved < 30.0f ? stillBeats + 1 : 0;
                 lastBusAt = bl;
             }
-            if (haveBus && stillBeats >= 2) {
+            // [F80] OUR ROUTE, ALWAYS — the F79 log proved the native aircraft
+            // flies its own default FlightInfo (start (0,0,0), Z=80000, outside
+            // the island) when the field writes fail read-back. The still-beats
+            // gate never engaged the pilot because the native bus was moving.
+            // The pilot now owns the route every tick from the moment the bus
+            // exists (the native flight was neutralized at spawn: FlightSpeed=0).
+            if (haveBus) {
                 static double lastDrive = 0;
                 if (now - lastDrive > 0.05) { lastDrive = now; BRBusPilot(now); }
             }
@@ -6435,12 +6678,34 @@ void Athena::BRTick() {
             }
             // [F73] Erbium: aircraft destroyed once FlightEndTime passes —
             // regardless of how the player exited (manual jump or forced).
+            // [F80] CRASH FIX — the F79 build crashed right after "aircraft
+            // destroyed": the view target WAS the bus and GameState.Aircraft /
+            // Aircrafts[] / CurrentAircraft kept pointing at it after the
+            // destroy. Everything is unbound BEFORE K2_DestroyActor now.
             if (!br.flight_done && br.flight_end > 0 && now >= br.flight_end) {
                 br.flight_done = true;
+                // 1) camera off the bus first — a destroyed view target is the
+                //    classic same-frame crash
+                void* camTarget = session.pawn && !IsBadPtr(session.pawn) ? session.pawn : (void*)session.controller;
+                if (session.controller && camTarget) {
+                    Call cam("/Script/Engine.PlayerController.SetViewTargetWithBlend");
+                    if (cam.ok()) { cam.set("NewViewTarget", camTarget); float blend = 0.0f; cam.set("BlendTime", blend); cam.run(session.controller); }
+                    if (void* amProp = GetProp("/Script/Engine.PlayerController.bAutoManageActiveCameraTarget"))
+                        Write<uint8_t>(GetField(session.controller, amProp), 0, 1);
+                }
+                // 2) every replicated reference cleared while the actor lives
+                if (void* ac1 = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircraft"))
+                    Write<void*>(GetField(session.state, ac1), 0, nullptr);
+                if (void* acsProp = GetProp("/Script/FortniteGame.FortGameStateAthena.Aircrafts")) {
+                    void* arr = GetField(session.state, acsProp);
+                    Write<int>(arr, 8, 0);   // Num = 0 (data freed with the GC-safe array)
+                }
+                if (void* acc = GetAircraftComponent(session.controller))
+                    BRWritePtr(acc, "/Script/FortniteGame.FortControllerComponent_Aircraft.CurrentAircraft", nullptr);
                 Call d("/Script/Engine.Actor.K2_DestroyActor");
                 if (d.ok()) d.run(ac);
                 br.aircraft = nullptr;
-                LOG("[BR] aircraft destroyed (flight over)");
+                LOG("[BR] aircraft destroyed (flight over) — references cleared first (F80)");
                 // [F79-a] Erbium Tick: SafeZonesStartTime = DropEndTime + 60 —
                 // the storm waits a full minute after the drop window so every
                 // skydiver (player + bots) lands first. The F78 +12s was the
@@ -6459,41 +6724,24 @@ void Athena::BRTick() {
             LOG("[BR] no aircraft — SafeZones in 15s (bSkipAircraft path)");
         }
         // [F79-a] respawn watcher — the jump was requested (button or forced)
-        // and the NATIVE respawn should have spawned a fresh pawn (detected in
-        // Athena::Tick). If it never appears within 1.5s (native preconditions
-        // failed), spawn the pawn ourselves at the route end ON THE GROUND —
-        // a safe landing, never a fall from 80000.
+        // and the LOCAL respawn should have run synchronously (F80). If no
+        // pawn exists anyway, spawn from the bus's current position (skydive),
+        // or the zone centre when the bus is gone — never the mirrored route
+        // start the F79 fallback used (it dropped the player at the map's
+        // opposite corner, "outside the drawn bounds").
         if (br.jump_requested_at > 0 && !session.pawn &&
             Monotonic() - br.jump_requested_at > 1.5) {
             br.jump_requested_at = -1;
-            LOG("[BR] native respawn did not appear — safe ground fallback (F79)");
-            Vector end{ br.route_start.X, br.route_start.Y, br.route_start.Z };
-            if (br.have_route) {
-                float rad = br.route_yaw * 3.14159265f / 180.0f;
-                end.X += std::cos(rad) * br.route_speed * br.route_dur;
-                end.Y += std::sin(rad) * br.route_speed * br.route_dur;
-            }
-            float gz = 0;
-            if (!BRGroundZ(end.X, end.Y, gz)) gz = 500;
-            if (!br.zone_centers.empty()) {
-                const Vector& c = br.zone_centers[0];
-                float zr = br.radius.empty() ? 25600.0f : br.radius[0];
-                if (zr > 1000) { end.X = c.X; end.Y = c.Y; gz = 0; if (!BRGroundZ(end.X, end.Y, gz)) gz = 500; }
-            }
-            void* pcls = BRBotPawnClass ? BRBotPawnClass
-                       : LoadClass("/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C", "/Script/Engine.Pawn");
-            if (pcls && session.world) {
-                Transform t{};
-                t.Location[0] = end.X; t.Location[1] = end.Y; t.Location[2] = gz + 200;
-                Rotator rr{}; rr.Yaw = br.route_yaw; RotatorToQuat(rr, t.Rotation);
-                void* p = SpawnActor(session.world, pcls, nullptr, t);
-                if (p) {
-                    Possess(session.controller, p);
-                    if (void* mfp = GetProp("/Script/FortniteGame.FortPlayerController.MyFortPawn"))
-                        Write<void*>(GetField(session.controller, mfp), 0, p);
-                    BRPawnRespawned(p);
-                    LOG("[BR] fallback pawn spawned on the ground at (%.0f, %.0f, %.0f)", end.X, end.Y, gz);
-                }
+            LOG("[BR] no pawn after jump request — F80 safety respawn");
+            Vector busAt{};
+            if (br.aircraft && !IsBadPtr(br.aircraft) && ActorLocation(br.aircraft, busAt)) {
+                BRSpawnPlayerSkydiveAt(busAt.X, busAt.Y, busAt.Z - 250.0f);
+            } else {
+                Vector end{ br.route_start.X, br.route_start.Y, br.route_start.Z };
+                if (!br.zone_centers.empty()) { end.X = br.zone_centers[0].X; end.Y = br.zone_centers[0].Y; }
+                float gz = 0;
+                if (!BRGroundZ(end.X, end.Y, gz)) gz = 500;
+                BRSpawnPlayerSkydiveAt(end.X, end.Y, gz + 2500);
             }
         }
         return;
@@ -6945,6 +7193,59 @@ void Athena::SpawnFloorLootRetry() {
     if (session.loot_attempts >= 8) return;
     ++session.loot_attempts;
     SpawnFloorLoot();
+    SpawnFloorLootPickups();   // [F80] visible ground guns ride the same retries
+}
+
+// [F80-b] REAL FLOOR LOOT — Erbium's loot model is AFortPickupAthena actors
+// lying on the ground (SpawnPickup + TossPickup), not containers. The F79
+// build only filled the map's own floorloot CONTAINERS, so the player landing
+// anywhere saw zero loot ("اللوت لم يعمل"). Now: every PlayerStart (the
+// game's own ground-verified playable points) gets 1-2 pickups rolled from
+// the resident weapon pool + ammo/materials — visible loot everywhere the
+// player can be, collected by the live fly-collect path.
+void Athena::SpawnFloorLootPickups() {
+    if (!session.world || !session.pawn) return;
+    static int totalSpawned = 0;
+    if (totalSpawned >= 64) return;                 // bounded across all retries
+    static std::vector<void*> starts;
+    if (starts.empty()) {
+        void* psCls = FindObj("/Script/Engine.PlayerStart");
+        if (psCls) starts = FindAllInstances(psCls, 128);
+        LOG("[Loot] pickups: %zu PlayerStart sites available", starts.size());
+    }
+    if (starts.empty()) return;
+    BRWeaponPool();
+    if (g_weapon_defs.empty()) return;
+    // ammo + material defs for the secondary rolls (same set the starter
+    // loadout uses)
+    void* ammoDef = LoadAsset("/Game/Athena/Items/Ammo/AmmoDataBulletsLight.AmmoDataBulletsLight");
+    if (!ammoDef) ammoDef = ByShortName("AthenaAmmoDataBulletsLight");
+    void* woodDef = LoadAsset("/Game/Items/ResourcePickups/WoodItemData.WoodItemData");
+    if (!woodDef) woodDef = ByShortName("WoodItemData");
+    Vector origin{};
+    ActorLocation(session.pawn, origin);
+    int spawned = 0;
+    // spread deterministically over the starts, biased toward the player's
+    // region first (the user sees loot right where they are)
+    size_t begin = (size_t)(session.loot_attempts * 8) % starts.size();
+    for (size_t i = 0; i < starts.size() && totalSpawned < 64 && spawned < 16; ++i) {
+        void* s = starts[(begin + i) % starts.size()];
+        if (!s || IsBadPtr(s)) continue;
+        Vector at{};
+        if (!ActorLocation(s, at)) continue;
+        if (at.Z < -1000.0) continue;               // under-void start
+        at.Z += 80.0;
+        // roll: 60% weapon, 25% ammo, 15% materials
+        uint32_t r = (uint32_t)(BRRand() % 100);
+        void* def = nullptr; int count = 1;
+        if (r < 60) def = g_weapon_defs[(size_t)(BRRand() % g_weapon_defs.size())];
+        else if (r < 85 && ammoDef) { def = ammoDef; count = 30; }
+        else if (woodDef) { def = woodDef; count = 100; }
+        if (!def) continue;
+        SpawnPickup(def, count, at, 0, 0, true);
+        ++spawned; ++totalSpawned;
+    }
+    if (spawned) LOG("[Loot] ✅ floor pickups spawned=%d (total=%d, Erbium SpawnPickup model)", spawned, totalSpawned);
 }
 
 // [F24/F58] Inventory drop — the crash on device came from (a) the native
@@ -7397,6 +7698,25 @@ void Athena::NearbyScanRefresh() {
     };
     collect("/Script/FortniteGame.BuildingContainer", session.near_containers, session.near_container_locs, 512);
     collect("/Script/FortniteGame.FortPickup",        session.near_pickups,    session.near_pickup_locs, 256);
+    // [F80] door walls — the interact candidates never included BuildingWall,
+    // so the HUD/auto-interact could never open a door. Only walls that
+    // actually carry a door (bits 0-3 of the door byte) are kept.
+    {
+        size_t before = session.near_walls.size();
+        collect("/Script/FortniteGame.BuildingWall", session.near_walls, session.near_wall_locs, 384);
+        if (before != session.near_walls.size()) {
+            constexpr uint8_t kDoorMask = 0x0F;   // swinging|sliding|auto|double
+            std::vector<void*> keep; std::vector<Vector> keepLoc;
+            for (size_t i = 0; i < session.near_walls.size(); ++i) {
+                void* w = session.near_walls[i];
+                if (!w || IsBadPtr(w)) continue;
+                if ((Read<uint8_t>(w, profile::BuildingWall_bDoorOpen_Byte) & kDoorMask) == 0) continue;
+                keep.push_back(w); keepLoc.push_back(session.near_wall_locs[i]);
+            }
+            session.near_walls.swap(keep);
+            session.near_wall_locs.swap(keepLoc);
+        }
+    }
 }
 
 void Athena::InteractTick() {
@@ -7449,6 +7769,12 @@ void Athena::InteractTick() {
             consider(session.containers[i], at, 1, 320.0);
         }
     }
+    // [F80] door walls — the missing interact kind (doors "never finished")
+    for (size_t i = 0; i < session.near_walls.size() && i < session.near_wall_locs.size(); ++i) {
+        void* w = session.near_walls[i];
+        if (!w || IsBadPtr(w)) continue;
+        consider(w, session.near_wall_locs[i], 4, 300.0);
+    }
     // vehicles (live tracked set — spawner-produced + map-preplaced)
     for (void* v : session.vehicles) {
         if (!v || IsBadPtr(v)) continue;
@@ -7456,15 +7782,10 @@ void Athena::InteractTick() {
         if (!ActorLocation(v, at)) continue;
         consider(v, at, 2, 320.0);
     }
-    // [F77-e] wildlife answers proximity too — every tracked animal becomes a
-    // candidate (DoInteract's per-class BlueprintOnInteract override walk;
-    // classes without their own handler fail the receiver check silently).
-    for (auto& wm : g_wild_motors) {
-        if (!wm.pawn || IsBadPtr(wm.pawn)) continue;
-        Vector l{};
-        if (!ActorLocation(wm.pawn, l)) continue;
-        consider(wm.pawn, l, 3, 260.0);
-    }
+    // [F80] wildlife is NOT an interact candidate anymore — the F79 log
+    // spammed "[Call] rejected BlueprintOnInteract" for animals (they never
+    // implemented it) and made interaction feel dead. NPC pawns keep their
+    // own native interaction; loot/chests/vehicles/doors are the candidates.
     session.nearest_interact = best;
     session.nearest_kind = bestKind;
     // [F75-d] one-shot per candidate — proves the scan actually sees world
@@ -7515,7 +7836,7 @@ void Athena::InteractTick() {
                     seated = (curVeh && !IsBadPtr(curVeh) && curVeh == best);
                 }
             }
-            double reach = bestKind == 1 ? 260.0 : 300.0;
+            double reach = (bestKind == 1) ? 260.0 : 300.0;   // [F80] doors ride the 300 reach too (kind 4)
             if (!seated && bestD2 <= reach * reach) {
                 auto& last = session.auto_interact_at[best];
                 if (now - last > 2.0) {
@@ -8309,10 +8630,20 @@ static void pe_hook(void* obj, void* func, void* params) {
             uint8_t bar = 0; int slot = -1;
             if (void* bp = incoming(func, params, "InQuickBar", 1)) bar = Read<uint8_t>(bp, 0);
             if (void* sp = incoming(func, params, "Slot", 4)) slot = Read<int>(sp, 0);
+            // [F80] the HUD's own focused-slot state is empty on this build
+            // (F79 taps arrived as slot=-1). Mirror the focus ourselves: a -1
+            // means "the bar's current slot" — the last one we activated.
+            if (slot < 0 && bar < 2) {
+                slot = session.focus_slot[bar];
+                static bool onceNeg = false;
+                if (!onceNeg) { onceNeg = true;
+                    LOG("[QB] tap slot=-1 — using tracked focus (bar=%u slot=%d, F80)", (unsigned)bar, slot); }
+            }
             void* inst = nullptr;
             if (slot >= 0 && slot < 6)
                 inst = (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot];
             if (inst && !IsBadPtr(inst)) {
+                if (slot >= 0 && slot < 6 && bar < 2) session.focus_slot[bar] = slot;
                 Guid guid = ItemGuidOf(inst);
                 if ((guid.A | guid.B | guid.C | guid.D) && !memcmp(&guid, &session.last_equip_guid, sizeof(Guid))) {
                     if (!once) { once = true; LOG("[QB] tap on already-held item — skipped (F79)"); }

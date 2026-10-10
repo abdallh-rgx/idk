@@ -844,3 +844,51 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 
 ## تصحيح تالي (نفس الجولة)
 - **زر القفز في وضع المشاهدة**: فحص `br.spectating` كان يأتي **بعد** early-return `session.aircraft_jumped` (ما زال true من قفزة الباص عند الموت) — صار الفحص أولًا فيتعامل الزر مع تبديل هدف المشاهدة فعليًا. hook_fixed.cpp = **8796 سطرًا**، parts (832×6+3804) — EXIT=0
+
+---
+
+# F80 — جولة «نفّذ المخزون فعلًا» (تقرير جهاز F79: «QuicBars لم يعمل، اللوت لم يعمل، الباص لا أنزل منه وكرشت اللعبة بعده، بوتات بلا راس ونسخ مني، الحيوانات ليست بمنطقها، الأبواب والتفاعل لم يكتملا»)
+
+## قرائن اللوق F79 (التحليل قبل الكود)
+- `[QB] tap swallowed — no item bound at bar=0 slot=-1` — **الـ HUD يرسل slot=-1**: حالته الداخلية للتركيز فارغة لأن أحدًا لم يخبره (لا ClientEquipItem أبدًا) — هذا جذر «الـ QuickBars لم يعمل»
+- `[QB] Before: Primary=0 Secondary=0` بعد vtable match — **native init فشل** بسبب Owner=NULL: استدعاء `SetOwner` كان **بلا معاملات** (كتب Owner=null!)
+- `[BUS] (...) 80000` — الباص على Z=80000 (FlightInfo الافتراضي: start (0,0,0)) رغم أن مسارنا المُصنّع Z=10500 — **الكتابة فشلت readback لأن اسم الصنف "AthenaAircraftFlightInfo" والقارئ سأل فقط عن "FortAthenaAircraftFlightInfo"**
+- الباص حلّق 130+ ثانية وخرج من حدود الجزيرة — **الطيار الاحتياطي لم يشتغل أبدًا** (شرط still-beats: الباص الأصلي كان يتحرك بمساره المهمل)
+- `🛩 [BR] aircraft destroyed (flight over)` ثم **كراش** — ViewTarget + GameState.Aircraft/Aircrafts[] + CurrentAircraft كلها كانت تشير للباص المدمَّر
+- `[Wild] spawned NPC_Pawn_Parent_C` — **أصناف PARENT مجردة** (لا AI، لا behavior tree): فلتر skip كان يقارن أحرف صغيرة بأسماء CamelCase — «parent» لا تطابق «Parent» أبدًا
+- `[BR] bot skins: <parts> | CP_Backpack_HeadbandKMale | CP_Body_Nug` — **حقيبة ظهر في تجمع الرؤوس** (نفس الفلتر: «Headband» تحتوي «Head») + تجمعات بلا dedup (heads=44 = ~11 جزء ×4)
+- «نسخ كثيرة مني» — نفس الزوج الاحتياطي طبق على دفعات كاملة من البوتات
+- `[Call] rejected BlueprintOnInteract` سبام لكل مرشح كل تِك — الحيوانات مرشحات تفاعل بلا معالج
+
+## جدول التغييرات (13 بند)
+| البند | العنوان | التنفيذ |
+|---|---|---|
+| F80-a1 | **ServerAddItemInternal الأصلي** | GiveItem ⇒ بعد إدراج الـ instance والـ entry، استدعاء `FortQuickBars.ServerAddItemInternal(Guid, bSecondary, -3)` — **مسار تعبئة الشريط الحقيقي** الذي يستعمله اللعبة نفسها (هيئته تشعل إشعارات الـ HUD الأصلية)، **مُتحقق بقراءة الـ GUID داخل مصفوفات الـ slots**؛ BindSlot اليدوي احتياط فقط |
+| F80-a2 | **ClientEquipItem** | بعد كل give/equip: `FortPlayerController.ClientEquipItem(Guid, true)` — **حلقة التركيز التي لم تكن موجودة أبدًا** (Erbium تنهي كل give بها؛ الـ HUD عندها يعرف الـ slot المركّز) |
+| F80-a3 | **SetOwner بمعامل فعلي** | FortInventory.SetOwner + FortQuickBars.SetOwner يربطان `NewOwner` + كتابة `Actor.Owner` مباشرة — native InitializeAthenaQuickBars يعمل على Owner حقيقي (الـ 0/0 كان Owner=NULL) |
+| F80-a4 | **slot=-1 = التركيز المتعقب** | توجيه النقر المحلي: slot<0 ⇒ استعمال آخر slot فعّلناه (focus_slot[bar]، افتراضي 0 = الفأس) — النقر يعمل حتى بحالة HUD فارغة |
+| F80-b | **لوت أرضي حقيقي** | `SpawnFloorLootPickups`: FortPickupAthena **تُرمى (TossPickup) عند كل PlayerStart** من مجمع الأسلحة الساكن + ذخيرة/خشب (60/25/15%) — **أسلحة مرئية على الأرض أينما هبطت** (نموذج Erbium SpawnPickup)، تُجمع بمسار fly-collect الحي؛ تتجدد عبر محاولات SpawnFloorLootRetry (سقف 64) |
+| F80-c | **الأبواب مرشحات تفاعل** | NearbyScanRefresh يجمع BuildingWall ويحتفظ بمن يحمل بتات باب فقط (0x0F) ⇒ InteractTick مرشح kind=4 بمدى 300 — **الأبواب صارت قابلة للفتح/الإغلاق** من المرشح الأقرب (HandleDoor الأصلي toggle بالاتجاهين) |
+| F80-c2 | **لا سبام رفض** | Call::run يسجل الرفض **مرة واحدة لكل اسم دالة** (الرفض نفسه لم يتغير) |
+| F80-d1 | **القفز محلي 100%** | HandleJumpFromHudStart ⇒ **فوري محلي**: pawn جديدة عند موقع الباص الحالي − 250 + Possess + **BeginSkydiving(bFromBus=true)** + كل الأنظمة تُعاد (BRSpawnPlayerSkydiveAt) — **نفس الدالة للزر وللقفزة القسرية** (لا انتظار رسبن أصلي رفضه الجهاز) |
+| F80-d2 | **جذر كاميرا الباص** | `PlayerController.bAutoManageActiveCameraTarget = false` عند الصعود (المحرك كان يعيد تأكيد ViewTarget المدمرة كل تِك — «الكاميرا لم تلحق الباص») + استعادة =1 عند الرسبن |
+| F80-d3 | **المسار داخل الجزيرة** | الباص تُصفّف **على بداية مسارنا** (K2_SetActorLocationAndRotation + readback) والطيران الأصلي **يُعطَّل** (FlightSpeed=0 مُتحقق) — **طيارنا يقود كل تِك** (50ms، بلا شرط still-beats) + المدة 40-70ث داخل الحدود (كانت 95) |
+| F80-d4 | **لا كراش بعد اختفاء الباص** | قبل K2_DestroyActor: الكاميرا على الـ pawn/المتحكم + bAutoManage=1 + **GameState.Aircraft=null + Aircrafts.Num=0 + CurrentAircraft=null** — لا إشارة معلقة تبقى للباص المدمّر |
+| F80-d5 | **شبكة الأمان بموقع الباص** | مراقب الرسبن: skydive من موقع الباص الحالي (لا «بداية المسار المعكوسة» التي ألقت اللاعب في الركن المقابل) |
+| F80-e/f | **بوتات وحيوانات** | الرؤوس/الأجسام بـ PartType من الانعكاس (0/1) + dedup — **لا حقيبة ظهر رأسًا ولا تكرار**؛ زوج **مميز لكل بوت بفهرس الرولستر** (لا نسخ من اللاعب)؛ بوت يهبط بلا سلاح ⇒ **فأس أولًا** ثم سلاح عشوائي؛ الحيوانات: **أصناف Irwin الخرسانية فقط + لا motors إطلاقًا** (الـ AI الأصلي يقودها) وليست مرشحات تفاعل |
+
+## فحص + تزامن
+- `g++ -std=c++17 -fsyntax-only -Wall -Wextra` مع stubs → **EXIT=0** (صفر تحذيرات) — jni/hook.cpp = **9127 سطرًا**
+- parts1..7 أُوقفت (بنية المستودع الحالية jni/hook.cpp واحد + CI)
+
+## المتوقع في اللوق القادم (سطور التحقق — بالترتيب)
+1. `[QB] native ServerAddItemInternal ✅ verified (bar=0)` — **التعبئة الأصلية تعمل** (أو «ran without visible slot write» ⇒ BindSlot الاحتياطي اتخذها)
+2. عند فتح أي صندوق/إعطاء عنصر: `Inventory inserted ... ` ثم **الشريط يُظهر الأيقونة** — ClientEquipItem ربط التركيز
+3. عند الصعود: `[BR] bus parked on route start (...) — readback (...)` + `[BR] native flight neutralized: FlightSpeed readback=0` + `[BR] bAutoManageActiveCameraTarget parked` — **الباص على مسارنا والكاميرا معه**
+4. أثناء الطيران: `[BUS] (x, y, 10500±) moved=...` — **داخل الجزيرة على ارتفاع MapInfo** (لا 80000)
+5. نقرتك على القفز: `[Bus] JumpFromHudStart intercepted` ثم `[BR] player skydive from (...)` — **فورًا، من موقع الباص**
+6. بعد اختفاء الباص: `[BR] aircraft destroyed (flight over) — references cleared first (F80)` — **لا كراش**
+7. اللوت: `[Loot] pickups: N PlayerStart sites available` + `[Loot] ✅ floor pickups spawned=...` — **أسلحة مرئية على الأرض** والمشي عليها يجمعها
+8. `[BR] bot skins: <parts> | CP_Head_* | CP_Body_*` — **رؤوس حقيقية**، كل بوت بزوج مختلف
+9. `[Wild]` بلا NPC_Pawn_Parent_C — أصناف Irwin خرسانية فقط وتتحرك بـ AI الأصلي
+10. باب قريب: مرشح kind=4 والنقر يفتحه/يغلقه — `[Door] OPEN/CLOSE via ...`

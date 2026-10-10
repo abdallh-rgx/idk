@@ -386,3 +386,27 @@ Stage Summary:
 - المُنتَج: libhook.so (arm64) مبني من F79 الكامل على NDK r27 الحقيقي — artifact جاهز للتحميل من Actions
 - المستودع يحوي: jni/hook.cpp (F79 8796 سطرًا) + CHANGES.md (تاريخ F01→F79 كاملًا) + WORKLOG.md
 - جولتان CI خضراء متتاليتان على الكود النهائي
+
+---
+Task ID: 17
+Agent: Z.ai Code (main)
+Task: جولة F80 — تنفيذ المخزون الحقيقي + إصلاح الباص الكامل (القفز المحلي/الكاميرا/المسار/الكراش) + اللوت الأرضي المرئي + الأبواب + بوتات بلا رؤوس مبتورة أو نسخ + حيوانات بمنطقها الأصلي — رد على تقرير المستخدم بعد لعبه F79
+
+Work Log:
+- استعادة كاملة للبيئة: الـ sandbox أُعيد تصفير — استنساخ المستودع abdallh-rgx/idk بالتوكن واستعادة jni/hook.cpp (F79, 8796 سطرًا) + CHANGES + WORKLOG
+- قراءة Erbium عميقًا (FortInventory.cpp GiveItem/SpawnPickup + FortPlayerPawnAthena.cpp ServerHandlePickup/FinishedTargetSpline + FortPlayerControllerAthena.cpp InternalPickup/بدء المخزون + BattleRoyaleGamePhaseLogic.cpp StartAircraftPhase/Tick كاملة)
+- تحليل لوق F79 سطرًا سطرًا واستخراج 9 جذور: (1) الـ HUD يرسل slot=-1 (لا ClientEquipItem أبدًا)؛ (2) native QB init فشل بـ Owner=NULL (SetOwner كان بلا معاملات!)؛ (3) كتابة FlightInfo فشلت readback — اسم الصنف "AthenaAircraftFlightInfo" والقارئ سأل "FortAthenaAircraftFlightInfo" فقط؛ (4) الطيار الاحتياطي بشرط still-beats لم يشتغل لأن الباص الأصلي كان يتحرك بمساره المهمل (Z=80000 خارج الجزيرة 130+ث)؛ (5) كراش بعد تدمير الباص — ViewTarget + 3 حقول مرجعية معلقة؛ (6) ServerAttemptAircraftJump لا يرسبن standalone (لا قائمة ركاب سيرفرية) — «لا أستطيع النزول»؛ (7) فلتر الحيوانات case-sensitive فأنبت أصناف PARENT مجردة؛ (8) فلتر الرؤوس case-sensitive فأدخل CP_Backpack_HeadbandKMale في تجمع الرؤوس + لا dedup (44 = 11×4)؛ (9) الأبواب ليست مرشحات تفاعل إطلاقًا
+- [F80-a] المخزون الحقيقي (توجيه صديق المستخدم "u need to implement inventory"): ServerAddItemInternal الأصلي في GiveItem (متحقق بقراءة الـ GUID في الـ slots) + ClientEquipItem بعد كل give (حلقة تركيز الـ HUD) + SetOwner بمعامل NewOwner فعلي + كتابة Actor.Owner مباشرة + النقر slot=-1 ⇒ التركيز المتعقب focus_slot[bar]
+- [F80-b] اللوت الأرضي المرئي: SpawnFloorLootPickups — FortPickupAthena عند PlayerStarts (مجمع الأسلحة الساكن 60% / ذخيرة 25% / خشب 15%) برمي TossPickup، تجميع بمسار fly-collect الحي، سقف 64 عبر المحاولات
+- [F80-c] الأبواب: BuildingWall ببتات باب ⇒ مرشح تفاعل kind=4 (NearbyScanRefresh يجمعها بمدى 384 ويفلتر بتات 0x0F) + rate-limit لسبام rejected في Call::run (مرة لكل اسم دالة)
+- [F80-d] الباص كاملًا: القفز محلي 100% (BRSpawnPlayerSkydiveAt: pawn عند الباص − 250 + Possess + BeginSkydiving + إعادة كل الأنظمة — للزر وللقفزة القسرية) + bAutoManageActiveCameraTarget=false عند الصعود و=1 عند الرسبن (جذر «الكاميرا لا تلحق») + تصفيف الباص على بداية مسارنا + FlightSpeed=0 (تعطيل الطيران الأصلي، متحقق) + الطيار كل 50ms بلا شرط + مدة 40-70ث + تفريغ كل المراجع قبل K2_DestroyActor (GameState.Aircraft/Aircrafts/CurrentAircraft/ViewTarget) + شبكة أمان من موقع الباص
+- [F80-e] البوتات: تجمعات الرؤوس/الأجسام بـ PartType انعكاسي (0/1) + dedup بالعنوان + زوج مميز لكل بوت بفهرس الرولستر + بوت يهبط بلا سلاح ⇒ فأس أولًا (BRBotLoadout)
+- [F80-f] الحيوانات: فلتر lowercase (الأصناف الخرسانية Irwin فقط) + لا wild motors إطلاقًا (AI أصلي يقود) + إزالتها من مرشحات التفاعل
+- فحص syntax: g++ -std=c++17 -fsyntax-only -Wall -Wextra مع stubs → EXIT=0 صفر تحذيرات — jni/hook.cpp = 9127 سطرًا
+- توثيق F80 كامل في CHANGES.md (قرائن اللوق + جدول 13 بند + 10 سطور تحقق)
+
+Stage Summary:
+- jni/hook.cpp (9127 سطرًا) = المصدر الوحيد للحقيقة (بنية المستودع: CI يبني libhook.so من jni/hook.cpp على كل push)
+- المخزون: مسار التعبئة الأصلي (ServerAddItemInternal) + تركيز الـ HUD (ClientEquipItem) + SetOwner حقيقي + نقر بلا slot=-1
+- الباص: قفز محلي فوري من موقع الباص، كاميرا تلاحقه، مسار 40-70ث داخل الجزيرة على ارتفاع MapInfo، لا كراش بعد اختفائه
+- اللوت: أسلحة مرئية على الأرض أينما هبط اللاعب؛ الأبواب تفاعلية؛ البوتات برؤوس وأزواج مميزة وفؤوس؛ الحيوانات بمنطقها الأصلي
