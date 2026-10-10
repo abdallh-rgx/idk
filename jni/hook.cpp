@@ -2988,7 +2988,17 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
                         nativeAssigned ? "✅ verified" : "ran without visible slot write", bar); }
             }
         }
-        if (!nativeAssigned) BindSlot(inst, slot, bar);
+        if (nativeAssigned) {
+            // [F80] the native put the item in ITS chosen slot — re-sync our
+            // mirror so taps at that slot resolve the instance (the requested
+            // slot binding above may now point elsewhere).
+            auto& mirror = (bar == 0 ? session.slots : session.secondary_slots);
+            for (int s2 = 0; s2 < 6; ++s2)
+                if (mirror[(size_t)s2] == inst && s2 != slot) mirror[(size_t)s2] = nullptr;
+            if (slot >= 0 && slot < 6) mirror[(size_t)slot] = inst;
+        } else {
+            BindSlot(inst, slot, bar);
+        }
         // [F80] the client equip notification — Erbium's flow ends with
         // ClientEquipItem(Guid, true) after every give/equip; this is what
         // tells the HUD which slot is focused (the F79 taps arrived with
