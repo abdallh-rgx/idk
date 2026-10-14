@@ -413,6 +413,7 @@ struct TScriptInterface { void* Object; void* Interface; };
 // ============================================================================
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
+namespace local_loot { int TableCount(); }   // [F92] heartbeat accessor
 static bool IsA(void* obj, void* type);
 static bool SubclassOfFast(void* klass, void* targetClass);
 static void* GetProp(const char* path);
@@ -658,6 +659,49 @@ class Call {
 public:
     explicit Call(const char* path, void* event_receiver = nullptr) {
         m_func = FindObj(path);
+        // [F92] Name-walk fallback — the device log proved path lookup fails
+        // for some UFunctions ('⚠️ OnRep_CosmeticLoadout not present' while
+        // GetProp reflection works fine), silently killing OnRep chains
+        // (→ dead anims/skin!) and every other call whose StaticFindObject
+        // misses. Resolve by NAME over the receiver's class chain — the exact
+        // machinery GetProp uses successfully everywhere. Receiver instance →
+        // its Class; otherwise the class object named in the path itself.
+        if (!m_func) {
+            std::string p(path);
+            auto dot = p.rfind('.');
+            std::string clsPath = (dot != std::string::npos) ? p.substr(0, dot) : std::string();
+            std::string fname   = (dot != std::string::npos) ? p.substr(dot + 1) : p;
+            void* funcType = FindObj("/Script/CoreUObject.Function");
+            void* klass = nullptr;
+            if (event_receiver && !IsBadPtr(event_receiver))
+                klass = Read<void*>(event_receiver, profile::ObjectClass);
+            if (!klass && !clsPath.empty()) {
+                void* holder = FindObj(clsPath);
+                if (holder && !IsBadPtr(holder)) {
+                    void* classCls = FindObj("/Script/CoreUObject.Class");
+                    klass = (classCls && IsA(holder, classCls)) ? holder
+                                                                : Read<void*>(holder, profile::ObjectClass);
+                }
+            }
+            for (int d = 0; d < 64 && !m_func && klass && !IsBadPtr(klass); ++d) {
+                void* f = Read<void*>(klass, profile::StructChildProps);
+                for (int i = 0; f && !IsBadPtr(f) && i < 1024; ++i) {
+                    std::string n;
+                    if (SafeFieldName(f, profile::FFieldName, n) && n == fname && (!funcType || IsA(f, funcType))) { m_func = f; break; }
+                    f = Read<void*>(f, profile::FFieldNext);
+                }
+                if (!m_func) {
+                    void* c = Read<void*>(klass, profile::StructChildren);
+                    for (int i = 0; c && !IsBadPtr(c) && i < 1024; ++i) {
+                        std::string n;
+                        if (SafeFieldName(c, profile::ObjectName, n) && n == fname && (!funcType || IsA(c, funcType))) { m_func = c; break; }
+                        c = Read<void*>(c, profile::FieldNext);
+                    }
+                }
+                if (!m_func) klass = Read<void*>(klass, profile::StructSuper);
+            }
+            if (m_func) LOG("[Call] [F92] name-resolved '%s' (StaticFindObject missed it)", fname.c_str());
+        }
         if (!m_func) return;
         // [F16] Blueprint override resolution: walk the receiver's super
         // chain from most-derived to base and prefer the matching Function
@@ -1292,6 +1336,7 @@ namespace Athena {
     // QuickBars [F19]
     void InitializeQuickBarsNative();
     void SetQuickBarReady();
+    void VerifyHUDReadPath();   // [F92] replay the exact native HUD read chain
     bool BindSlot(void* item, int slot, uint8_t bar);
     void ActivateQuickBarSlot(uint8_t bar, int slot);
     void ForceUpdateQuickBars();
@@ -1539,7 +1584,25 @@ void Athena::InitializeQuickBarsNative() {
     Array s_after = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
     LOG("[QB] After: Primary=%d Secondary=%d", p_after.Count, s_after.Count);
     if (p_after.Count >= 1 && s_after.Count >= 1) { LOG("[QB] ✅ Init succeeded"); session.quickbars_initialized = true; }
-    else LOG("[QB] ⚠️ Init may have failed");
+    else {
+        LOG("[QB] ⚠️ Init may have failed");
+        // [F92] disasm 0x56607ec: native init bails SILENTLY when ctx
+        // ([this+0x138]) is null OR fails both IsA casts (0x7071ee4 /
+        // 0x70975fc probes; sources owner+0x3DA0 | owner+0x31A0). The spawn
+        // code already tried ctx=controller. Diagnostic-only retry with
+        // ctx=PlayerState — never sets the flag (the manual builder remains
+        // the item provider); this just names the real owner for the log.
+        void* psCtx = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
+        if (psCtx && !IsBadPtr(psCtx)) {
+            Write<void*>((char*)session.quickbars + 0x138, 0, psCtx);
+            { Guard g; reinterpret_cast<void(*)(void*, void*)>(init_slot)(session.quickbars, session.controller); }
+            Array p2 = Read<Array>(primary, profile::QuickBar_SlotsOffset);
+            Array s2 = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
+            LOG("[QB] ctx=PlayerState retry: P=%d S=%d%s", p2.Count, s2.Count,
+                (p2.Count >= 1 && s2.Count >= 1) ? " — native owner IS the PlayerState" : "");
+            Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
+        } else LOG("[QB] [F92] no PlayerState for ctx retry");
+    }
 }
 
 // [F01] Manual QuickBar construction — the enable byte is at slot+0x10
@@ -1709,16 +1772,60 @@ void Athena::BuildQuickBarsManually() {
 
 void Athena::SetQuickBarReady() {
     if (!session.controller) return;
+    // [F92] the readiness byte is a disasm-verified RAW offset (PC+0x1A68):
+    // native GetItemInQuickbarSlot (0x6673508) AND GetQuickBarSlotCount
+    // (0x66734cc) both cbz on it as their second gate — 0 means the HUD
+    // reads NOTHING. Reflection is informational only; never gate the
+    // write on it (the old 3 skip-guards could leave it 0 forever).
     void* qp = GetProp("/Script/FortniteGame.FortPlayerController.ClientQuickBars");
-    if (!qp) { LOG("[QB] ClientQuickBars property not found"); return; }
-    int propOff = Read<int>(qp, profile::PropOffset);
-    LOG("[QB] ClientQuickBars offset = 0x%X (expect 0x%X)", propOff, profile::Controller_ClientQuickBars);
-    if (propOff != (int)profile::Controller_ClientQuickBars) { LOG("[QB] ❌ offset mismatch — SKIPPING"); return; }
-    if (!session.quickbars_initialized) { LOG("[QB] ❌ QuickBars not initialized — SKIPPING"); return; }
+    int propOff = qp ? Read<int>(qp, profile::PropOffset) : -1;
+    LOG("[QB] ClientQuickBars reflect offset=0x%X (const 0x%X)", propOff, (int)profile::Controller_ClientQuickBars);
+    // HUD check #1 — the raw pointer link (must be OUR quickbars object)
+    void* cur = Read<void*>(session.controller, profile::Controller_ClientQuickBars);
+    if (cur != session.quickbars) {
+        LOG("[QB] ⚠️ PC->ClientQuickBars=%p != quickbars=%p — writing raw link", cur, session.quickbars);
+        Write<void*>(session.controller, profile::Controller_ClientQuickBars, session.quickbars);
+    }
+    if (!session.quickbars_initialized) { LOG("[QB] ❌ QuickBars not initialized — readiness deferred"); return; }
     uint8_t before = Read<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte);
-    if (before > 1) { LOG("[QB] Unexpected byte=%u", before); return; }
     Write<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte, 1);
-    LOG("[QB] ✅ Readiness byte: %u -> 1", before);
+    LOG("[QB] ✅ readiness byte: %u -> 1 (raw write — HUD read path is now live)", before);
+}
+
+// [F92] Replay the EXACT native HUD read chain (GetItemInQuickbarSlot
+// 0x6673508 + GetQuickBarSlotCount 0x66734cc, both fully disassembled):
+//   1) PC->0x1A60 (ClientQuickBars) non-null       → else HUD reads nothing
+//   2) PC->0x1A68 readiness byte non-zero           → else HUD reads nothing
+//   3) quickbars+0x278/0x308 bar Count > slot      (bar+0x18)
+//   4) quickbars vtable[0x6f0] GetItemInSlot(type, slot)
+// If all four pass, the hotbar HUD WILL show our items; if any fails the
+// log names the exact broken link. At most once per minute.
+void Athena::VerifyHUDReadPath() {
+    static double lastRun = -1e9;
+    double now = Monotonic();
+    if (now - lastRun < 60.0) return;
+    lastRun = now;
+    if (!session.controller || !session.quickbars || IsBadPtr(session.quickbars)) return;
+    void* qbLink = Read<void*>(session.controller, profile::Controller_ClientQuickBars);
+    uint8_t gate = Read<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte);
+    LOG("[QB] HUD-verify: PC->ClientQuickBars=%p qb=%p (%s) gate=%u", qbLink, session.quickbars,
+        (qbLink == session.quickbars ? "MATCH" : "MISMATCH"), (unsigned)gate);
+    void* vt = Read<void*>(session.quickbars);
+    if (!vt || IsBadPtr(vt)) { LOG("[QB] HUD-verify: vtable invalid"); return; }
+    using GIS_t = void* (*)(void*, int, int);
+    GIS_t gis = reinterpret_cast<GIS_t>(Read<uintptr_t>(vt, profile::QuickBars_VtableSlot_GetItemInSlot));
+    if (!gis || IsBadPtr((void*)gis)) { LOG("[QB] HUD-verify: GetItemInSlot vtable[0x6f0] invalid"); return; }
+    const struct { const char* name; unsigned off; } bars[2] = {
+        {"Primary", profile::QuickBars_PrimaryOffset}, {"Secondary", profile::QuickBars_SecondaryOffset} };
+    for (int b = 0; b < 2; ++b) {
+        Array slots = Read<Array>((char*)session.quickbars + bars[b].off, profile::QuickBar_SlotsOffset);
+        LOG("[QB] HUD-verify: %s slots=%d", bars[b].name, slots.Count);
+        for (int s = 0; s < slots.Count && s < 6; ++s) {
+            void* item = nullptr;
+            { Guard g; item = gis(session.quickbars, b, s); }
+            LOG("[QB] HUD-verify:   %s[%d] -> %p %s", bars[b].name, s, item, item ? "OK" : "NULL");
+        }
+    }
 }
 
 // [F19] Bind through the native Kismet helper, then verify by reading the
@@ -2386,7 +2493,9 @@ void Athena::LoadDefaultCosmetics() {
             void* pawnLoadoutProp = GetProp("/Script/FortniteGame.FortPlayerPawn.CosmeticLoadout");
             if (pawnLoadoutProp && Read<int>(pawnLoadoutProp, profile::PropElementSize) == pcSize) {
                 memcpy(GetField(session.pawn, pawnLoadoutProp), loadout, (size_t)pcSize);
-                Call ro("/Script/FortniteGame.FortPlayerPawn.OnRep_CosmeticLoadout");
+                // [F92] pass the receiver — enables the name-walk fallback
+                // when StaticFindObject misses the UFunction (device-proven).
+                Call ro("/Script/FortniteGame.FortPlayerPawn.OnRep_CosmeticLoadout", session.pawn);
                 if (ro.ok()) { ro.run(session.pawn); LOG("[Cosmetics] ✅ pawn OnRep_CosmeticLoadout"); }
                 else LOG("[Cosmetics] ⚠️ OnRep_CosmeticLoadout not present");
             }
@@ -2430,11 +2539,12 @@ void Athena::LoadDefaultCosmetics() {
         void* heroTypeProp = GetProp("/Script/FortniteGame.FortPlayerState.HeroType");
         if (hero && heroTypeProp) Write<void*>(GetField(state, heroTypeProp), 0, hero);
     }
-    Call r1("/Script/FortniteGame.FortPlayerState.OnRep_HeroType"); if (r1.ok()) r1.run(state);
-    Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData"); if (r3.ok()) r3.run(state);
+    // [F92] receivers passed — name-walk fallback covers StaticFindObject misses
+    Call r1("/Script/FortniteGame.FortPlayerState.OnRep_HeroType", state); if (r1.ok()) r1.run(state);
+    Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData", state); if (r3.ok()) r3.run(state);
     // [F82] OnRep_CharacterParts exists client-side (verified) and drives the
     // state→pawn part evaluation — the old flow never called it.
-    Call rcp("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts");
+    Call rcp("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts", state);
     if (rcp.ok()) rcp.run(state);
     void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
     if (klib) {
@@ -2625,7 +2735,7 @@ void Athena::FinalizePlayer() {
     // now that the state is guaranteed.
     if (!session.cosmetics_with_state) { LOG("Finalize: cosmetics with state"); LoadDefaultCosmetics(); }
     // Readiness can change possession — refresh cached pawn-dependent state.
-    Call ps("/Script/Engine.Pawn.OnRep_PlayerState"); if (ps.ok()) ps.run(pawn);
+    Call ps("/Script/Engine.Pawn.OnRep_PlayerState", pawn); if (ps.ok()) ps.run(pawn);
     if (!session.abilities_granted) GrantAllAbilitySets();
     if (!session.tactical_sprint_setup) SetupTacticalSprint();
     if (!session.movement_enabled) EnableMovementFeatures();
@@ -2638,6 +2748,7 @@ void Athena::FinalizePlayer() {
         ForceUpdateQuickBars();
         ActivateQuickBarSlot(0, 0);
     }
+    VerifyHUDReadPath();   // [F92] once per minute max — names the exact broken HUD link if any
     if (!session.ready_called) {
         // [F89] commit only when the readiness RPC actually dispatched —
         // an unconditional commit here froze failed readiness forever
@@ -2680,6 +2791,30 @@ void Athena::Tick() {
     static double lastCosmeticsCheck = 0;  // [F90-c/AUD-1] cosmetics with-state retry
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
+    // [F92] 30s heartbeat — the whole state machine in one line so ANY
+    // partial device-log fragment always carries the state picture.
+    static double lastHB = 0;
+    if (session.finalized && now - lastHB > 30.0) {
+        lastHB = now;
+        uint8_t hbGate = session.controller ? Read<uint8_t>(session.controller, profile::Controller_QuickBarReadyByte) : 0;
+        void* qbLink = session.controller ? Read<void*>(session.controller, profile::Controller_ClientQuickBars) : nullptr;
+        int hbP = -1, hbS = -1;
+        if (session.quickbars && !IsBadPtr(session.quickbars)) {
+            Array p = Read<Array>((char*)session.quickbars + profile::QuickBars_PrimaryOffset, profile::QuickBar_SlotsOffset);
+            Array s = Read<Array>((char*)session.quickbars + profile::QuickBars_SecondaryOffset, profile::QuickBar_SlotsOffset);
+            hbP = p.Count; hbS = s.Count;
+        }
+        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d",
+            (int)session.quickbars_initialized,
+            (qbLink == session.quickbars ? "ok" : "BAD"),
+            (unsigned)hbGate, hbP, hbS,
+            local_loot::TableCount(),
+            (int)session.vehicles_spawned,
+            (int)session.match_state_ready,
+            (int)session.cosmetics_with_state,
+            (int)session.body_fixed,
+            (int)session.world_abilities_granted);
+    }
     if (session.finalized && session.pawn && now - lastAbilityCheck > 10.0) {
         lastAbilityCheck = now;
         if (!session.abilities_granted) { GrantAllAbilitySets(); RefreshHUD(); }
@@ -3783,6 +3918,11 @@ namespace local_loot {
         double failAt = -1000.0;
     };
     static Cache g_cache;
+
+    // [F92] heartbeat accessor — table count for the [HB] state line
+    int TableCount() {
+        return g_cache.ready ? (int)(g_cache.tiers.size() + g_cache.packages.size()) : 0;
+    }
 
     static int WorldLevelNow() {
         int lvl = 0;
