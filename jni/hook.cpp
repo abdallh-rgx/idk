@@ -1035,6 +1035,7 @@ struct Session {
     void* quickbars = nullptr;
     void* player_state = nullptr;      // [F43] Erbium FortPlayerStateAthena parity
     void* tactical_sprint = nullptr;
+    bool  cosmetics_with_state = false; // [F82] cosmetic flow ran WITH a PlayerState present
     bool  initialized = false;
     bool  inventory_ready = false;
     bool  aircraft_jumped = false;
@@ -2121,6 +2122,40 @@ void Athena::LoadProfileCosmetics() {
 void Athena::LoadDefaultCosmetics() {
     if (!session.pawn || !session.controller) return;
     LOG("[Cosmetics] Loading hardcoded defaults...");
+    // [F82] ROOT CAUSE of dead run/slide anims: the pawn is spawned with an
+    // EMPTY CosmeticLoadout, and on this client build the mesh + animation
+    // stack only materialize through the loadout evaluation path
+    // (OnRep_CosmeticLoadout — verified present in libUnreal.so; server RPCs
+    // like EvaluateCharacterParts are stripped). Give the locker a REAL
+    // default AthenaCharacterItemDefinition first, mirror it onto the pawn,
+    // then the native OnRep rebuilds parts + anim instance.
+    {
+        void* loadoutProp = GetProp("/Script/FortniteGame.FortPlayerController.CosmeticLoadoutPC");
+        void* charProp    = GetProp("/Script/FortniteGame.FortAthenaLoadout.Character");
+        if (loadoutProp && charProp) {
+            void* loadout = GetField(session.controller, loadoutProp);
+            void* cur = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Character");
+            if (!cur || IsBadPtr(cur)) {
+                void* cid = LoadAsset("/Game/Athena/Items/Cosmetics/Characters/CID_001_Athena_Character_F.CID_001_Athena_Character_F",
+                                      "/Script/FortniteGame.AthenaCharacterItemDefinition");
+                if (!cid) cid = LoadAsset("/Game/Athena/Items/Cosmetics/Characters/CID_001_Athena_Character_M.CID_001_Athena_Character_M",
+                                          "/Script/FortniteGame.AthenaCharacterItemDefinition");
+                if (cid) {
+                    Write<void*>(GetField(loadout, charProp), 0, cid);
+                    LOG("[Cosmetics] default CID written into locker loadout");
+                } else LOG("[Cosmetics] ⚠️ default CID asset not found");
+            }
+            // Mirror onto the pawn and fire the CLIENT-side evaluation.
+            int pcSize = Read<int>(loadoutProp, profile::PropElementSize);
+            void* pawnLoadoutProp = GetProp("/Script/FortniteGame.FortPlayerPawn.CosmeticLoadout");
+            if (pawnLoadoutProp && Read<int>(pawnLoadoutProp, profile::PropElementSize) == pcSize) {
+                memcpy(GetField(session.pawn, pawnLoadoutProp), loadout, (size_t)pcSize);
+                Call ro("/Script/FortniteGame.FortPlayerPawn.OnRep_CosmeticLoadout");
+                if (ro.ok()) { ro.run(session.pawn); LOG("[Cosmetics] ✅ pawn OnRep_CosmeticLoadout"); }
+                else LOG("[Cosmetics] ⚠️ OnRep_CosmeticLoadout not present");
+            }
+        }
+    }
     const char* partPaths[] = {
         "/Game/Athena/Heroes/Meshes/Heads/F_Med_Head1_ATH.F_Med_Head1_ATH",
         "/Game/Athena/Heroes/Meshes/Bodies/CP_001_Athena_Body.CP_001_Athena_Body",
@@ -2161,11 +2196,17 @@ void Athena::LoadDefaultCosmetics() {
     }
     Call r1("/Script/FortniteGame.FortPlayerState.OnRep_HeroType"); if (r1.ok()) r1.run(state);
     Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData"); if (r3.ok()) r3.run(state);
+    // [F82] OnRep_CharacterParts exists client-side (verified) and drives the
+    // state→pawn part evaluation — the old flow never called it.
+    Call rcp("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts");
+    if (rcp.ok()) rcp.run(state);
     void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
     if (klib) {
         Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
         if (upd.ok() && upd.set("PlayerState", state)) upd.run(klib);
     }
+    session.cosmetics_with_state = true;
+    LOG("[Cosmetics] ✅ full flow with state done");
 }
 void Athena::ShowSkin() { LoadDefaultCosmetics(); }
 
@@ -2342,6 +2383,11 @@ void Athena::FinalizePlayer() {
     if (!pawn || !pawnCls || !IsA(pawn, pawnCls)) { LOG("Finalize: pawn is not FortPlayerPawnAthena"); return; }
     session.pawn = pawn;
     if (!session.player_state || IsBadPtr(session.player_state)) EnsurePlayerState();   // [F43]
+    // [F82] anim restoration: at SetupWorld time the PlayerState did not exist
+    // yet, so LoadDefaultCosmetics early-returned (log proof: cosmetics line
+    // printed BEFORE 'SetupWorld: EnsurePlayerState'). Re-run the full flow
+    // now that the state is guaranteed.
+    if (!session.cosmetics_with_state) { LOG("Finalize: cosmetics with state"); LoadDefaultCosmetics(); }
     // Readiness can change possession — refresh cached pawn-dependent state.
     Call ps("/Script/Engine.Pawn.OnRep_PlayerState"); if (ps.ok()) ps.run(pawn);
     if (!session.abilities_granted) GrantAllAbilitySets();
