@@ -938,3 +938,15 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 ## المتوقع في اللوق القادم (سلاسل التفاعل)
 - `[Interact] target=... class=BuildingContainer` عند فتح صندوق → `[Loot] Opening ...` → spawn pickups
 - `[Interact] F84 far/non-actor target rejected` لو وصل هدف فاسد — يعني بوابة F84 تعمل
+
+## F85 — السيارات 1/325 (VEH-1): إصلاح تثبيت النجاح الجزئي
+
+| # | التغيير | السبب |
+|---|---|---|
+| F85-a | **عدّاد `viable`**: يُحصي كل spawner/provider كلاسه قابل للتحديد في الـ pass الحالي | تشخيص دقيق للكثافة في اللوق |
+| F85-b | **لا تثبيت `vehicles_spawned` على نجاح جزئي**: العلم يُثبَّت فقط عند تغطية كل الأهداف القابلة للحل أو استنفاد نافذة المحاولات (12) | الجذر: كلاسات المركبات تتأخر بالتحميل → أول pass ينجز سيارة واحدة → العلم يُثبَّت → 324 لا تُنتج أبداً (عرض 1/325) |
+| F85-c | **لوق كثافة**: `spawner actors: N` في كل pass | رؤية عدد الـ spawners المتدفقة لحظياً |
+| ملاحظة | الأهداف المرفوضة بالـ roll تُعاد قرعتها في كل pass لاحق | كثافة Erbium عبر VehicleMin/MaxSpawnPercent محفوظة |
+
+## المتوقع في اللوق
+- `[Vehicles] spawner actors: 325` ثم `partial: +N ... retrying` عدة مرات ثم `✅ complete: M vehicles total`

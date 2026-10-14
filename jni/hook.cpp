@@ -4868,6 +4868,7 @@ void Athena::SpawnVehicles() {
     ++session.vehicle_attempts;
     static std::vector<Vector> spawnedAt;   // [F43] dedupe across passes
     int spawned = 0;
+    int viable = 0;                         // [F85] resolvable-class targets this pass
 
     // ---- Pass 1 (Erbium 1:1): LivingWorld providers matched by GameplayTag ----
     {
@@ -4910,6 +4911,7 @@ void Athena::SpawnVehicles() {
                             LOG("[Vehicles] ⚠️ class missing for '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
                             break;
                         }
+                        ++viable;   // [F85] class resolved — this provider counts
                         if (SpawnVehicleAt(cls, loc, rot)) {
                             ++spawned;
                             spawnedAt.push_back(loc);
@@ -4928,6 +4930,7 @@ void Athena::SpawnVehicles() {
         if (!spawnerCls) spawnerCls = LoadClass("/Script/FortniteGame.FortAthenaVehicleSpawner", "/Script/Engine.Actor");
         std::vector<void*> spawners;
         if (spawnerCls && GetAllActorsOfClassRaw(spawnerCls, spawners) && !spawners.empty()) {
+            LOG("[Vehicles] spawner actors: %zu", spawners.size());   // [F85] density diagnostics
             for (void* spawner : spawners) {
                 if (!spawner || IsBadPtr(spawner)) continue;
                 void* vehicleClass = nullptr;
@@ -4936,6 +4939,7 @@ void Athena::SpawnVehicles() {
                     if (c.ok() && c.run(spawner)) vehicleClass = c.result<void*>();
                 }
                 if (!vehicleClass || IsBadPtr(vehicleClass)) continue;
+                ++viable;   // [F85] class resolved — this spawner counts
                 // [F28] spawn-percent roll (Erbium 1:1): only when a definition is
                 // cached AND the spawner is not forced.
                 void* cachedDef = GetObjField(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.CachedFortVehicleItemDef");
@@ -4971,9 +4975,21 @@ void Athena::SpawnVehicles() {
         }
     }
 
-    if (spawned > 0) {
-        session.vehicles_spawned = true;   // [F43] committed only on success
-        LOG("[Vehicles] spawned %d vehicles this pass (attempts=%d)", spawned, session.vehicle_attempts);
+    // [F85] Commit semantics fix (root cause of the user's 1/325 symptom):
+    // the old code set vehicles_spawned on the FIRST pass with ANY success.
+    // Spawner classes stream in late, so pass 1 spawns exactly 1 car, the
+    // flag commits, and the remaining spawners never spawn again. Now the
+    // flag commits ONLY when a pass fully covers its viable targets, or the
+    // F41 retry window (12 attempts) is exhausted. Rolled-skip targets are
+    // re-rolled on every retry pass (density per Erbium spawn-percent).
+    if (spawned > 0 && spawned >= viable) {
+        session.vehicles_spawned = true;
+        LOG("[Vehicles] ✅ complete: %d vehicles total (attempts=%d)", (int)spawnedAt.size(), session.vehicle_attempts);
+    } else if (spawned > 0) {
+        LOG("[Vehicles] partial: +%d this pass, %d total, viable=%d — retrying (attempts=%d)", spawned, (int)spawnedAt.size(), viable, session.vehicle_attempts);
+    } else if (session.vehicle_attempts >= 12) {
+        session.vehicles_spawned = true;   // [F85] window exhausted — stop cleanly
+        LOG("[Vehicles] retry window exhausted: %d vehicles total", (int)spawnedAt.size());
     } else {
         LOG("[Vehicles] pass %d: no vehicles yet — will retry", session.vehicle_attempts);
     }
