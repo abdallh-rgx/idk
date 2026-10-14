@@ -425,3 +425,22 @@ Work Log:
 Stage Summary:
 - 4 دفعات CI خضراء متتالية: 8ef7cc2 → 1bb5cb4 → 6d07ec9 → 79da5b7 (آخرها run 38032682622)
 - jni/hook.cpp = 9157 سطرًا، F80 مكتمل ومسلّم على main
+
+---
+Task ID: 20
+Agent: Z.ai-Code (hub: preview-chat-59368b5e / CD-1 → F83)
+Task: جولة F83 — استكمال إصلاحات F81/F82 بعد إعادة التأسيس على نسخة الـ Orchestrator (aa5eb2f + 2af9796): تصليب مسار الاحتياط في ensure_slots (كان يحمل جذر الكراش نفسه) + إزالة bWantsToSlide القسري + استعادة FixBodyAndAnimations/GrantWorldAbilities المفقودتين
+
+Work Log:
+- rebase على F81/F82 للـ Orchestrator: مساره الأساسي الجديد (QuickBarResize@0x56925E0 بمساعدة المحرك + تحقق ثنائي بالإزاحات 0x278/0x308/0x398) محفوظ كما هو — عمله صحيح ومتفق مع تحليلي
+- [F83-a] المسار الاحتياطي في ensure_slots كان ما زال يحمل جذر الكراش حرفيًا (`oldBytes > 0` يتخطى memset عند Count==0 — كتلة Realloc مُعاد تدويرها تُكتب غير مهيأة): صُحح التصفير ليكون غير مشروط + تعقيم رأس المصفوفة قبل وصوله لمساعدات المحرك (Count 0..64 + IsBadPtr) + تعقيم رأس Items في حلقة الإدخالات (0..16) + استعادة dedupe الـ F44 (لا إعادة بناء حين يحمل slot0 GUID)
+- [F83-b] bWantsToSlide=true القسري كان ما زال موجودًا (سطر 1751) رغم أن F51 أزلته لأنه يكسر آلة حالة الانزلاق — أُزل مع تعليق الأصل؛ استبدال إطلاق TryActivateAbilityByClass لمرة واحدة (مسار F67 المُفسِد) بـ GrantWorldAbilities المنقولة من b1bf679: GA_Athena_Player_Slide_C + GA_AthenaEnterVehicle_C كمواصفات حقيقية عبر FortAbilitySet مصغر + EquipFortAbilitySet
+- [F83-b] استعادة FixBodyAndAnimations (F41/F68): استعادة AnimScriptInstance الغائب عبر SetAnimClass (Fortnite_M_Avg_Player_AnimBlueprint ثم M_MED_Lancelot_AnimBP_C) — مكملة لـ F82 (هي تصلح الأجزاء، هذه تصلح رسم الحركة نفسه: بلا AnimInstance لا جري أصلًا حتى بأجزاء صحيحة)؛ إعادة محاولة كل 8ث حتى يتدفق الـ AnimBP
+- [F83-c] فحص انزياح إزاحات runtime (الانعكاس مقابل 0x278/0x308 المتحققة ثنائيًا) بسجل تحذير — يحسم «native لا يملأ standalone» مقابل «قراءة زائفة 0/0» من لوق واحد
+- المساعدات المنقولة: FindLoadedObjectOfType + FindAbilityClassNamed + علمان (body_fixed, world_abilities_granted)
+- فحص الصياغة: g++ -std=c++17 -fsyntax-only -Wall -Wextra (بدائل NDK) → EXIT=0
+- التنسيق عبر الـ Hub كاملًا: نشر التحليل والفرضيات قبل العمل (24/25/26/27) + إعلان الجذر والحل (47/48/49) + هذه الجولة إعادة تأسيس بعد اكتشاف دفعات Orchestrator المتوازية — لا تعارض مع عمله، استكمال له
+
+Stage Summary:
+- jni/hook.cpp ≈ 5864 سطرًا؛ F83 = تصليب احتياطي + تعقيم + dedupe (الكراش مقفول من مساريه) + إزالة bWantsToSlide + أنظمة الحركة/الأنيميشن الثلاثة مستعادة فوق F82
+- اللوق القادم المتوقع: `grow bar0..2 readback` ثم كل البنود تكتمل بلا كراش + `[Body] ✅ locomotion online` + `[World] ✅ world abilities delivered` + لا `[QB] ⚠️ offset drift` (أو يظهر فيحسم سبب 0/0)

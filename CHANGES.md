@@ -895,3 +895,32 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 
 ## تصحيح تالٍ (نفس جولة F80)
 - **«NPC و بوتات مختفين» — جذر ثانٍ أُصيب**: بوت ما زال راكبًا (bus_state=1) حين يُدمَّر الباص كان يبقى **مخفيًا للأبد** (الكود القديم: `bus_state=0; continue` بلا إظهار!) — الآن: إظهار + إنزال عند هدفه على الأرض + استئناف الـ AI الأرضي. hook.cpp = **9162 سطرًا**، EXIT=0
+
+---
+
+# F83 — جولة «استكمال ما بعد الدفعات المتوازية» (rebase على F81/F82)
+
+## قرائن المصدر
+- مسار F81 الأساسي (QuickBarResize المحركية) سليم — لكن مساره الاحتياطي كان يحمل جذر الكراش نفسه: `if (oldBytes > 0 && oldBytes < newBytes) memset` يقفز عن التصفير عند Count==0 ← كتلة Realloc معاد تدويرها (هدم جولة سابقة) تُكتب غير مهيأة، والحلقة تقرأ رؤوس Items قمامة
+- `bWantsToSlide=true` القسري ما زال (F51 أزالته لأنه يكسر الانزلاق) + TryActivateAbilityByClass لمرة واحدة = مسار F67 المُفسِد للـ pawn
+- FixBodyAndAnimations (F41/F68) وGrantWorldAbilities (F52/F67) غائبتان — بلا AnimScriptInstance لا رسم حركة حتى مع أجزاء F82 الصحيحة
+
+## جدول التغييرات (6 بنود)
+| البند | العنوان | التنفيذ |
+|---|---|---|
+| F83-a1 | **تصفير احتياطي غير مشروط** | مسار Realloc الاحتياطي: `if (newBytes > oldBytes) memset(...)` — يصفّر الكل عند التخصيص الطازج ويحفظ القديم عند النمو |
+| F83-a2 | **تعقيم الرؤوس** | رأس slots (Count 0..64 + IsBadPtr) قبل مساعدات المحرك + رأس Items في الحلقة (0..16) — لا مؤشرات وحشية إلى memcmp/GenericArrayAdd/Resize |
+| F83-a3 | **استعادة dedupe F44** | slot0 يحمل GUID ⇒ تخطي إعادة البناء (مسار إعادة محاولات Tick) |
+| F83-b1 | **إزالة bWantsToSlide القسري** | إعادة تعليق F51/F52 — العلم مدفوع بالدخل؛ يبقى SetCanSlide فقط |
+| F83-b2 | **استعادة FixBodyAndAnimations** | AnimScriptInstance عبر SetAnimClass + إظهار الجسم — بلا استبدال mesh (F68)؛ تكامل مع F82 (أجزاء صحيحة + رسم حركة) |
+| F83-b3 | **استعادة GrantWorldAbilities** | slide + enter/exit/in-vehicle + emote كمواصفات حقيقية (FortAbilitySet مصغر → EquipFortAbilitySet) |
+| F83-c | **فحص انزياح runtime** | تحذير عند اختلاف الانعكاس عن 0x278/0x308 — يحسم سبب 0/0 من لوق واحد |
+
+## فحص + تزامن
+- `g++ -std=c++17 -fsyntax-only -Wall -Wextra` (بدائل NDK) → **EXIT=0**
+
+## المتوقع في اللوق القادم
+1. `[QB] grow bar0/1/2 readback` ثم **كل بنود bar1 تكتمل** بلا كراش
+2. `[QB] already filled` عند إعادة الدخول (dedupe يعمل)
+3. `[Body] ✅ locomotion online` + `[World] ✅ N world abilities delivered` — **الجري/الانزلاق حيّان**
+4. `[QB] ⚠️ offset drift` غائب (أو حاضر فيحسم 0/0 فورًا)

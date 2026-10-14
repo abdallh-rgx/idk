@@ -512,6 +512,38 @@ static void* ByShortName(const std::string& wanted) {
     return nullptr;
 }
 
+// [F41/F83-b] Find a LOADED object of a type by short name (AnimBPs stream
+// in late — a package-path FindObj misses them until they are resident).
+static void* FindLoadedObjectOfType(const char* type_path, const std::string& wanted) {
+    GObjects_t* go = GObjectArray();
+    void* type = FindObj(type_path);
+    if (!go || !type) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (!IsA(object, type)) continue;
+        if (ObjName(object) == wanted) return object;
+    }
+    return nullptr;
+}
+
+// [F52/F83-b] Find a GameplayAbility subclass by short name (BP ability
+// classes are not FindObj-able by package path before they stream in).
+static void* FindAbilityClassNamed(const std::string& wanted) {
+    GObjects_t* go = GObjectArray();
+    void* gaCls = FindObj("/Script/GameplayAbilities.GameplayAbility");
+    void* classClass = FindObj("/Script/CoreUObject.Class");
+    if (!go || !gaCls || !classClass) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (!IsA(object, classClass)) continue;
+        if (!SubclassOfFast(object, gaCls)) continue;
+        if (ObjName(object) == wanted) return object;
+    }
+    return nullptr;
+}
+
 // ============================================================================
 // PROPERTY ACCESS
 // ============================================================================
@@ -1052,6 +1084,8 @@ struct Session {
     bool  tactical_sprint_setup = false;
     bool  quickbars_initialized = false;
     bool  movement_enabled = false;
+    bool  body_fixed = false;           // [F41/F83-b] locomotion AnimInstance restored
+    bool  world_abilities_granted = false; // [F52/F83-b] slide + vehicle ability specs
     bool  lobby_requested = false;      // [F24]
     int   last_phase = -1;              // [F24] GamePhase tracking
     // [F21] local build dedup + touch polling
@@ -1146,6 +1180,8 @@ namespace Athena {
     void GrantDefaultAbilities();
     void GrantAbility(void* klass);
     void GrantAllAbilitySets();
+    void GrantWorldAbilities();        // [F52/F83-b] slide + vehicle abilities as real specs
+    void FixBodyAndAnimations();       // [F41/F68/F83-b] restore missing locomotion AnimInstance
     void EnsurePlayerState();          // [F43] Erbium standalone PlayerState 1:1
     void InitStaminaAttributes();
     void RefreshHUD();
@@ -1410,6 +1446,20 @@ void Athena::InitializeQuickBarsNative() {
     LOG("[QB] vtable=%p slot+0x%X=0x%llX expected=0x%llX", vtable, profile::QuickBars_VtableSlot, (unsigned long long)init_slot, (unsigned long long)expected_fn);
     if (init_slot != expected_fn) { LOG("[QB] ❌ vtable mismatch — SKIPPING native call"); return; }
     LOG("[QB] ✅ vtable match — calling native init");
+    // [F83-c] runtime cross-check of the F81-verified layout (0x278/0x308 —
+    // binary-verified via disassembly) against live reflection. A drift here
+    // means every read below is a false 0/0 and the builder would write the
+    // wrong bars; the log settles it in one device run.
+    {
+        void* pProp = GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
+        void* sProp = GetProp("/Script/FortniteGame.FortQuickBars.SecondaryQuickBar");
+        if (pProp) { int ro = Read<int>(pProp, profile::PropOffset);
+            if (ro != (int)profile::QuickBars_PrimaryOffset)
+                LOG("[QB] ⚠️ PrimaryQuickBar offset drift: reflect=0x%X const=0x%X", ro, (int)profile::QuickBars_PrimaryOffset); }
+        if (sProp) { int ro = Read<int>(sProp, profile::PropOffset);
+            if (ro != (int)profile::QuickBars_SecondaryOffset)
+                LOG("[QB] ⚠️ SecondaryQuickBar offset drift: reflect=0x%X const=0x%X", ro, (int)profile::QuickBars_SecondaryOffset); }
+    }
     void* primary = (char*)session.quickbars + profile::QuickBars_PrimaryOffset;
     void* secondary = (char*)session.quickbars + profile::QuickBars_SecondaryOffset;
     Array p_before = Read<Array>(primary, profile::QuickBar_SlotsOffset);
@@ -1431,6 +1481,26 @@ void Athena::InitializeQuickBarsNative() {
 // the old code wrote slot+0x18 which is UsedByItemGuid.
 void Athena::BuildQuickBarsManually() {
     if (!session.quickbars) { LOG("[QB] No quickbars"); return; }
+    // [F44/F83-a] Dedupe: if slot 0 of the primary bar already holds a GUID
+    // we are already filled — re-running would leak arrays, re-grow stale
+    // buffers and duplicate entries (the Tick retry path calls us repeatedly).
+    {
+        void* barChk = GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
+        if (barChk) {
+            void* bar = GetField(session.quickbars, barChk);
+            if (bar && !IsBadPtr(bar)) {
+                Array arr = Read<Array>((char*)bar + profile::QuickBar_SlotsOffset);
+                if (arr.Count > 0 && arr.Data && !IsBadPtr(arr.Data)) {
+                    Guid g0 = Read<Guid>((char*)arr.Data + 0x18, 0);   // UsedByItemGuid
+                    if (g0.A | g0.B | g0.C | g0.D) {
+                        LOG("[QB] already filled (slot0 guid) — skipping rebuild");
+                        session.quickbars_initialized = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
     LOG("[QB] Building QuickBars manually...");
 
     struct SlotEntry { int idx; Guid guid; uint8_t bar; };
@@ -1465,6 +1535,13 @@ void Athena::BuildQuickBarsManually() {
     auto ensure_slots = [&](void* bar, int want, uint8_t barId) -> Array {
         void* slotsField = (char*)bar + profile::QuickBar_SlotsOffset;
         Array arr = Read<Array>(slotsField);
+        // [F83-a] never trust a stale/garbage header — a wild Data pointer
+        // must not reach the engine helpers (Resize/Realloc on a freed or
+        // wild pointer corrupts the heap; teardown on build exit suspect).
+        if (arr.Count < 0 || arr.Count > 64 || (arr.Count > 0 && IsBadPtr(arr.Data))) {
+            LOG("[QB] ⚠️ bar%u header sanitized (Count=%d Data=%p)", barId, arr.Count, arr.Data);
+            arr = Array{nullptr, 0, 0};
+        }
         if (arr.Count < want) {
             LOG("[QB] grow bar%u: Data=%p Count=%d Max=%d want=%d", barId, arr.Data, arr.Count, arr.Max, want);
             { Guard g; Fn<void(*)(void*, int32, int32)>(profile::QuickBarResize)(slotsField, want, 1); }
@@ -1478,8 +1555,15 @@ void Athena::BuildQuickBarsManually() {
                 void* newData = Fn<void*(*)(void*, size_t, uint32_t)>(profile::Realloc)(
                     arr.Count > 0 ? arr.Data : nullptr, (size_t)newBytes, 0u);
                 if (!newData) { LOG("[QB] ⚠️ slot growth failed (want=%d)", want); return arr; }
-                if (oldBytes > 0 && oldBytes < newBytes)
-                    memset((char*)newData + oldBytes, 0, newBytes - oldBytes);
+                // [F83-a] CRASH FIX (fallback path): the old `oldBytes > 0`
+                // guard skipped this memset exactly when Count==0 — the
+                // fresh Realloc'd chunk (recycled from a previous match's
+                // teardown) went in UNINITIALIZED and the entries loop read
+                // garbage Items headers from it (wild memcmp/GenericArrayAdd
+                // → the Bar1-slot1 crash). Zero beyond preserved contents,
+                // unconditionally.
+                if (newBytes > oldBytes)
+                    memset((char*)newData + oldBytes, 0, (size_t)(newBytes - oldBytes));
                 Write<void*>(slotsField, 0, newData);
                 Write<int32>(slotsField, 8, want);
                 Write<int32>(slotsField, 12, want);
@@ -1516,6 +1600,10 @@ void Athena::BuildQuickBarsManually() {
         Array values = Read<Array>(itemsField);
         LOG("[QB] bind bar%u slot%d: slot=%p items=%p count=%d max=%d",
             e.bar, e.idx, slot, values.Data, values.Count, values.Max);
+        // [F83-a] harden: a garbage Items header must read as empty — never
+        // as a wild Data pointer for the memcmp scan below.
+        if (values.Count < 0 || values.Count > 16 || (values.Count > 0 && IsBadPtr(values.Data)))
+            values = Array{nullptr, 0, 0};
         bool present = false;
         for (int i = 0; i < values.Count; ++i)
             if (!memcmp((char*)values.Data + (size_t)i * sizeof(Guid), &e.guid, sizeof(Guid))) { present = true; break; }
@@ -1748,7 +1836,10 @@ void Athena::EnableMovementFeatures() {
         }
     } else LOG("[Movement] SetCanSlide not found");
 
-    SetBool(session.pawn, "/Script/FortniteGame.FortPawn.bWantsToSlide", true);
+    // [F51/F52/F83-b] bWantsToSlide is input/game-driven — forcing it on
+    // permanently broke the slide state machine (the F51 fix the rewrite
+    // lost). Only SetCanSlide stays forced; the actual SLIDE ability spec is
+    // granted by GrantWorldAbilities below.
 
     void* movement = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
     if (movement && !IsBadPtr(movement)) {
@@ -1764,20 +1855,94 @@ void Athena::EnableMovementFeatures() {
         }
     }
 
-    // [F13] Slide ability rides in the ability set delivery path — activate
-    // it directly if the class is available (K2_GiveAbility is gone in 21.30).
-    void* slideAbility = LoadClass(
-        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_Athena_Player_Slide.GA_Athena_Player_Slide_C",
-        "/Script/GameplayAbilities.GameplayAbility");
-    if (slideAbility) {
-        LOG("[Movement] Found slide ability — activating through ASC");
-        GrantAbility(slideAbility);
-    } else {
-        LOG("[Movement] Slide ability class not found");
-    }
+    // [F52/F67/F83-b] Slide is delivered as a REAL ability spec through a
+    // mini FortAbilitySet + EquipFortAbilitySet (GrantWorldAbilities retries
+    // from Tick until the BP classes stream in). The old direct
+    // TryActivateAbilityByClass fire here activated the ability ONCE outside
+    // the spec system — that path corrupted pawn state on device (F67).
+    GrantWorldAbilities();
 
     session.movement_enabled = true;
     LOG("[Movement] Done");
+}
+
+// ============================================================================
+// [F41/F68/F83-b] BODY + LOCOMOTION ANIMS — Erbium assembles the body through
+// parts only (F82 cosmetics flow, already present). Here we (a) re-run the
+// part pipeline when no parts ever landed, (b) restore a MISSING
+// AnimScriptInstance — without it the pawn has NO locomotion graph at all,
+// which is exactly "dead run/slide anims" even with correct parts, (c) keep
+// the body visible. No direct mesh swap (F68 — that caused the "sick body").
+// Complements F82: F82 fixes the PARTS pipeline, this fixes the ANIM GRAPH.
+void Athena::FixBodyAndAnimations() {
+    if (session.body_fixed || !session.pawn) return;
+    void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
+    if (!mesh || IsBadPtr(mesh)) return;
+
+    if (session.character_parts.empty()) {
+        LoadProfileCosmetics();          // locker -> part pipeline -> defaults
+        if (session.character_parts.empty()) return;   // assets not resident yet — retry next pass
+    }
+    void* animInst = GetObjField(mesh, "/Script/Engine.SkeletalMeshComponent.AnimScriptInstance");
+    if (!animInst) {
+        void* animBP = FindLoadedObjectOfType("/Script/Engine.AnimBlueprintGeneratedClass", "Fortnite_M_Avg_Player_AnimBlueprint");
+        if (!animBP) animBP = FindLoadedObjectOfType("/Script/Engine.AnimBlueprintGeneratedClass", "M_MED_Lancelot_AnimBP_C");
+        if (animBP) {
+            Call a("/Script/Engine.SkeletalMeshComponent.SetAnimClass");
+            if (a.ok() && a.set("NewClass", animBP) && a.run(mesh))
+                LOG("[Body] AnimScriptInstance restored (locomotion)");
+        }
+    }
+    animInst = GetObjField(mesh, "/Script/Engine.SkeletalMeshComponent.AnimScriptInstance");
+    if (!animInst) return;   // AnimBP not resident yet — retry next pass
+
+    Call body("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
+    if (body.ok()) { bool bShow = true; if (body.set("bVisible", bShow)) body.run(session.pawn); }
+    Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
+    if (hid.ok()) { bool h = false; if (hid.set("bNewHidden", h)) hid.run(session.pawn); }
+
+    session.body_fixed = true;
+    LOG("[Body] ✅ locomotion online — body via %zu character parts (Erbium)",
+        session.character_parts.size());
+}
+
+// ============================================================================
+// [F52/F67/F83-b] WORLD ABILITIES — slide + vehicle abilities delivered the
+// Erbium way: build a mini FortAbilitySet and Equip it, so the ASC creates
+// real ability specs with input bindings.
+void Athena::GrantWorldAbilities() {
+    if (session.world_abilities_granted || !session.pawn) return;
+    static const char* const names[] = {
+        "GA_Athena_Player_Slide_C",     // core — slide
+        "GA_AthenaEnterVehicle_C",      // core (exact 21.30 spelling)
+        "GA_AthenaExitVehicle_C",       // best-effort
+        "GA_AthenaInVehicle_C",         // best-effort
+        "GAB_Emote_Generic_C",          // best-effort (emote input)
+        nullptr
+    };
+    std::vector<void*> classes;
+    for (int i = 0; names[i]; ++i) {
+        if (void* k = FindAbilityClassNamed(names[i])) classes.push_back(k);
+        else if (i < 2) LOG("[World] ability class not resident yet: %s", names[i]);
+    }
+    if (classes.size() < 2) return;   // wait for the core pair to stream in
+
+    void* setCls = FindObj("/Script/FortniteGame.FortAbilitySet");
+    if (!setCls) { LOG("[World] FortAbilitySet class missing"); return; }
+    void* set = Fn<void*(*)(void*, void*)>(profile::SpawnObject)(setCls, session.pawn);
+    if (!set || IsBadPtr(set)) { LOG("[World] mini ability set creation failed"); return; }
+    void* abProp = GetProp("/Script/FortniteGame.FortAbilitySet.GameplayAbilities");
+    if (!abProp) { LOG("[World] GameplayAbilities property missing"); return; }
+    Array* arr = reinterpret_cast<Array*>(GetField(set, abProp));
+    if (!arr || arr->Count != 0) { LOG("[World] mini set array unavailable"); return; }
+    for (void* k : classes) {
+        if (!k || IsBadPtr(k)) continue;
+        Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, abProp, &k);
+    }
+    if (ApplyAbilitySet(session.pawn, set)) {
+        session.world_abilities_granted = true;
+        LOG("[World] ✅ %zu world abilities delivered through EquipFortAbilitySet", classes.size());
+    }
 }
 
 // ============================================================================
@@ -2393,6 +2558,8 @@ void Athena::FinalizePlayer() {
     if (!session.abilities_granted) GrantAllAbilitySets();
     if (!session.tactical_sprint_setup) SetupTacticalSprint();
     if (!session.movement_enabled) EnableMovementFeatures();
+    FixBodyAndAnimations();        // [F41/F83-b] restore the locomotion AnimInstance
+    GrantWorldAbilities();         // [F52/F83-b] slide + vehicle abilities as real specs
     if (!session.quickbars_initialized) {
         InitializeQuickBarsNative();
         if (!session.quickbars_initialized) BuildQuickBarsManually();
@@ -2433,6 +2600,7 @@ void Athena::Tick() {
     static double lastSprintCheck = 0;
     static double lastQBCheck = 0;
     static double lastMovementCheck = 0;
+    static double lastAnimCheck = 0;      // [F83-b] body/anim + world ability retries
     static int qbRetries = 0;
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
@@ -2456,6 +2624,11 @@ void Athena::Tick() {
     if (session.finalized && session.pawn && now - lastMovementCheck > 8.0) {
         lastMovementCheck = now;
         if (!session.movement_enabled) EnableMovementFeatures();
+    }
+    if (session.finalized && session.pawn && now - lastAnimCheck > 8.0) {
+        lastAnimCheck = now;
+        FixBodyAndAnimations();       // [F83-b] retries until the AnimBP streams in
+        GrantWorldAbilities();        // [F52] retries until the core ability pair streams in
     }
     if (session.finalized) {
         PollTouchBuild();
