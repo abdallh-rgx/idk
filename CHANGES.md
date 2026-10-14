@@ -950,3 +950,12 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 
 ## المتوقع في اللوق
 - `[Vehicles] spawner actors: 325` ثم `partial: +N ... retrying` عدة مرات ثم `✅ complete: M vehicles total`
+
+## F87 — LOOT-1 الجذر الثنائي: StructPropertiesSize الصحيح 0x54 (binary-verified)
+
+| # | التغيير | الدليل |
+|---|---|---|
+| F87-a | `StructPropertiesSize = 0xA8 → 0x54` | سلسلة الإثبات: StructSuper=0x40 مُثبت عامل على الجهاز (SubclassOfFast نجح في 37 ability) + ترتيب أعضاء UStruct في مصدر UE5.0 المحلي (Class.h سطر 310-321): SuperStruct 0x40 → Children 0x48 → ChildProperties 0x50 → **PropertiesSize 0x54** → MinAlignment 0x58 (كلاهما int32). 0xA8 تقع داخل أعضاء UScriptStruct الخاصة → صفر دائماً |
+| F87-b | تسمية اللوق `raw@0xA8` → `raw@0x54` | اللوق القادم يطابق الحقيقة |
+| تكامل | F86 (Z.ai-Code) walk يبقى fallback + cross-check | مع 0x54 الصحيحة القراءة الأولية تعمل والwalk لا يُستدعى — يبقى تحققاً |
+| يصلح | bad row sizes 0/0 + ClipSizeOf (دائماً 30) + ItemLevelOf | كلها نفس القراءة المعطوبة |

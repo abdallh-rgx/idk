@@ -213,7 +213,7 @@ constexpr unsigned FieldNext    = 0x28;
 constexpr unsigned StructSuper  = 0x40;
 constexpr unsigned StructChildren   = 0x48;
 constexpr unsigned StructChildProps = 0x50;
-constexpr unsigned StructPropertiesSize = 0xA8;   // UScriptStruct::PropertiesSize (UE5.1)
+constexpr unsigned StructPropertiesSize = 0x54;   // UStruct::PropertiesSize — [F86] was 0xA8 (UE5.1-era, wrong). Derivation: runtime-verified StructSuper=0x40 anchors the UE5.0 UStruct layout (local UE5.0 Class.h member order): SuperStruct 0x40 → Children 0x48 → ChildProperties 0x50 → PropertiesSize 0x54 → MinAlignment 0x58 (both int32). The 0xA8 read landed INSIDE UScriptStruct's own members (past the UStruct header) and returned 0/garbage → 'bad row sizes 0/0' DataTable abort + ClipSizeOf always default 30.
 constexpr unsigned FunctionParamSize = 0xB6;
 constexpr unsigned PropFlags       = 0x38;
 constexpr unsigned PropOffset      = 0x44;
@@ -3812,9 +3812,10 @@ namespace local_loot {
         int pkgRaw  = Read<int>(pkgStruct, profile::StructPropertiesSize);
         int tierRowSize = (tierRaw > 0 && tierRaw <= 512) ? tierRaw : StructSizeByFFieldWalk(tierStruct, tierMust, 5);
         int pkgRowSize  = (pkgRaw  > 0 && pkgRaw  <= 512) ? pkgRaw  : StructSizeByFFieldWalk(pkgStruct,  pkgMust,  4);
-        LOG("[Loot] row sizes: tier=0x%X (raw@0xA8=%d) pkg=0x%X (raw@0xA8=%d)",
+        LOG("[Loot] row sizes: tier=0x%X (raw@0x54=%d) pkg=0x%X (raw@0x54=%d)",
             tierRowSize, tierRaw, pkgRowSize, pkgRaw);
         if (tierRowSize <= 0 || tierRowSize > 512 || pkgRowSize <= 0 || pkgRowSize > 512) { LOG("[Loot] ⚠️ bad row sizes %d/%d", tierRowSize, pkgRowSize); g_cache.failAt = Monotonic(); return; }
+        LOG("[Loot] [F86] row sizes OK: tier=%d pkg=%d (UStruct::PropertiesSize @0x54)", tierRowSize, pkgRowSize);
 
         int toNum  = PropOffsetOn(tierStruct, "NumLootPackageDrops");
         int toGrp  = PropOffsetOn(tierStruct, "TierGroup");
