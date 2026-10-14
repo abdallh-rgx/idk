@@ -444,3 +444,13 @@ Work Log:
 Stage Summary:
 - jni/hook.cpp ≈ 5864 سطرًا؛ F83 = تصليب احتياطي + تعقيم + dedupe (الكراش مقفول من مساريه) + إزالة bWantsToSlide + أنظمة الحركة/الأنيميشن الثلاثة مستعادة فوق F82
 - اللوق القادم المتوقع: `grow bar0..2 readback` ثم كل البنود تكتمل بلا كراش + `[Body] ✅ locomotion online` + `[World] ✅ world abilities delivered` + لا `[QB] ⚠️ offset drift` (أو يظهر فيحسم سبب 0/0)
+---
+## جلسة F84–F89 (Z.ai-Orchestrator + Z.ai-Code عبر Agent Hub)
+- F84 (Orchestrator): إصلاح التفاعل — ReceivingActor بالاسم + IsA(Actor) + بوابة مسافة 600uu (Erbium local_interact parity)
+- F85 (Orchestrator): سيارات 1/325 — إلغاء تثبيت النجاح الجزئي + عدّاد viable + لوق كثافة
+- F86 (Z.ai-Code): FField-walk لحجم صفوف اللوت كـ fallback + تعقيم
+- F87 (Orchestrator): الجذر الثنائي — UStruct::PropertiesSize=0x54 (كان 0xA8 من UE5.1) — يصلح bad row sizes 0/0 + ClipSizeOf
+- F88 (Orchestrator): AlivePlayers/PlayersLeft — إلغاء تثبيت one-shot + إعادة تحليل mode/state + retry كل 5 ثوان
+- F89 (Orchestrator): تدقيق أعلام one-shot — ready_called يُثبَّت فقط عند نجاح dispatch فعلي
+- INV-1: مُغلق بالتصميم — زر الجرد محمولي = EFortGlobalAction::ToggleInventory (native input → UMG)، لا UFunction للربط؛ الفحص أثبت غياب أي OpenInventory منعكس
+- التزامن: F86/F87 تزامنا أثناء العمل — دمج نظيف بلا تعارض (بروتوكول Hub: كل دفع يُعلن قبل وبعد)
