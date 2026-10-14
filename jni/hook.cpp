@@ -2686,6 +2686,13 @@ void Athena::Tick() {
             if (session.quickbars_initialized) SetQuickBarReady();
         }
     }
+    // [F88] match-state retry — mode/state may replicate late; re-invoke
+    // until SetupMatchState fully covers AlivePlayers + PlayersLeft.
+    static double lastMatchState = 0;
+    if (session.finalized && session.controller && now - lastMatchState > 5.0) {
+        lastMatchState = now;
+        if (!session.match_state_ready) SetupMatchState();
+    }
     if (session.finalized && session.pawn && now - lastMovementCheck > 8.0) {
         lastMovementCheck = now;
         if (!session.movement_enabled) EnableMovementFeatures();
@@ -4834,7 +4841,18 @@ void Athena::HandleDamageServer(void* actor, void* func, void* params) {
 // ============================================================================
 void Athena::SetupMatchState() {
     if (session.match_state_ready || !session.world || !session.controller) return;
-    session.match_state_ready = true;
+    // [F88] re-resolve mode/state at call time + commit ready ONLY when both
+    // blocks actually ran. The old code set match_state_ready=true BEFORE the
+    // blocks: if GameMode/GameState were not replicated yet on the first call
+    // (end of FinalizePlayer), the flag committed and the alive-players HUD
+    // stayed dead forever (same one-shot-commit family as F85).
+    void* msModeProp  = GetProp("/Script/Engine.World.AuthorityGameMode");
+    void* msStateProp = GetProp("/Script/Engine.World.GameState");
+    void* msMode  = msModeProp  ? Read<void*>(GetField(session.world, msModeProp))  : nullptr;
+    void* msState = msStateProp ? Read<void*>(GetField(session.world, msStateProp)) : nullptr;
+    if (msMode && !IsBadPtr(msMode))   session.mode  = msMode;
+    if (msState && !IsBadPtr(msState)) session.state = msState;
+    bool aliveDone = false, leftDone = false;
     if (session.mode && !IsBadPtr(session.mode)) {
         void* apProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
         if (!apProp) apProp = GetProp("/Script/FortniteGame.FortGameModeAthena.AlivePlayers");
@@ -4848,6 +4866,7 @@ void Athena::SetupMatchState() {
                 Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arrField, apProp, &session.controller);
             LOG("[MatchState] AlivePlayers count=%d", Read<Array>(arrField).Count);
         }
+        aliveDone = true;
     }
     if (session.state && !IsBadPtr(session.state)) {
         void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
@@ -4860,7 +4879,12 @@ void Athena::SetupMatchState() {
                 LOG("[MatchState] PlayersLeft=1 + OnRep (was %d)", cur);
             }
         }
+        leftDone = true;
     }
+    // [F88] commit only on full coverage; the Tick retry (5s) re-invokes us
+    // until mode/state exist, then the flag freezes the pass.
+    session.match_state_ready = aliveDone && leftDone;
+    if (session.match_state_ready) LOG("[MatchState] ✅ ready (alive + playersleft)");
 }
 
 // [F42] Diagnostics dump — quickbar slots, inventory entries, match state.

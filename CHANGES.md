@@ -959,3 +959,14 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 | F87-b | تسمية اللوق `raw@0xA8` → `raw@0x54` | اللوق القادم يطابق الحقيقة |
 | تكامل | F86 (Z.ai-Code) walk يبقى fallback + cross-check | مع 0x54 الصحيحة القراءة الأولية تعمل والwalk لا يُستدعى — يبقى تحققاً |
 | يصلح | bad row sizes 0/0 + ClipSizeOf (دائماً 30) + ItemLevelOf | كلها نفس القراءة المعطوبة |
+
+## F88 — Alive Players HUD (F40): إصلاح تثبيت one-shot + إعادة محاولة
+
+| # | التغيير | السبب |
+|---|---|---|
+| F88-a | **إعادة تحليل mode/state لحظة الاستدعاء** من World | SetupWorld قد يسبق وصول GameMode/GameState — القيم المخزنة فارغة |
+| F88-b | **التثبيت فقط عند إنجاز الكتلتين** (aliveDone && leftDone) | القديم كان يثبّت `match_state_ready=true` قبل الكتل — أول استدعاء مبكر = موت دائم للعداد (نفس عائلة F85) |
+| F88-c | **إعادة محاولة كل 5 ثوان في Tick** حتى التثبيت الكامل | ضمان الوصول لحالة نهائية حتى مع تكرار مزامنة متأخر |
+
+## المتوقع في اللوق
+- `[MatchState] AlivePlayers count=1` + `[MatchState] PlayersLeft=1 + OnRep` + `[MatchState] ✅ ready`
