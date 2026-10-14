@@ -799,6 +799,33 @@ public:
         for (auto& p : m_params) if (p.name == key) return p.size;
         return -1;
     }
+    // [F93] POSITIONAL/OUT BINDING — layout-stable fallback for K2 functions
+    // whose param NAMES drift across builds while the layout does not. Used
+    // by DataTableRow when the named binds miss: (a) nth non-ReturnParm param
+    // by OFFSET order (memory layout, not linked-list order), (b) first
+    // CPF_OutParm slot regardless of name/size.
+    bool bind_at(int nonReturnIndex, const void* src, int size) {
+        std::vector<const Param*> ordered;
+        for (auto& p : m_params) if (!(p.flags & profile::CPF_ReturnParm)) ordered.push_back(&p);
+        std::sort(ordered.begin(), ordered.end(), [](const Param* a, const Param* b) { return a->offset < b->offset; });
+        if (nonReturnIndex < 0 || nonReturnIndex >= (int)ordered.size()) return false;
+        const Param& p = *ordered[(size_t)nonReturnIndex];
+        if (p.offset < 0 || size <= 0 || p.offset + size > (int)m_data.size() || !src) return false;
+        memcpy(m_data.data() + p.offset, src, (size_t)size);
+        return true;
+    }
+    int param_at_size(int nonReturnIndex) const {
+        std::vector<const Param*> ordered;
+        for (auto& p : m_params) if (!(p.flags & profile::CPF_ReturnParm)) ordered.push_back(&p);
+        std::sort(ordered.begin(), ordered.end(), [](const Param* a, const Param* b) { return a->offset < b->offset; });
+        if (nonReturnIndex < 0 || nonReturnIndex >= (int)ordered.size()) return -1;
+        return ordered[(size_t)nonReturnIndex]->size;
+    }
+    void* out_slot() {
+        for (auto& p : m_params)
+            if (p.flags & profile::CPF_OutParm) return m_data.data() + p.offset;
+        return nullptr;
+    }
     template<class T> T result() const {
         for (auto& p : m_params)
             if ((p.flags & profile::CPF_ReturnParm) && p.size == (int)sizeof(T))
@@ -1000,18 +1027,51 @@ static bool DataTableRowNames(void* table, std::vector<FName>& out) {
 }
 // [F32] Copy a row into a caller buffer. The native writes Table->RowStruct->
 // PropertiesSize bytes at the OutRow slot, so the slot is read back raw.
+// [F93] one-shot diagnosis: every historical failure of this function was
+// SILENT (all return-false paths unlogged) — the 'cache ready=0 tiers=0
+// packages=0' device line with 'tiers=252 rows' one line above proves all
+// 2401 calls fail without telling us WHY. This names the path, once.
 static bool DataTableRow(void* table, const FName& row, void* dst, int rowSize) {
     if (!table || IsBadPtr(table) || rowSize <= 0 || rowSize > 512 || !dst) return false;
     Call c("/Script/Engine.DataTableFunctionLibrary.GetDataTableRow");
-    if (!c.ok()) return false;
-    int psz = c.param_size("OutRow");
-    uint8_t zero[256]{};
-    if (psz > 0) { if (!c.set_bytes("OutRow", zero, std::min(psz, 256))) return false; }
-    else { if (!c.set_bytes("OutRow", zero, 8)) return false; }
-    if (!c.set("Table", table) || !c.set("RowName", row)) return false;
-    if (!c.run(FindObj("/Script/Engine.Default__DataTableFunctionLibrary"))) return false;
-    void* slot = c.param_slot("OutRow");
-    if (!slot) return false;
+    static bool dumped = false;   // one diagnosis per process — 2401 failures, 1 log
+    auto diagnose = [&](const char* why) {
+        if (dumped) return;
+        dumped = true;
+        LOG("[Loot][F93] DataTableRow first-failure diagnosis: %s", why);
+        c.dump("GetDataTableRow");
+    };
+    if (!c.ok()) { diagnose("c.ok()==false — UFunction unresolved (F92 name-walk also missed)"); return false; }
+    // [F93] Named binds first (fast path); positional fallback binds by
+    // LAYOUT — GetDataTableRow(Table, RowName, OutRow): Table+RowName are
+    // the two 8-byte in-parms in offset order, OutRow is the CPF_OutParm
+    // slot. Names drift across builds; the layout does not.
+    bool tblBound = c.set("Table", table);
+    bool rowBound = c.set("RowName", row);
+    void* slot = (tblBound && rowBound) ? c.param_slot("OutRow") : nullptr;
+    if (!tblBound) {
+        if (c.param_at_size(0) == (int)sizeof(void*) && c.bind_at(0, &table, sizeof(void*))) tblBound = true;
+        else { diagnose("Table bind failed (named AND positional)"); return false; }
+    }
+    if (!rowBound) {
+        if (c.param_at_size(1) == (int)sizeof(FName) && c.bind_at(1, &row, sizeof(FName))) rowBound = true;
+        else { diagnose("RowName bind failed (named AND positional)"); return false; }
+    }
+    if (!slot) {
+        slot = c.out_slot();
+        if (!slot && c.param_size("OutRow") > 0) slot = c.param_slot("OutRow");
+        if (!slot) { diagnose("OutRow slot unresolved (named AND CPF_OutParm scan)"); return false; }
+        static bool posLogged = false;
+        if (!posLogged) { posLogged = true; LOG("[Loot][F93] positional binding engaged — param names drifted, layout held"); }
+    }
+    // zero the out slot before the call (native writes rowSize bytes there)
+    {   int zsz = c.param_size("OutRow");
+        if (zsz <= 0) zsz = 8;                        // wildcard out param
+        memset(slot, 0, (size_t)std::min(zsz, 256));
+    }
+    void* cdo = FindObj("/Script/Engine.Default__DataTableFunctionLibrary");
+    if (!cdo) { diagnose("Default__DataTableFunctionLibrary CDO unresolved"); return false; }
+    if (!c.run(cdo)) { diagnose("run() rejected/failed on the CDO"); return false; }
     memcpy(dst, slot, (size_t)rowSize);
     return true;
 }
