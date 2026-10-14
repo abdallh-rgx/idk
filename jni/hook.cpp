@@ -218,6 +218,10 @@ constexpr unsigned FunctionParamSize = 0xB6;
 constexpr unsigned PropFlags       = 0x38;
 constexpr unsigned PropOffset      = 0x44;
 constexpr unsigned PropElementSize = 0x34;
+// [F86-a] FProperty::ArrayDim (UE5.1: 0x30). Cross-validated by the walk
+// itself — a wrong value falls to the sanity clamp (dim=1) and the computed
+// size stays correct for non-array structs.
+constexpr unsigned PropArrayDim    = 0x30;
 constexpr unsigned BoolSize        = 0x80;
 constexpr unsigned BoolByteOffset  = 0x81;
 constexpr unsigned BoolFieldMask   = 0x82;
@@ -853,6 +857,65 @@ static int PropOffsetOn(void* s, const char* name, int* sizeOut = nullptr) {
     void* p = FindChildProp(s, name, sizeOut);
     return p ? Read<int>(p, profile::PropOffset) : -1;
 }
+// [F86-a/LOOT-1] Resolve a UScriptStruct row size WITHOUT trusting the
+// build-broken PropertiesSize@0xA8 read: walk the FField ChildProperties
+// chains (same proven machinery as FindChildProp/PropOffsetOn — verified
+// working on device by every reflection consumer) and compute
+//   size = max(prop.Offset + prop.ElementSize * prop.ArrayDim)
+// across the struct and its SuperStruct chain, 8-aligned.
+// mustHave/mustHaveCount: required member names — the walk counts hits and
+// returns 0 when none match, so a WRONG RowStruct pointer (bad 0x28 on some
+// build) is detected instead of producing a garbage size. Pass nullptr to
+// skip validation (caller already validates members via PropOffsetOn).
+// Never reads, never crashes: every value is range-clamped; a prop with a
+// wild offset/size is ignored.
+static int StructSizeByFFieldWalk(void* s, const char* const* mustHave, int mustHaveCount) {
+    if (!s || IsBadPtr(s)) return 0;
+    int best = 0, hits = 0;
+    void* u = s;
+    for (int d = 0; u && !IsBadPtr(u) && d < 16; ++d) {
+        // FField chain (UE4.22+ reflection)
+        void* f = Read<void*>(u, profile::StructChildProps);
+        for (int i = 0; f && !IsBadPtr(f) && i < 512; ++i) {
+            int off = Read<int>(f, profile::PropOffset);
+            int esz = Read<int>(f, profile::PropElementSize);
+            int dim = Read<int>(f, profile::PropArrayDim);
+            if (dim < 1 || dim > 64) dim = 1;
+            if (off >= 0 && off < 4096 && esz > 0 && esz <= 512) {
+                int end = off + esz * dim;
+                if (end > best) best = end;
+            }
+            if (mustHave) for (int k = 0; k < mustHaveCount; ++k) {
+                std::string n;
+                if (SafeFieldName(f, profile::FFieldName, n) && n == mustHave[k]) ++hits;
+            }
+            f = Read<void*>(f, profile::FFieldNext);
+        }
+        // Legacy UProperty children chain (pre-FField / mixed builds)
+        void* c = Read<void*>(u, profile::StructChildren);
+        for (int i = 0; c && !IsBadPtr(c) && i < 512; ++i) {
+            int off = Read<int>(c, profile::PropOffset);
+            int esz = Read<int>(c, profile::PropElementSize);
+            int dim = Read<int>(c, profile::PropArrayDim);
+            if (dim < 1 || dim > 64) dim = 1;
+            if (off >= 0 && off < 4096 && esz > 0 && esz <= 512) {
+                int end = off + esz * dim;
+                if (end > best) best = end;
+            }
+            if (mustHave) for (int k = 0; k < mustHaveCount; ++k) {
+                std::string n;
+                if (SafeFieldName(c, profile::ObjectName, n) && n == mustHave[k]) ++hits;
+            }
+            c = Read<void*>(c, profile::FieldNext);
+        }
+        void* next = Read<void*>(u, profile::StructSuper);
+        if (next == u) break;
+        u = next;
+    }
+    if (mustHave && mustHaveCount > 0 && hits < 2) return 0;   // wrong struct pointer — not our row type
+    if (best <= 0 || best > 512) return 0;
+    return (best + 7) & ~7;   // align to 8 (row copies are struct-aligned)
+}
 static std::string FNameToString(const void* fnameBytes) {
     if (!fnameBytes) return {};
     FStringNative ns{};
@@ -918,6 +981,8 @@ static int ClipSizeOf(void* weaponDef) {
     void* rs = Read<void*>(table, 0x28);   // UDataTable::RowStruct
     if (!rs || IsBadPtr(rs)) return 30;
     int rowSize = Read<int>(rs, profile::StructPropertiesSize);
+    if (rowSize <= 0 || rowSize > 512)   // [F86-a/LOOT-1] 0xA8 reads 0 on this build
+        rowSize = StructSizeByFFieldWalk(rs, nullptr, 0);   // ClipSize presence is validated right below
     if (rowSize <= 0 || rowSize > 512) return 30;
     int off = PropOffsetOn(rs, "ClipSize");
     if (off < 0) return 30;
@@ -3737,8 +3802,18 @@ namespace local_loot {
         void* tierStruct = Read<void*>(tierTable, 0x28);   // UDataTable::RowStruct
         void* pkgStruct  = Read<void*>(pkgTable, 0x28);
         if (!tierStruct || !pkgStruct || IsBadPtr(tierStruct) || IsBadPtr(pkgStruct)) { LOG("[Loot] ⚠️ row structs missing"); g_cache.failAt = Monotonic(); return; }
-        int tierRowSize = Read<int>(tierStruct, profile::StructPropertiesSize);
-        int pkgRowSize  = Read<int>(pkgStruct, profile::StructPropertiesSize);
+        // [F86-a/LOOT-1] PropertiesSize@0xA8 reads 0/0 on this build (the
+        // reported bug): raw read kept as primary when sane, FField-walk as
+        // fallback + RowStruct validation via required members. Both values
+        // logged — the first device run settles the true constant.
+        static const char* const tierMust[] = { "LootPackage", "Weight", "TierGroup", "NumLootPackageDrops", "LootTier" };
+        static const char* const pkgMust[]  = { "LootPackageID", "Weight", "ItemDefinition", "Count" };
+        int tierRaw = Read<int>(tierStruct, profile::StructPropertiesSize);
+        int pkgRaw  = Read<int>(pkgStruct, profile::StructPropertiesSize);
+        int tierRowSize = (tierRaw > 0 && tierRaw <= 512) ? tierRaw : StructSizeByFFieldWalk(tierStruct, tierMust, 5);
+        int pkgRowSize  = (pkgRaw  > 0 && pkgRaw  <= 512) ? pkgRaw  : StructSizeByFFieldWalk(pkgStruct,  pkgMust,  4);
+        LOG("[Loot] row sizes: tier=0x%X (raw@0xA8=%d) pkg=0x%X (raw@0xA8=%d)",
+            tierRowSize, tierRaw, pkgRowSize, pkgRaw);
         if (tierRowSize <= 0 || tierRowSize > 512 || pkgRowSize <= 0 || pkgRowSize > 512) { LOG("[Loot] ⚠️ bad row sizes %d/%d", tierRowSize, pkgRowSize); g_cache.failAt = Monotonic(); return; }
 
         int toNum  = PropOffsetOn(tierStruct, "NumLootPackageDrops");
@@ -3899,6 +3974,8 @@ namespace local_loot {
         void* rs = Read<void*>(table, 0x28);
         if (!rs || IsBadPtr(rs)) return 0;
         int rowSize = Read<int>(rs, profile::StructPropertiesSize);
+        if (rowSize <= 0 || rowSize > 512)   // [F86-a/LOOT-1] 0xA8 reads 0 on this build
+            rowSize = StructSizeByFFieldWalk(rs, nullptr, 0);   // Category/LootLevel validated below
         if (rowSize <= 0 || rowSize > 512) return 0;
         int catOff = PropOffsetOn(rs, "Category");
         if (catOff < 0) catOff = PropOffsetOn(rs, "category");
