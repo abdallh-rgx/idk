@@ -1177,6 +1177,7 @@ struct Session {
     // [F28] vehicles
     bool  vehicles_spawned = false;
     int   vehicle_attempts = 0;         // [F41] keep retrying until spawners stream in
+    int   qb_retries = 0;               // [F91/BEX-1] per-match QB retry budget (was a Tick function-local static — a second match inherited the exhausted counter and never retried QuickBars)
     Guid  vehicle_weapon_guid{};
     int   vehicle_weapon_seat = -1;
     bool  vehicle_weapon_active = false;
@@ -2677,7 +2678,6 @@ void Athena::Tick() {
     static double lastMovementCheck = 0;
     static double lastAnimCheck = 0;      // [F83-b] body/anim + world ability retries
     static double lastCosmeticsCheck = 0;  // [F90-c/AUD-1] cosmetics with-state retry
-    static int qbRetries = 0;
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
     if (session.finalized && session.pawn && now - lastAbilityCheck > 10.0) {
@@ -2690,8 +2690,8 @@ void Athena::Tick() {
     }
     if (session.finalized && session.controller && now - lastQBCheck > 6.0) {
         lastQBCheck = now;
-        if (!session.quickbars_initialized && qbRetries++ < 5) {
-            LOG("Tick: QuickBars retry #%d", qbRetries);
+        if (!session.quickbars_initialized && session.qb_retries++ < 5) {
+            LOG("Tick: QuickBars retry #%d", session.qb_retries);
             InitializeQuickBarsNative();
             if (!session.quickbars_initialized) BuildQuickBarsManually();
             if (session.quickbars_initialized) SetQuickBarReady();
@@ -5814,6 +5814,21 @@ static void tick_hook(void* world, int type, float delta) {
         if (session.attempted && !session.finalized && session.finalize_at > 0) {
             double now = Monotonic();
             if (now >= session.finalize_at) Athena::FinalizePlayer();
+        }
+        // [F91-b/BEX-1] transition-window scrub: we are in Frontend while the
+        // session still points at the departed terrain world — every actor
+        // pointer (pawn/controller/inventory/quickbars/state) is stale and
+        // pe_hook class-based handlers (JumpFromHudStart family) would
+        // dereference freed actors. Scrub the pointers (flags keep their
+        // semantics for the pending-finalize check above); the terrain
+        // detector issues a full fresh session on the next match, which also
+        // re-arms session.qb_retries [F91-a].
+        if (session.world && session.world != world) {
+            session.pawn = nullptr; session.controller = nullptr;
+            session.inventory = nullptr; session.quickbars = nullptr;
+            session.player_state = nullptr; session.tactical_sprint = nullptr;
+            session.world = nullptr; session.world_index = -1;
+            LOG(">>> [F91] stale terrain session scrubbed (entered %s)", wn.c_str());
         }
         return;
     }
