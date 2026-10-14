@@ -1428,7 +1428,7 @@ void Athena::GrantAllAbilitySets() {
     void* coreSet = LoadAsset(
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_AthenaPlayer.GAS_AthenaPlayer",
         "/Script/FortniteGame.FortAbilitySet");
-    if (!coreSet) { LOG("[Abilities] GAS_AthenaPlayer missing"); session.abilities_granted = true; return; }
+    if (!coreSet) { LOG("[Abilities] GAS_AthenaPlayer missing — will retry (asset may stream late)"); return; }   // [F90-a/AUD-1] no premature commit: the 10s Tick retry re-invokes until the set lands
 
     // Add the mobile interaction/harvest/sprint abilities into the set before
     // EquipFortAbilitySet so the native delivery path initializes their
@@ -1892,11 +1892,12 @@ void Athena::EnableMovementFeatures() {
     if (!session.pawn) return;
     LOG("[Movement] Enabling slide & swim...");
 
+    bool canSlideOk = false;   // [F90-b/AUD-1] movement commits only when the critical gate landed
     Call canSlide("/Script/FortniteGame.FortPlayerPawn.SetCanSlide");
     if (canSlide.ok()) {
         bool bTrue = true;
         if (canSlide.set("bCanSlide", bTrue)) {
-            if (canSlide.run(session.pawn)) LOG("[Movement] ✅ SetCanSlide(true)");
+            if (canSlide.run(session.pawn)) { LOG("[Movement] ✅ SetCanSlide(true)"); canSlideOk = true; }
             else LOG("[Movement] SetCanSlide run failed");
         }
     } else LOG("[Movement] SetCanSlide not found");
@@ -1927,8 +1928,12 @@ void Athena::EnableMovementFeatures() {
     // the spec system — that path corrupted pawn state on device (F67).
     GrantWorldAbilities();
 
-    session.movement_enabled = true;
-    LOG("[Movement] Done");
+    // [F90-b/AUD-1] commit ONLY on SetCanSlide success: on failure the 8s
+    // Tick retry re-invokes this function — GrantWorldAbilities is
+    // flag-guarded (idempotent) and the comp fields are re-applied by
+    // ApplySprintSpeed every 2s, so a re-run is free of side effects.
+    session.movement_enabled = canSlideOk;
+    LOG("[Movement] %s", canSlideOk ? "Done" : "incomplete — retry scheduled");
 }
 
 // ============================================================================
@@ -2671,6 +2676,7 @@ void Athena::Tick() {
     static double lastQBCheck = 0;
     static double lastMovementCheck = 0;
     static double lastAnimCheck = 0;      // [F83-b] body/anim + world ability retries
+    static double lastCosmeticsCheck = 0;  // [F90-c/AUD-1] cosmetics with-state retry
     static int qbRetries = 0;
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
     if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
@@ -2706,6 +2712,10 @@ void Athena::Tick() {
         lastAnimCheck = now;
         FixBodyAndAnimations();       // [F83-b] retries until the AnimBP streams in
         GrantWorldAbilities();        // [F52] retries until the core ability pair streams in
+    }
+    if (session.finalized && now - lastCosmeticsCheck > 8.0) {   // [F90-c/AUD-1]
+        lastCosmeticsCheck = now;
+        if (!session.cosmetics_with_state) LoadDefaultCosmetics();   // re-runs the full with-state flow once PlayerState replicates
     }
     if (session.finalized) {
         PollTouchBuild();
