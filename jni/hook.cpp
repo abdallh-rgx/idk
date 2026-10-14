@@ -86,6 +86,48 @@
 //        + guarded TossPickup (refuses to run with an unbound location).
 //  [F34] Standalone cache fix: stale bAlreadySearched reset + floor-loot
 //        spawners force-rolled and destroyed (Erbium ≥11 behaviour).
+//  [F35] PICKUP PIPELINE (Erbium 1:1) — fixes "loot appears but cannot be
+//        picked up / looks weird":
+//          • SetPickupTarget emulation (PickupLocationData + OnRep_Pickup-
+//            LocationData + bPickedUp/OnRep + IncomingPickups) → the native
+//            fly-to-player animation plays.
+//          • InternalPickup port (stacking / GiveOrSwapStack / GiveOrSwap /
+//            FinalLoc re-toss) with a scheduled transfer after FlyTime.
+//          • OnCapsuleBeginOverlap hook on the pawn (the live-server pickup
+//            trigger) + ServerHandlePickup* RPCs fully replaced (native half
+//            does not exist in this build — loot used to vanish).
+//          • Container loot now TossPickups out of the chest (was hovering
+//            mid-air), PawnWhoDroppedPickup set on every spawn.
+//  [F36] QUICKBARS/INVENTORY (Erbium 1:1) — fixes "QuickBars disabled":
+//          • FortQuickBars.ServerAddItemInternal / ServerActivateSlotInternal
+//            / ServerRemoveItemInternal / EmptySlot native binding with the
+//            manual path as fallback.
+//          • GiveItem: OwnerInventory + ParentInventory + TrackerGuid +
+//            bIsReplicatedCopy (inventory UI orphan fixes).
+//          • UE-allocator growth for QuickBar slot arrays (mixed malloc/UE
+//            heap was a latent corruption/crash).
+//  [F37] INTERACTION — ServerOnAttemptInteract is also dispatched ON the
+//        container (Erbium v3 vft hook parity); the old receiver filter
+//        dropped those calls, so chests and most world objects ignored the
+//        interact button. Chests/doors/BP-interact now resolve from either
+//        receiver shape.
+//  [F38] BUILD MODE EXIT CRASH — ServerCreateBuildingActor* native path is
+//        fully replaced (Erbium parity) and the OG call skipped: the
+//        standalone BuildingClassMap is empty, and the exit-build payload
+//        crashed the native implementation. Hidden hand-rolled preview
+//        actors (SpawnBuildPreviews) removed — they collided with the native
+//        preview teardown when build mode ended.
+//  [F39] HARVEST RESOURCES (Erbium ABuildingSMActor::OnDamageServer 1:1) —
+//        pickaxe damage on trees/rocks grants the mapped resource
+//        (K2_GetResourceItemDefinition + AthenaResourceRates curve +
+//        BuildingResourceAmountOverride), stack-clamped with overflow
+//        re-toss, + ClientReportDamagedResourceBuilding HUD feedback.
+//  [F40] ALIVE PLAYERS — GameMode.AlivePlayers.Add(PC) + GameState.PlayersLeft
+//        = 1 + OnRep_PlayersLeft (the HUD counter now shows a number).
+//  [F41] VEHICLES retry fix — the spawn pass no longer marks itself done
+//        before the map's spawners stream in (12 attempts × 15 s).
+//  [F42] era.fix (re-run every pass) + era.debug (dump slots/inventory/state)
+//        console commands.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -102,6 +144,7 @@
 #include <ctime>
 #include <cstdarg>
 #include <cstddef>
+#include <cerrno>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -287,6 +330,20 @@ template<class T> static T Read(const void* p, size_t off = 0) {
 }
 template<class T> static void Write(void* p, size_t off, const T& v) {
     if (p) memcpy((char*)p + off, &v, sizeof(T));
+}
+
+// [F35] Deep pointer probe — IsBadPtr only validates the VALUE range. On
+// Android, dereferencing a freed/unmapped pointer that happens to sit inside
+// the valid range range is a SIGSEGV (the "crash on exiting build mode"
+// class of bugs). Probing through write(/dev/null) makes the KERNEL validate
+// readability without ever touching the memory from our thread.
+static int g_devnull_fd = -1;
+static bool IsReadable(const void* p, size_t n = 8) {
+    if (!p || IsBadPtr(p)) return false;
+    if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY);
+    if (g_devnull_fd < 0) return true;               // cannot probe — assume ok
+    ssize_t r = write(g_devnull_fd, p, n);
+    return r == (ssize_t)n || (r < 0 && errno != EFAULT);
 }
 
 static uintptr_t g_base = 0;
@@ -876,6 +933,35 @@ static void* ResolveWeak(void* weak) {
     return item->Object;
 }
 
+// [F35] Object → TWeakObjectPtr bytes (the reverse of ResolveWeak). Needed
+// for AFortPickup.PickupLocationData.PickupTarget (the fly-to-player
+// animation reads it) — writing the RAW pointer into a TWeakObjectPtr would
+// corrupt it, so the {ObjectIndex, ObjectSerial} pair is built from GObjects.
+static bool MakeWeakRef(void* obj, void* weakDst, bool& cached, int32& cIdx, int32& cSerial) {
+    if (!obj || IsBadPtr(obj) || !weakDst) return false;
+    if (!cached) {
+        cached = true; cIdx = -1; cSerial = 0;
+        GObjects_t* go = GObjectArray();
+        if (go) {
+            // Bounded scan; GC may grow the array between calls, NumElements
+            // is read fresh every time. The pawn never moves, so this runs once.
+            int32 n = go->NumElements;
+            if (n > 0 && n < 8000000) {
+                for (int32 i = 0; i < n; ++i) {
+                    FUObjectItem* it = go->GetItem((uint32)i);
+                    if (!it) continue;
+                    if (it->Object == obj) { cIdx = i; cSerial = it->Serial; break; }
+                }
+            }
+        }
+        if (cIdx >= 0) LOG("[Pickup] weak ref cached idx=%d serial=%d", cIdx, cSerial);
+    }
+    if (cIdx < 0) return false;
+    Write<int32>(weakDst, 0, cIdx);
+    Write<int32>(weakDst, 4, cSerial);
+    return true;
+}
+
 // ============================================================================
 // ASSET LOADING / SPAWN
 // ============================================================================
@@ -988,12 +1074,23 @@ struct Session {
     void* roof = nullptr;
     // [F28] vehicles
     bool  vehicles_spawned = false;
+    int   vehicle_attempts = 0;         // [F41] keep retrying until spawners stream in
     Guid  vehicle_weapon_guid{};
     int   vehicle_weapon_seat = -1;
     bool  vehicle_weapon_active = false;
     Guid  previous_weapon_guid{};
     // [F29] shared build dedupe (RPC path records, touch path honors)
     double rpc_build_time = 0;
+    // [F35] Erbium pickup pipeline: pickups fly to the player natively, the
+    // inventory transfer is scheduled after the FlyTime animation.
+    struct PendingPickup { void* pickup; double at; };
+    std::vector<PendingPickup> pending_pickups;
+    // [F35] cached weak ref of the pawn (PickupTarget)
+    bool  pawn_weak_ready = false;
+    int32 pawn_weak_idx = -1;
+    int32 pawn_weak_serial = 0;
+    // [F40] match state (alive players / players-left HUD)
+    bool  match_state_ready = false;
 } session;
 
 static double Monotonic() {
@@ -1052,7 +1149,7 @@ namespace Athena {
     void SetupTacticalSprint();
     void SetTacticalSprinting(bool sprinting);
     void SpawnSafeZoneIndicator();
-    void SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, uint8_t spawnSource, bool toss, int level = -1);
+    void SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, uint8_t spawnSource, bool toss, int level = -1, int loadedAmmo = -1);
     void DropInventoryItem(Guid guid, int count);
     void OnServerExecuteInventoryItem(Guid guid);
     void OnServerExecuteInventoryWeapon(void* weapon);
@@ -1100,6 +1197,24 @@ namespace Athena {
     // [F18] pickups / [movement]
     void ServerHandlePickup(void* pickup);
     void EnableMovementFeatures();
+
+    // [F35] Erbium pickup pipeline (SetPickupTarget / InternalPickup parity)
+    void HandlePickupRPC(void* pickup, float flyTime);
+    void ProcessPendingPickups();
+    void SetPickupTargetAnim(void* pickup, float flyTime);
+    bool InternalPickup(void* entry, void* pickupActor);
+
+    // [F36] QuickBars native binding (ServerAddItemInternal parity)
+    bool QBAddItem(Guid guid, bool bSecondary, int slot);
+    void QBActivateSlot(bool bSecondary, int slot);
+    void QBRemoveItem(Guid guid, int slot);
+
+    // [F39] harvest resources on building damage (Erbium OnDamageServer 1:1)
+    void HandleDamageServer(void* actor, void* func, void* params);
+
+    // [F40] alive-players / players-left HUD state
+    void SetupMatchState();
+    void DebugDump();
 }
 
 // ============================================================================
@@ -1338,14 +1453,19 @@ void Athena::BuildQuickBarsManually() {
         void* slotsField = (char*)bar + profile::QuickBar_SlotsOffset;
         Array arr = Read<Array>(slotsField);
         if (arr.Count < want) {
-            void* newData = malloc(profile::QuickBarSlot_SlotSize * want);
+            // [F36] UE-allocator growth — a malloc'ed array replaced here would
+            // corrupt the heap the first time engine code reallocs it.
+            int oldBytes = arr.Count > 0 ? profile::QuickBarSlot_SlotSize * arr.Count : 0;
+            int newBytes = profile::QuickBarSlot_SlotSize * want;
+            void* newData = Fn<void*(*)(void*, size_t)>(profile::Realloc)(arr.Count > 0 ? arr.Data : nullptr, newBytes);
             if (newData) {
-                memset(newData, 0, profile::QuickBarSlot_SlotSize * want);
+                if (oldBytes > 0 && oldBytes < newBytes)
+                    memset((char*)newData + oldBytes, 0, newBytes - oldBytes);
                 Write<void*>(slotsField, 0, newData);
                 Write<int32>(slotsField, 8, want);
                 Write<int32>(slotsField, 12, want);
                 arr = Read<Array>(slotsField);
-                LOG("[QB] Allocated %d slots at %p", want, newData);
+                LOG("[QB] Reallocated %d slots at %p", want, newData);
             }
         }
         return arr;
@@ -1358,14 +1478,17 @@ void Athena::BuildQuickBarsManually() {
         Array& arr = e.bar == 0 ? primArr : secArr;
         if (e.idx < 0 || e.idx >= arr.Count || !arr.Data) continue;
         void* slot = (char*)arr.Data + (size_t)e.idx * profile::QuickBarSlot_SlotSize;
-        // Items array (TArray<FGuid>) at slot+0x00
+        // Items array (TArray<FGuid>) at slot+0x00 — grown through the UE
+        // allocator via GenericArrayAdd so native code can keep mutating it.
         void* itemsField = (char*)slot + profile::QuickBarSlot_ItemsOffset;
-        Guid* guidData = (Guid*)malloc(16);
-        if (!guidData) continue;
-        *guidData = e.guid;
-        Write<void*>(itemsField, 0, guidData);
-        Write<int32>(itemsField, 8, 1);
-        Write<int32>(itemsField, 12, 1);
+        Array values = Read<Array>(itemsField);
+        bool present = false;
+        for (int i = 0; i < values.Count; ++i)
+            if (!memcmp((char*)values.Data + (size_t)i * sizeof(Guid), &e.guid, sizeof(Guid))) { present = true; break; }
+        if (!present) {
+            auto add = Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd);
+            if (add(itemsField, GetProp("/Script/FortniteGame.QuickBarSlot.Items"), &e.guid) < 0) continue;
+        }
         // [F01] bEnabled bit0 + bIsOccupied bit3 on the flags byte at +0x10
         uint8_t* flags = (uint8_t*)((char*)slot + profile::QuickBarSlot_EnabledOffset);
         *flags |= profile::QuickBarSlot_EnabledBit | profile::QuickBarSlot_OccupiedBit;
@@ -1469,6 +1592,79 @@ void Athena::ForceUpdateQuickBars() {
         Call c("/Script/FortniteGame.FortPlayerController.ClientForceUpdateQuickbar");
         if (c.ok() && c.set("QuickbarToRefresh", bar)) c.run(session.controller);
     }
+}
+
+// ============================================================================
+// [F36] QUICKBARS NATIVE — Erbium binds every item through the QuickBars
+// actor itself (GiveItem → ServerAddItemInternal, swap → ServerActivateSlot-
+// Internal, Remove → ServerRemoveItemInternal). In standalone those RPCs run
+// locally, so the client HUD sees exactly what the native bookkeeping wrote —
+// no manual slot surgery needed. Every helper degrades to the manual path
+// when the UFunction is absent on this build.
+// ============================================================================
+bool Athena::QBAddItem(Guid guid, bool bSecondary, int slot) {
+    void* qb = session.quickbars;
+    if (!qb || IsBadPtr(qb) || !(guid.A | guid.B | guid.C | guid.D)) return false;
+    Call add("/Script/FortniteGame.FortQuickBars.ServerAddItemInternal");
+    if (!add.ok()) { LOG("[QB] ServerAddItemInternal not present"); return false; }
+    bool bound = false;
+    bound |= add.set("ItemGuid", guid) || add.set("Guid", guid) || add.set("InItemGuid", guid);
+    bool sec = bSecondary;
+    bound |= add.set("bSecondary", sec) || add.set("bSecondaryQuickBar", sec) || add.set("Secondary", sec) ||
+             add.set_at(1, sec);
+    int slotVal = slot;
+    if (!add.set("SlotIndex", slotVal) && !add.set("Slot", slotVal) && !add.set("NewSlot", slotVal))
+        add.set_at(2, slotVal);
+    if (!add.run(qb)) return false;
+    LOG("[QB] ✅ ServerAddItemInternal bar=%d slot=%d", (int)bSecondary, slot);
+    return true;
+}
+
+void Athena::QBActivateSlot(bool bSecondary, int slot) {
+    void* qb = session.quickbars;
+    if (!qb || IsBadPtr(qb) || slot < 0) return;
+    // [F36] Erbium parity: QuickBars.ServerActivateSlotInternal(bar, slot, delay, updatePrev)
+    Call act("/Script/FortniteGame.FortQuickBars.ServerActivateSlotInternal");
+    if (act.ok()) {
+        uint8_t bar = bSecondary ? 1 : 0;
+        float delay = 0.f; bool upd = true;
+        bool bound = act.set("QuickBarType", bar) || act.set("bSecondary", bar) || act.set_at(0, bar);
+        bound |= act.set("SlotIndex", slot) || act.set("Slot", slot) || act.set_at(1, slot);
+        act.set("ActivateDelay", delay) || act.set_at(2, delay);
+        act.set("bUpdatePreviousFocusedSlot", upd) || act.set_at(3, upd);
+        if (bound && act.run(qb)) return;
+    }
+    // Legacy fallback: controller-level activation.
+    if (!session.controller) return;
+    Call legacy("/Script/FortniteGame.FortPlayerController.ClientActivateSlot");
+    if (!legacy.ok()) return;
+    float delay = 0.f; bool bUpdatePrev = true; bool bForce = true;
+    if (legacy.set("InQuickBar", bSecondary ? (uint8_t)1 : (uint8_t)0) &&
+        legacy.set("Slot", slot) && legacy.set("ActivateDelay", delay) &&
+        legacy.set("bUpdatePreviousFocusedSlot", bUpdatePrev) && legacy.set("bForceExecution", bForce))
+        legacy.run(session.controller);
+}
+
+void Athena::QBRemoveItem(Guid guid, int slot) {
+    void* qb = session.quickbars;
+    if (!qb || IsBadPtr(qb)) return;
+    // Erbium Remove(): QuickBars->EmptySlot(bar, i) + ServerRemoveItemInternal(guid, false, true)
+    if (slot >= 0 && slot < 6) {
+        Call empty("/Script/FortniteGame.FortQuickBars.EmptySlot");
+        if (empty.ok()) {
+            bool sec = false; int s = slot;
+            bool bound = empty.set("bSecondary", sec) || empty.set("Secondary", sec) || empty.set_at(0, sec);
+            bound |= empty.set("SlotIndex", s) || empty.set("Slot", s) || empty.set_at(1, s);
+            if (bound) empty.run(qb);
+        }
+    }
+    Call rem("/Script/FortniteGame.FortQuickBars.ServerRemoveItemInternal");
+    if (!rem.ok()) return;
+    bool bound = rem.set("ItemGuid", guid) || rem.set("Guid", guid) || rem.set("InItemGuid", guid);
+    bool f1 = false, f2 = true;
+    rem.set("bForceRemoval", f1) || rem.set_at(1, f1);
+    rem.set("bDestroyItem", f2) || rem.set_at(2, f2);
+    if (bound) rem.run(qb);
 }
 
 // ============================================================================
@@ -2002,7 +2198,9 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SpawnVehicles"); SpawnVehicles();                 // [F28]
     LOG("SetupWorld: ApplySprintSpeed"); ApplySprintSpeed();
     LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
-    LOG("SetupWorld: SpawnBuildPreviews"); SpawnBuildPreviews();
+    // [F38] SpawnBuildPreviews removed — the hidden hand-rolled preview actors
+    // collided with the native preview system when build mode ended (exit
+    // crash) and were never used by the placement path.
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
     LOG("SetupWorld: SpawnBattleBus"); SpawnBattleBus();
     LOG("SetupWorld: RemoveNetDebugUI"); RemoveNetDebugUI();
@@ -2051,6 +2249,7 @@ void Athena::FinalizePlayer() {
     session.visibility_forced = false;
     ForcePlayerVisible();
     SetPawnHealth(100.0f);
+    SetupMatchState();   // [F40] AlivePlayers + PlayersLeft HUD state
     RefreshHUD();
     LOG("Finalize: complete");
 }
@@ -2095,13 +2294,17 @@ void Athena::Tick() {
         lastMovementCheck = now;
         if (!session.movement_enabled) EnableMovementFeatures();
     }
-    if (session.finalized) { PollTouchBuild(); TickVehicleSeats(); }
-    // [F28] one-shot vehicle spawning with a retry window (vehicle spawners
-    // can stream in after the world is ready).
+    if (session.finalized) {
+        PollTouchBuild();
+        TickVehicleSeats();
+        ProcessPendingPickups();   // [F35] fly-time → inventory transfer
+    }
+    // [F28/F41] one-shot vehicle spawning with a retry window (vehicle spawners
+    // stream in after the world is ready — 12 attempts × 15 s ≈ 3 min max).
     static double lastVehicleTry = 0;
     if (session.finalized && session.world && now - lastVehicleTry > 15.0) {
         lastVehicleTry = now;
-        if (!session.vehicles_spawned) SpawnVehicles();
+        if (!session.vehicles_spawned && session.vehicle_attempts < 12) SpawnVehicles();
     }
 }
 
@@ -2218,11 +2421,29 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
     void* guidProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
     if (!guidProp || Read<int>(guidProp, profile::PropElementSize) != sizeof(Guid)) return false;
 
+    // [F36] Erbium GiveItem 1:1: OwnerInventory + ParentInventory bind the
+    // instance to this inventory — without them the inventory UI shows the
+    // item as orphaned and stacking/search miss it.
+    {
+        void* oiProp = GetProp("/Script/FortniteGame.FortWorldItem.OwnerInventory");
+        if (oiProp) Write<void*>(GetField(inst, oiProp), 0, session.inventory);
+        void* piProp = GetProp("/Script/FortniteGame.FortItemEntry.ParentInventory");
+        if (piProp) Write<void*>(GetField(entrySrc, piProp), 0, session.inventory);
+    }
+
     // Assign the native GUID before the deep copy so the replicated entry
-    // and the instance share identity (Era core ordering).
+    // and the instance share identity (Era core ordering). TrackerGuid is
+    // zero-filled too (Erbium parity) — some equips read it.
     Guid guid = MakeGuid();
     if (!(guid.A | guid.B | guid.C | guid.D)) return false;
     Write<Guid>(GetField(entrySrc, guidProp), 0, guid);
+    {
+        void* trackerProp = GetProp("/Script/FortniteGame.FortItemEntry.TrackerGuid");
+        if (trackerProp) {
+            Guid t = Read<Guid>(GetField(entrySrc, trackerProp));
+            if (!(t.A | t.B | t.C | t.D)) Write<Guid>(GetField(entrySrc, trackerProp), 0, MakeGuid());
+        }
+    }
     Guid reported = ItemGuidOf(inst);
     if (memcmp(&reported, &guid, sizeof(guid)) != 0) {
         LOG("Temporary item GUID accessor mismatch; insertion refused");
@@ -2249,6 +2470,21 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
     if (idx < 0) return false;
     int entryIdx = add(entryArr, entryProp, entrySrc);
     if (entryIdx < 0) { LOG("Entry copy failed after instance insertion; stop granting items"); return false; }
+    // [F36] Erbium parity: flag the replicated copy + mark dirty so the
+    // inventory UI and the net layer treat the new entry as authoritative.
+    {
+        void* brcProp = GetProp("/Script/FortniteGame.FortItemEntry.bIsReplicatedCopy");
+        if (brcProp && Read<int>(brcProp, profile::PropElementSize) == 1) {
+            void* list2 = GetField(session.inventory, invProp);
+            Array reps = Read<Array>(GetField(list2, entryProp));
+            if (entryIdx < reps.Count && reps.Data) {
+                int stride = Read<int>(entryProp, profile::PropElementSize);
+                int off = Read<int>(brcProp, profile::PropOffset);
+                if (stride > 0 && off >= 0 && off < stride)
+                    Write<uint8_t>((char*)reps.Data + (size_t)entryIdx * stride, off, 1);
+            }
+        }
+    }
 
     InventoryUpdate();
 
@@ -2275,7 +2511,9 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
 
     if (slot >= 0 && slot < 6) {
         (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot] = inst;
-        BindSlot(inst, slot, bar);
+        // [F36] Native binding first (Erbium ServerAddItemInternal parity),
+        // manual slot surgery only as the fallback.
+        if (!QBAddItem(guid, bar == 1, slot)) BindSlot(inst, slot, bar);
     }
     LOG("Inventory inserted %s count=%d slot=%d bar=%u indices=%d/%d",
         ObjName(def).c_str(), count, slot, bar, idx, entryIdx);
@@ -2524,99 +2762,335 @@ static bool RemoveItemByGuid(Guid guid, bool drop, int count = -1) {
             Fn<void(*)(void*,void*,int)>(profile::GenericArrayRemove)(entryArr, entryProp, i);
         for (int s = 0; s < 6; ++s) if (session.slots[(size_t)s] == inst) session.slots[(size_t)s] = nullptr;
         for (int s = 0; s < 6; ++s) if (session.secondary_slots[(size_t)s] == inst) session.secondary_slots[(size_t)s] = nullptr;
+        // [F36] Erbium Remove(): empty the quickbar slot + native removal.
+        Athena::QBRemoveItem(guid, i);
         Athena::InventoryUpdate();
         return true;
     }
     return false;
 }
 
-// [F18] Local pickup with stack transfer and weapon slot assignment.
-bool Athena::LocalPickup(void* pickup) {
-    if (!pickup || !IsA(pickup, FindObj("/Script/FortniteGame.FortPickup"))) return false;
-    Vector location{};
-    if (!ActorLocation(pickup, location) || !NearPlayer(location, 600.0f)) return false;
+// ============================================================================
+// PICKUPS — [F35] Erbium 1:1: AFortPlayerControllerAthena::InternalPickup
+// (stacking / GiveOrSwapStack / GiveOrSwap) + the SetPickupTarget fly-to-
+// player animation. In the standalone client the native chain
+// (capsule overlap → ServerHandlePickup → FinishedTargetSpline) never
+// completes because its inventory half lives on the dedicated-server build —
+// loot either floated in place or flew to the player and vanished. This port
+// performs the whole flow locally: native animation state + a scheduled,
+// guaranteed inventory transfer.
+// ============================================================================
+
+// Erbium InternalPickup FinalLoc: pawn + forward*450 + z+50 + random 100u disc.
+static Vector FinalLocForToss() {
+    Vector loc{};
+    if (!session.pawn || !ActorLocation(session.pawn, loc)) return loc;
+    Vector fwd{1.0, 0.0, 0.0};
+    { Call c("/Script/Engine.Actor.GetActorForwardVector");
+      if (c.ok() && c.run(session.pawn)) fwd = c.result<Vector>(); }
+    fwd.Z = 0.0;
+    double len = std::sqrt(fwd.X * fwd.X + fwd.Y * fwd.Y);
+    if (len > 0.0001) { fwd.X /= len; fwd.Y /= len; } else { fwd.X = 1.0; fwd.Y = 0.0; }
+    loc.X += fwd.X * 450.0;
+    loc.Y += fwd.Y * 450.0;
+    loc.Z += 50.0;
+    float angleVar = ((float)rand() * 0.00109866634f) - 18.0f;      // Erbium scaling
+    double rad = (double)angleVar * 0.017453292519943295;
+    loc.X += std::cos(rad) * 100.0;
+    loc.Y += std::sin(rad) * 100.0;
+    return loc;
+}
+
+// Erbium InternalPickup's ItemCount: occupied primary quickbar slots
+// (pickaxe slot 0 excluded — IsPrimaryQuickbar(melee) is false in Erbium).
+static int PrimaryStackCount() {
+    int n = 0;
+    for (int i = 1; i < 6; ++i)
+        if (session.slots[(size_t)i] && !IsBadPtr(session.slots[(size_t)i])) ++n;
+    return n;
+}
+
+static void EntryAmmoLevel(void* entry, int& loadedAmmo, int& level) {
+    loadedAmmo = -1; level = 1;
+    if (!entry) return;
+    void* ap = GetProp("/Script/FortniteGame.FortItemEntry.LoadedAmmo");
+    if (ap && Read<int>(ap, profile::PropElementSize) == 4) {
+        int v = Read<int>(GetField(entry, ap));
+        if (v > 0 && v <= 1000) loadedAmmo = v;
+    }
+    void* lp = GetProp("/Script/FortniteGame.FortItemEntry.Level");
+    if (lp && Read<int>(lp, profile::PropElementSize) == 4) {
+        int v = Read<int>(GetField(entry, lp));
+        if (v > 1 && v <= 100) level = v;
+    }
+}
+
+// [F35] SetPickupTarget emulation (Erbium's native-call fallback, 1:1):
+//   PickupLocationData.PickupGuid / PickupTarget / FlyTime(+StartDirection)
+//   → OnRep_PickupLocationData → bPickedUp → OnRep_bPickedUp
+//   → Pawn.IncomingPickups.Add — this is what makes the pickup home to the
+//   player exactly like a live-server pickup.
+void Athena::SetPickupTargetAnim(void* pickup, float flyTime) {
+    if (!pickup || IsBadPtr(pickup) || !session.pawn) return;
     void* entry = PickupEntry(pickup);
+    void* data = GetObjField(pickup, "/Script/FortniteGame.FortPickup.PickupLocationData");
+    if (entry && data && !IsBadPtr(data)) {
+        void* guidProp = GetProp("/Script/FortniteGame.FortPickupLocationData.PickupGuid");
+        if (guidProp && Read<int>(guidProp, profile::PropElementSize) == sizeof(Guid))
+            Write<Guid>(GetField(data, guidProp), 0, Read<Guid>(GetField(entry, GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid"))));
+        // PickupTarget — a TWeakObjectPtr; build it from GObjects (cached).
+        void* tgtProp = GetProp("/Script/FortniteGame.FortPickupLocationData.PickupTarget");
+        if (tgtProp) {
+            int sz = Read<int>(tgtProp, profile::PropElementSize);
+            if (sz >= 8) {
+                void* tgtField = GetField(data, tgtProp);
+                MakeWeakRef(session.pawn, tgtField, session.pawn_weak_ready, session.pawn_weak_idx, session.pawn_weak_serial);
+            }
+        }
+        // FlyTime — clamp: a zero/garbage FlyTime skips the whole animation.
+        void* ftProp = GetProp("/Script/FortniteGame.FortPickupLocationData.FlyTime");
+        if (ftProp && Read<int>(ftProp, profile::PropElementSize) == 4) {
+            float ft = flyTime;
+            if (!(ft > 0.05f) || !std::isfinite(ft)) ft = 0.45f;
+            if (ft > 1.5f) ft = 1.5f;
+            Write<float>(GetField(data, ftProp), 0, ft);
+        }
+        // StartDirection — small upward nudge (native sends the throw vector).
+        void* sdProp = GetProp("/Script/FortniteGame.FortPickupLocationData.StartDirection");
+        if (sdProp && Read<int>(sdProp, profile::PropElementSize) == 24)
+            Write<Vector>(GetField(data, sdProp), 0, Vector{0.0, 0.0, 120.0});
+        // bPlayPickupSound bit — best effort (struct-relative, on the data).
+        SetBool(data, "/Script/FortniteGame.FortPickupLocationData.bPlayPickupSound", true);
+        Call rep("/Script/FortniteGame.FortPickup.OnRep_PickupLocationData");
+        if (rep.ok()) rep.run(pickup);
+    }
+    // bPickedUp + OnRep — hides the pickup from the ground-loot HUD and plays
+    // the fly animation.
+    SetBool(pickup, "/Script/FortniteGame.FortPickup.bPickedUp", true);
+    { Call r("/Script/FortniteGame.FortPickup.OnRep_bPickedUp"); if (r.ok()) r.run(pickup); }
+    // Pawn.IncomingPickups.Add(pickup) — the pawn keeps flying pickups here.
+    {
+        void* ipProp = GetProp("/Script/FortniteGame.FortPlayerPawn.IncomingPickups");
+        if (!ipProp) ipProp = GetProp("/Script/FortniteGame.FortPawn.IncomingPickups");
+        if (ipProp) {
+            void* arrField = GetField(session.pawn, ipProp);
+            if (arrField) {
+                Array cur = Read<Array>(arrField);
+                bool known = false;
+                for (int i = 0; i < cur.Count && cur.Data; ++i)
+                    if (Read<void*>(cur.Data, (size_t)i * 8) == pickup) { known = true; break; }
+                if (!known && cur.Count >= 0 && cur.Count < 64)
+                    Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arrField, ipProp, &pickup);
+            }
+        }
+    }
+    LOG("[Pickup] SetPickupTarget anim fly=%.2f", flyTime > 0.05f && std::isfinite(flyTime) ? std::min(flyTime, 1.5f) : 0.45f);
+}
+
+// [F35] Entry point for every pickup request (ServerHandlePickup* RPCs and
+// capsule overlaps). Deduplicates through bPickedUp + the pending list, sets
+// the native animation, and schedules the inventory transfer for Tick.
+void Athena::HandlePickupRPC(void* pickup, float flyTime) {
+    if (!pickup || IsBadPtr(pickup) || !session.pawn || !session.inventory) return;
+    if (!IsReadable(pickup, 0x40)) return;
+    void* pickupCls = FindObj("/Script/FortniteGame.FortPickup");
+    if (!pickupCls || !IsA(pickup, pickupCls)) return;
+    if (GetBool(pickup, "/Script/FortniteGame.FortPickup.bPickedUp")) return;   // already in flight
+    Vector location{};
+    if (!ActorLocation(pickup, location)) return;
+    if (!NearPlayer(location, 600.0f)) return;
+    void* entry = PickupEntry(pickup);
+    if (!entry || !EntryDefinition(entry)) return;   // nothing to give — let native handle
+    for (auto& p : session.pending_pickups)
+        if (p.pickup == pickup) return;              // already scheduled
+    float ft = flyTime;
+    if (!(ft > 0.05f) || !std::isfinite(ft)) ft = 0.45f;
+    if (ft > 1.5f) ft = 1.5f;
+    SetPickupTargetAnim(pickup, ft);
+    session.pending_pickups.push_back({pickup, Monotonic() + (double)ft});
+}
+
+// [F35] Tick-side completion: after the fly time elapses, run the Erbium
+// InternalPickup port and destroy the pickup (FinishedTargetSpline parity).
+void Athena::ProcessPendingPickups() {
+    if (session.pending_pickups.empty()) return;
+    double now = Monotonic();
+    std::vector<Session::PendingPickup> remaining;
+    for (auto& p : session.pending_pickups) {
+        if (now < p.at) { remaining.push_back(p); continue; }
+        void* pickup = p.pickup;
+        bool ok = false;
+        // The tick runs on the game thread — GC cannot interleave here.
+        if (pickup && !IsBadPtr(pickup) && IsReadable(pickup, 0x40)) {
+            void* entry = PickupEntry(pickup);
+            if (entry && EntryDefinition(entry)) ok = InternalPickup(entry, pickup);
+        }
+        if (ok) {
+            Call d("/Script/Engine.Actor.K2_DestroyActor");
+            if (d.ok() && pickup) d.run(pickup);
+            LOG("[Pickup] ✅ transfer complete");
+        } else {
+            LOG("[Pickup] transfer skipped (dead pickup or full inventory) — dropped from queue");
+        }
+    }
+    session.pending_pickups.swap(remaining);
+}
+
+// [F35] Erbium AFortPlayerControllerAthena::InternalPickup 1:1.
+bool Athena::InternalPickup(void* entry, void* pickupActor) {
+    if (!entry || !session.inventory) return false;
     void* def = EntryDefinition(entry);
     int count = EntryCount(entry);
-    if (!def || count < 1 || count > 9999) return true;
+    if (!def || count < 1 || count > 9999) return false;
 
-    // [F31] Carry the pickup entry's own ammo/level (Erbium InternalPickup).
     int loadedAmmo = -1, level = 1;
-    if (entry) {
-        void* ap = GetProp("/Script/FortniteGame.FortItemEntry.LoadedAmmo");
-        if (ap && Read<int>(ap, profile::PropElementSize) == 4) {
-            int v = Read<int>(GetField(entry, ap));
-            if (v > 0 && v <= 1000) loadedAmmo = v;
-        }
-        void* lp = GetProp("/Script/FortniteGame.FortItemEntry.Level");
-        if (lp && Read<int>(lp, profile::PropElementSize) == 4) {
-            int v = Read<int>(GetField(entry, lp));
-            if (v > 1 && v <= 100) level = v;
-        }
-    }
+    EntryAmmoLevel(entry, loadedAmmo, level);
 
-    // Stackable: transfer into existing stacks first.
-    int maximum = 0;
-    void* maxProp = GetProp("/Script/FortniteGame.FortItemDefinition.MaxStackSize");
-    if (maxProp && Read<int>(maxProp, profile::PropElementSize) == 8) {
-        double v = Read<double>(GetField(def, maxProp));
-        if (v > 1.0 && v <= 9999.0) maximum = (int)v;
-    }
-    if (maximum > 1) {
-        void* invProp   = GetProp("/Script/FortniteGame.FortInventory.Inventory");
-        void* instProp  = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
-        void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
-        void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
-        void* countProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
-        void* guidProp  = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
-        if (invProp && instProp && entryProp && itemEntryProp && countProp && guidProp) {
-            void* list = GetField(session.inventory, invProp);
-            void* instArr = GetField(list, instProp);
-            void* entryArr = GetField(list, entryProp);
-            Array instances = Read<Array>(instArr);
-            Array replicated = Read<Array>(entryArr);
-            int stride = Read<int>(itemEntryProp, profile::PropElementSize);
-            for (int i = 0; i < instances.Count && count > 0; ++i) {
-                void* item = Read<void*>(instances.Data, (size_t)i * 8);
-                if (!item || ItemDefinitionOf(item) != def) continue;
-                void* itemEntry = GetField(item, itemEntryProp);
-                int have = Read<int>(GetField(itemEntry, countProp));
-                int amount = std::min(count, std::max(0, maximum - have));
-                Guid id = Read<Guid>(GetField(itemEntry, guidProp));
-                void* matching = nullptr;
-                for (int j = 0; j < replicated.Count; ++j) {
-                    void* candidate = (char*)replicated.Data + (size_t)j * stride;
-                    Guid other = Read<Guid>(GetField(candidate, guidProp));
-                    if (!memcmp(&id, &other, sizeof(id))) { matching = candidate; break; }
-                }
-                if (!matching || amount < 1) break;
-                int updated = have + amount;
-                Write<int>(GetField(itemEntry, countProp), 0, updated);
-                Write<int>(GetField(matching, countProp), 0, updated);
-                count -= amount;
+    int maxStack = MaxStackSizeOf(def);
+    if (maxStack <= 0) maxStack = 1;
+    int itemCount = PrimaryStackCount();
+
+    bool bAllowMultipleStacks = false;
+    { void* p = GetProp("/Script/FortniteGame.FortItemDefinition.bAllowMultipleStacks");
+      if (p && Read<int>(p, profile::PropElementSize) == 1)
+          bAllowMultipleStacks = Read<uint8_t>(GetField(def, p)) != 0; }
+
+    void* invProp   = GetProp("/Script/FortniteGame.FortInventory.Inventory");
+    void* instProp  = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+    void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
+    void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
+    void* countProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
+    void* guidProp  = GetProp("/Script/FortniteGame.FortItemEntry.ItemGuid");
+    void* defProp   = GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition");
+    if (!invProp || !instProp || !entryProp || !itemEntryProp || !countProp || !guidProp || !defProp) return false;
+    void* list = GetField(session.inventory, invProp);
+    void* instArr = GetField(list, instProp);
+    void* entryArr = GetField(list, entryProp);
+    int entryStride = Read<int>(entryProp, profile::PropElementSize);
+    if (entryStride <= 0 || entryStride > 1024) return false;
+
+    // GiveItem wrapper that reports the GUID of the granted stack.
+    // require_new is relaxed for multi-stack definitions (Erbium allows a
+    // second stack); unique items stay duplicate-protected.
+    auto giveNew = [&](int giveCount, int slot, uint8_t bar) -> Guid {
+        if (!GiveItem(def, giveCount, slot, bar, !bAllowMultipleStacks, loadedAmmo, level)) return Guid{};
+        return GuidOfDefInInventory(def);
+    };
+    // Re-toss (Erbium GiveOrSwapStack overflow / hotbar-full reject).
+    auto retoss = [&](int outCount) {
+        if (outCount < 1) return;
+        Vector loc = FinalLocForToss();
+        SpawnPickup(def, outCount, loc, 1 /*Player*/, 0, true, level, loadedAmmo);
+    };
+    // Equip + activate the slot the new item occupies (Erbium end of swap).
+    auto equipNew = [&](Guid g) {
+        if (!(g.A | g.B | g.C | g.D)) return;
+        OnServerExecuteInventoryItem(g);
+        for (int i = 0; i < 6; ++i)
+            if (session.slots[(size_t)i] && !IsBadPtr(session.slots[(size_t)i])) {
+                Guid ig = ItemGuidOf(session.slots[(size_t)i]);
+                if (!memcmp(&ig, &g, sizeof g)) { QBActivateSlot(false, i); return; }
             }
-            if (count < EntryCount(entry)) {
-                if (count > 0) { Write<int>(GetField(entry, countProp), 0, count); }
-                else { Call d("/Script/Engine.Actor.K2_DestroyActor"); if (d.ok()) d.run(pickup); }
-                InventoryUpdate();
-                LOG("Pickup stacked %s remainder=%d", ObjName(def).c_str(), count);
+    };
+
+    if (maxStack > 1) {
+        // ---- Erbium MaxStack > 1 branch (stack into an existing partial) ----
+        void* item = nullptr;
+        Array instances = Read<Array>(instArr);
+        for (int i = 0; i < instances.Count; ++i) {
+            void* cand = Read<void*>(instances.Data, (size_t)i * 8);
+            if (!cand || IsBadPtr(cand) || ItemDefinitionOf(cand) != def) continue;
+            void* ie = GetField(cand, itemEntryProp);
+            if (Read<int>(GetField(ie, countProp)) < maxStack) { item = cand; break; }
+        }
+        void* matchingEntry = nullptr;
+        Array replicated = Read<Array>(entryArr);
+        for (int j = 0; j < replicated.Count && replicated.Data; ++j) {
+            void* cand = (char*)replicated.Data + (size_t)j * entryStride;
+            if (Read<void*>(GetField(cand, defProp)) != def) continue;
+            if (Read<int>(GetField(cand, countProp)) < maxStack) { matchingEntry = cand; break; }
+        }
+        if (item && matchingEntry) {
+            int original = Read<int>(GetField(matchingEntry, countProp));
+            int updated = original + count;
+            int overflow = 0;
+            if (updated > maxStack) { overflow = updated - maxStack; updated = maxStack; }
+            Write<int>(GetField(matchingEntry, countProp), 0, updated);
+            // keep the instance entry in sync (Erbium: (*item)->ItemEntry.Count = ...)
+            void* itemEntry = GetField(item, itemEntryProp);
+            Write<int>(GetField(itemEntry, countProp), 0, updated);
+            InventoryUpdate();
+            LOG("[Pickup] stacked +%d -> %d/%d (%s)", count - overflow, updated, maxStack, ObjName(def).c_str());
+            if (overflow > 0) {
+                // Erbium GiveOrSwapStack: extra stacks when allowed, else re-toss
+                if (bAllowMultipleStacks && itemCount < 5) {
+                    GiveItem(def, overflow, -1, IsPrimaryQuickbarItem(def) ? (uint8_t)0 : (uint8_t)-1, true, loadedAmmo, level);
+                } else {
+                    retoss(overflow);
+                }
+            }
+            return true;
+        }
+        // No partial stack — Erbium: full-stack guard for single-stack items.
+        void* fullEntry = nullptr;
+        for (int j = 0; j < replicated.Count && replicated.Data; ++j) {
+            void* cand = (char*)replicated.Data + (size_t)j * entryStride;
+            if (Read<void*>(GetField(cand, defProp)) == def) { fullEntry = cand; break; }
+        }
+        if (!matchingEntry && fullEntry && !bAllowMultipleStacks) { retoss(count); return true; }
+        int giveCount = count;
+        if (count > maxStack) { giveCount = maxStack; retoss(count - maxStack); }
+        // ---- Erbium GiveOrSwap ----
+        if (itemCount >= 5 && IsPrimaryQuickbarItem(def)) {
+            void* cur = session.pawn ? Read<void*>(session.pawn, profile::FortPawn_CurrentWeapon) : nullptr;
+            void* curDef = (cur && !IsBadPtr(cur)) ? GetObjField(cur, "/Script/FortniteGame.FortWeapon.WeaponData") : nullptr;
+            if (cur && curDef && !IsBadPtr(curDef) && IsPrimaryQuickbarItem(curDef)) {
+                // Toss the held weapon out in front of the player, remove, give.
+                void* gp = GetProp("/Script/FortniteGame.FortWeapon.ItemEntryGuid");
+                Guid curGuid = gp ? Read<Guid>(GetField(cur, gp)) : Guid{};
+                if (curGuid.A | curGuid.B | curGuid.C | curGuid.D) {
+                    int dropCount = 1;
+                    Array insts = Read<Array>(instArr);
+                    for (int i = 0; i < insts.Count; ++i) {
+                        void* cand = Read<void*>(insts.Data, (size_t)i * 8);
+                        if (cand && !IsBadPtr(cand)) {
+                            Guid g = ItemGuidOf(cand);
+                            if (!memcmp(&g, &curGuid, sizeof g)) {
+                                void* ie = GetField(cand, itemEntryProp);
+                                dropCount = std::max(1, Read<int>(GetField(ie, countProp)));
+                                break;
+                            }
+                        }
+                    }
+                    Vector tossLoc{};
+                    if (session.pawn) { ActorLocation(session.pawn, tossLoc); tossLoc.Z += 50.0; }
+                    SpawnPickup(curDef, dropCount, tossLoc, 1 /*Player*/, 0, true, level, loadedAmmo);
+                    RemoveItemByGuid(curGuid, false);
+                    LOG("[Pickup] swap: tossed %s", ObjName(curDef).c_str());
+                }
+                int slot = -1;
+                for (int i = 1; i < 6; ++i) if (!session.slots[(size_t)i]) { slot = i; break; }
+                Guid g = giveNew(giveCount, slot, 0);
+                equipNew(g);
                 return true;
             }
-            if (count == 0) return true;
+            // Holding a non-primary (pickaxe): re-toss in front (Erbium parity).
+            retoss(count);
+            return true;
         }
+        // Regular give — primary items take the first free slot.
+        bool primary = IsPrimaryQuickbarItem(def);
+        int slot = -1;
+        if (primary) {
+            for (int i = 1; i < 6; ++i) if (!session.slots[(size_t)i]) { slot = i; break; }
+            if (slot < 0) { retoss(count); return true; }
+        }
+        Guid g = giveNew(giveCount, slot, primary ? (uint8_t)0 : (uint8_t)-1);
+        return (g.A | g.B | g.C | g.D) != 0;
     }
 
-    // [F31] Primary-quickbar items (weapons AND consumables/gadgets) take a
-    // hotbar slot; ammo/resources never do (Erbium IsPrimaryQuickbar parity).
-    int slot = -1;
-    bool primary = IsPrimaryQuickbarItem(def);
-    if (primary) {
-        for (int i = 1; i < 6; ++i)
-            if (!session.slots[(size_t)i]) { slot = i; break; }
-    }
-    if (primary && slot < 0) {
-        // [F31] Hotbar full — swap with the held weapon (Erbium GiveOrSwap):
-        // toss the current item out, remove it, then take the new one.
+    // ---- Erbium MaxStack <= 1 branch (unique items: weapons, gadgets) ----
+    if (itemCount >= 5 && IsPrimaryQuickbarItem(def)) {
         void* cur = session.pawn ? Read<void*>(session.pawn, profile::FortPawn_CurrentWeapon) : nullptr;
         void* curDef = (cur && !IsBadPtr(cur)) ? GetObjField(cur, "/Script/FortniteGame.FortWeapon.WeaponData") : nullptr;
         if (cur && curDef && !IsBadPtr(curDef) && IsPrimaryQuickbarItem(curDef)) {
@@ -2624,57 +3098,67 @@ bool Athena::LocalPickup(void* pickup) {
             Guid curGuid = gp ? Read<Guid>(GetField(cur, gp)) : Guid{};
             if (curGuid.A | curGuid.B | curGuid.C | curGuid.D) {
                 int dropCount = 1;
-                { // resolve the live instance for an accurate drop count
-                  void* invProp  = GetProp("/Script/FortniteGame.FortInventory.Inventory");
-                  void* instProp = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
-                  if (invProp && instProp && session.inventory) {
-                      Array arr = Read<Array>(GetField(GetField(session.inventory, invProp), instProp));
-                      for (int i = 0; i < arr.Count; ++i) {
-                          void* cand = Read<void*>(arr.Data, (size_t)i * 8);
-                          if (cand && !IsBadPtr(cand)) {
-                              Guid g = ItemGuidOf(cand);
-                              if (!memcmp(&g, &curGuid, sizeof g)) {
-                                  void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
-                                  if (itemEntryProp) {
-                                      void* cp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
-                                      if (cp) dropCount = std::max(1, Read<int>(GetField(GetField(cand, itemEntryProp), cp)));
-                                  }
-                                  break;
-                              }
-                          }
-                      }
-                  }
+                Array insts = Read<Array>(instArr);
+                for (int i = 0; i < insts.Count; ++i) {
+                    void* cand = Read<void*>(insts.Data, (size_t)i * 8);
+                    if (cand && !IsBadPtr(cand)) {
+                        Guid g = ItemGuidOf(cand);
+                        if (!memcmp(&g, &curGuid, sizeof g)) {
+                            void* ie = GetField(cand, itemEntryProp);
+                            dropCount = std::max(1, Read<int>(GetField(ie, countProp)));
+                            break;
+                        }
+                    }
                 }
-                Vector loc{};
-                if (session.pawn) ActorLocation(session.pawn, loc);
-                SpawnPickup(curDef, dropCount, loc, 1 /*Player*/, 0, true);
+                Vector tossLoc{};
+                if (session.pawn) { ActorLocation(session.pawn, tossLoc); tossLoc.Z += 50.0; }
+                SpawnPickup(curDef, dropCount, tossLoc, 1 /*Player*/, 0, true, level, loadedAmmo);
                 RemoveItemByGuid(curGuid, false);
-                LOG("Pickup swap: dropped %s", ObjName(curDef).c_str());
+                LOG("[Pickup] swap: tossed %s", ObjName(curDef).c_str());
             }
-            for (int i = 1; i < 6; ++i)
-                if (!session.slots[(size_t)i]) { slot = i; break; }
+            int slot = -1;
+            for (int i = 1; i < 6; ++i) if (!session.slots[(size_t)i]) { slot = i; break; }
+            Guid g = giveNew(count, slot, 0);
+            equipNew(g);
+            return true;
         }
-        if (slot < 0) { LOG("Pickup retained: hotbar full"); return true; }
-    }
-    if (!GiveItem(def, count, slot, primary ? 0 : (uint8_t)-1, true, loadedAmmo, level)) {
-        LOG("Pickup retained: duplicate, full stack, or insertion failed (%s)", ObjName(def).c_str());
+        retoss(count);
         return true;
     }
+    bool primary = IsPrimaryQuickbarItem(def);
+    int slot = -1;
+    if (primary) {
+        for (int i = 1; i < 6; ++i) if (!session.slots[(size_t)i]) { slot = i; break; }
+        if (slot < 0) { retoss(count); return true; }
+    }
+    Guid g = giveNew(count, slot, primary ? (uint8_t)0 : (uint8_t)-1);
+    return (g.A | g.B | g.C | g.D) != 0;
+}
+
+// [F35] Immediate pickup (compat path — era commands and direct requests).
+bool Athena::LocalPickup(void* pickup) {
+    if (!pickup || IsBadPtr(pickup)) return false;
+    void* pickupCls = FindObj("/Script/FortniteGame.FortPickup");
+    if (!pickupCls || !IsA(pickup, pickupCls)) return false;
+    Vector location{};
+    if (!ActorLocation(pickup, location) || !NearPlayer(location, 600.0f)) return false;
+    void* entry = PickupEntry(pickup);
+    if (!entry || !EntryDefinition(entry)) return true;
+    if (!InternalPickup(entry, pickup)) return true;
     Call d("/Script/Engine.Actor.K2_DestroyActor");
     if (d.ok()) d.run(pickup);
     InventoryUpdate();
-    LOG("Local pickup transferred %s count=%d slot=%d", ObjName(def).c_str(), count, slot);
     return true;
 }
 
-void Athena::ServerHandlePickup(void* pickup) { LocalPickup(pickup); }
+void Athena::ServerHandlePickup(void* pickup) { HandlePickupRPC(pickup, 0.45f); }
 
-// [F06/F33] SpawnPickup writes the FFortPickup entry (ItemDefinition/Count no
-// longer exist on AFortPickup in 21.30) and tags source flags so the pickup
-// widget/despawn behave like native loot. TossPickup is REFUSED unless its
-// location param actually binds — running it unbound would fly the pickup to
-// the world origin.
-void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, uint8_t spawnSource, bool toss, int level) {
+// [F06/F33/F35] SpawnPickup — Erbium AFortInventory::SpawnPickup 1:1:
+// entry (ItemDefinition/Count/Level/LoadedAmmo), PawnWhoDroppedPickup,
+// source flags, bRandomRotation → OnRep_PrimaryPickupItemEntry → TossPickup
+// (param names probed with fallbacks — Erbium's signature is
+// (FinalLocation, Pawn, MaxStackCount, bToss, bCombine, SourceFlags, Source)).
+void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, uint8_t spawnSource, bool toss, int level, int loadedAmmo) {
     if (!def || !session.world) return;
     void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
     if (!klass) return;
@@ -2686,10 +3170,18 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, 
     void* defProp = GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition");
     void* cntProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
     void* lvlProp = GetProp("/Script/FortniteGame.FortItemEntry.Level");
+    void* ammProp = GetProp("/Script/FortniteGame.FortItemEntry.LoadedAmmo");
     if (entry && defProp) Write<void*>(GetField(entry, defProp), 0, def);
     if (entry && cntProp) Write<int>(GetField(entry, cntProp), 0, count);
     if (entry && lvlProp && level > 0 && Read<int>(lvlProp, profile::PropElementSize) == 4)
         Write<int>(GetField(entry, lvlProp), 0, level);
+    if (entry && ammProp && loadedAmmo > 0 && Read<int>(ammProp, profile::PropElementSize) == 4)
+        Write<int>(GetField(entry, ammProp), 0, loadedAmmo);
+    // [F35] Erbium parity — the overlap pickup gate checks this pawn pointer.
+    {
+        void* pwdProp = GetProp("/Script/FortniteGame.FortPickup.PawnWhoDroppedPickup");
+        if (pwdProp && session.pawn) Write<void*>(GetField(pickup, pwdProp), 0, session.pawn);
+    }
     Write<uint8_t>(pickup, profile::AFortPickup_SourceFlags, sourceFlags);
     Write<uint8_t>(pickup, profile::AFortPickup_SpawnSource, spawnSource);
     SetBool(pickup, "/Script/FortniteGame.FortPickup.bRandomRotation", true);
@@ -2703,13 +3195,15 @@ void Athena::SpawnPickup(void* def, int count, Vector loc, uint8_t sourceFlags, 
         Call c("/Script/FortniteGame.FortPickup.TossPickup");
         if (c.ok()) {
             bool locBound = c.set("FinalLocation", loc) || c.set("TargetLoc", loc) || c.set("InTargetLoc", loc);
-            c.set("ItemOwner", session.pawn) || c.set("InItemOwner", session.pawn);
-            int overrideMax = -1; c.set("OverrideMaxStackCount", overrideMax);
+            // [F35] Erbium param names — Pawn + MaxStackCount(-1).
+            c.set("Pawn", session.pawn) || c.set("ItemOwner", session.pawn) || c.set("InItemOwner", session.pawn);
+            int maxStack = -1;
+            c.set("MaxStackCount", maxStack) || c.set("OverrideMaxStackCount", maxStack);
             bool bToss = true; c.set("bToss", bToss);
             bool combine = true; c.set("bShouldCombinePickupsWhenTossCompletes", combine);
             // EEFortPickupSourceTypeFlag (uint8) / EEFortPickupSpawnSource (uint8)
-            c.set_any((uint8_t)sourceFlags, "InPickupSourceTypeFlags");
-            c.set_any((uint8_t)spawnSource, "InPickupSpawnSource");
+            c.set_any((uint8_t)sourceFlags, "InPickupSourceTypeFlags", "PickupSourceTypeFlags");
+            c.set_any((uint8_t)spawnSource, "InPickupSpawnSource", "PickupSpawnSource");
             if (locBound) c.run(pickup);
             else LOG("[Pickup] TossPickup location unbound — pickup stays in place");
         }
@@ -3354,7 +3848,24 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force) {
                 SetBool(pickup, "/Script/FortniteGame.FortPickup.bRandomRotation", true);   // [F33]
                 Call rep("/Script/FortniteGame.FortPickup.OnRep_PrimaryPickupItemEntry");
                 if (rep.ok()) rep.run(pickup);
-                if (spawnSource == 2 || spawnSource == 4) {   // [F33] container-tossed FX
+                // [F35] Erbium SpawnPickup(Container) parity: without TossPickup
+                // the loot hovers where it spawned (above the chest) and the
+                // pickup overlap never sees it properly — toss it out like the
+                // native chest does (fallback branch of the Erbium container
+                // spawner) and mark the container-toss FX.
+                {
+                    Call tp("/Script/FortniteGame.FortPickup.TossPickup");
+                    if (tp.ok()) {
+                        bool bound = tp.set("FinalLocation", loc) || tp.set("InTargetLoc", loc) || tp.set("TargetLoc", loc);
+                        tp.set("Pawn", session.pawn) || tp.set("ItemOwner", session.pawn);
+                        int maxStack = -1;
+                        tp.set("MaxStackCount", maxStack) || tp.set("OverrideMaxStackCount", maxStack);
+                        bool bToss = true; tp.set("bToss", bToss);
+                        bool combine = true; tp.set("bShouldCombinePickupsWhenTossCompletes", combine);
+                        uint8_t sf = 4; tp.set_any(sf, "InPickupSourceTypeFlags", "PickupSourceTypeFlags");
+                        tp.set_any(spawnSource, "InPickupSpawnSource", "PickupSpawnSource");
+                        if (bound) tp.run(pickup);
+                    }
                     SetBool(pickup, "/Script/FortniteGame.FortPickup.bTossedFromContainer", true);
                     Call r3("/Script/FortniteGame.FortPickup.OnRep_TossedFromContainer");
                     if (r3.ok()) r3.run(pickup);
@@ -3714,17 +4225,273 @@ void Athena::SpawnBuildPreviews() {
 }
 
 // ============================================================================
+// [F39] HARVEST — Erbium ABuildingSMActor::OnDamageServer 1:1. The pickaxe
+// damage on trees/rocks/builds grants the mapped resource directly into the
+// inventory (stack-clamped, overflow re-tossed) and reports it to the HUD.
+// The original damage still applies: pe_hook falls through to the native.
+// ============================================================================
+void Athena::HandleDamageServer(void* actor, void* func, void* params) {
+    if (!actor || !func || !params || !session.controller || !session.inventory) return;
+    if (!IsReadable(actor, 0x60) || !IsReadable(params, 0x20)) return;
+    static void* smCls = nullptr;
+    if (!smCls) smCls = FindObj("/Script/FortniteGame.BuildingSMActor");
+    if (!smCls) return;
+    void* cls = Read<void*>(actor, profile::ObjectClass);
+    if (!cls || !SubclassOfFast(cls, smCls)) return;
+
+    void* instSlot = incoming(func, params, "InstigatedBy", 8);
+    void* causeSlot = incoming(func, params, "DamageCauser", 8);
+    void* dmgSlot  = incoming(func, params, "Damage", 4);
+    if (!instSlot || !causeSlot || !dmgSlot) return;
+    void* inst = Read<void*>(instSlot);
+    void* causer = Read<void*>(causeSlot);
+    float damage = Read<float>(dmgSlot);
+    if (!inst || !causer) return;
+
+    // Erbium gates: bPlayerPlaced pieces and dropped-resource gating.
+    if (GetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayerPlaced")) return;
+    {
+        // Erbium: HasbAllowResourceDrop() && !bAllowResourceDrop → no harvest.
+        void* ardProp = GetProp("/Script/FortniteGame.BuildingSMActor.bAllowResourceDrop");
+        if (ardProp && Read<int>(ardProp, profile::PropElementSize) == 1) {
+            void* f = GetField(actor, ardProp);
+            if (f && !Read<uint8_t>(f)) return;
+        }
+    }
+
+    // Erbium: only the pickaxe (melee WeaponData) harvests.
+    static void* weaponCls = nullptr, *meleeCls = nullptr;
+    if (!weaponCls) weaponCls = FindObj("/Script/FortniteGame.FortWeapon");
+    if (!meleeCls) meleeCls = FindObj("/Script/FortniteGame.FortWeaponMeleeItemDefinition");
+    if (!weaponCls || !meleeCls) return;
+    if (!IsA(causer, weaponCls)) return;
+    void* weaponDef = GetObjField(causer, "/Script/FortniteGame.FortWeapon.WeaponData");
+    if (!weaponDef || IsBadPtr(weaponDef) || !IsA(weaponDef, meleeCls)) return;
+
+    // Resource definition for the actor's ResourceType (Kismet helper).
+    uint8_t resType = 0;
+    {
+        void* rtProp = GetProp("/Script/FortniteGame.BuildingSMActor.ResourceType");
+        if (rtProp && Read<int>(rtProp, profile::PropElementSize) == 1)
+            resType = Read<uint8_t>(GetField(actor, rtProp));
+    }
+    void* resource = nullptr;
+    {
+        Call c("/Script/FortniteGame.FortKismetLibrary.K2_GetResourceItemDefinition");
+        if (c.ok()) {
+            uint8_t t = resType;
+            if (c.set("Type", t) || c.set_at(0, t)) {
+                if (c.run(FindObj("/Script/FortniteGame.Default__FortKismetLibrary")))
+                    resource = c.result<void*>();
+            }
+        }
+    }
+    if (!resource || IsBadPtr(resource)) return;
+    int maxMat = MaxStackSizeOf(resource);
+    if (maxMat <= 0) maxMat = 999;
+
+    // Erbium curve: BuildingResourceAmountOverride row → Out / (MaxHealth / Damage).
+    int resCount = 0;
+    float maxHealth = 0.0f;
+    {
+        void* mhProp = GetProp("/Script/FortniteGame.BuildingActor.MaxHealth");
+        if (!mhProp) mhProp = GetProp("/Script/FortniteGame.BuildingSMActor.MaxHealth");
+        if (mhProp && Read<int>(mhProp, profile::PropElementSize) == 4) {
+            float v = Read<float>(GetField(actor, mhProp));
+            if (v > 1.0f && v < 100000.0f) maxHealth = v;
+        }
+    }
+    {
+        void* broProp = GetProp("/Script/FortniteGame.BuildingSMActor.BuildingResourceAmountOverride");
+        if (broProp) {
+            void* handle = GetField(actor, broProp);
+            void* curveTable = handle ? Read<void*>(handle, 0) : nullptr;
+            FName row = handle ? Read<FName>(handle, 8) : FName{};
+            if (!curveTable || IsBadPtr(curveTable) || !row.CompIdx) {
+                // Class-level override lives on the row table default — try the
+                // shared AthenaResourceRates table with the class's row.
+                curveTable = FindObj("/Game/Athena/Balance/DataTables/AthenaResourceRates.AthenaResourceRates");
+                if (!curveTable) curveTable = LoadAsset("/Game/Athena/Balance/DataTables/AthenaResourceRates.AthenaResourceRates", "/Script/Engine.DataTable");
+            }
+            if (curveTable && !IsBadPtr(curveTable) && row.CompIdx) {
+                Call ev("/Script/Engine.DataTableFunctionLibrary.EvaluateCurveTableRow");
+                if (ev.ok()) {
+                    float t0 = 0.0f;
+                    uint8_t zeroRow[64]{};
+                    bool bound = ev.set("CurveTable", curveTable) && ev.set("RowName", row) && ev.set("InTime", t0);
+                    bound |= ev.set_bytes("OutRow", zeroRow, 8);
+                    if (bound && ev.run(FindObj("/Script/Engine.Default__DataTableFunctionLibrary"))) {
+                        void* slot = ev.param_slot("OutValue");
+                        float out = slot ? Read<float>(slot) : 0.0f;
+                        if (out > 0.0f && damage > 0.0f) {
+                            float denom = maxHealth > 1.0f ? maxHealth : 100.0f;
+                            float rc = out / (denom / damage);
+                            resCount = (int)std::lround(rc);
+                        }
+                    }
+                }
+            }
+        }
+        if (resCount <= 0 && damage > 0.0f) {
+            // No curve row resolved — proportional fallback: 50 resources per
+            // full break of the target (AthenaResourceRates ballpark).
+            float denom = maxHealth > 1.0f ? maxHealth : 100.0f;
+            resCount = (int)std::lround(50.0f * damage / denom);
+        }
+        if (resCount < 0) resCount = 0;
+        if (resCount > 100) resCount = 100;   // single-hit sanity cap
+    }
+    if (resCount <= 0) return;
+
+    // Erbium give: merge into the existing stack, overflow re-tossed.
+    void* invProp   = GetProp("/Script/FortniteGame.FortInventory.Inventory");
+    void* instProp  = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+    void* entryProp = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
+    void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
+    void* countProp = GetProp("/Script/FortniteGame.FortItemEntry.Count");
+    void* defProp   = GetProp("/Script/FortniteGame.FortItemEntry.ItemDefinition");
+    if (invProp && instProp && entryProp && itemEntryProp && countProp && defProp) {
+        void* list = GetField(session.inventory, invProp);
+        Array instances = Read<Array>(GetField(list, instProp));
+        Array replicated = Read<Array>(GetField(list, entryProp));
+        void* foundInst = nullptr;
+        for (int i = 0; i < instances.Count; ++i) {
+            void* cand = Read<void*>(instances.Data, (size_t)i * 8);
+            if (cand && !IsBadPtr(cand) && ItemDefinitionOf(cand) == resource) { foundInst = cand; break; }
+        }
+        if (foundInst) {
+            int stride = Read<int>(entryProp, profile::PropElementSize);
+            for (int j = 0; j < replicated.Count && replicated.Data && stride > 0; ++j) {
+                void* ent = (char*)replicated.Data + (size_t)j * stride;
+                if (Read<void*>(GetField(ent, defProp)) != resource) continue;
+                int updated = Read<int>(GetField(ent, countProp)) + resCount;
+                if (updated > maxMat) {
+                    Vector loc{};
+                    if (session.pawn) ActorLocation(session.pawn, loc);
+                    SpawnPickup(resource, updated - maxMat, loc, 16 /*Tossed*/, 0, true);
+                    updated = maxMat;
+                }
+                Write<int>(GetField(ent, countProp), 0, updated);
+                Write<int>(GetField(GetField(foundInst, itemEntryProp), countProp), 0, updated);
+                InventoryUpdate();
+                LOG("[Harvest] ✅ +%d %s (total %d)", resCount, ObjName(resource).c_str(), updated);
+                break;
+            }
+        } else {
+            int grant = resCount;
+            if (grant > maxMat) {
+                Vector loc{};
+                if (session.pawn) ActorLocation(session.pawn, loc);
+                SpawnPickup(resource, grant - maxMat, loc, 16 /*Tossed*/, 0, true);
+                grant = maxMat;
+            }
+            if (GiveItem(resource, grant, -1, (uint8_t)-1, false))
+                LOG("[Harvest] ✅ new stack +%d %s", grant, ObjName(resource).c_str());
+        }
+    }
+
+    // HUD feedback (Erbium ClientReportDamagedResourceBuilding).
+    {
+        Call rep("/Script/FortniteGame.FortPlayerController.ClientReportDamagedResourceBuilding");
+        if (rep.ok() && session.controller) {
+            bool bound = rep.set_any((uint8_t)resType, "ResourceType", "Type");
+            int rc = resCount; bound |= rep.set("ResCount", rc) || rep.set("Count", rc) || rep.set("ResourceCount", rc);
+            bool destroyed = false; bound |= rep.set("bDestroyed", destroyed) || rep.set("Destroyed", destroyed);
+            bool weak = damage >= 100.0f; bound |= rep.set("bWeakspot", weak) || rep.set("bWeakSpot", weak) || rep.set("bWeakSpotAttack", weak);
+            if (bound) rep.run(session.controller);
+        }
+    }
+    { Call n("/Script/Engine.Actor.ForceNetUpdate"); if (n.ok()) n.run(actor); }
+}
+
+// ============================================================================
+// [F40] MATCH STATE — Erbium GameMode/GameState parity for the HUD:
+// AlivePlayers.Add(PC) + PlayersLeft=1 + OnRep_PlayersLeft so the alive-
+// players counter actually shows a number instead of staying empty.
+// ============================================================================
+void Athena::SetupMatchState() {
+    if (session.match_state_ready || !session.world || !session.controller) return;
+    session.match_state_ready = true;
+    if (session.mode && !IsBadPtr(session.mode)) {
+        void* apProp = GetProp("/Script/FortniteGame.FortGameMode.AlivePlayers");
+        if (!apProp) apProp = GetProp("/Script/FortniteGame.FortGameModeAthena.AlivePlayers");
+        if (apProp) {
+            void* arrField = GetField(session.mode, apProp);
+            Array cur = Read<Array>(arrField);
+            bool known = false;
+            for (int i = 0; i < cur.Count && cur.Data; ++i)
+                if (Read<void*>(cur.Data, (size_t)i * 8) == session.controller) known = true;
+            if (!known && cur.Count >= 0 && cur.Count < 256)
+                Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arrField, apProp, &session.controller);
+            LOG("[MatchState] AlivePlayers count=%d", Read<Array>(arrField).Count);
+        }
+    }
+    if (session.state && !IsBadPtr(session.state)) {
+        void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+        if (plProp && Read<int>(plProp, profile::PropElementSize) == 4) {
+            int cur = Read<int>(GetField(session.state, plProp));
+            if (cur < 1) {
+                Write<int>(GetField(session.state, plProp), 0, 1);
+                Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+                if (n.ok()) n.run(session.state);
+                LOG("[MatchState] PlayersLeft=1 + OnRep (was %d)", cur);
+            }
+        }
+    }
+}
+
+// [F42] Diagnostics dump — quickbar slots, inventory entries, match state.
+void Athena::DebugDump() {
+    LOG("=== era.debug ===");
+    LOG("world=%p pc=%p pawn=%p inv=%p qb=%p pendingPickups=%zu",
+        session.world, session.controller, session.pawn, session.inventory,
+        session.quickbars, session.pending_pickups.size());
+    for (int i = 0; i < 6; ++i)
+        LOG("SLOT %d: %s", i, ObjName(ItemDefinitionOf(session.slots[(size_t)i])).c_str());
+    for (int i = 0; i < 6; ++i)
+        LOG("BUILD %d: %s", i, ObjName(ItemDefinitionOf(session.secondary_slots[(size_t)i])).c_str());
+    if (session.quickbars && !IsBadPtr(session.quickbars)) {
+        void* barProp = GetProp("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar");
+        void* slotsProp = GetProp("/Script/FortniteGame.QuickBar.Slots");
+        if (barProp && slotsProp) {
+            void* barField = GetField(session.quickbars, barProp);
+            Array slots = Read<Array>(GetField(barField, slotsProp));
+            LOG("PrimaryQuickBar slots=%d", slots.Count);
+            for (int i = 0; i < slots.Count && slots.Data && i < 6; ++i) {
+                void* slot = (char*)slots.Data + (size_t)i * profile::QuickBarSlot_SlotSize;
+                Array items = Read<Array>(slot);
+                uint8_t flags = Read<uint8_t>(slot, profile::QuickBarSlot_EnabledOffset);
+                LOG("  slot %d items=%d flags=0x%02X", i, items.Count, flags);
+            }
+        }
+    }
+    if (session.state && !IsBadPtr(session.state)) {
+        void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+        if (plProp) LOG("PlayersLeft=%d", Read<int>(GetField(session.state, plProp)));
+    }
+    LOG("=== end dump ===");
+}
+
+// ============================================================================
 // VEHICLES — [F28] Erbium AFortAthenaVehicleSpawner path (1:1) + seat weapons
 // ============================================================================
 void Athena::SpawnVehicles() {
     if (!session.world || session.vehicles_spawned) return;
     if (!WorldIsStandalone(session.world)) return;
-    session.vehicles_spawned = true;
+    // [F41] The flag is only committed when spawners are actually found —
+    // the map streams its spawners in over time, and the old code marked the
+    // pass done on the first (usually empty) attempt, so cars never came back.
+    ++session.vehicle_attempts;
     void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
     if (!spawnerCls) spawnerCls = LoadClass("/Script/FortniteGame.FortAthenaVehicleSpawner", "/Script/Engine.Actor");
-    if (!spawnerCls) { LOG("[Vehicles] spawner class missing"); return; }
+    if (!spawnerCls) { LOG("[Vehicles] spawner class missing (attempt %d)", session.vehicle_attempts); return; }
     std::vector<void*> spawners;
     if (!GetAllActorsOfClassRaw(spawnerCls, spawners)) { LOG("[Vehicles] spawner enumeration failed"); return; }
+    if (spawners.empty()) {
+        LOG("[Vehicles] no spawners streamed in yet (attempt %d) — will retry", session.vehicle_attempts);
+        return;   // vehicles_spawned stays false → Tick retries
+    }
+    session.vehicles_spawned = true;
     int spawned = 0;
     for (void* spawner : spawners) {
         if (!spawner || IsBadPtr(spawner)) continue;
@@ -4173,25 +4940,72 @@ static void pe_hook(void* obj, void* func, void* params) {
             void* cls = Read<void*>(obj, profile::ObjectClass);
             isInteraction = SubclassOfFast(cls, g_interactionClass);
         }
-        if (isPC || isPawn || isWeapon || isInteraction) {
+
+        // [F37] Container/BuildingSMActor receivers: interaction + harvest
+        // functions are dispatched ON the world actor, not on the controller
+        // (ABuildingContainer::ServerOnAttemptInteract in Erbium v3,
+        // ABuildingSMActor::OnDamageServer) — the old filter dropped them.
+        bool isWorldTarget = false;
+        static void* s_bcCls = nullptr, *s_smCls = nullptr;
+        if (obj && !isPC && !isPawn && !isWeapon && !isInteraction &&
+            (fn == "ServerOnAttemptInteract" || fn == "OnDamageServer")) {
+            void* cls = Read<void*>(obj, profile::ObjectClass);
+            if (!s_bcCls) s_bcCls = FindObj("/Script/FortniteGame.BuildingContainer");
+            if (!s_smCls) s_smCls = FindObj("/Script/FortniteGame.BuildingSMActor");
+            if ((s_bcCls && SubclassOfFast(cls, s_bcCls)) || (s_smCls && SubclassOfFast(cls, s_smCls)))
+                isWorldTarget = true;
+        }
+
+        if (isPC || isPawn || isWeapon || isInteraction || isWorldTarget) {
             Guard g;
             if (fn == "ServerExecuteInventoryItem") {
                 if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid))
                     Athena::OnServerExecuteInventoryItem(Read<Guid>(params));
             }
             else if (fn == "ServerExecuteInventoryWeapon") Athena::OnServerExecuteInventoryWeapon(Read<void*>(params));
-            // [F06] ServerHandlePickup(PickUp, InFlyTime, InStartDirection,
-            // bPlayPickupSound) and ServerHandlePickupInfo(PickUp, Info) —
-            // the pickup pointer is the first parameter in both.
-            else if ((fn == "ServerHandlePickupInfo" || fn == "ServerHandlePickup") && isPawn) {
+            // [F35] ServerHandlePickup(PickUp, InFlyTime, InStartDirection,
+            // bPlayPickupSound) / ServerHandlePickupInfo(Pickup, Info) /
+            // ServerHandlePickupWithRequestedSwap — the fly-to-player flow is
+            // FULLY replaced (Erbium SetPickupTarget + scheduled InternalPickup);
+            // the native server-side half does not exist in this build, which
+            // is why loot vanished instead of being picked up. The OG call is
+            // therefore SKIPPED for pickup RPCs.
+            else if ((fn == "ServerHandlePickupInfo" || fn == "ServerHandlePickup" ||
+                      fn == "ServerHandlePickupWithRequestedSwap") && isPawn && params) {
                 void* arg = incoming(func, params, "PickUp", 8);
                 if (!arg) arg = incoming(func, params, "Pickup", 8);
                 if (!arg) arg = params;   // PickUp is the first parameter
-                if (arg) Athena::ServerHandlePickup(Read<void*>(arg));
+                float flyTime = 0.45f;
+                { void* ft = incoming(func, params, "InFlyTime", 4);
+                  if (ft) flyTime = Read<float>(ft);
+                  else if ((ft = incoming(func, params, "FlyTime", 4))) flyTime = Read<float>(ft); }
+                Athena::HandlePickupRPC(Read<void*>(arg), flyTime);
+                return;   // native flow replaced — no OG
             }
-            else if ((fn == "ServerAttemptInteract" || fn == "ServerOnAttemptInteract") && params && (isInteraction || isPC)) {
+            // [F35] Erbium OnCapsuleBeginOverlap parity: the pawn's capsule is
+            // what triggers pickup on a live server; in standalone the native
+            // client pawn never requests the pickup, so detect it here.
+            else if (fn == "OnCapsuleBeginOverlap" && isPawn && params) {
+                void* otherSlot = incoming(func, params, "OtherActor", 8);
+                if (!otherSlot) otherSlot = incoming(func, params, "OtherActor", 0);
+                if (otherSlot) {
+                    void* other = Read<void*>(otherSlot);
+                    if (other && !IsBadPtr(other) && IsReadable(other, 0x40)) {
+                        static void* pickCls = nullptr;
+                        if (!pickCls) pickCls = FindObj("/Script/FortniteGame.FortPickupAthena");
+                        if (!pickCls) pickCls = FindObj("/Script/FortniteGame.FortPickup");
+                        if (pickCls && IsA(other, pickCls))
+                            Athena::HandlePickupRPC(other, 0.45f);
+                    }
+                }
+            }
+            // [F37] Interaction — receivers: interaction component, PC, and
+            // (v3 Erbium parity) the container itself via ServerOnAttemptInteract.
+            else if ((fn == "ServerAttemptInteract" || fn == "ServerOnAttemptInteract") && params && (isInteraction || isPC || isWorldTarget)) {
                 void* target = Read<void*>(params, 0);
-                if (target && !IsBadPtr(target)) {
+                // ServerOnAttemptInteract dispatched on the container: obj IS the target.
+                if ((!target || IsBadPtr(target)) && isWorldTarget) target = obj;
+                if (target && !IsBadPtr(target) && IsReadable(target, 0x60)) {
                     void* bcCls   = FindObj("/Script/FortniteGame.BuildingContainer");
                     void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
                     void* actorCls = FindObj("/Script/FortniteGame.BuildingActor");
@@ -4206,11 +5020,27 @@ static void pe_hook(void* obj, void* func, void* params) {
                     }
                 }
             }
+            // [F39] Harvest resources on pickaxe damage (Erbium OnDamageServer).
+            else if (fn == "OnDamageServer" && isWorldTarget) {
+                Athena::HandleDamageServer(obj, func, params);
+            }
             else if (fn == "ServerAttemptAircraftJump" && !session.aircraft_jumped) Athena::HandleJumpFromHudStart();
-            else if (fn == "ServerCreateBuildingActor" && params && isPC) Athena::OnServerCreateBuildingActor(params);
-            // [F21] Local preview build for any ServerCreateBuilding variant.
-            else if (fn.rfind("ServerCreateBuilding", 0) == 0 && params && isPC) { if (!Athena::LocalBuild()) Athena::OnServerCreateBuildingActor(params); }
-            else if (fn == "ServerBeginEditingBuildingActor" && params) Athena::OnBeginEditActor(Read<void*>(params, 0));
+            // [F38] Building RPCs are FULLY replaced (Erbium ServerCreate-
+            // BuildingActor path). The native implementation is skipped: in
+            // standalone its BuildingClassMap is empty and the exit-build-mode
+            // payload crashes it — the crash the user saw when leaving build mode.
+            else if (fn == "ServerCreateBuildingActor" && params && isPC) {
+                Athena::OnServerCreateBuildingActor(params);
+                return;   // native path replaced — no OG
+            }
+            else if (fn.rfind("ServerCreateBuilding", 0) == 0 && params && isPC) {
+                Athena::LocalBuild();
+                return;   // native path replaced — no OG
+            }
+            else if (fn == "ServerBeginEditingBuildingActor" && params) {
+                void* piece = Read<void*>(params, 0);
+                if (piece && !IsBadPtr(piece) && IsReadable(piece, 0x40)) Athena::OnBeginEditActor(piece);
+            }
             else if (fn == "ServerEditBuildingActor" && params) {
                 // [F08] Named extraction: BuildingActorToEdit(ptr),
                 // NewBuildingClass(ptr), RotationIterations(u8), bMirrored(bool).
@@ -4373,7 +5203,21 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
         } else if (normalized == "era.vehicles" && session.world) {
             // [F28] manual re-run of the vehicle spawner pass
             session.vehicles_spawned = false;
+            session.vehicle_attempts = 0;
             Athena::SpawnVehicles();
+        } else if (normalized == "era.debug") {
+            Athena::DebugDump();   // [F42] quickbars/inventory/match-state dump
+        } else if (normalized == "era.fix" && session.world && session.finalized) {
+            // [F42] re-run every world-side fix pass (loot, cars, match HUD)
+            Athena::ResetStaleContainers();
+            Athena::SpawnFloorLoot();
+            session.vehicles_spawned = false;
+            session.vehicle_attempts = 0;
+            Athena::SpawnVehicles();
+            Athena::SetupMatchState();
+            Athena::InventoryUpdate();
+            Athena::ForceUpdateQuickBars();
+            LOG("era.fix: all passes re-run");
         } else if (normalized == "era.loot" && session.world && session.pawn) {
             // [F32] roll every unsearched container within 30 m (diagnostic aid)
             void* cls = FindObj("/Script/FortniteGame.BuildingContainer");
@@ -4405,7 +5249,7 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                     } else LOG("era.spawn: nothing found at %s", path);
                 }
             }
-        } else LOG("Commands: era.status | era.inventory | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles | era.loot | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
+        } else LOG("Commands: era.status | era.inventory | era.debug | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles | era.loot | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
