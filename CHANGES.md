@@ -924,3 +924,17 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 2. `[QB] already filled` عند إعادة الدخول (dedupe يعمل)
 3. `[Body] ✅ locomotion online` + `[World] ✅ N world abilities delivered` — **الجري/الانزلاق حيّان**
 4. `[QB] ⚠️ offset drift` غائب (أو حاضر فيحسم 0/0 فورًا)
+
+---
+
+## F84 — إصلاح التفاعل مع الصناديق (INT-1) — Erbium local_interact parity
+
+| # | التغيير | السبب (مقارنة game.cpp المرجعي سطر 917-929) |
+|---|---|---|
+| F84-a | **تحديد الهدف بالاسم المُعرّف**: `incoming(func, params, "ReceivingActor", 8)` أولاً ثم fallback إلى القراءة الخام `params+0` | المرجع يقرأ `ReceivingActor` بالاسم؛ القراءة الخام عند offset 0 تُرجع garbage إذا تغيّر ترتيب البارامترات المطبوخة — هذا سبب صمت التفاعل |
+| F84-b | **بوابة IsA Actor**: الهدف يجب أن يكون `/Script/Engine.Actor` فعلاً | المرجع يفحص `isa(actor, Actor)` — يمنع dispatch على مؤشرات وحشية من slot قديم |
+| F84-c | **بوابة مسافة 600uu**: `NearPlayer(tloc, 600)` | المرجع `near_player(location, 600)` — يرفض أهدافاً بعيدة/فاسدة، والأهداف غير القابلة للتحديد الموقعي تمر كما في السابق |
+
+## المتوقع في اللوق القادم (سلاسل التفاعل)
+- `[Interact] target=... class=BuildingContainer` عند فتح صندوق → `[Loot] Opening ...` → spawn pickups
+- `[Interact] F84 far/non-actor target rejected` لو وصل هدف فاسد — يعني بوابة F84 تعمل

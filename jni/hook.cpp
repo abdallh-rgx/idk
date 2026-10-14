@@ -5541,10 +5541,31 @@ static void pe_hook(void* obj, void* func, void* params) {
             // [F37] Interaction — receivers: interaction component, PC, and
             // (v3 Erbium parity) the container itself via ServerOnAttemptInteract.
             else if ((fn == "ServerAttemptInteract" || fn == "ServerOnAttemptInteract") && params && (isInteraction || isPC || isWorldTarget)) {
-                void* target = Read<void*>(params, 0);
+                // [F84] Named-param target resolution (Erbium local_interact
+                // parity): ServerAttemptInteract carries ReceivingActor as a
+                // NAMED 8-byte property; a raw offset-0 read returns garbage
+                // whenever the cooked param layout shifts — the silent
+                // dead-interact symptom. Named lookup first, raw fallback
+                // second, container-self third.
+                void* slot = incoming(func, params, "ReceivingActor", 8);
+                void* target = slot ? Read<void*>(slot) : nullptr;
+                if (!target || IsBadPtr(target)) target = Read<void*>(params, 0);
                 // ServerOnAttemptInteract dispatched on the container: obj IS the target.
                 if ((!target || IsBadPtr(target)) && isWorldTarget) target = obj;
                 if (target && !IsBadPtr(target) && IsReadable(target, 0x60)) {
+                    // [F84] Erbium gates (local_interact): the target must be
+                    // a real Actor within 600 uu of the pawn — wild pointers
+                    // from a stale param slot are rejected instead of being
+                    // dispatched into (crash/poison source). Un-locatable
+                    // targets still dispatch to preserve the old paths.
+                    static void* s_engineActorCls = nullptr;
+                    if (!s_engineActorCls) s_engineActorCls = FindObj("/Script/Engine.Actor");
+                    Vector tloc{};
+                    if (s_engineActorCls && !IsA(target, s_engineActorCls)) {
+                        LOG("[Interact] F84 non-actor target rejected");
+                    } else if (ActorLocation(target, tloc) && !NearPlayer(tloc, 600.0f)) {
+                        LOG("[Interact] F84 far target rejected (%.0f,%.0f,%.0f)", tloc.X, tloc.Y, tloc.Z);
+                    } else {
                     void* bcCls   = FindObj("/Script/FortniteGame.BuildingContainer");
                     void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
                     void* actorCls = FindObj("/Script/FortniteGame.BuildingActor");
@@ -5556,6 +5577,7 @@ static void pe_hook(void* obj, void* func, void* params) {
                         // [F16] generic building interaction via BP override.
                         Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", target);
                         if (interact.ok() && interact.set("InteractingPawn", session.pawn)) interact.run(target);
+                    }
                     }
                 }
             }
