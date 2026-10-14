@@ -287,6 +287,7 @@ constexpr unsigned  QuickBarSlot_EnabledOffset   = 0x10;    // FQuickBarSlot.bEn
 constexpr unsigned  QuickBarSlot_EnabledBit      = 0x01;
 constexpr unsigned  QuickBarSlot_OccupiedBit     = 0x08;    // bIsOccupied (bit3, same byte)
 constexpr unsigned  QuickBarSlot_SlotSize        = 0x28;
+constexpr uintptr_t QuickBarResize               = 0x056925E0;  // [F81] engine quickbar slot resize+init (verified: ResizeGrow + per-slot init flags=0x03/prev=-1)
 constexpr unsigned  Controller_ClientQuickBars   = 0x1a60;
 constexpr unsigned  Controller_QuickBarReadyByte = 0x1a68;
 constexpr uintptr_t GetItemInQuickbarSlot_Gate   = 0x06673524;
@@ -1456,75 +1457,96 @@ void Athena::BuildQuickBarsManually() {
     void* slotsProp = GetProp("/Script/FortniteGame.QuickBar.Slots");   // [F02] struct name is QuickBar
     if (!barProp || !secProp || !slotsProp) { LOG("[QB] QuickBar reflection missing"); return; }
 
-    auto ensure_slots = [&](void* bar, int want) -> Array {
+    // [F81] Grow slot arrays through the ENGINE'S OWN quickbar resize helper
+    // (0x56925E0, verified in the binary: ResizeGrow + per-slot init with
+    // flags=(old&0xF0)|0x03 and prev=-1). The old raw Realloc+memset left
+    // flags=0 and prev=0 — state the native writer never produces.
+    auto ensure_slots = [&](void* bar, int want, uint8_t barId) -> Array {
         void* slotsField = (char*)bar + profile::QuickBar_SlotsOffset;
         Array arr = Read<Array>(slotsField);
         if (arr.Count < want) {
-            // [F36] UE-allocator growth — a malloc'ed array replaced here would
-            // corrupt the heap the first time engine code reallocs it.
-            int oldBytes = arr.Count > 0 ? profile::QuickBarSlot_SlotSize * arr.Count : 0;
-            int newBytes = profile::QuickBarSlot_SlotSize * want;
-            // [F43] CRASH FIX: FMemory::Realloc takes (ptr, size, alignment).
-            // The old 2-arg call left the alignment register holding garbage,
-            // which crashed inside the allocator the moment the slot arrays
-            // were grown — the exact "Collected 6 item GUIDs" crash.
-            void* newData = Fn<void*(*)(void*, size_t, uint32_t)>(profile::Realloc)(
-                arr.Count > 0 ? arr.Data : nullptr, (size_t)newBytes, 0u);
-            if (!newData) LOG("[QB] ⚠️ slot growth failed (want=%d)", want);
-            if (newData) {
+            LOG("[QB] grow bar%u: Data=%p Count=%d Max=%d want=%d", barId, arr.Data, arr.Count, arr.Max, want);
+            { Guard g; Fn<void(*)(void*, int32, int32)>(profile::QuickBarResize)(slotsField, want, 1); }
+            arr = Read<Array>(slotsField);
+            LOG("[QB] grow bar%u readback: Data=%p Count=%d Max=%d", barId, arr.Data, arr.Count, arr.Max);
+            if (arr.Count < want || !arr.Data) {
+                // [F36] fallback: UE-allocator growth (FMemory::Realloc 3-arg).
+                LOG("[QB] ⚠️ native grow short — manual fallback bar%u", barId);
+                int oldBytes = arr.Count > 0 ? profile::QuickBarSlot_SlotSize * arr.Count : 0;
+                int newBytes = profile::QuickBarSlot_SlotSize * want;
+                void* newData = Fn<void*(*)(void*, size_t, uint32_t)>(profile::Realloc)(
+                    arr.Count > 0 ? arr.Data : nullptr, (size_t)newBytes, 0u);
+                if (!newData) { LOG("[QB] ⚠️ slot growth failed (want=%d)", want); return arr; }
                 if (oldBytes > 0 && oldBytes < newBytes)
                     memset((char*)newData + oldBytes, 0, newBytes - oldBytes);
                 Write<void*>(slotsField, 0, newData);
                 Write<int32>(slotsField, 8, want);
                 Write<int32>(slotsField, 12, want);
                 arr = Read<Array>(slotsField);
-                LOG("[QB] Reallocated %d slots at %p", want, newData);
+                LOG("[QB] manual grow bar%u readback: Data=%p Count=%d", barId, arr.Data, arr.Count);
             }
         }
         return arr;
     };
 
-    Array primArr = ensure_slots(GetField(session.quickbars, barProp), 6);
-    Array secArr  = ensure_slots(GetField(session.quickbars, secProp), 5);
+    Array primArr = ensure_slots(GetField(session.quickbars, barProp), 6, 0);
+    Array secArr  = ensure_slots(GetField(session.quickbars, secProp), 5, 1);
     // [F43] all 21.30 quickbars: Primary(6) + Secondary(5) + Creative(6).
     {
         void* creatProp = GetProp("/Script/FortniteGame.FortQuickBars.CreativeQuickBar");
         if (creatProp) {
-            Array c = ensure_slots(GetField(session.quickbars, creatProp), 6);
-            LOG("[QB] Creative bar slots=%d", c.Count);
+            Array c = ensure_slots(GetField(session.quickbars, creatProp), 6, 2);
+            LOG("[QB] Creative bar slots=%d (Data=%p)", c.Count, c.Data);
         }
     }
 
+    // [F81] every path is now logged with readbacks — if anything still dies,
+    // the LAST "[QB] bind" line names the exact bar/slot/step.
     for (auto& e : entries) {
         Array& arr = e.bar == 0 ? primArr : secArr;
-        if (e.idx < 0 || e.idx >= arr.Count || !arr.Data) continue;
+        if (e.idx < 0 || e.idx >= arr.Count || !arr.Data) {
+            LOG("[QB] SKIP bar%u slot%d (Count=%d Data=%p)", e.bar, e.idx, arr.Count, arr.Data);
+            continue;
+        }
         void* slot = (char*)arr.Data + (size_t)e.idx * profile::QuickBarSlot_SlotSize;
         // Items array (TArray<FGuid>) at slot+0x00 — grown through the UE
         // allocator via GenericArrayAdd so native code can keep mutating it.
         void* itemsField = (char*)slot + profile::QuickBarSlot_ItemsOffset;
         Array values = Read<Array>(itemsField);
+        LOG("[QB] bind bar%u slot%d: slot=%p items=%p count=%d max=%d",
+            e.bar, e.idx, slot, values.Data, values.Count, values.Max);
         bool present = false;
         for (int i = 0; i < values.Count; ++i)
             if (!memcmp((char*)values.Data + (size_t)i * sizeof(Guid), &e.guid, sizeof(Guid))) { present = true; break; }
         if (!present) {
             auto add = Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd);
-            if (add(itemsField, GetProp("/Script/FortniteGame.QuickBarSlot.Items"), &e.guid) < 0) continue;
+            int rc = add(itemsField, GetProp("/Script/FortniteGame.QuickBarSlot.Items"), &e.guid);
+            Array after = Read<Array>(itemsField);
+            LOG("[QB] add rc=%d → items=%p count=%d", rc, after.Data, after.Count);
+            if (after.Count < 1 || IsBadPtr(after.Data)) { LOG("[QB] ⚠️ add failed bar%u slot%d — skip", e.bar, e.idx); continue; }
         }
-        // [F01] bEnabled bit0 + bIsOccupied bit3 on the flags byte at +0x10
+        // [F81] native-writer parity: prev slot index = -1, flags keep the
+        // high nibble and set Enabled|Dirty|Occupied (native init writes 0x03;
+        // occupied marks the slot as holding an item for the HUD).
+        Write<int32>(slot, 0x14, -1);
         uint8_t* flags = (uint8_t*)((char*)slot + profile::QuickBarSlot_EnabledOffset);
-        *flags |= profile::QuickBarSlot_EnabledBit | profile::QuickBarSlot_OccupiedBit;
-        LOG("[QB] Bar%u slot %d -> GUID %08X:%08X", e.bar, e.idx, e.guid.A, e.guid.B);
+        *flags = (uint8_t)((*flags & 0xF0) | profile::QuickBarSlot_EnabledBit |
+                           profile::QuickBarSlot_OccupiedBit | 0x02);
+        LOG("[QB] Bar%u slot %d -> GUID %08X:%08X ✅", e.bar, e.idx, e.guid.A, e.guid.B);
     }
 
     // [F43] Push the refreshed bars into the UI layer (Erbium calls the
     // OnRep_* pair after manual slot writes; both degrade silently when the
     // UFunctions are absent on this build).
     {
+        LOG("[QB] OnRep Primary...");
         Call r1("/Script/FortniteGame.FortQuickBars.OnRep_PrimaryQuickBar");
         if (r1.ok()) r1.run(session.quickbars);
+        LOG("[QB] OnRep Secondary...");
         Call r2("/Script/FortniteGame.FortQuickBars.OnRep_SecondaryQuickBar");
         if (r2.ok()) r2.run(session.quickbars);
     }
+    LOG("[QB] ClientForceUpdateQuickbar...");
     ForceUpdateQuickBars();
     session.quickbars_initialized = true;
     LOG("[QB] ✅ Manual initialization done");
