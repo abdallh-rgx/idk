@@ -296,6 +296,7 @@ constexpr unsigned  Controller_ClientQuickBars   = 0x1a60;
 constexpr unsigned  Controller_QuickBarReadyByte = 0x1a68;
 constexpr uintptr_t GetItemInQuickbarSlot_Gate   = 0x06673524;
 constexpr unsigned  QuickBars_VtableSlot_GetItemInSlot = 0x6f0;
+constexpr unsigned  QuickBars_CtxOwner           = 0x138;   // [F94] ctx the native init IsA-casts (0x56607ec: null/fail-cast → silent ret)
 
 // ⭐ Local building / reticle / touch (AFortPlayerController, verified)
 constexpr unsigned Controller_CurrentBuildableClass = 0x1898;
@@ -1594,13 +1595,13 @@ void Athena::InitializeQuickBarsNative() {
         // the item provider); this just names the real owner for the log.
         void* psCtx = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
         if (psCtx && !IsBadPtr(psCtx)) {
-            Write<void*>((char*)session.quickbars + 0x138, 0, psCtx);
+            Write<void*>((char*)session.quickbars + profile::QuickBars_CtxOwner, 0, psCtx);
             { Guard g; reinterpret_cast<void(*)(void*, void*)>(init_slot)(session.quickbars, session.controller); }
             Array p2 = Read<Array>(primary, profile::QuickBar_SlotsOffset);
             Array s2 = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
             LOG("[QB] ctx=PlayerState retry: P=%d S=%d%s", p2.Count, s2.Count,
                 (p2.Count >= 1 && s2.Count >= 1) ? " — native owner IS the PlayerState" : "");
-            Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
+            Write<void*>((char*)session.quickbars + profile::QuickBars_CtxOwner, 0, session.controller);
         } else LOG("[QB] [F92] no PlayerState for ctx retry");
     }
 }
@@ -2806,7 +2807,7 @@ void Athena::Tick() {
         }
         LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d",
             (int)session.quickbars_initialized,
-            (qbLink == session.quickbars ? "ok" : "BAD"),
+            (qbLink == session.quickbars ? (session.quickbars ? "ok" : "n/a") : "BAD"),
             (unsigned)hbGate, hbP, hbS,
             local_loot::TableCount(),
             (int)session.vehicles_spawned,
@@ -2815,6 +2816,9 @@ void Athena::Tick() {
             (int)session.body_fixed,
             (int)session.world_abilities_granted);
     }
+    // [F94-a] reviewer note (1): state can change after FinalizePlayer — the
+    // internal 60s rate-limit makes this call free next to the heartbeat.
+    VerifyHUDReadPath();
     if (session.finalized && session.pawn && now - lastAbilityCheck > 10.0) {
         lastAbilityCheck = now;
         if (!session.abilities_granted) { GrantAllAbilitySets(); RefreshHUD(); }
@@ -3132,7 +3136,7 @@ void Athena::InitializeInventory() {
             }
         }
         if (session.quickbars) {
-            Write<void*>((char*)session.quickbars + 0x138, 0, session.controller);
+            Write<void*>((char*)session.quickbars + profile::QuickBars_CtxOwner, 0, session.controller);
             Call soQB("/Script/FortniteGame.FortQuickBars.SetOwner");
             if (soQB.ok() && (soQB.set("NewOwner", session.controller) || soQB.set_at(0, session.controller))) soQB.run(session.quickbars);
             // [F43] Erbium binds the controller's QuickBars pointer (the
