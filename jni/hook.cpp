@@ -2633,9 +2633,14 @@ void Athena::FinalizePlayer() {
         ActivateQuickBarSlot(0, 0);
     }
     if (!session.ready_called) {
-        Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch"); if (srt.ok()) srt.run(pc);
+        // [F89] commit only when the readiness RPC actually dispatched —
+        // an unconditional commit here froze failed readiness forever
+        // (same one-shot-commit family as F85/F88); the loading-screen
+        // drop path retries until it lands.
+        Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
+        bool srtOk = srt.ok() && srt.run(pc);
         Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned"); if (cps.ok()) cps.run(pc);
-        session.ready_called = true;
+        if (srtOk) session.ready_called = true;
     }
     Call restart("/Script/Engine.PlayerController.ClientRestart");
     if (restart.ok() && restart.set("NewPawn", pawn)) restart.run(pc);
@@ -2754,9 +2759,11 @@ void Athena::DropLoadingScreen() {
         Call a("/Script/FortniteGame.FortGameStateAthena.OnRep_CurrentPlaylistInfo"); if (a.ok()) a.run(session.state);
     }
     if (!session.ready_called) {
-        Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch"); if (srt.ok()) srt.run(session.controller);
+        // [F89] same conditional commit — see FinalizePlayer site
+        Call srt("/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
+        bool srtOk = srt.ok() && srt.run(session.controller);
         Call cps("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnSpawned"); if (cps.ok()) cps.run(session.controller);
-        session.ready_called = true;
+        if (srtOk) session.ready_called = true;
     }
     LOG("Loading screen dropped");
 }

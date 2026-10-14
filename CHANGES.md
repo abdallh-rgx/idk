@@ -970,3 +970,16 @@ if (... std::floor(VersionInfo.FortniteVersion) != 20 && != 21 && != 22)
 
 ## المتوقع في اللوق
 - `[MatchState] AlivePlayers count=1` + `[MatchState] PlayersLeft=1 + OnRep` + `[MatchState] ✅ ready`
+
+## F89 — تدقيق أعلام one-shot: إصلاح ready_called (نتيجة تدقيق F88)
+
+| العلم | الحكم | الإجراء |
+|---|---|---|
+| vehicles_spawned | خاطئ (F85) | مُصلح |
+| match_state_ready | خاطئ (F88) | مُصلح |
+| ready_called | **خاطئ** — كان يُثبَّت حتى لو فشل dispatch الـ RPC | **F89**: يُثبَّت فقط عند نجاح ServerReadyToStartMatch الفعلي (srt.ok() && run) — مسار إسقاط شاشة التحميل يعيد المحاولة |
+| cosmetics_with_state | آمن | يُثبَّت بعد النجاح الفعلي + إعادة محاولة عند false |
+| abilities_granted / tactical_sprint_setup / movement_enabled / quickbars_initialized | آمنة | لها حرّاس إعادة محاولة في Tick |
+
+## المتوقع في اللوق
+- لا سلوك جديد مرئي إن كان RPC الجاهزية يعمل؛ لو كان غائباً: لا مزيد تثبيت فاشل صامت
