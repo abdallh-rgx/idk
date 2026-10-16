@@ -1,0 +1,593 @@
+name: Agent Ops Pro
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */5 * * *"
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: agent-ops
+  cancel-in-progress: true
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip file ripgrep python3
+          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+
+      - name: Write server
+        shell: bash
+        run: |
+          cat > /tmp/server.js <<'SERVER_EOF'
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const PORT = Number(process.env.PORT || 3040);
+const GH_TOKEN = process.env.GH_TOKEN || "";
+const GH_REPO = process.env.GH_REPO || "abdallh-rgx/idk";
+const GH_BRANCH = process.env.GH_BRANCH || "main";
+const WORKSPACE = path.resolve(process.env.WORKSPACE || "/tmp/agent-ops-workspace");
+const HTML_FILE = path.resolve(process.env.HTML_FILE || "./index.html");
+const CHAT_FILE = process.env.CHAT_FILE || "chat.json";
+const MAX_BODY = 128 * 1024;
+const messages = [];
+const proposals = new Map();
+const rate = new Map();
+const improvementRequests = new Map();
+let chatSha = null;
+let saveTimer = null;
+let saveInFlight = null;
+
+fs.mkdirSync(WORKSPACE, { recursive: true });
+
+function send(res, status, data, type = "application/json; charset=utf-8") {
+  res.writeHead(status, {
+    "content-type": type,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  });
+  res.end(type.startsWith("application/json") ? JSON.stringify(data) : data);
+}
+
+async function body(req) {
+  let s = "";
+  for await (const c of req) {
+    s += c;
+    if (s.length > MAX_BODY) throw Error("Request too large");
+  }
+  return s ? JSON.parse(s) : {};
+}
+
+function limited(req, res) {
+  const ip = req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const a = (rate.get(ip) || []).filter((t) => now - t < 60000);
+  if (a.length >= 120) { send(res, 429, { error: "Rate limit exceeded" }); return true; }
+  a.push(now); rate.set(ip, a); return false;
+}
+
+async function gh(endpoint, opts = {}) {
+  if (!GH_TOKEN) throw Error("GH_TOKEN is not configured");
+  const r = await fetch(`https://api.github.com/repos/${GH_REPO}${endpoint}`, {
+    ...opts,
+    headers: {
+      authorization: `Bearer ${GH_TOKEN}`,
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "content-type": "application/json",
+      ...(opts.headers || {}),
+    },
+  });
+  const t = await r.text();
+  let j;
+  try { j = JSON.parse(t); } catch { j = { message: t }; }
+  if (!r.ok) {
+    const err = new Error(j.message || `GitHub API ${r.status}`);
+    err.status = r.status;
+    err.body = j;
+    throw err;
+  }
+  return j;
+}
+
+async function loadChat() {
+  try {
+    const r = await gh(`/contents/${CHAT_FILE}?ref=${GH_BRANCH}`);
+    chatSha = r.sha;
+    const decoded = Buffer.from(r.content, "base64").toString("utf8");
+    const data = JSON.parse(decoded);
+    if (Array.isArray(data.messages)) {
+      messages.length = 0;
+      messages.push(...data.messages.slice(-1000));
+    }
+    proposals.clear();
+    if (Array.isArray(data.proposals)) {
+      for (const p of data.proposals) {
+        if (p && typeof p.id === "string") proposals.set(p.id, p);
+      }
+    }
+    console.log(`chat.json loaded: ${messages.length} messages, ${proposals.size} proposals`);
+  } catch (e) {
+    if (e.status === 404) {
+      console.log("chat.json not found in repo; starting fresh");
+      chatSha = null;
+    } else {
+      console.error("loadChat failed:", e.message);
+    }
+  }
+}
+
+async function persistChat(reason) {
+  if (!GH_TOKEN) return;
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      messages: messages.slice(-1000),
+      proposals: [...proposals.values()],
+    };
+    const content = Buffer.from(JSON.stringify(payload, null, 2) + "\n").toString("base64");
+    const req = {
+      message: `chat: ${reason} [skip ci]`,
+      content,
+      branch: GH_BRANCH,
+    };
+    if (chatSha) req.sha = chatSha;
+    const r = await gh(`/contents/${CHAT_FILE}`, { method: "PUT", body: JSON.stringify(req) });
+    chatSha = r.content?.sha || chatSha;
+    console.log(`chat.json saved (${reason})`);
+  } catch (e) {
+    if (e.status === 409) {
+      try {
+        const cur = await gh(`/contents/${CHAT_FILE}?ref=${GH_BRANCH}`);
+        chatSha = cur.sha;
+        const req = {
+          message: `chat: ${reason} [skip ci]`,
+          content: Buffer.from(JSON.stringify({
+            updatedAt: new Date().toISOString(),
+            messages: messages.slice(-1000),
+            proposals: [...proposals.values()],
+          }, null, 2) + "\n").toString("base64"),
+          branch: GH_BRANCH,
+          sha: chatSha,
+        };
+        const r = await gh(`/contents/${CHAT_FILE}`, { method: "PUT", body: JSON.stringify(req) });
+        chatSha = r.content?.sha || chatSha;
+        console.log(`chat.json saved after conflict retry (${reason})`);
+        return;
+      } catch (e2) {
+        console.error("persistChat retry failed:", e2.message);
+        return;
+      }
+    }
+    console.error("persistChat failed:", e.message);
+  }
+}
+
+function scheduleSave(reason) {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    if (saveInFlight) { try { await saveInFlight; } catch {} }
+    saveInFlight = persistChat(reason).finally(() => { saveInFlight = null; });
+    await saveInFlight;
+  }, 2500);
+}
+
+function safePath(rel) {
+  if (typeof rel !== "string" || !rel || rel.includes("\0")) throw Error("Invalid path");
+  const full = path.resolve(WORKSPACE, rel);
+  if (full !== WORKSPACE && !full.startsWith(WORKSPACE + path.sep)) throw Error("Path escapes workspace");
+  return full;
+}
+
+async function listFiles(rel = ".") {
+  const dir = safePath(rel);
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  return Promise.all(entries.slice(0, 500).map(async (e) => {
+    const p = path.join(dir, e.name);
+    const s = await fs.promises.stat(p);
+    return {
+      name: e.name,
+      path: path.relative(WORKSPACE, p),
+      type: e.isDirectory() ? "dir" : "file",
+      size: s.size,
+    };
+  }));
+}
+
+const scripts = {
+  inventory: async () => {
+    const out = [];
+    async function walk(d, depth = 0) {
+      if (depth > 8 || out.length > 5000) return;
+      for (const e of await fs.promises.readdir(d, { withFileTypes: true })) {
+        if ([".git", "node_modules"].includes(e.name)) continue;
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) await walk(p, depth + 1);
+        else { const s = await fs.promises.stat(p); out.push({ path: path.relative(WORKSPACE, p), size: s.size }); }
+      }
+    }
+    await walk(WORKSPACE);
+    return JSON.stringify({ count: out.length, files: out }, null, 2);
+  },
+  "file-types": async () => {
+    const counts = {};
+    async function walk(d, depth = 0) {
+      if (depth > 8) return;
+      for (const e of await fs.promises.readdir(d, { withFileTypes: true })) {
+        if ([".git", "node_modules"].includes(e.name)) continue;
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) await walk(p, depth + 1);
+        else {
+          const ext = path.extname(e.name).toLowerCase() || "[no extension]";
+          counts[ext] = (counts[ext] || 0) + 1;
+        }
+      }
+    }
+    await walk(WORKSPACE);
+    return JSON.stringify(counts, null, 2);
+  },
+  "hash-manifest": async () => {
+    const rows = [];
+    async function walk(d, depth = 0) {
+      if (depth > 8) return;
+      for (const e of await fs.promises.readdir(d, { withFileTypes: true })) {
+        if ([".git", "node_modules"].includes(e.name)) continue;
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) await walk(p, depth + 1);
+        else {
+          const h = crypto.createHash("sha256");
+          await new Promise((resolve, reject) => {
+            const s = fs.createReadStream(p);
+            s.on("data", (x) => h.update(x));
+            s.on("end", resolve);
+            s.on("error", reject);
+          });
+          rows.push(`${h.digest("hex")}  ${path.relative(WORKSPACE, p)}`);
+        }
+      }
+    }
+    await walk(WORKSPACE);
+    return rows.join("\n");
+  },
+};
+
+const server = http.createServer(async (req, res) => {
+  if (limited(req, res)) return;
+  try {
+    const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/index.html")) {
+      if (!fs.existsSync(HTML_FILE)) return send(res, 500, "index.html not found on host", "text/plain");
+      return send(res, 200, fs.readFileSync(HTML_FILE, "utf8"), "text/html; charset=utf-8");
+    }
+
+    if (req.method === "GET" && u.pathname === "/health") {
+      return send(res, 200, { ok: true, repo: GH_REPO, branch: GH_BRANCH, chatSha: chatSha ? chatSha.slice(0, 8) : null });
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/state") {
+      return send(res, 200, {
+        repo: GH_REPO,
+        branch: GH_BRANCH,
+        workspace: WORKSPACE,
+        messages: messages.slice(-150),
+        proposals: [...proposals.values()],
+      });
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/chat") {
+      const b = await body(req);
+      const text = String(b.text || "").trim();
+      if (!text || text.length > 4000) return send(res, 400, { error: "Message length must be 1–4000" });
+      const m = {
+        id: crypto.randomUUID(),
+        text,
+        author: String(b.author || "operator").slice(0, 40),
+        createdAt: new Date().toISOString(),
+      };
+      messages.push(m);
+      if (messages.length > 1000) messages.shift();
+      scheduleSave("new message");
+      return send(res, 201, m);
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/proposals") {
+      const b = await body(req);
+      const title = String(b.title || "").trim();
+      const details = String(b.details || "").trim();
+      if (!title || !details || title.length > 160 || details.length > 4000)
+        return send(res, 400, { error: "Invalid request" });
+      const p = {
+        id: crypto.randomUUID(),
+        title,
+        details,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+        votes: {},
+      };
+      proposals.set(p.id, p);
+      scheduleSave("new proposal");
+      return send(res, 201, p);
+    }
+
+    if (req.method === "POST" && u.pathname.startsWith("/api/proposals/") && u.pathname.endsWith("/vote")) {
+      const id = u.pathname.split("/")[3];
+      const p = proposals.get(id);
+      const b = await body(req);
+      if (!p) return send(res, 404, { error: "Proposal not found" });
+      if (!["approve", "reject"].includes(b.vote)) return send(res, 400, { error: "Invalid vote" });
+      p.votes[String(b.agent || "operator").slice(0, 40)] = b.vote;
+      const vals = Object.values(p.votes);
+      p.status = vals.includes("reject")
+        ? "rejected"
+        : vals.length >= Number(process.env.REQUIRED_APPROVALS || 1)
+        ? "approved"
+        : "pending";
+      scheduleSave("vote");
+      return send(res, 200, p);
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/repo/info") {
+      const a = await gh("");
+      return send(res, 200, {
+        name: a.full_name,
+        description: a.description,
+        defaultBranch: a.default_branch,
+        private: a.private,
+        htmlUrl: a.html_url,
+        updatedAt: a.updated_at,
+        openIssues: a.open_issues_count,
+      });
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/repo/improve") {
+      const ip = req.socket.remoteAddress || "unknown";
+      const now = Date.now();
+      const last = improvementRequests.get(ip) || 0;
+      if (now - last < 60 * 60 * 1000)
+        return send(res, 429, { error: "طلب تحسين واحد فقط لكل عنوان خلال ساعة" });
+      const b = await body(req);
+      const extra = String(b.details || "").trim().slice(0, 3000);
+      const title = "Improve Agent Ops Pro: review and substantially upgrade this repository";
+      const issueBody = `## Request: serious improvement pass
+
+The current implementation is a starting point. Inspect the repository before changing anything.
+
+### Required work
+- Review the full codebase for correctness, security, reliability, and UX issues.
+- Improve the Arabic-first responsive UI, keeping each tool on its own page.
+- Add tests for server routes, path handling, API errors, and key UI flows.
+- Improve repository integration, error handling, logging, and documentation.
+- Make changes on a dedicated branch and open a pull request; never push directly to the default branch.
+- Run available tests and lint/type checks, and summarize changes and limitations.
+- Do not claim anything is connected unless it actually is.
+
+### Additional operator feedback
+${extra || "The site feels weak and incomplete. Improve it substantially, not cosmetically."}
+
+### Acceptance criteria
+1. Project starts with documented commands.
+2. Tests pass or blockers are documented with evidence.
+3. No credentials committed; no unauthenticated endpoint executes arbitrary commands.
+4. The PR explains what changed, why, and how it was verified.`;
+      const issue = await gh("/issues", {
+        method: "POST",
+        body: JSON.stringify({ title, body: issueBody, labels: ["enhancement"] }),
+      });
+      improvementRequests.set(ip, now);
+      return send(res, 201, {
+        ok: true,
+        number: issue.number,
+        title: issue.title,
+        url: issue.html_url,
+        message:
+          "تم إنشاء طلب التحسين. يجب على وكيل/مساهم معالجته؛ هذا لا يشغل وكيل AI تلقائياً.",
+      });
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/commits") {
+      const a = await gh("/commits?per_page=30");
+      return send(res, 200, a.map((c) => ({
+        sha: c.sha,
+        message: c.commit.message,
+        author: c.commit.author?.name,
+        date: c.commit.author?.date,
+        url: c.html_url,
+      })));
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/runs") {
+      const a = await gh("/actions/runs?per_page=20");
+      return send(res, 200, a.workflow_runs.map((r) => ({
+        id: r.id,
+        name: r.name,
+        status: r.status,
+        conclusion: r.conclusion,
+        created_at: r.created_at,
+        url: r.html_url,
+      })));
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/dispatch") {
+      const b = await body(req);
+      if (b.workflow !== "Agent Ops Pro") return send(res, 400, { error: "Workflow not allow-listed" });
+      const a = await gh("/actions/workflows");
+      const w = a.workflows.find((x) => x.name === b.workflow && x.state === "active");
+      if (!w) return send(res, 404, { error: "Workflow not found" });
+      await gh(`/actions/workflows/${w.id}/dispatches`, {
+        method: "POST",
+        body: JSON.stringify({ ref: GH_BRANCH }),
+      });
+      return send(res, 202, { ok: true, message: "Workflow dispatch requested" });
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/files") {
+      return send(res, 200, await listFiles(u.searchParams.get("path") || "."));
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/read") {
+      const rel = u.searchParams.get("path") || "";
+      const p = safePath(rel);
+      const s = await fs.promises.stat(p);
+      if (!s.isFile()) return send(res, 400, { error: "Not a file" });
+      if (s.size > 1024 * 1024) return send(res, 413, { error: "Preview limited to 1 MiB" });
+      const b = await fs.promises.readFile(p);
+      const text = b.toString("utf8");
+      if (text.includes("\u0000")) return send(res, 415, { error: "Binary file; download it instead" });
+      return send(res, 200, { path: rel, size: s.size, content: text });
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/run-script") {
+      const b = await body(req);
+      const name = String(b.name || "");
+      if (!Object.hasOwn(scripts, name))
+        return send(res, 400, { error: "Only predefined read-only scripts are allowed" });
+      const result = await scripts[name]();
+      return send(res, 200, {
+        name,
+        finishedAt: new Date().toISOString(),
+        output: result.slice(0, 500000),
+      });
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/download") {
+      const rel = u.searchParams.get("path") || "";
+      const p = safePath(rel);
+      const s = await fs.promises.stat(p);
+      if (!s.isFile()) return send(res, 400, { error: "Not a file" });
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": s.size,
+        "content-disposition": `attachment; filename="${path.basename(p).replace(/["\\\r\n]/g, "_")}"`,
+        "x-content-type-options": "nosniff",
+      });
+      fs.createReadStream(p).pipe(res);
+      return;
+    }
+
+    return send(res, 404, { error: "Not found" });
+  } catch (e) {
+    send(res, 500, { error: String(e.message || e) });
+  }
+});
+
+await loadChat();
+
+process.on("SIGTERM", async () => {
+  if (saveTimer) clearTimeout(saveTimer);
+  try { await persistChat("shutdown"); } catch {}
+  process.exit(0);
+});
+process.on("SIGINT", async () => {
+  if (saveTimer) clearTimeout(saveTimer);
+  try { await persistChat("shutdown"); } catch {}
+  process.exit(0);
+});
+
+server.listen(PORT, "127.0.0.1", () =>
+  console.log(`Agent Ops Pro on http://127.0.0.1:${PORT} | chat persisted in ${CHAT_FILE}`)
+);
+SERVER_EOF
+
+      - name: Fetch workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/agent-ops-workspace
+          python3 - <<'PY'
+          import re, urllib.request, html, shutil, os
+          url = 'https://www.mediafire.com/file/8f5r7ltcfiynt0w/src%25284%2529.zip/file'
+          req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"})
+          with urllib.request.urlopen(req, timeout=45) as r:
+              data = r.read()
+          text = data.decode("utf-8", "replace")
+          candidates = []
+          for pat in [
+              r'<a[^>]+id=["\']downloadButton["\'][^>]+href=["\']([^"\']+)',
+              r'href=["\'](https?://download\d+\.mediafire\.com/[^"\']+)',
+              r'"(https?://download[^"\s]+mediafire\.com/[^"\s]+)"',
+              r'(https?://download\d+\.mediafire\.com/[^\s"\']+)',
+          ]:
+              candidates += re.findall(pat, text, re.I)
+          if not candidates:
+              raise SystemExit("Could not identify MediaFire direct-download URL")
+          dl = html.unescape(candidates[0].replace("&amp;", "&"))
+          req2 = urllib.request.Request(dl, headers={"User-Agent": "Mozilla/5.0"})
+          with urllib.request.urlopen(req2, timeout=90) as r2, open('/tmp/agent-ops-workspace/src.zip', 'wb') as f:
+              ctype = r2.headers.get("Content-Type", "")
+              if "text/html" in ctype.lower():
+                  raise SystemExit("MediaFire returned HTML instead of a file")
+              shutil.copyfileobj(r2, f)
+          print(f"Saved {os.path.getsize('/tmp/agent-ops-workspace/src.zip')} bytes")
+          PY
+          unzip -t /tmp/agent-ops-workspace/src.zip
+          mkdir -p /tmp/agent-ops-workspace/src
+          unzip -oq /tmp/agent-ops-workspace/src.zip -d /tmp/agent-ops-workspace/src
+          du -sh /tmp/agent-ops-workspace/src.zip /tmp/agent-ops-workspace/src
+
+      - name: Start host and tunnel
+        env:
+          PORT: "3040"
+          GH_TOKEN: ${{ secrets.IDK_READ_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.ref_name }}
+          WORKSPACE: "/tmp/agent-ops-workspace"
+          HTML_FILE: "${{ github.workspace }}/index.html"
+          CHAT_FILE: "chat.json"
+          REQUIRED_APPROVALS: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          node /tmp/server.js > /tmp/agent-ops.log 2>&1 &
+          APP_PID=$!
+          for i in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:3040/health >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3040/health
+          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3040 > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          URL=""
+          for i in $(seq 1 60); do
+            URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)"
+            if [ -n "$URL" ]; then
+              echo "OPS_CENTER_URL=$URL"
+              echo "::notice title=Ops Center URL::$URL"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then cat /tmp/cloudflared.log; exit 1; fi
+          trap 'kill -TERM "$APP_PID" 2>/dev/null || true; sleep 3; kill "$CF_PID" 2>/dev/null || true' EXIT
+          while kill -0 "$APP_PID" 2>/dev/null && kill -0 "$CF_PID" 2>/dev/null; do sleep 20; done
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          cat /tmp/agent-ops.log 2>/dev/null || true
+          cat /tmp/cloudflared.log 2>/dev/null || true
