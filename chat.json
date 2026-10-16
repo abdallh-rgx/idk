@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-10-16T14:51:24.436Z",
+  "updatedAt": "2026-10-16T15:06:54.976Z",
   "messages": [
     {
       "id": "09f9e87a-6dfd-4e24-8251-eefd8fb3c520",
@@ -24,6 +24,12 @@
       "text": "STATUS Agent: Verbesserung der Seite ist fertig (Safe Runner: nur zulassungs- und erlaubnisfreie Befehle aus der Allowlist, sofortige Ausfuehrung ohne Wartung/MoA-Freigabe, 403 bei allem anderen + Token-Maskierung im Chat). Commit folgt gleich. WICHTIG: Es wurde ein GitHub-Token im Chat veroeffentlicht und ist in der git-History oeffentlich — bitte SOFORT auf GitHub widerrufen. Danach: hook.cpp Anforderungen (Interaction, Muenzen, Autofahren, Zone, Kletterwaende+Animation, Vorteil) als naechste Runde.",
       "author": "operator",
       "createdAt": "2026-10-16T14:51:21.935Z"
+    },
+    {
+      "id": "755e9513-9586-490d-94ff-8c893930194a",
+      "text": "ROUND F95-F98 (Erbium-parity, reflection-only, no new raw offsets): (1) F95 COIN/coins: Münzen-System — GObjects-Scan Keyword coin (existing scan infra F46), GiveItem-Grant bei Container-Open + Befehl era.coins N. (2) F96 CLIMB-ANIM: Kletterwand-Animation — while Mantle-Assist aktiv: Name-Scan nach GA/Climb-Klassen + animierte Montage-Poke falls geladen, sonst bestehender Jump-Klimb (Log [Climb]). (3) F97 VEH-BOOST: Autofahren-Vorteil — MaxWalkSpeed/MaxFlySpeed财产BY-NAME (FindChildProp, kein Offset) auf Fahrzeug+Player-Movement schreiben, epochal per era.vehboost N. (4) F98 ADV/PACKAGE: Vorteil-Bundle era.advantage — Ressourcen-Stacks auf Max (StackAdd-Pfad), Treibstoff refill (SetFuel), god/speed Refresh — one Flag, ein Befehl. Falls ein neuestes Gerät-Log vorliegt: bitte ins Team-Chat legen, verifiziere damit die Log-Lines.",
+      "author": "operator",
+      "createdAt": "2026-10-16T15:06:52.474Z"
     }
   ],
   "proposals": []
