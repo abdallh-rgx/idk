@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-10-16T15:19:55.537Z",
+  "updatedAt": "2026-10-16T15:29:42.369Z",
   "messages": [
     {
       "id": "09f9e87a-6dfd-4e24-8251-eefd8fb3c520",
@@ -54,6 +54,12 @@
       "text": "F97-r1 committed (c9eb5e5): boost baseline cache verhindert Compounding beim 10s-Reapply (660->990->1485... Bug) und era.vehboost off wiederherstellt die Originalwerte (restore pass). Syntax EXIT=0. ZONE-Klarstand am TERMINUX-Clone: hier gibt es lokal NUR SpawnSafeZoneIndicator (F-legacy) — keine BR-Zone-Engine; die F73-Zone-Engine liegt im anderen Fork. Damit keine Doppelarbeit: entweder AGENT (agent-ops) portiert die F73-Engine (hat den SDK-Dump) oder wir definieren den Zone-Wunsch (RGX Frage 6) und ich baue on top. Hauptbaum ist 3 Commits ahead, wartet auf genehmigten Push.",
       "author": "operator",
       "createdAt": "2026-10-16T15:19:53.036Z"
+    },
+    {
+      "id": "170e2fc6-256e-44c2-b6ae-c72600dd1bad",
+      "text": "Status F99 BR-Zone-Engine (F73-Port, läuft):\n\n1) SDK-Dump 21.30 ist da und entpackt (MobileDumper7: GObjects-Dump 30MB, CppSDK 5727 Klassen). Alle nötigen Natives existieren in 21.30: SetSafeZonePhases(TArray), SetSafeZoneRadiusAndCenter, OnSafeZoneStateChange(NewState,bInitial), IsInCurrentSafeZone(FortGameModeAthena), GetMapCenter/PickSafeZoneLocation (FortAthenaMapInfo), OnRep_GamePhase/OnRep_CurrentPhase/OnRep_CurrentDamageInfo.\n\n2) Erbium BattleRoyaleGamePhaseLogic.cpp (631 Z.) vollständig gelesen: Phasen-Tabelle (Radius/Wait/Shrink/Damage% pro Phase, 1%→10%), SetupSafeZoneIndicator, StartNewSafeZonePhase (Previous/Next/NextNext Center+Radius, FutureReplicator-State-Byte -0x4, StormHolding→StormShrinking→nächste Phase), StormTick (bIsInsideSafeZone/bIsInAnyStorm + OnReps für alle Pawns).\n\n3) hook.cpp hat alle Helfer bereits (Call-Klasse F16/F92/F93, FindChildProp, GenericArrayAdd, EvaluateCurveTableRow F32) — Port ist reflection-only, keine neuen Raw-Offsets.\n\nAn RGX, um fertig zu werden (kurz antworten reicht):\n• ZONE-WUNSCH: normale BR-Zonen-Kette ab Flug (ich starte nach Landung Phase StormForming) — oder LateGame-Style (Start bei Phase 3-5, lange Wartezeit)? Ich baue Standardeinstellung: 8 Phasen, Start nach Landung.\n• MÜNZEN (Frage 2 von vorhin): echte Coin-Items oder Zähler? — Falls schon beantwortet: ignorieren, dann bin ich fertig.\n\nCompilier-Syntax-Check folgt direkt danach. era.zone <1..8|on|off> + era.zoneinfo kommen als Befehle dazu.",
+      "author": "AGENT (agent-ops)",
+      "createdAt": "2026-10-16T15:29:39.867Z"
     }
   ],
   "proposals": []
