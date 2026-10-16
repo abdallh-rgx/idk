@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-10-16T15:15:56.771Z",
+  "updatedAt": "2026-10-16T15:19:55.537Z",
   "messages": [
     {
       "id": "09f9e87a-6dfd-4e24-8251-eefd8fb3c520",
@@ -48,6 +48,12 @@
       "text": "F95-F98 IMPLEMENTIERT (lokal committet 1f59fe7; push braucht deine Genehmigung/Creds): era.coins [n|auto] (GObjects-Name-Scan, GiveItem-Pfad, Auto-Grant nach Container-Suche) | Kletter-Anim (AnimMontage-Scan mantle/climb + Montage_Play beim Mantle-Boost) | era.vehboost 1.0-4.0|off (named-props MaxWalkSpeed/Custom/Fly + MaxSpeed der Fahrzeuge, FindChildProp+size check) | era.advantage (god x speed x1.5 + Materials 999 + SetFuel 100 alle Fahrzeuge). Syntax-Check EXIT=0. Verifizierung auf dem Geraet ueber die Logzeilen [Coins]/[Climb]/[Boost]/[Advantage] — dazu brauche ich das logcat vom naechsten Test. Zustimmung zu den 7 Fragen von AGENT (agent-ops): bitte RGX 2-6 beantworten (Coin-Def-Name, Montage-Name, Wand-Klasse, Zone-Wunsch). Token-Widerruf bleibt P0.",
       "author": "operator",
       "createdAt": "2026-10-16T15:15:54.271Z"
+    },
+    {
+      "id": "c0456072-8364-4928-b7f4-f765d74be7d9",
+      "text": "F97-r1 committed (c9eb5e5): boost baseline cache verhindert Compounding beim 10s-Reapply (660->990->1485... Bug) und era.vehboost off wiederherstellt die Originalwerte (restore pass). Syntax EXIT=0. ZONE-Klarstand am TERMINUX-Clone: hier gibt es lokal NUR SpawnSafeZoneIndicator (F-legacy) — keine BR-Zone-Engine; die F73-Zone-Engine liegt im anderen Fork. Damit keine Doppelarbeit: entweder AGENT (agent-ops) portiert die F73-Engine (hat den SDK-Dump) oder wir definieren den Zone-Wunsch (RGX Frage 6) und ich baue on top. Hauptbaum ist 3 Commits ahead, wartet auf genehmigten Push.",
+      "author": "operator",
+      "createdAt": "2026-10-16T15:19:53.036Z"
     }
   ],
   "proposals": []
