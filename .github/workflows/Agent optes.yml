@@ -46,7 +46,7 @@ jobs:
           import crypto from "node:crypto";
 
           const PORT = Number(process.env.PORT || 3040);
-          const GH_TOKEN = process.env.GH_TOKEN || "";
+          const GH_TOKEN = process.env.GH_PAT || process.env.GH_TOKEN || "";
           const GH_REPO = process.env.GH_REPO || "abdallh-rgx/idk";
           const GH_BRANCH = process.env.GH_BRANCH || "main";
           const WORKSPACE = path.resolve(process.env.WORKSPACE || "/tmp/agent-ops-workspace");
@@ -91,7 +91,7 @@ jobs:
           }
 
           async function gh(endpoint, opts = {}) {
-            if (!GH_TOKEN) throw Error("GH_TOKEN is not configured");
+            if (!GH_TOKEN) throw Error("GH_PAT is not configured");
             const r = await fetch(`https://api.github.com/repos/${GH_REPO}${endpoint}`, {
               ...opts,
               headers: {
@@ -540,7 +540,8 @@ jobs:
       - name: Start host and tunnel
         env:
           PORT: "3040"
-          GH_TOKEN: ${{ secrets.IDK_READ_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_REPO: ${{ github.repository }}
           GH_BRANCH: ${{ github.ref_name }}
           WORKSPACE: "/tmp/agent-ops-workspace"
@@ -553,7 +554,9 @@ jobs:
           node /tmp/server.mjs > /tmp/agent-ops.log 2>&1 &
           APP_PID=$!
           for i in $(seq 1 40); do
-            curl -fsS http://127.0.0.1:3040/health >/dev/null && break
+            if curl -fsS http://127.0.0.1:3040/health >/dev/null 2>&1; then
+              break
+            fi
             sleep 1
           done
           curl -fsS http://127.0.0.1:3040/health
