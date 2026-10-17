@@ -5416,9 +5416,9 @@ void Athena::SpawnVehicles() {
                         if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
                     }
                     if (dup) continue;
-                    for (int r = 0; kVehicleTagRules[r].needle; ++r) {
-                        bool hit = false;
-                        for (auto& tg : tags) if (tg.find(kVehicleTagRules[r].needle) != std::string::npos) { hit = true; break; }
+                    bool reequipAfterExit = false;   // ← أضف هذا السطر
+if (isPC || isPawn || isWeapon || isInteraction || isWorldTarget) {
+    Guard g;
                         if (!hit) continue;
                         void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
                         if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
