@@ -5462,7 +5462,138 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
 
     return true;
 }
+void Athena::SpawnVehicles() {
+    if (!session.world || session.vehicles_spawned) return;
+    if (!WorldIsStandalone(session.world)) return;
 
+    ++session.vehicle_attempts;
+    static std::vector<Vector> spawnedAt;
+    int spawned = 0;
+    int viable = 0;
+
+    // ---- Pass 1: LivingWorld providers ----
+    {
+        void* providerCls = FindObj("/Script/FortniteGame.FortAthenaLivingWorldStaticPointProvider");
+        if (providerCls) {
+            std::vector<void*> providers;
+            if (GetAllActorsOfClassRaw(providerCls, providers) && !providers.empty()) {
+                LOG("[Vehicles] LivingWorld providers: %zu", providers.size());
+                void* tagsProp    = GetProp("/Script/FortniteGame.FortAthenaLivingWorldStaticPointProvider.FiltersTags");
+                void* tagsArrProp = tagsProp ? GetProp("/Script/GameplayTags.GameplayTagContainer.GameplayTags") : nullptr;
+                if (!tagsArrProp) tagsArrProp = GetProp("/Script/FortniteGame.GameplayTagContainer.GameplayTags");
+
+                for (void* sp : providers) {
+                    if (!sp || IsBadPtr(sp)) continue;
+                    std::vector<std::string> tags;
+                    if (tagsProp && tagsArrProp) {
+                        void* container = GetField(sp, tagsProp);
+                        if (container) {
+                            Array arr = Read<Array>(GetField(container, tagsArrProp));
+                            for (int i = 0; i < arr.Count && i < 16 && arr.Data; ++i)
+                                tags.push_back(FNameToString((char*)arr.Data + (size_t)i * 8));
+                        }
+                    }
+                    if (tags.empty()) continue;
+
+                    Vector loc{}; Rotator rot{};
+                    if (!ActorLocation(sp, loc)) continue;
+                    { Call c("/Script/Engine.Actor.K2_GetActorRotation"); if (c.ok() && c.run(sp)) rot = c.result<Rotator>(); }
+
+                    bool dup = false;
+                    for (auto& s : spawnedAt) {
+                        double dx = s.X - loc.X, dy = s.Y - loc.Y;
+                        if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
+                    }
+                    if (dup) continue;
+
+                    for (int r = 0; kVehicleTagRules[r].tag; ++r) {
+                        bool hit = false;
+                        for (auto& tg : tags) if (tg == kVehicleTagRules[r].tag) { hit = true; break; }
+                        if (!hit) continue;
+
+                        void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
+                        if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
+                        if (!cls || IsBadPtr(cls)) {
+                            LOG("[Vehicles] ⚠️ class missing for tag '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
+                            break;
+                        }
+
+                        ++viable;
+                        if (SpawnVehicleAt(cls, loc, rot)) {
+                            ++spawned;
+                            spawnedAt.push_back(loc);
+                            LOG("[Vehicles] ✅ %s (tag %s) @ %.0f %.0f %.0f",
+                                kVehicleTagRules[r].shortName, tags[0].c_str(), loc.X, loc.Y, loc.Z);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Pass 2: AFortAthenaVehicleSpawner ----
+    {
+        void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
+        if (!spawnerCls) spawnerCls = LoadClass("/Script/FortniteGame.FortAthenaVehicleSpawner", "/Script/Engine.Actor");
+        std::vector<void*> spawners;
+        if (spawnerCls && GetAllActorsOfClassRaw(spawnerCls, spawners) && !spawners.empty()) {
+            LOG("[Vehicles] spawner actors: %zu", spawners.size());
+            for (void* spawner : spawners) {
+                if (!spawner || IsBadPtr(spawner)) continue;
+
+                void* vehicleClass = nullptr;
+                { Call c("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass"); if (c.ok() && c.run(spawner)) vehicleClass = c.result<void*>(); }
+                if (!vehicleClass || IsBadPtr(vehicleClass)) continue;
+                ++viable;
+
+                void* cachedDef = GetObjField(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.CachedFortVehicleItemDef");
+                bool forced = GetBool(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.bForceSpawnAlways");
+                if (cachedDef && !IsBadPtr(cachedDef) && !forced) {
+                    float mn = 100.0f, mx = 100.0f;
+                    void* minProp = GetProp("/Script/FortniteGame.FortVehicleItemDefinition.VehicleMinSpawnPercent");
+                    void* maxProp = GetProp("/Script/FortniteGame.FortVehicleItemDefinition.VehicleMaxSpawnPercent");
+                    if (minProp && Read<int>(minProp, profile::PropElementSize) >= 4) mn = Read<float>(GetField(cachedDef, minProp));
+                    if (maxProp && Read<int>(maxProp, profile::PropElementSize) >= 4) mx = Read<float>(GetField(cachedDef, maxProp));
+                    double lo = std::clamp((double)mn * 0.01, 0.0, 1.0);
+                    double hi = std::clamp((double)mx * 0.01, 0.0, 1.0);
+                    if (hi < lo) hi = lo;
+                    double spawnPercent = lo + (hi - lo) * (rand() / (float)RAND_MAX);
+                    if ((rand() / (float)RAND_MAX) > spawnPercent) continue;
+                }
+
+                Vector loc{}; Rotator rot{};
+                if (!ActorLocation(spawner, loc)) continue;
+                { Call c("/Script/Engine.Actor.K2_GetActorRotation"); if (c.ok() && c.run(spawner)) rot = c.result<Rotator>(); }
+
+                bool dup = false;
+                for (auto& s : spawnedAt) {
+                    double dx = s.X - loc.X, dy = s.Y - loc.Y;
+                    if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
+                }
+                if (dup) continue;
+
+                if (SpawnVehicleAt(vehicleClass, loc, rot)) {
+                    ++spawned;
+                    spawnedAt.push_back(loc);
+                    LOG("[Vehicles] ✅ %s @ %.0f %.0f %.0f", ObjName(vehicleClass).c_str(), loc.X, loc.Y, loc.Z);
+                }
+            }
+        }
+    }
+
+    if (spawned > 0 && spawned >= viable) {
+        session.vehicles_spawned = true;
+        LOG("[Vehicles] ✅ complete: %d vehicles total (attempts=%d)", (int)spawnedAt.size(), session.vehicle_attempts);
+    } else if (spawned > 0) {
+        LOG("[Vehicles] partial: +%d this pass, %d total, viable=%d — retrying (attempts=%d)", spawned, (int)spawnedAt.size(), viable, session.vehicle_attempts);
+    } else if (session.vehicle_attempts >= 12) {
+        session.vehicles_spawned = true;
+        LOG("[Vehicles] retry window exhausted: %d vehicles total", (int)spawnedAt.size());
+    } else {
+        LOG("[Vehicles] pass %d: no vehicles yet — will retry", session.vehicle_attempts);
+    }
+}
 // [F45] 21.30 wall-climb / mantle assist — standalone has no mantle path, so
 // a jump pressed against a wall relaunches the pawn up+forward (climb-over
 // feel, Grapple-Glove-era mobility). Pure movement impulse — safe.
