@@ -5377,15 +5377,13 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
 void Athena::SpawnVehicles() {
     if (!session.world || session.vehicles_spawned) return;
     if (!WorldIsStandalone(session.world)) return;
-    // [F41] The flag is only committed when spawners are actually found —
-    // the map streams its spawners in over time, and the old code marked the
-    // pass done on the first (usually empty) attempt, so cars never came back.
-    ++session.vehicle_attempts;
-    static std::vector<Vector> spawnedAt;   // [F43] dedupe across passes
-    int spawned = 0;
-    int viable = 0;                         // [F85] resolvable-class targets this pass
 
-    // ---- Pass 1 (Erbium 1:1): LivingWorld providers matched by GameplayTag ----
+    ++session.vehicle_attempts;
+    static std::vector<Vector> spawnedAt;
+    int spawned = 0;
+    int viable = 0;
+
+    // ---- Pass 1: LivingWorld providers (matched by GameplayTag) ----
     {
         void* providerCls = FindObj("/Script/FortniteGame.FortAthenaLivingWorldStaticPointProvider");
         if (providerCls) {
@@ -5395,8 +5393,10 @@ void Athena::SpawnVehicles() {
                 void* tagsProp    = GetProp("/Script/FortniteGame.FortAthenaLivingWorldStaticPointProvider.FiltersTags");
                 void* tagsArrProp = tagsProp ? GetProp("/Script/GameplayTags.GameplayTagContainer.GameplayTags") : nullptr;
                 if (!tagsArrProp) tagsArrProp = GetProp("/Script/FortniteGame.GameplayTagContainer.GameplayTags");
+
                 for (void* sp : providers) {
                     if (!sp || IsBadPtr(sp)) continue;
+
                     std::vector<std::string> tags;
                     if (tagsProp && tagsArrProp) {
                         void* container = GetField(sp, tagsProp);
@@ -5407,41 +5407,36 @@ void Athena::SpawnVehicles() {
                         }
                     }
                     if (tags.empty()) continue;
+
                     Vector loc{}; Rotator rot{};
                     if (!ActorLocation(sp, loc)) continue;
                     { Call c("/Script/Engine.Actor.K2_GetActorRotation"); if (c.ok() && c.run(sp)) rot = c.result<Rotator>(); }
+
                     bool dup = false;
                     for (auto& s : spawnedAt) {
                         double dx = s.X - loc.X, dy = s.Y - loc.Y;
                         if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
                     }
                     if (dup) continue;
-                    bool reequipAfterExit = false;   // ← أضف هذا السطر
-// ✅ النسخة الصحيحة — داخل SpawnVehicles، داخل حلقة providers
-for (int r = 0; kVehicleTagRules[r].tag; ++r) {
-    bool hit = false;
-    for (auto& tg : tags) if (tg == kVehicleTagRules[r].tag) { hit = true; break; }
-    if (!hit) continue;
-    void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
-    if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
-    if (!cls || IsBadPtr(cls)) {
-        LOG("[Vehicles] ⚠️ class missing for tag '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
-        break;
-    }
-    ++viable;
-    if (SpawnVehicleAt(cls, loc, rot)) {
-        ++spawned;
-        spawnedAt.push_back(loc);
-        LOG("[Vehicles] ✅ %s (tag %s) @ %.0f %.0f %.0f",
-            kVehicleTagRules[r].shortName, tags[0].c_str(), loc.X, loc.Y, loc.Z);
-    }
-    break;
-}
-                        ++viable;   // [F85] class resolved — this provider counts
+
+                    for (int r = 0; kVehicleTagRules[r].tag; ++r) {
+                        bool hit = false;
+                        for (auto& tg : tags) if (tg == kVehicleTagRules[r].tag) { hit = true; break; }
+                        if (!hit) continue;
+
+                        void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
+                        if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
+                        if (!cls || IsBadPtr(cls)) {
+                            LOG("[Vehicles] ⚠️ class missing for tag '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
+                            break;
+                        }
+
+                        ++viable;
                         if (SpawnVehicleAt(cls, loc, rot)) {
                             ++spawned;
                             spawnedAt.push_back(loc);
-                            LOG("[Vehicles] ✅ %s (tag %s) @ %.0f %.0f %.0f", kVehicleTagRules[r].shortName, tags[0].c_str(), loc.X, loc.Y, loc.Z);
+                            LOG("[Vehicles] ✅ %s (tag %s) @ %.0f %.0f %.0f",
+                                kVehicleTagRules[r].shortName, tags[0].c_str(), loc.X, loc.Y, loc.Z);
                         }
                         break;
                     }
@@ -5450,24 +5445,21 @@ for (int r = 0; kVehicleTagRules[r].tag; ++r) {
         }
     }
 
-    // ---- Pass 2: AFortAthenaVehicleSpawner (kept from [F28]) ----
+    // ---- Pass 2: AFortAthenaVehicleSpawner (standalone needs this) ----
     {
         void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
         if (!spawnerCls) spawnerCls = LoadClass("/Script/FortniteGame.FortAthenaVehicleSpawner", "/Script/Engine.Actor");
         std::vector<void*> spawners;
         if (spawnerCls && GetAllActorsOfClassRaw(spawnerCls, spawners) && !spawners.empty()) {
-            LOG("[Vehicles] spawner actors: %zu", spawners.size());   // [F85] density diagnostics
+            LOG("[Vehicles] spawner actors: %zu", spawners.size());
             for (void* spawner : spawners) {
                 if (!spawner || IsBadPtr(spawner)) continue;
+
                 void* vehicleClass = nullptr;
-                {
-                    Call c("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass");
-                    if (c.ok() && c.run(spawner)) vehicleClass = c.result<void*>();
-                }
+                { Call c("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass"); if (c.ok() && c.run(spawner)) vehicleClass = c.result<void*>(); }
                 if (!vehicleClass || IsBadPtr(vehicleClass)) continue;
-                ++viable;   // [F85] class resolved — this spawner counts
-                // [F28] spawn-percent roll (Erbium 1:1): only when a definition is
-                // cached AND the spawner is not forced.
+                ++viable;
+
                 void* cachedDef = GetObjField(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.CachedFortVehicleItemDef");
                 bool forced = GetBool(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.bForceSpawnAlways");
                 if (cachedDef && !IsBadPtr(cachedDef) && !forced) {
@@ -5482,16 +5474,18 @@ for (int r = 0; kVehicleTagRules[r].tag; ++r) {
                     double spawnPercent = lo + (hi - lo) * (rand() / (float)RAND_MAX);
                     if ((rand() / (float)RAND_MAX) > spawnPercent) continue;
                 }
-                Vector loc{};
-                Rotator rot{};
+
+                Vector loc{}; Rotator rot{};
                 if (!ActorLocation(spawner, loc)) continue;
                 { Call c("/Script/Engine.Actor.K2_GetActorRotation"); if (c.ok() && c.run(spawner)) rot = c.result<Rotator>(); }
+
                 bool dup = false;
                 for (auto& s : spawnedAt) {
                     double dx = s.X - loc.X, dy = s.Y - loc.Y;
                     if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
                 }
                 if (dup) continue;
+
                 if (SpawnVehicleAt(vehicleClass, loc, rot)) {
                     ++spawned;
                     spawnedAt.push_back(loc);
@@ -5501,20 +5495,14 @@ for (int r = 0; kVehicleTagRules[r].tag; ++r) {
         }
     }
 
-    // [F85] Commit semantics fix (root cause of the user's 1/325 symptom):
-    // the old code set vehicles_spawned on the FIRST pass with ANY success.
-    // Spawner classes stream in late, so pass 1 spawns exactly 1 car, the
-    // flag commits, and the remaining spawners never spawn again. Now the
-    // flag commits ONLY when a pass fully covers its viable targets, or the
-    // F41 retry window (12 attempts) is exhausted. Rolled-skip targets are
-    // re-rolled on every retry pass (density per Erbium spawn-percent).
+    // ---- Commit semantics ----
     if (spawned > 0 && spawned >= viable) {
         session.vehicles_spawned = true;
         LOG("[Vehicles] ✅ complete: %d vehicles total (attempts=%d)", (int)spawnedAt.size(), session.vehicle_attempts);
     } else if (spawned > 0) {
         LOG("[Vehicles] partial: +%d this pass, %d total, viable=%d — retrying (attempts=%d)", spawned, (int)spawnedAt.size(), viable, session.vehicle_attempts);
     } else if (session.vehicle_attempts >= 12) {
-        session.vehicles_spawned = true;   // [F85] window exhausted — stop cleanly
+        session.vehicles_spawned = true;
         LOG("[Vehicles] retry window exhausted: %d vehicles total", (int)spawnedAt.size());
     } else {
         LOG("[Vehicles] pass %d: no vehicles yet — will retry", session.vehicle_attempts);
