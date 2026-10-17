@@ -1299,6 +1299,13 @@ struct Session {
     int32 pawn_weak_serial = 0;
     // [F40] match state (alive players / players-left HUD)
     bool  match_state_ready = false;
+    // [F-door r1/r2] doors we opened stay open until the next interact closes
+    // them again; the sprint fast-open path caches nearby walls so the scan
+    // costs nothing unless the player is actively sprinting.
+    struct PinnedDoor { void* wall; };
+    std::vector<PinnedDoor> door_pins;
+    std::vector<void*>      sprint_doors;   // closed BuildingWalls within reach
+    double last_door_scan = 0;
 } session;
 
 static double Monotonic() {
@@ -1373,6 +1380,8 @@ namespace Athena {
     bool LocalPickup(void* pickup);    // [F18]
     void Loot(void* actor);
     void HandleDoor(void* door);
+    void TickDoorPins();               // [F-door r1] stay-open guard
+    void TickSprintDoors();            // [F-door r2] sprint fast-open
     void OnServerCreateBuildingActor(void* params);
     bool LocalBuild();                 // [F21]
     bool SpawnBuildingActor(void* klass, const Vector& loc, const Rotator& rot, bool mirrored, int level); // [F30]
@@ -2348,31 +2357,145 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// DOORS — 21.30 bDoorOpen is a plain bool byte (0/1)
+// DOORS — [F-door r1] 21.30 bDoorOpen is bit 5 of the 0x0FDE bit-pack
 // ============================================================================
+// 21.30 layout (MobileDumper7 dump, ABuildingWall 0x0FF8):
+//   0x0FDE = bSwingingDoor(0)|bSlidingDoor(1)|bAutomaticSlidingDoor(2)|
+//            bDoubleDoor(3)|bCreateDoorLink(4)|bDoorOpen(5,RepNotify)|
+//            bLocalDoorOpen(6)|bDoorCollisionDisabled(7)
+//   0x0FDF = bFastOpenRequested(4, Net|Transient)
+// The previous "plain bool byte" write flipped the wall-type bits along with
+// bDoorOpen — with bAutomaticSlidingDoor forced on, the native trigger path
+// slammed the door shut a moment later: the door-closes-by-itself symptom.
+// Every door write now touches only the door bits.
+static void DoorOpenApply(void* wall, bool fast) {
+    uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
+    *pack |= 0x20 | 0x40;                        // bDoorOpen | bLocalDoorOpen
+    if (fast) {
+        uint8_t* fastPack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte + 1;
+        *fastPack |= 0x10;                       // bFastOpenRequested
+    }
+    Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
+    if (r.ok()) r.run(wall);
+
+    Call netup("/Script/Engine.Actor.ForceNetUpdate");
+    if (netup.ok()) netup.run(wall);
+}
+
+static void DoorCloseApply(void* wall) {
+    uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
+    *pack &= uint8_t(~(0x20 | 0x40));            // clear bDoorOpen|bLocalDoorOpen
+    Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
+    if (r.ok()) r.run(wall);
+
+    Call netup("/Script/Engine.Actor.ForceNetUpdate");
+    if (netup.ok()) netup.run(wall);
+}
+
 void Athena::HandleDoor(void* door) {
     if (!door || IsBadPtr(door)) return;
     static void* wallCls = nullptr;
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
 
-    uint8_t* byte = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
-    bool wasOpen = *byte != 0;
-    *byte = wasOpen ? 0 : 1;
+    uint8_t* pack = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
+    const bool open = (*pack & 0x20) != 0;
 
-    Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
-    if (r.ok()) r.run(door);
-
-    Call netup("/Script/Engine.Actor.ForceNetUpdate");
-    if (netup.ok()) netup.run(door);
+    // Interact toggle: closing removes the stay-open pin first; opening
+    // registers it so TickDoorPins can re-assert if anything slams it shut.
+    bool wasPinned = false;
+    for (auto it = session.door_pins.begin(); it != session.door_pins.end(); ++it) {
+        if (it->wall == door) { wasPinned = true; session.door_pins.erase(it); break; }
+    }
+    if (!open && !wasPinned) {
+        DoorOpenApply(door, /*fast=*/false);
+        session.door_pins.push_back({door});
+        if (session.door_pins.size() > 64) session.door_pins.erase(session.door_pins.begin());   // cap runaway growth
+        LOG("[Door] OPEN (pinned, pins=%zu)", session.door_pins.size());
+    } else {
+        DoorCloseApply(door);
+        LOG("[Door] CLOSED (was %s)", wasPinned ? "pinned" : "native-open");
+    }
 
     // [F16] Blueprint event — resolve the receiver's override.
     Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", door);
     if (interact.ok() && session.pawn) {
         if (interact.set("InteractingPawn", session.pawn)) interact.run(door);
     }
+}
 
-    LOG("[Door] Toggled: %s -> %s", wasOpen ? "OPEN" : "CLOSED", wasOpen ? "CLOSED" : "OPEN");
+// [F-door r1] stay-open guard: whatever slams a door back shut on this build
+// (trigger volume, replication reset, edit path), we only act when bDoorOpen
+// actually flipped — doors we closed, and doors nobody touched, stay as-is.
+void Athena::TickDoorPins() {
+    if (session.door_pins.empty()) return;
+    static double last = 0;
+    double now = Monotonic();
+    if (now - last < 0.30) return;
+    last = now;
+    int reasserted = 0;
+    for (auto it = session.door_pins.begin(); it != session.door_pins.end(); ) {
+        void* wall = it->wall;
+        if (!wall || IsBadPtr(wall)) { it = session.door_pins.erase(it); continue; }
+        uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
+        if (!(*pack & 0x20)) {
+            DoorOpenApply(wall, false);
+            ++reasserted;
+        }
+        ++it;
+    }
+    if (reasserted) LOG("[Door] [F-door] re-asserted %d pinned doors", reasserted);
+}
+
+// [F-door r2] sprint fast-open (bFastOpenRequested — the 21.30 native behaviour
+// pair of AutoOpenDoorInputMagnitude/AutoOpenDoorTraceDistance): while the
+// player is tactically sprinting, closed BuildingWalls within 400 uu are
+// queued (2 s scan throttle) and any one reached within 150 uu opens with the
+// fast flag. Doors opened this way land in door_pins, so interact-close still
+// works and the stay-open guard keeps them from slamming back.
+static bool GetAllActorsOfClassRaw(void* klass, std::vector<void*>& out);   // [F-door r2] defined below
+void Athena::TickSprintDoors() {
+    if (!session.tactical_sprint || !session.pawn) return;
+    if (IsBadPtr(session.tactical_sprint)) return;
+    double now = Monotonic();
+    const bool sprinting = (Read<uint8_t>(session.tactical_sprint, profile::TacticalSprint_Flags)
+                            & profile::TacticalSprint_Bit_IsSprinting) != 0;
+    if (!sprinting) return;
+
+    if (now - session.last_door_scan > 2.0) {
+        session.last_door_scan = now;
+        session.sprint_doors.clear();
+        void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
+        if (!wallCls) return;
+        std::vector<void*> walls;
+        if (GetAllActorsOfClassRaw(wallCls, walls)) {
+            for (void* w : walls) {
+                if (!w || IsBadPtr(w)) continue;
+                uint8_t* pack = (uint8_t*)w + profile::BuildingWall_bDoorOpen_Byte;
+                if (*pack & 0x20) continue;                     // already open
+                Vector loc{};
+                if (!ActorLocation(w, loc) || !NearPlayer(loc, 400.0f)) continue;
+                session.sprint_doors.push_back(w);
+                if (session.sprint_doors.size() >= 32) break;   // tiny working set only
+            }
+        }
+    }
+    int opened = 0;
+    for (void* w : session.sprint_doors) {
+        if (!w || IsBadPtr(w)) continue;
+        uint8_t* pack = (uint8_t*)w + profile::BuildingWall_bDoorOpen_Byte;
+        if (*pack & 0x20) continue;
+        Vector loc{};
+        if (!ActorLocation(w, loc) || !NearPlayer(loc, 150.0f)) continue;
+        static void* wallCls = nullptr;
+        if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
+        if (!wallCls || !IsA(w, wallCls)) continue;
+        DoorOpenApply(w, /*fast=*/true);
+        session.door_pins.push_back({w});
+        if (session.door_pins.size() > 64) session.door_pins.erase(session.door_pins.begin());
+        ++opened;
+    }
+    if (opened) LOG("[Door] [F-door] sprint fast-open %d", opened);
 }
 
 // ============================================================================
@@ -2922,6 +3045,8 @@ void Athena::Tick() {
         ProcessPendingPickups();   // [F35] fly-time → inventory transfer
         TickMantleAssist();        // [F45] 21.30 wall climb assist
         TickRealityProximity();    // [F44] reality tree proximity effect
+        TickDoorPins();            // [F-door r1] doors stay open until we close them
+        TickSprintDoors();         // [F-door r2] sprint fast-open
     }
     // [F28/F41] one-shot vehicle spawning with a retry window (vehicle spawners
     // stream in after the world is ready — 12 attempts × 15 s ≈ 3 min max).
