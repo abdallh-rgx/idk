@@ -415,6 +415,7 @@ struct TScriptInterface { void* Object; void* Interface; };
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
 namespace local_loot { int TableCount(); }   // [F92] heartbeat accessor
+static bool TryActivateHinted(void* asc, const char* hint);
 static FName StringToFName(const char* str);
 static bool ApplyAbilitySet(void* pawn, void* abilitySet);
 static bool IsA(void* obj, void* type);
