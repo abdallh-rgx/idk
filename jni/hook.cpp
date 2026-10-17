@@ -1582,22 +1582,31 @@ void Athena::GrantAllAbilitySets() {
     if (ApplyAbilitySet(session.pawn, coreSet)) session.granted_ability_sets.push_back(coreSet);
 
     // Fallback direct activations (only works for already-granted abilities).
-    const char* abilities[] = {
+        if (ApplyAbilitySet(session.pawn, coreSet)) session.granted_ability_sets.push_back(coreSet);
+
+    // [F13] Fallback direct activation — only fires for abilities already
+    // granted via the ability set above (the spec must exist in the ASC).
+    // Expanded per 21.30: Sprint + Jump + interact + harvest + emote + rift.
+    static const char* const individualAbilities[] = {
         "/Script/GameplayAbilities.GameplayAbility_CharacterJump",
+        "/Script/FortniteGame.FortGameplayAbility_Sprint",
+        "/Script/FortniteGame.FortGameplayAbility_Jump",
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractUse.GA_DefaultPlayer_InteractUse_C",
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractSearch.GA_DefaultPlayer_InteractSearch_C",
+        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_Harvest.GA_DefaultPlayer_Harvest_C",
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_Death.GA_DefaultPlayer_Death_C",
+        "/Game/Abilities/Player/Emotes/GAB_Emote_Generic.GAB_Emote_Generic_C",
         "/Game/Athena/Items/ForagedItems/Rift/GA_Rift_Athena_Skydive.GA_Rift_Athena_Skydive_C",
         nullptr
     };
-    for (int i = 0; abilities[i]; ++i) {
-        void* cls = FindObj(abilities[i]);
-        if (!cls) cls = LoadClass(abilities[i], "/Script/GameplayAbilities.GameplayAbility");
+    for (int i = 0; individualAbilities[i]; ++i) {
+        void* cls = FindObj(individualAbilities[i]);
+        if (!cls) cls = LoadClass(individualAbilities[i], "/Script/GameplayAbilities.GameplayAbility");
         if (!cls) continue;
         GrantAbility(cls);
     }
     session.abilities_granted = true;
-    session.melee_granted = true; // [F13] melee flows with the pickaxe weapon intrinsics; no separate grant API exists
+    session.melee_granted = true;
     LOG("[Abilities] Done — sets=%zu", session.granted_ability_sets.size());
 }
 
@@ -2160,39 +2169,39 @@ void Athena::FixBodyAndAnimations() {
 // real ability specs with input bindings.
 void Athena::GrantWorldAbilities() {
     if (session.world_abilities_granted || !session.pawn) return;
-    static const char* const names[] = {
-        "GA_Athena_Player_Slide_C",     // core — slide
-        "GA_AthenaEnterVehicle_C",      // core (exact 21.30 spelling)
-        "GA_AthenaExitVehicle_C",       // best-effort
-        "GA_AthenaInVehicle_C",         // best-effort
-        "GAB_Emote_Generic_C",          // best-effort (emote input)
+
+    // Erbium AFortGameMode::FinishWorldInitialization — 21.30 ability sets
+    static const char* const setPaths[] = {
+        "/TacticalSprintGame/Gameplay/AS_TacticalSprint.AS_TacticalSprint",
+        "/Ascender/Gameplay/Ascender/AS_Ascender.AS_Ascender",
+        "/DoorBashContent/Gameplay/AS_DoorBash.AS_DoorBash",
+        "/HillScramble/Gameplay/AS_HillScramble.AS_HillScramble",
+        "/SlideImpulse/Gameplay/AS_SlideImpulse.AS_SlideImpulse",
+        "/RealitySeedGameplay/Environment/Foliage/GAS_Athena_RealitySapling.GAS_Athena_RealitySapling",
         nullptr
     };
-    std::vector<void*> classes;
-    for (int i = 0; names[i]; ++i) {
-        if (void* k = FindAbilityClassNamed(names[i])) classes.push_back(k);
-        else if (i < 2) LOG("[World] ability class not resident yet: %s", names[i]);
-    }
-    if (classes.size() < 2) return;   // wait for the core pair to stream in
 
-    void* setCls = FindObj("/Script/FortniteGame.FortAbilitySet");
-    if (!setCls) { LOG("[World] FortAbilitySet class missing"); return; }
-    void* set = Fn<void*(*)(void*, void*)>(profile::SpawnObject)(setCls, session.pawn);
-    if (!set || IsBadPtr(set)) { LOG("[World] mini ability set creation failed"); return; }
-    void* abProp = GetProp("/Script/FortniteGame.FortAbilitySet.GameplayAbilities");
-    if (!abProp) { LOG("[World] GameplayAbilities property missing"); return; }
-    Array* arr = reinterpret_cast<Array*>(GetField(set, abProp));
-    if (!arr || arr->Count != 0) { LOG("[World] mini set array unavailable"); return; }
-    for (void* k : classes) {
-        if (!k || IsBadPtr(k)) continue;
-        Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, abProp, &k);
+    int applied = 0, tried = 0;
+    for (int i = 0; setPaths[i]; ++i) {
+        void* set = LoadAsset(setPaths[i], "/Script/FortniteGame.FortAbilitySet");
+        if (!set) set = FindObj(setPaths[i]);          // بعض المجموعات تُحمَّل كـ UObject عادي
+        if (!set || IsBadPtr(set)) continue;
+        ++tried;
+        if (ApplyAbilitySet(session.pawn, set)) {
+            session.granted_ability_sets.push_back(set);
+            ++applied;
+            LOG("[World] ✅ Applied: %s", setPaths[i]);
+        }
     }
-    if (ApplyAbilitySet(session.pawn, set)) {
+
+    // نعتبر النجاح إذا تم منح مجموعتين على الأقل (مثل HillScramble + DoorBash)
+    if (applied >= 2) {
         session.world_abilities_granted = true;
-        LOG("[World] ✅ %zu world abilities delivered through EquipFortAbilitySet", classes.size());
+        LOG("[World] ✅ %d/%d movement ability sets delivered (Erbium 1:1)", applied, tried);
+    } else {
+        LOG("[World] only %d/%d delivered — retry on next Tick", applied, tried);
     }
 }
-
 // ============================================================================
 // TACTICAL SPRINT
 // ============================================================================
@@ -5272,38 +5281,96 @@ void Athena::DebugDump() {
 // StaticPointProvider spawners carry GameplayTags that select the vehicle
 // class. On real s20–s22 servers the AFortAthenaVehicleSpawner path is native-
 // auto, so this provider pass is what actually fills the map with cars.
-static const struct { const char* needle; const char* classPath; const char* shortName; } kVehicleTagRules[] = {
-    {"Valet.BasicCar.Taxi",      "/Valet/TaxiCab/Valet_TaxiCab_Vehicle.Valet_TaxiCab_Vehicle_C",                                        "Valet_TaxiCab_Vehicle_C"},
-    {"Valet.BasicCar.Modded",    "/ModdedBasicCar/Vehicle/Valet_BasicCar_Vehicle_SuperSedan.Valet_BasicCar_Vehicle_SuperSedan_C",      "Valet_BasicCar_Vehicle_SuperSedan_C"},
-    {"Valet.BasicTruck",         "/Valet/BasicTruck/Valet_BasicTruck_Vehicle.Valet_BasicTruck_Vehicle_C",                              "Valet_BasicTruck_Vehicle_C"},
-    {"Valet.BigRig",             "/Valet/BigRig/Valet_BigRig_Vehicle.Valet_BigRig_Vehicle_C",                                          "Valet_BigRig_Vehicle_C"},
-    {"Valet.SportsCar",          "/Valet/SportsCar/Valet_SportsCar_Vehicle.Valet_SportsCar_Vehicle_C",                                  "Valet_SportsCar_Vehicle_C"},
-    {"Valet.BasicCar",           "/Valet/BasicCar/Valet_BasicCar_Vehicle.Valet_BasicCar_Vehicle_C",                                    "Valet_BasicCar_Vehicle_C"},
-    {"Motorcycle.Dirtbike",      "/Dirtbike/Vehicle/Motorcycle_DirtBike_Vehicle.Motorcycle_DirtBike_Vehicle_C",                        "Motorcycle_DirtBike_Vehicle_C"},
-    {"Motorcycle.Sportbike",     "/Sportbike/Vehicle/Motorcycle_Sport_Vehicle.Motorcycle_Sport_Vehicle_C",                              "Motorcycle_Sport_Vehicle_C"},
-    {"SpawnLocation.Boat",       "/Athena/Vehicles/Boat/Boat_Athena_Boat.Boat_Athena_Boat_C",                                          "Boat_Athena_Boat_C"},
+// Erbium 1:1 — Chapter 3 S21 vehicle tag map.
+// المطابقة حرفية (tag == needle) وليس find().
+static const struct { const char* tag; const char* classPath; const char* shortName; } kVehicleTagRules[] = {
+    // --- Upgraded Valet (الفئات الفعلية على خريطة S21) ---
+    {"Athena.Vehicle.SpawnLocation.Valet.BasicTruck.Upgraded",
+     "/Valet/BasicTruck/Valet_BasicTruck_Vehicle_Upgrade.Valet_BasicTruck_Vehicle_Upgrade_C",
+     "Valet_BasicTruck_Vehicle_Upgrade_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.BigRig.Upgraded",
+     "/Valet/BigRig/Valet_BigRig_Vehicle_Upgrade.Valet_BigRig_Vehicle_Upgrade_C",
+     "Valet_BigRig_Vehicle_Upgrade_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.SportsCar.Upgraded",
+     "/Valet/SportsCar/Valet_SportsCar_Vehicle_Upgrade.Valet_SportsCar_Vehicle_Upgrade_C",
+     "Valet_SportsCar_Vehicle_Upgrade_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.BasicCar.Upgraded",
+     "/Valet/BasicCar/Valet_BasicCar_Vehicle_Upgrade.Valet_BasicCar_Vehicle_Upgrade_C",
+     "Valet_BasicCar_Vehicle_Upgrade_C"},
+
+    // --- Variants الخاصة (بدون Upgraded) ---
+    {"Athena.Vehicle.SpawnLocation.Valet.BasicCar.Taxi",
+     "/Valet/TaxiCab/Valet_TaxiCab_Vehicle.Valet_TaxiCab_Vehicle_C",
+     "Valet_TaxiCab_Vehicle_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.BasicCar.Modded",
+     "/ModdedBasicCar/Vehicle/Valet_BasicCar_Vehicle_SuperSedan.Valet_BasicCar_Vehicle_SuperSedan_C",
+     "Valet_BasicCar_Vehicle_SuperSedan_C"},
+
+    // --- Motorcycles ---
+    {"Athena.Vehicle.SpawnLocation.Motorcycle.Dirtbike",
+     "/Dirtbike/Vehicle/Motorcycle_DirtBike_Vehicle.Motorcycle_DirtBike_Vehicle_C",
+     "Motorcycle_DirtBike_Vehicle_C"},
+    {"Athena.Vehicle.SpawnLocation.Motorcycle.Sportbike",
+     "/Sportbike/Vehicle/Motorcycle_Sport_Vehicle.Motorcycle_Sport_Vehicle_C",
+     "Motorcycle_Sport_Vehicle_C"},
+
+    // --- Base variants (احتياطي — قد تظهر في بعض الخرائط/الأوضاع) ---
+    {"Athena.Vehicle.SpawnLocation.Valet.BasicCar",
+     "/Valet/BasicCar/Valet_BasicCar_Vehicle_Upgrade.Valet_BasicCar_Vehicle_Upgrade_C",
+     "Valet_BasicCar_Vehicle_Upgrade_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.SportsCar",
+     "/Valet/SportsCar/Valet_SportsCar_Vehicle_Upgrade.Valet_SportsCar_Vehicle_Upgrade_C",
+     "Valet_SportsCar_Vehicle_Upgrade_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.BasicTruck",
+     "/Valet/BasicTruck/Valet_BasicTruck_Vehicle_Upgrade.Valet_BasicTruck_Vehicle_Upgrade_C",
+     "Valet_BasicTruck_Vehicle_Upgrade_C"},
+    {"Athena.Vehicle.SpawnLocation.Valet.BigRig",
+     "/Valet/BigRig/Valet_BigRig_Vehicle_Upgrade.Valet_BigRig_Vehicle_Upgrade_C",
+     "Valet_BigRig_Vehicle_Upgrade_C"},
+
     {nullptr, nullptr, nullptr}
 };
 
 static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
     if (!cls || IsBadPtr(cls)) return false;
     Transform t{};
-    t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z + 50.0;
+    t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z + 5.0;   // ⬅️ كان 50.0 (طفو)
     RotatorToQuat(rot, t.Rotation);
     void* vehicle = SpawnActor(session.world, cls, nullptr, t);
     if (!vehicle) return false;
-    // [F28] full fuel — SetFuel lives on the car subclasses; the property
-    // write covers every vehicle shape.
+
+    // الوقود الكامل
     {
         std::string clsName = ObjName(Read<void*>(vehicle, profile::ObjectClass));
         Call f((std::string("/Script/FortniteGame.") + clsName + ".SetFuel").c_str());
         if (!f.ok()) f = Call("/Script/FortniteGame.FortDagwoodVehicle.SetFuel");
         if (!f.ok()) f = Call("/Script/FortniteGame.FortAthenaVehicle.SetFuel");
         if (f.ok() && f.set_at(0, 100.0f)) f.run(vehicle);
-        void* fuelProp = GetProp("/Script/FortniteGame.FortAthenaVehicle.Fuel");
+        void* fuelProp = GetProp("/Script/FortniteGame/FortAthenaVehicle.Fuel");
         if (fuelProp && Read<int>(fuelProp, profile::PropElementSize) == 4)
             Write<float>(GetField(vehicle, fuelProp), 0, 100.0f);
     }
+
+    // ⬇️ جديد: تفعيل السيارة — بدون هذا لا يمكن ركوبها
+    {
+        Call act("/Script/FortniteGame.FortAthenaVehicle.SetIsVehicleActivated");
+        if (!act.ok()) act = Call("/Script/FortniteGame.FortAthenaVehicle.SetVehicleActivated");
+        if (!act.ok()) act = Call("/Script/FortniteGame.FortAthenaVehicle.ActivateVehicle");
+        if (act.ok()) {
+            bool b = true;
+            if (act.set("bNewValue", b) || act.set("bActivated", b) || act.set_at(0, b)) {
+                bool ok = act.run(vehicle);
+                LOG("[Vehicles] activation %s", ok ? "dispatched" : "rejected");
+            }
+        } else {
+            LOG("[Vehicles] ⚠️ no activation fn resolved");
+        }
+
+        // تأكيد التفعيل بمزامنة الحالة
+        Call net("/Script/Engine.Actor.ForceNetUpdate");
+        if (net.ok()) net.run(vehicle);
+    }
+
     return true;
 }
 
@@ -5584,14 +5651,19 @@ void Athena::GiveVehicleWeapon(void* weaponDef, int seatIdx) {
 void Athena::RemoveVehicleWeapon(bool reequip) {
     if (!session.vehicle_weapon_active) return;
     session.vehicle_weapon_active = false;
+
+    // احذف سلاح المقعد من المخزون (بدون drop — Erbium parity)
     RemoveItemByGuid(session.vehicle_weapon_guid, false, -1);
     session.vehicle_weapon_guid = Guid{};
     session.vehicle_weapon_seat = -1;
+
     if (reequip) {
-        if (session.previous_weapon_guid.A | session.previous_weapon_guid.B | session.previous_weapon_guid.C | session.previous_weapon_guid.D) {
+        // إعادة تجهيز السلاح السابق أو الفأس
+        if (session.previous_weapon_guid.A | session.previous_weapon_guid.B |
+            session.previous_weapon_guid.C | session.previous_weapon_guid.D) {
             OnServerExecuteInventoryItem(session.previous_weapon_guid);
         } else if (session.slots[0]) {
-            EquipSlot(0);   // pickaxe fallback (Erbium parity)
+            EquipSlot(0);
         }
         session.previous_weapon_guid = Guid{};
     }
@@ -5959,8 +6031,9 @@ static void pe_hook(void* obj, void* func, void* params) {
                 isWorldTarget = true;
         }
 
-        if (isPC || isPawn || isWeapon || isInteraction || isWorldTarget) {
-            Guard g;
+bool reequipAfterExit = false;   // [F28-b] خروج من مركبة يحمل سلاح مقعد
+if (isPC || isPawn || isWeapon || isInteraction || isWorldTarget) {
+    Guard g;
             if (fn == "ServerExecuteInventoryItem") {
                 if (Read<uint16_t>(func, profile::FunctionParamSize) >= (int)sizeof(Guid))
                     Athena::OnServerExecuteInventoryItem(Read<Guid>(params));
@@ -6035,6 +6108,12 @@ static void pe_hook(void* obj, void* func, void* params) {
                     void* actorCls = FindObj("/Script/FortniteGame.BuildingActor");
                     void* targetCls = Read<void*>(target, profile::ObjectClass);
                     LOG("[Interact] target=%p class=%s", target, ObjName(targetCls).c_str());
+static void* vCls = nullptr;
+if (!vCls) vCls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+if (vCls && SubclassOfFast(targetCls, vCls)) {
+    LOG("[Vehicle] interact -> %s (native handles enter)", ObjName(targetCls).c_str());
+    // لا return — يجب أن يصل إلى orig_PE() في نهاية pe_hook
+}
                     if (bcCls && SubclassOfFast(targetCls, bcCls)) Athena::Loot(target);
                     else if (wallCls && SubclassOfFast(targetCls, wallCls)) Athena::HandleDoor(target);
                     else if (actorCls && SubclassOfFast(targetCls, actorCls)) {
@@ -6081,9 +6160,15 @@ static void pe_hook(void* obj, void* func, void* params) {
                 }
             }
             else if (fn == "ServerPlayEmoteItem" && isPC) Athena::PlayEmoteItem(Read<void*>(params));
-            else if (fn == "ServerAttemptExitVehicle") Athena::OnExitVehicle();
-            else if (fn == "ServerOnExitVehicle" && isPawn) Athena::RemoveVehicleWeapon(true);   // [F28] seat-weapon cleanup
-            // [F24] ServerAttemptInventoryDrop(ItemGuid, Count, bTrash).
+            // [F28-b] الخروج: احذف سلاح المقعد الآن، وأعد التجهيز بعد اكتمال
+// الخروج الأصلي (Erbium ترتيب: Remove → native → re-equip).
+else if (fn == "ServerOnExitVehicle" && isPawn) {
+    if (session.vehicle_weapon_active) {
+        Athena::RemoveVehicleWeapon(false);   // حذف فقط، لا reequip
+        reequipAfterExit = true;
+    }
+}
+// ServerAttemptExitVehicle يُتْرك للأصلي (native يتولّى RPC الخروج)            // [F24] ServerAttemptInventoryDrop(ItemGuid, Count, bTrash).
             else if (fn == "ServerAttemptInventoryDrop" && params) {
                 Guid gg = Read<Guid>(params);
                 int cnt = Read<int>(params, sizeof(Guid));
@@ -6092,6 +6177,19 @@ static void pe_hook(void* obj, void* func, void* params) {
         }
     }
     orig_PE(obj, func, params);
+
+    // [F28-b] إعادة تجهيز السلاح السابق بعد اكتمال الخروج
+    if (reequipAfterExit) {
+        if (session.previous_weapon_guid.A | session.previous_weapon_guid.B |
+            session.previous_weapon_guid.C | session.previous_weapon_guid.D) {
+            Athena::OnServerExecuteInventoryItem(session.previous_weapon_guid);
+            LOG("[Vehicle] re-equipped previous weapon after exit");
+        } else if (session.slots[0]) {
+            Athena::EquipSlot(0);   // فأس كاحتياطي
+            LOG("[Vehicle] re-equipped pickaxe after exit");
+        }
+        session.previous_weapon_guid = Guid{};
+    }
 }
 
 static const char* PhaseName(int phase) {
