@@ -414,7 +414,9 @@ struct TScriptInterface { void* Object; void* Interface; };
 // ============================================================================
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
-namespace local_loot { int TableCount(); }   // [F92] heartbeat accessor
+namespace local_loot { int TableCount(); 
+// forward decl — ApplyAbilitySet تُعرَّف لاحقاً لكن GrantAbility تحتاجها
+static bool ApplyAbilitySet(void* pawn, void* abilitySet);}   // [F92] heartbeat accessor
 static bool IsA(void* obj, void* type);
 static bool SubclassOfFast(void* klass, void* targetClass);
 static void* GetProp(const char* path);
@@ -5365,49 +5367,6 @@ static const struct { const char* tag; const char* classPath; const char* shortN
 
     {nullptr, nullptr, nullptr}
 };
-
-static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
-    if (!cls || IsBadPtr(cls)) return false;
-    Transform t{};
-    t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z + 5.0;   // ⬅️ كان 50.0 (طفو)
-    RotatorToQuat(rot, t.Rotation);
-    void* vehicle = SpawnActor(session.world, cls, nullptr, t);
-    if (!vehicle) return false;
-
-    // الوقود الكامل
-    {
-        std::string clsName = ObjName(Read<void*>(vehicle, profile::ObjectClass));
-        Call f((std::string("/Script/FortniteGame.") + clsName + ".SetFuel").c_str());
-        if (!f.ok()) f = Call("/Script/FortniteGame.FortDagwoodVehicle.SetFuel");
-        if (!f.ok()) f = Call("/Script/FortniteGame.FortAthenaVehicle.SetFuel");
-        if (f.ok() && f.set_at(0, 100.0f)) f.run(vehicle);
-        void* fuelProp = GetProp("/Script/FortniteGame/FortAthenaVehicle.Fuel");
-        if (fuelProp && Read<int>(fuelProp, profile::PropElementSize) == 4)
-            Write<float>(GetField(vehicle, fuelProp), 0, 100.0f);
-    }
-
-    // ⬇️ جديد: تفعيل السيارة — بدون هذا لا يمكن ركوبها
-    {
-        Call act("/Script/FortniteGame.FortAthenaVehicle.SetIsVehicleActivated");
-        if (!act.ok()) act = Call("/Script/FortniteGame.FortAthenaVehicle.SetVehicleActivated");
-        if (!act.ok()) act = Call("/Script/FortniteGame.FortAthenaVehicle.ActivateVehicle");
-        if (act.ok()) {
-            bool b = true;
-            if (act.set("bNewValue", b) || act.set("bActivated", b) || act.set_at(0, b)) {
-                bool ok = act.run(vehicle);
-                LOG("[Vehicles] activation %s", ok ? "dispatched" : "rejected");
-            }
-        } else {
-            LOG("[Vehicles] ⚠️ no activation fn resolved");
-        }
-
-        // تأكيد التفعيل بمزامنة الحالة
-        Call net("/Script/Engine.Actor.ForceNetUpdate");
-        if (net.ok()) net.run(vehicle);
-    }
-
-    return true;
-}
 
 static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
     if (!cls || IsBadPtr(cls)) return false;
