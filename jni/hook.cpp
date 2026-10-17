@@ -1306,6 +1306,10 @@ struct Session {
     std::vector<PinnedDoor> door_pins;
     std::vector<void*>      sprint_doors;   // closed BuildingWalls within reach
     double last_door_scan = 0;
+    // [F-cities] building-instruction handler load attempts (streaming window)
+    int   building_load_attempts = 0;
+    // [F-loot-auto] floor loot retries while spawners still stream in
+    int   floor_loot_attempts = 0;
 } session;
 
 static double Monotonic() {
@@ -1350,6 +1354,9 @@ namespace Athena {
     void DestroyLods();
     void DropLoadingScreen();
     void FixBuildingFoundations();
+    void FixMissingBuildings();        // [F-cities] standalone building-load driver
+    void TickBuildingLoads();          // [F-cities] streaming retry window
+    void TickFloorLootStreaming();     // [F-loot-auto] floor loot while streaming
     void FixBus();
     void InitializeInventory();
     bool GiveItem(void* def, int count, int slot, uint8_t bar, bool require_new, int loadedAmmo = -1, int level = 1); // [F17/F31]
@@ -3047,6 +3054,8 @@ void Athena::Tick() {
         TickRealityProximity();    // [F44] reality tree proximity effect
         TickDoorPins();            // [F-door r1] doors stay open until we close them
         TickSprintDoors();         // [F-door r2] sprint fast-open
+        TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
+        TickFloorLootStreaming();  // [F-loot-auto] roll floor loot as spawners stream in
     }
     // [F28/F41] one-shot vehicle spawning with a retry window (vehicle spawners
     // stream in after the world is ready — 12 attempts × 15 s ≈ 3 min max).
@@ -5701,6 +5710,81 @@ void Athena::FixBuildingFoundations() {
         ++fixed;
     }
     LOG("[Foundations] Static type applied to %d foundations", fixed);
+}
+
+// ============================================================================
+// MISSING CITIES / BUILDINGS — [F-cities r1]
+// ============================================================================
+// 21.30 preassembled structures (POIs, cities, buildings) stream through
+// AFortSaveFileBuildingInstructionsHandler::LoadBuildings(FortPC) — the same
+// native driver the live server runs. In standalone nobody drives it, so the
+// handler ships inert (bLoadInvisible / no auto-spawn) and whole POIs never
+// materialise. Fix: find the handler actors, flip the invisible flag off and
+// run the load pass ourselves. The retry window (TickBuildingLoads) covers
+// handlers that stream in late with the POI sublevels.
+void Athena::FixMissingBuildings() {
+    if (!session.world) return;
+    void* cls = FindObj("/Script/FortniteGame.FortSaveFileBuildingInstructionsHandler");
+    if (!cls) { LOG("[Cities] handler class not present"); return; }
+    std::vector<void*> handlers;
+    if (!GetAllActorsOfClassRaw(cls, handlers) || handlers.empty()) { LOG("[Cities] no handler actors (yet)"); return; }
+    int driven = 0;
+    for (void* h : handlers) {
+        if (!h || IsBadPtr(h)) continue;
+        SetBool(h, "/Script/FortniteGame.FortSaveFileBuildingInstructionsHandler.bLoadInvisible", false);
+        Call load("/Script/FortniteGame.FortSaveFileBuildingInstructionsHandler.LoadBuildings");
+        if (!load.ok()) continue;
+        load.set("FortPC", session.controller);
+        if (load.run(h)) ++driven;
+    }
+    LOG("[Cities] LoadBuildings driven on %d/%zu handlers", driven, handlers.size());
+    if (driven > 0) {
+        // Native driver loaded the pieces — level-set the foundations so the
+        // static/ dynamic split matches the standalone expectations.
+        FixBuildingFoundations();
+    }
+}
+
+void Athena::TickBuildingLoads() {
+    if (session.building_load_attempts >= 10) return;
+    static double last = 0;
+    double now = Monotonic();
+    if (now - last < 15.0) return;
+    last = now;
+    void* cls = FindObj("/Script/FortniteGame.FortSaveFileBuildingInstructionsHandler");
+    if (!cls) return;
+    std::vector<void*> handlers;
+    if (!GetAllActorsOfClassRaw(cls, handlers) || handlers.empty()) return;
+    if (session.building_load_attempts == 0) LOG("[Cities] handler actors found: %zu", handlers.size());
+    ++session.building_load_attempts;
+    LOG("[Cities] loading attempt %d", session.building_load_attempts);
+    FixMissingBuildings();
+}
+
+// ============================================================================
+// FLOOR LOOT WHILE STREAMING — [F-loot-auto r1]
+// ============================================================================
+// "Loot seems manual" — Atlas: the one-shot SpawnFloorLoot ran during
+// SetupWorld, but Tiered_Athena_FloorLoot/Warmup spawners stream in with the
+// POI sublevels minutes later; the early pass found nothing, so the only loot
+// the player ever saw came from chest interaction. Fix: keep re-rolling the
+// floor-loot spawners over a 20 s × 6 window like the vehicles path
+// (SpawnFloorLoot destroys each spawner after rolling it, so retries only
+// process newly streamed ones).
+void Athena::TickFloorLootStreaming() {
+    if (session.floor_loot_attempts >= 6) return;
+    static double last = 0;
+    double now = Monotonic();
+    if (now - last < 20.0) return;
+    last = now;
+    void* cls = FindObj("/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C");
+    if (!cls) cls = LoadClass("/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C", "/Script/Engine.Actor");
+    if (!cls) return;
+    std::vector<void*> spawners;
+    if (!GetAllActorsOfClassRaw(cls, spawners) || spawners.empty()) return;
+    session.floor_loot_attempts = 6;   // spawners present — final full rollout below covers warmup type too
+    LOG("[Loot] streaming rollout: %zu floor-loot spawners", spawners.size());
+    SpawnFloorLoot();
 }
 
 void Athena::TeleportToSpawnIsland() {
