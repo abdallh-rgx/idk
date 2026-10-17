@@ -1365,6 +1365,7 @@ namespace Athena {
     void InitStaminaAttributes();
     void RefreshHUD();
     void ApplySprintSpeed();
+    void TickMovementAnimation()
     void SetupTacticalSprint();
     void SetTacticalSprinting(bool sprinting);
     void SpawnSafeZoneIndicator();
@@ -1452,6 +1453,90 @@ static void* GetASC(void* actor) {
     if (asc) return asc;
     asc = GetObjField(actor, "/Script/GameplayAbilities.AbilitySystemComponent");
     return asc;
+}
+// تبحث في قدرات اللاعب عن قدرة باسم يحتوي على hint ثم تفعّلها
+static bool TryActivateHinted(void* asc, const char* hint) {
+    if (!asc || IsBadPtr(asc) || !hint) return false;
+
+    // 1. جرّب أنماط التفعيل المباشرة أولاً
+    static const char* const directNames[] = {
+        "GA_Athena_RealitySapling_C", "GA_RealitySapling_C",
+        "GA_DoorBash_C", "GA_Athena_DoorBash_C",
+        "GA_Athena_Player_Slide_C", "GA_SlideImpulse_C",
+        nullptr
+    };
+    for (int i = 0; directNames[i]; ++i) {
+        if (!strstr(directNames[i], hint)) continue;
+        void* cls = ByShortName(directNames[i]);
+        if (!cls || IsBadPtr(cls)) continue;
+        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
+        if (c.ok()) {
+            bool bAllow = true;
+            if (c.set("InAbilityToActivate", cls) && c.set("bAllowRemoteActivation", bAllow)) {
+                if (c.run(asc)) { LOG("[Ability] ✅ direct activate %s", directNames[i]); return true; }
+            }
+        }
+    }
+
+    // 2. ابحث في قدرات ASC المسجّلة
+    void* actProp = GetProp("/Script/GameplayAbilities.AbilitySystemComponent.ActivatableAbilities");
+    if (!actProp) return false;
+    void* container = GetField(asc, actProp);
+    if (!container) return false;
+    void* itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.Items");
+    if (!itemsProp) itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.ActivatableAbilities");
+    if (!itemsProp) return false;
+    int stride = Read<int>(itemsProp, profile::PropElementSize);
+    void* inner = Read<void*>(itemsProp, 0x70);
+    void* specStruct = inner ? Read<void*>(inner, 0x70) : nullptr;
+    if (!specStruct || stride <= 0) return false;
+    int abilityOff = PropOffsetOn(specStruct, "Ability");
+    if (abilityOff < 0) return false;
+
+    Array arr = Read<Array>(GetField(container, itemsProp));
+    if (arr.Count < 0 || arr.Count > 256 || !arr.Data) return false;
+
+    for (int i = 0; i < arr.Count; ++i) {
+        void* row = (char*)arr.Data + (size_t)i * stride;
+        void* ability = Read<void*>(row, abilityOff);
+        if (!ability || IsBadPtr(ability)) continue;
+        void* abilityClass = Read<void*>(ability, profile::ObjectClass);
+        if (!abilityClass) continue;
+        std::string n = ObjName(abilityClass);
+        if (n.find(hint) == std::string::npos) continue;
+
+        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
+        if (c.ok()) {
+            bool bAllow = true;
+            if (c.set("InAbilityToActivate", abilityClass) && c.set("bAllowRemoteActivation", bAllow)) {
+                if (c.run(asc)) { LOG("[Ability] ✅ activate %s", n.c_str()); return true; }
+            }
+        }
+    }
+    return false;
+}
+
+// إرسال GameplayEvent (بديل لـ TryActivate — لبعض القدرات التي تعتمد على event)
+static bool SendGameplayEvent(void* asc, const char* eventTagName) {
+    if (!asc || IsBadPtr(asc) || !eventTagName) return false;
+    void* tag = ByShortName(eventTagName);
+    // GameplayTag = FName (8 بايت)
+    // جرّب عدة أشكال للوسم
+    static const char* const tags[] = {
+        eventTagName, nullptr
+    };
+    for (int i = 0; tags[i]; ++i) {
+        FName tagName = StringToFName(tags[i]);
+        if (!tagName.CompIdx) continue;
+        Call c("/Script/GameplayAbilities.AbilitySystemComponent.HandleGameplayEvent");
+        if (!c.ok()) continue;
+        // HandleGameplayEvent(GameplayTag, FGameplayEventData*)
+        uint8_t eventData[256]{};
+        if (c.set_bytes("EventTag", &tagName, sizeof(FName)) && c.set_bytes("Payload", eventData, 8)) {
+            if (c.run(asc)) { LOG("[Ability] ✅ event %s", tags[i]); return true; }
+        }
+    }
+    return false;
 }
 
 void Athena::GrantAbility(void* klass) {
@@ -2207,15 +2292,16 @@ void Athena::GrantWorldAbilities() {
     if (session.world_abilities_granted || !session.pawn) return;
 
     // Erbium AFortGameMode::FinishWorldInitialization — 21.30 ability sets
-    static const char* const setPaths[] = {
-        "/TacticalSprintGame/Gameplay/AS_TacticalSprint.AS_TacticalSprint",
-        "/Ascender/Gameplay/Ascender/AS_Ascender.AS_Ascender",
-        "/DoorBashContent/Gameplay/AS_DoorBash.AS_DoorBash",
-        "/HillScramble/Gameplay/AS_HillScramble.AS_HillScramble",
-        "/SlideImpulse/Gameplay/AS_SlideImpulse.AS_SlideImpulse",
-        "/RealitySeedGameplay/Environment/Foliage/GAS_Athena_RealitySapling.GAS_Athena_RealitySapling",
-        nullptr
-    };
+static const char* const setPaths[] = {
+    "/TacticalSprintGame/Gameplay/AS_TacticalSprint.AS_TacticalSprint",
+    "/TacticalSprint/Gameplay/AS_TacticalSprint.AS_TacticalSprint",        // fallback
+    "/Ascender/Gameplay/Ascender/AS_Ascender.AS_Ascender",
+    "/DoorBashContent/Gameplay/AS_DoorBash.AS_DoorBash",
+    "/HillScramble/Gameplay/AS_HillScramble.AS_HillScramble",              // ← جديد
+    "/SlideImpulse/Gameplay/AS_SlideImpulse.AS_SlideImpulse",              // ← جديد
+    "/RealitySeedGameplay/Environment/Foliage/GAS_Athena_RealitySapling.GAS_Athena_RealitySapling",
+    nullptr
+};
 
     int applied = 0, tried = 0;
     for (int i = 0; setPaths[i]; ++i) {
@@ -2300,6 +2386,96 @@ void Athena::ApplySprintSpeed() {
         if (flyProp) { float* val = (float*)GetField(cmc, flyProp); if (val && !IsBadPtr(val)) { if (fabsf(*val - 1200.f) > 1.0f) *val = 1200.f; } }
     }
     session.sprint_applied = true;
+}
+
+void Athena::TickMovementAnimation() {
+    if (!session.pawn || IsBadPtr(session.pawn)) return;
+    static double lastCheck = 0;
+    double now = Monotonic();
+    if (now - lastCheck < 0.15) return;
+    lastCheck = now;
+
+    // قراءة السرعة من CharacterMovement
+    void* cmc = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
+    if (!cmc || IsBadPtr(cmc)) return;
+    void* velProp = GetProp("/Script/Engine.MovementComponent.Velocity");
+    if (!velProp || Read<int>(velProp, profile::PropElementSize) != 24) return;
+    Vector vel = Read<Vector>(GetField(cmc, velProp));
+    double hSpeed = std::sqrt(vel.X*vel.X + vel.Y*vel.Y);
+
+    // --- Sprint detection ---
+    bool sprinting = (hSpeed > 750.0);
+
+    // اكتب TacticalSprint flags
+    if (session.tactical_sprint && !IsBadPtr(session.tactical_sprint)) {
+        uint8_t* flags = (uint8_t*)session.tactical_sprint + profile::TacticalSprint_Flags;
+        if (sprinting)
+            *flags |= profile::TacticalSprint_Bit_WantsSprint | profile::TacticalSprint_Bit_IsSprinting;
+        else
+            *flags &= (uint8_t)~(profile::TacticalSprint_Bit_IsSprinting);
+    }
+
+    // اكتب bIsSprinting على الـ pawn (أول مسار موجود)
+    static const char* const sprintProps[] = {
+        "/Script/FortniteGame.FortPlayerPawn.bIsSprinting",
+        "/Script/FortniteGame.FortPawn.bIsSprinting",
+        "/Script/FortniteGame.FortPlayerPawnAthena.bIsSprinting",
+        "/Script/FortniteGame.FortPlayerPawn.bIsSprintActive",
+        nullptr
+    };
+    for (int i = 0; sprintProps[i]; ++i) {
+        if (!GetProp(sprintProps[i])) continue;
+        bool current = GetBool(session.pawn, sprintProps[i]);
+        if (current != sprinting) {
+            SetBool(session.pawn, sprintProps[i], sprinting);
+            std::string onRep = std::string(sprintProps[i]);
+            auto dot = onRep.rfind('.');
+            if (dot != std::string::npos) {
+                onRep = onRep.substr(0, dot) + ".OnRep_bIsSprinting";
+                Call r(onRep.c_str());
+                if (r.ok()) r.run(session.pawn);
+            }
+            static int logged = 0;
+            if (logged++ < 3) LOG("[Anim] %s=%d (speed=%.0f)", sprintProps[i], (int)sprinting, hSpeed);
+        }
+        break;
+    }
+
+    // --- Slide detection ---
+    // ✅ الإصلاح: currentlySliding معرّف هنا، خارج if
+    bool currentlySliding = false;
+    uint8_t* slidingByte = (uint8_t*)session.pawn + profile::FortPlayerPawn_bIsSliding_Byte;
+    if (!IsBadPtr(slidingByte) && IsReadable(slidingByte, 1)) {
+        currentlySliding = ((*slidingByte >> profile::FortPlayerPawn_bIsSliding_Bit) & 1) != 0;
+        uint8_t mode = Read<uint8_t>(cmc, profile::CharacterMovement_MovementMode);
+        bool shouldSlide = (hSpeed > 900.0) && (mode == 3 || mode == 7);
+        if (currentlySliding != shouldSlide) {
+            if (shouldSlide) *slidingByte |= (1 << profile::FortPlayerPawn_bIsSliding_Bit);
+            else             *slidingByte &= ~(1 << profile::FortPlayerPawn_bIsSliding_Bit);
+            currentlySliding = shouldSlide;
+            static int sLogged = 0;
+            if (sLogged++ < 3) LOG("[Anim] bIsSliding=%d (speed=%.0f mode=%u)", (int)shouldSlide, hSpeed, mode);
+        }
+    }
+
+    // --- AnimInstance fallback ---
+    void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
+    if (mesh && !IsBadPtr(mesh)) {
+        void* animInst = GetObjField(mesh, "/Script/Engine.SkeletalMeshComponent.AnimScriptInstance");
+        if (animInst && !IsBadPtr(animInst)) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                void* sp = GetProp("/Script/FortniteGame.FortPlayerAnimInstance.bIsSprinting");
+                void* sl = GetProp("/Script/FortniteGame.FortPlayerAnimInstance.bIsSliding");
+                if (!sp) LOG("[Anim] ⚠️ bIsSprinting not on AnimInstance");
+                if (!sl) LOG("[Anim] ⚠️ bIsSliding not on AnimInstance");
+                if (sp && sl) LOG("[Anim] ✅ AnimInstance props OK");
+            }
+            SetBool(animInst, "/Script/FortniteGame.FortPlayerAnimInstance.bIsSprinting", sprinting);
+            SetBool(animInst, "/Script/FortniteGame.FortPlayerAnimInstance.bIsSliding", currentlySliding);
+        }
+    }
 }
 
 // ============================================================================
@@ -2507,6 +2683,7 @@ void Athena::TickSprintDoors() {
                             & profile::TacticalSprint_Bit_IsSprinting) != 0;
     if (!sprinting) return;
 
+    // مسح دوري
     if (now - session.last_door_scan > 2.0) {
         session.last_door_scan = now;
         session.sprint_doors.clear();
@@ -2517,14 +2694,15 @@ void Athena::TickSprintDoors() {
             for (void* w : walls) {
                 if (!w || IsBadPtr(w)) continue;
                 uint8_t* pack = (uint8_t*)w + profile::BuildingWall_bDoorOpen_Byte;
-                if (*pack & 0x20) continue;                     // already open
+                if (*pack & 0x20) continue;
                 Vector loc{};
                 if (!ActorLocation(w, loc) || !NearPlayer(loc, 400.0f)) continue;
                 session.sprint_doors.push_back(w);
-                if (session.sprint_doors.size() >= 32) break;   // tiny working set only
+                if (session.sprint_doors.size() >= 32) break;
             }
         }
     }
+
     int opened = 0;
     for (void* w : session.sprint_doors) {
         if (!w || IsBadPtr(w)) continue;
@@ -2535,14 +2713,23 @@ void Athena::TickSprintDoors() {
         static void* wallCls = nullptr;
         if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
         if (!wallCls || !IsA(w, wallCls)) continue;
+
+        // ✅ جديد: جرّب تفعيل DoorBash الأصلي أولاً
+        void* asc = GetASC(session.pawn);
+        bool abilityFired = asc ? TryActivateHinted(asc, "DoorBash") : false;
+
+        // fallback: فتح يدوي (يعمل دائماً)
         DoorOpenApply(w, /*fast=*/true);
         session.door_pins.push_back({w});
         if (session.door_pins.size() > 64) session.door_pins.erase(session.door_pins.begin());
+
+        static int logged = 0;
+        if (logged++ < 5)
+            LOG("[Door] bash on %s ability=%d", ObjName(w).c_str(), (int)abilityFired);
         ++opened;
     }
     if (opened) LOG("[Door] [F-door] sprint fast-open %d", opened);
 }
-
 // ============================================================================
 // COSMETICS — [F22] locker sync through the MCP context, with the menu-hero
 // parts fallback from the original hook (Era core setup_cosmetics ported).
@@ -3019,7 +3206,13 @@ void Athena::Tick() {
     static double lastAnimCheck = 0;      // [F83-b] body/anim + world ability retries
     static double lastCosmeticsCheck = 0;  // [F90-c/AUD-1] cosmetics with-state retry
     if (session.finalized && now - lastVisibility > 8.0) { lastVisibility = now; if (!session.visibility_forced) ForcePlayerVisible(); }
-    if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) { lastSpeedReapply = now; ApplySprintSpeed(); }
+if (session.finalized && session.pawn && now - lastSpeedReapply > 2.0) {
+    lastSpeedReapply = now;
+    ApplySprintSpeed();
+}
+if (session.finalized && session.pawn) {
+    TickMovementAnimation();   // ← جديد
+}
     // [F92] 30s heartbeat — the whole state machine in one line so ANY
     // partial device-log fragment always carries the state picture.
     static double lastHB = 0;
@@ -5389,58 +5582,27 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
 
     // تفعيل السيارة — كتابة خصائص مباشرة (UFUNCTIONs غير موجودة في 21.30)
     {
-        int set = 0;
-        static const char* const actProps[] = {
+    // عمليات آمنة فقط + تشخيص للقراءة (لا كتابة على خصائص مجهولة)
+    {
+        // Tick + collision (آمنتان تماماً)
+        Call tick("/Script/Engine.Actor.SetActorTickEnabled");
+        if (tick.ok()) { bool b = true; tick.set("bEnabled", b); tick.run(vehicle); }
+        Call coll("/Script/Engine.Actor.SetActorEnableCollision");
+        if (coll.ok()) { bool b = true; coll.set("bNewActorEnableCollision", b); coll.run(vehicle); }
+
+        // تشخيص: اقرأ فقط، لا تكتب (آمن)
+        static const char* const diagProps[] = {
             "/Script/FortniteGame.FortAthenaVehicle.bCanBeUsed",
             "/Script/FortniteGame.FortAthenaVehicle.bIsReadyForPlayers",
             "/Script/FortniteGame.FortAthenaVehicle.bPlayersCanEnter",
-            "/Script/FortniteGame.FortAthenaVehicle.bAllowPlayerEntry",
+            "/Script/FortniteGame.FortAthenaVehicle.bIsVehicleDestroyed",
             "/Script/FortniteGame.FortAthenaVehicle.bIsVehicleSetup",
-            "/Script/FortniteGame.FortAthenaVehicle.bVehicleSetupComplete",
-            "/Script/FortniteGame.FortDagwoodVehicle.bCanBeUsed",
-            "/Script/FortniteGame.FortDagwoodVehicle.bIsReadyForPlayers",
             nullptr
         };
-        for (int i = 0; actProps[i]; ++i) {
-            void* p = GetProp(actProps[i]);
-            if (!p) continue;
-            SetBool(vehicle, actProps[i], true);
-            LOG("[Vehicles] set %s=true", actProps[i]);
-            ++set;
+        for (int i = 0; diagProps[i]; ++i) {
+            if (GetProp(diagProps[i]))
+                LOG("[Vehicles] diag %s=%d", diagProps[i], (int)GetBool(vehicle, diagProps[i]));
         }
-
-        // أوقف bIsVehicleDestroyed إن وجد
-        void* destroyedProp = GetProp("/Script/FortniteGame.FortAthenaVehicle.bIsVehicleDestroyed");
-        if (destroyedProp) SetBool(vehicle, "/Script/FortniteGame.FortAthenaVehicle.bIsVehicleDestroyed", false);
-
-        // SetOwner
-        Call so("/Script/Engine.Actor.SetOwner");
-        if (so.ok() && session.controller) {
-            so.set("NewOwner", session.controller);
-            if (so.run(vehicle)) LOG("[Vehicles] owner assigned");
-        }
-
-        // collision + tick
-        Call coll("/Script/Engine.Actor.SetActorEnableCollision");
-        if (coll.ok()) { bool b = true; coll.set("bNewActorEnableCollision", b); coll.run(vehicle); }
-        Call tick("/Script/Engine.Actor.SetActorTickEnabled");
-        if (tick.ok()) { bool b = true; tick.set("bEnabled", b); tick.run(vehicle); }
-
-        // OnRep
-        static const char* const onReps[] = {
-            "/Script/FortniteGame.FortAthenaVehicle.OnRep_bCanBeUsed",
-            "/Script/FortniteGame.FortAthenaVehicle.OnRep_bIsReadyForPlayers",
-            "/Script/FortniteGame.FortAthenaVehicle.OnRep_VehicleSetup",
-            "/Script/FortniteGame.FortDagwoodVehicle.OnRep_bCanBeUsed",
-            nullptr
-        };
-        for (int i = 0; onReps[i]; ++i) {
-            Call r(onReps[i]);
-            if (r.ok()) r.run(vehicle);
-        }
-
-        Call net("/Script/Engine.Actor.ForceNetUpdate");
-        if (net.ok()) net.run(vehicle);
 
         // سجّل سعة المقاعد
         Call get("/Script/Engine.Actor.GetComponentByClass");
@@ -5455,11 +5617,10 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
                 }
             }
         }
-
-        if (set == 0) LOG("[Vehicles] ⚠️ no activation bits found");
-        else LOG("[Vehicles] ✅ %d activation bits set", set);
     }
 
+    return true;
+}
     return true;
 }
 void Athena::SpawnVehicles() {
@@ -5631,43 +5792,115 @@ void Athena::TickMantleAssist() {
 // once through GObjects, then re-trigger their proximity blueprint events
 // when the player walks close. Best-effort: the visual/audio systems are
 // cooked inside the tree's BP; without a server they just need a nudge.
+static FName StringToFName(const char* str) {
+    if (!str || !*str) return FName{};
+    auto w = ToWide(str);
+    FStringNative fs{(TCHAR*)w.data(), (int32)w.size() + 1, (int32)w.size() + 1};
+    Call c("/Script/Engine.KismetSystemLibrary.Conv_StringToName");
+    if (!c.ok()) c = Call("/Script/Engine.KismetStringLibrary.Conv_StringToName");
+    if (!c.ok()) return FName{};
+    if (!c.set("InString", fs)) return FName{};
+    void* cdo = FindObj("/Script/Engine.Default__KismetSystemLibrary");
+    if (!cdo) cdo = FindObj("/Script/Engine.Default__KismetStringLibrary");
+    if (!cdo || !c.run(cdo)) return FName{};
+    return c.result<FName>();
+}
+
+static bool TryActivateHinted(void* asc, const char* hint) {
+    if (!asc || IsBadPtr(asc) || !hint) return false;
+
+    void* actProp = GetProp("/Script/GameplayAbilities.AbilitySystemComponent.ActivatableAbilities");
+    if (!actProp) return false;
+    void* container = GetField(asc, actProp);
+    if (!container) return false;
+    void* itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.Items");
+    if (!itemsProp) itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.ActivatableAbilities");
+    if (!itemsProp) return false;
+    int stride = Read<int>(itemsProp, profile::PropElementSize);
+    void* inner = Read<void*>(itemsProp, 0x70);
+    void* specStruct = inner ? Read<void*>(inner, 0x70) : nullptr;
+    if (!specStruct || stride <= 0) return false;
+    int abilityOff = PropOffsetOn(specStruct, "Ability");
+    if (abilityOff < 0) return false;
+
+    Array arr = Read<Array>(GetField(container, itemsProp));
+    if (arr.Count < 0 || arr.Count > 256 || !arr.Data) return false;
+
+    for (int i = 0; i < arr.Count; ++i) {
+        void* row = (char*)arr.Data + (size_t)i * stride;
+        void* ability = Read<void*>(row, abilityOff);
+        if (!ability || IsBadPtr(ability)) continue;
+        void* abilityClass = Read<void*>(ability, profile::ObjectClass);
+        if (!abilityClass) continue;
+        std::string n = ObjName(abilityClass);
+        if (n.find(hint) == std::string::npos) continue;
+
+        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
+        if (!c.ok()) continue;
+        bool bAllow = true;
+        if (c.set("InAbilityToActivate", abilityClass) && c.set("bAllowRemoteActivation", bAllow)) {
+            if (c.run(asc)) { LOG("[Ability] ✅ activated %s (hint=%s)", n.c_str(), hint); return true; }
+        }
+    }
+    static std::set<std::string> logged;
+    if (logged.insert(hint).second)
+        LOG("[Ability] ⚠️ hint '%s' not found in ASC", hint);
+    return false;
+}
+
+static bool SendGameplayEventTag(void* asc, const char* tagStr) {
+    if (!asc || !tagStr) return false;
+    FName tag = StringToFName(tagStr);
+    if (!tag.CompIdx) return false;
+
+    Call c("/Script/GameplayAbilities.AbilitySystemComponent.HandleGameplayEvent");
+    if (!c.ok()) c = Call("/Script/GameplayAbilities.AbilitySystemComponent.SendGameplayEvent");
+    if (!c.ok()) return false;
+
+    uint8_t eventData[256]{};
+    if (c.set_bytes("EventTag", &tag, sizeof(FName)) ||
+        c.set_bytes("GameplayEventTag", &tag, sizeof(FName))) {
+        if (c.set_bytes("Payload", eventData, 8) || c.set_bytes("Data", eventData, 8)) {
+            if (c.run(asc)) { LOG("[Ability] ✅ event %s", tagStr); return true; }
+        }
+    }
+    return false;
+}
+
 void Athena::TickRealityProximity() {
     static std::vector<void*> classes;
-    static std::vector<std::string> classNames;
     static std::vector<void*> actors;
-    static int failedSweeps = 0;
     static bool discovered = false;
+    static int failedSweeps = 0;
     static double nextScan = 0;
     static double lastApproach = 0;
     double now = Monotonic();
 
+    // الاكتشاف مرة واحدة
     if (!discovered) {
         if (failedSweeps >= 2 || now < nextScan) return;
         nextScan = now + 8.0;
         GObjects_t* go = GObjectArray();
         void* classType = FindObj("/Script/CoreUObject.Class");
         if (!go || !classType) { ++failedSweeps; return; }
-        classes.clear(); classNames.clear();
+        classes.clear();
         for (int32 i = 0; i < go->NumElements && (int)classes.size() < 4; ++i) {
             void* object = go->GetById((uint32)i);
             if (!object || IsBadPtr(object)) continue;
-            if (Read<void*>(object, profile::ObjectClass) != classType) continue;   // UClass objects only
+            if (Read<void*>(object, profile::ObjectClass) != classType) continue;
             std::string n = ObjName(object);
             if (n.find("RealityTree") == std::string::npos &&
                 n.find("RealitySapling") == std::string::npos) continue;
             classes.push_back(object);
-            classNames.push_back(n);
+            LOG("[Reality] class found: %s", n.c_str());
         }
-        if (!classes.empty()) {
-            discovered = true;
-            LOG("[Reality] ✅ discovered %zu reality classes (e.g. %s)", classes.size(), classNames[0].c_str());
-        } else {
-            ++failedSweeps;
-        }
+        if (!classes.empty()) discovered = true;
+        else ++failedSweeps;
         return;
     }
 
-    if (now - nextScan > 5.0) {
+    // تحديث قائمة الـ actors
+    if (now - nextScan > 3.0) {
         nextScan = now;
         actors.clear();
         for (void* cls : classes) {
@@ -5680,24 +5913,52 @@ void Athena::TickRealityProximity() {
 
     Vector pawnLoc{};
     if (!ActorLocation(session.pawn, pawnLoc)) return;
+
+    // ابحث عن أقرب شجرة ضمن 800 وحدة (8 متر — مدى معقول)
+    void* nearest = nullptr;
+    double nearestDist2 = 800.0 * 800.0;
     for (void* a : actors) {
         Vector loc{};
         if (!ActorLocation(a, loc)) continue;
         double dx = loc.X - pawnLoc.X, dy = loc.Y - pawnLoc.Y, dz = loc.Z - pawnLoc.Z;
-        if (dx*dx + dy*dy + dz*dz > 25000.0 * 25000.0) continue;
-        if (now - lastApproach < 45.0) return;
-        lastApproach = now;
-        LOG("[Reality] ✅ proximity to %s — triggering effect", ObjName(Read<void*>(a, profile::ObjectClass)).c_str());
-        static const char* events[] = {"OnPlayerNear", "BP_OnPlayerNear", "OnApproach", "PlayerNear", "BP_OnApproach"};
-        std::string cn = ObjName(Read<void*>(a, profile::ObjectClass));
-        for (const char* ev : events) {
-            Call c(("/Script/FortniteGame." + cn + "." + ev).c_str());
-            if (c.ok() && c.run(a)) { LOG("[Reality] fired %s", ev); break; }
-        }
-        break;
+        double d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 < nearestDist2) { nearestDist2 = d2; nearest = a; }
+    }
+    if (!nearest) return;
+    if (now - lastApproach < 3.0) return;   // cooldown قصير — نسمح بمحاولات متكررة
+    lastApproach = now;
+
+    void* asc = GetASC(session.pawn);
+    if (!asc) return;
+
+    // 1. جرّب التفعيل المباشر
+    bool ok = TryActivateHinted(asc, "Sapling");
+    if (!ok) ok = TryActivateHinted(asc, "Reality");
+
+    // 2. إذا فشل، جرّب GameplayEvent tags
+    if (!ok) {
+        static const char* const tagCandidates[] = {
+            "GameplayEvent.RealitySapling.Enter",
+            "GameplayEvent.RealitySapling",
+            "GameplayEvent.Athena.RealitySapling.Enter",
+            "GameplayEvent.Interact.RealitySapling",
+            "RealitySapling.Enter",
+            "Event.RealitySapling.Enter",
+            nullptr
+        };
+        for (int i = 0; tagCandidates[i] && !ok; ++i)
+            ok = SendGameplayEventTag(asc, tagCandidates[i]);
+    }
+
+    if (ok) {
+        LOG("[Reality] ✅ triggered near %s (dist=%.0f)",
+            ObjName(Read<void*>(nearest, profile::ObjectClass)).c_str(),
+            std::sqrt(nearestDist2));
+    } else {
+        static bool once = false;
+        if (!once) { once = true; LOG("[Reality] ⚠️ all activate paths failed — need correct event tag"); }
     }
 }
-
 // [F28] Seat weapons (Erbium EquipVehicleWeapon parity): while the pawn sits
 // in a WeaponSeatDefinitions seat, grant + equip the seat weapon with a full
 // clip; on seat change/exit remove it and re-equip the previous weapon or the
