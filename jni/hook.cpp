@@ -5417,15 +5417,26 @@ void Athena::SpawnVehicles() {
                     }
                     if (dup) continue;
                     bool reequipAfterExit = false;   // ← أضف هذا السطر
-if (isPC || isPawn || isWeapon || isInteraction || isWorldTarget) {
-    Guard g;
-                        if (!hit) continue;
-                        void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
-                        if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
-                        if (!cls || IsBadPtr(cls)) {
-                            LOG("[Vehicles] ⚠️ class missing for '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
-                            break;
-                        }
+// ✅ النسخة الصحيحة — داخل SpawnVehicles، داخل حلقة providers
+for (int r = 0; kVehicleTagRules[r].tag; ++r) {
+    bool hit = false;
+    for (auto& tg : tags) if (tg == kVehicleTagRules[r].tag) { hit = true; break; }
+    if (!hit) continue;
+    void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
+    if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
+    if (!cls || IsBadPtr(cls)) {
+        LOG("[Vehicles] ⚠️ class missing for tag '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
+        break;
+    }
+    ++viable;
+    if (SpawnVehicleAt(cls, loc, rot)) {
+        ++spawned;
+        spawnedAt.push_back(loc);
+        LOG("[Vehicles] ✅ %s (tag %s) @ %.0f %.0f %.0f",
+            kVehicleTagRules[r].shortName, tags[0].c_str(), loc.X, loc.Y, loc.Z);
+    }
+    break;
+}
                         ++viable;   // [F85] class resolved — this provider counts
                         if (SpawnVehicleAt(cls, loc, rot)) {
                             ++spawned;
@@ -5975,6 +5986,7 @@ static bool PrologueMatchPE(const char* label, uintptr_t rva) {
 
 static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
+    bool reequipAfterExit = false;   // ← أضف هذا
     if (!g_internal && func && g_gameTid.load() == (int)gettid()) {
         if (session.lobby_requested) { orig_PE(obj, func, params); return; }
 
