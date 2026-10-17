@@ -5374,139 +5374,100 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
     return true;
 }
 
-void Athena::SpawnVehicles() {
-    if (!session.world || session.vehicles_spawned) return;
-    if (!WorldIsStandalone(session.world)) return;
+static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
+    if (!cls || IsBadPtr(cls)) return false;
+    Transform t{};
+    t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z + 5.0;
+    RotatorToQuat(rot, t.Rotation);
+    void* vehicle = SpawnActor(session.world, cls, nullptr, t);
+    if (!vehicle) return false;
 
-    ++session.vehicle_attempts;
-    static std::vector<Vector> spawnedAt;
-    int spawned = 0;
-    int viable = 0;
-
-    // ---- Pass 1: LivingWorld providers (matched by GameplayTag) ----
+    // الوقود الكامل
     {
-        void* providerCls = FindObj("/Script/FortniteGame.FortAthenaLivingWorldStaticPointProvider");
-        if (providerCls) {
-            std::vector<void*> providers;
-            if (GetAllActorsOfClassRaw(providerCls, providers) && !providers.empty()) {
-                LOG("[Vehicles] LivingWorld providers: %zu", providers.size());
-                void* tagsProp    = GetProp("/Script/FortniteGame.FortAthenaLivingWorldStaticPointProvider.FiltersTags");
-                void* tagsArrProp = tagsProp ? GetProp("/Script/GameplayTags.GameplayTagContainer.GameplayTags") : nullptr;
-                if (!tagsArrProp) tagsArrProp = GetProp("/Script/FortniteGame.GameplayTagContainer.GameplayTags");
+        std::string clsName = ObjName(Read<void*>(vehicle, profile::ObjectClass));
+        Call f((std::string("/Script/FortniteGame.") + clsName + ".SetFuel").c_str());
+        if (!f.ok()) f = Call("/Script/FortniteGame.FortDagwoodVehicle.SetFuel");
+        if (!f.ok()) f = Call("/Script/FortniteGame.FortAthenaVehicle.SetFuel");
+        if (f.ok() && f.set_at(0, 100.0f)) f.run(vehicle);
+        void* fuelProp = GetProp("/Script/FortniteGame.FortAthenaVehicle.Fuel");
+        if (fuelProp && Read<int>(fuelProp, profile::PropElementSize) == 4)
+            Write<float>(GetField(vehicle, fuelProp), 0, 100.0f);
+    }
 
-                for (void* sp : providers) {
-                    if (!sp || IsBadPtr(sp)) continue;
+    // تفعيل السيارة — كتابة خصائص مباشرة (UFUNCTIONs غير موجودة في 21.30)
+    {
+        int set = 0;
+        static const char* const actProps[] = {
+            "/Script/FortniteGame.FortAthenaVehicle.bCanBeUsed",
+            "/Script/FortniteGame.FortAthenaVehicle.bIsReadyForPlayers",
+            "/Script/FortniteGame.FortAthenaVehicle.bPlayersCanEnter",
+            "/Script/FortniteGame.FortAthenaVehicle.bAllowPlayerEntry",
+            "/Script/FortniteGame.FortAthenaVehicle.bIsVehicleSetup",
+            "/Script/FortniteGame.FortAthenaVehicle.bVehicleSetupComplete",
+            "/Script/FortniteGame.FortDagwoodVehicle.bCanBeUsed",
+            "/Script/FortniteGame.FortDagwoodVehicle.bIsReadyForPlayers",
+            nullptr
+        };
+        for (int i = 0; actProps[i]; ++i) {
+            void* p = GetProp(actProps[i]);
+            if (!p) continue;
+            SetBool(vehicle, actProps[i], true);
+            LOG("[Vehicles] set %s=true", actProps[i]);
+            ++set;
+        }
 
-                    std::vector<std::string> tags;
-                    if (tagsProp && tagsArrProp) {
-                        void* container = GetField(sp, tagsProp);
-                        if (container) {
-                            Array arr = Read<Array>(GetField(container, tagsArrProp));
-                            for (int i = 0; i < arr.Count && i < 16 && arr.Data; ++i)
-                                tags.push_back(FNameToString((char*)arr.Data + (size_t)i * 8));
-                        }
-                    }
-                    if (tags.empty()) continue;
+        // أوقف bIsVehicleDestroyed إن وجد
+        void* destroyedProp = GetProp("/Script/FortniteGame.FortAthenaVehicle.bIsVehicleDestroyed");
+        if (destroyedProp) SetBool(vehicle, "/Script/FortniteGame.FortAthenaVehicle.bIsVehicleDestroyed", false);
 
-                    Vector loc{}; Rotator rot{};
-                    if (!ActorLocation(sp, loc)) continue;
-                    { Call c("/Script/Engine.Actor.K2_GetActorRotation"); if (c.ok() && c.run(sp)) rot = c.result<Rotator>(); }
+        // SetOwner
+        Call so("/Script/Engine.Actor.SetOwner");
+        if (so.ok() && session.controller) {
+            so.set("NewOwner", session.controller);
+            if (so.run(vehicle)) LOG("[Vehicles] owner assigned");
+        }
 
-                    bool dup = false;
-                    for (auto& s : spawnedAt) {
-                        double dx = s.X - loc.X, dy = s.Y - loc.Y;
-                        if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
-                    }
-                    if (dup) continue;
+        // collision + tick
+        Call coll("/Script/Engine.Actor.SetActorEnableCollision");
+        if (coll.ok()) { bool b = true; coll.set("bNewActorEnableCollision", b); coll.run(vehicle); }
+        Call tick("/Script/Engine.Actor.SetActorTickEnabled");
+        if (tick.ok()) { bool b = true; tick.set("bEnabled", b); tick.run(vehicle); }
 
-                    for (int r = 0; kVehicleTagRules[r].tag; ++r) {
-                        bool hit = false;
-                        for (auto& tg : tags) if (tg == kVehicleTagRules[r].tag) { hit = true; break; }
-                        if (!hit) continue;
+        // OnRep
+        static const char* const onReps[] = {
+            "/Script/FortniteGame.FortAthenaVehicle.OnRep_bCanBeUsed",
+            "/Script/FortniteGame.FortAthenaVehicle.OnRep_bIsReadyForPlayers",
+            "/Script/FortniteGame.FortAthenaVehicle.OnRep_VehicleSetup",
+            "/Script/FortniteGame.FortDagwoodVehicle.OnRep_bCanBeUsed",
+            nullptr
+        };
+        for (int i = 0; onReps[i]; ++i) {
+            Call r(onReps[i]);
+            if (r.ok()) r.run(vehicle);
+        }
 
-                        void* cls = LoadClass(kVehicleTagRules[r].classPath, "/Script/Engine.Actor");
-                        if (!cls) cls = ByShortName(kVehicleTagRules[r].shortName);
-                        if (!cls || IsBadPtr(cls)) {
-                            LOG("[Vehicles] ⚠️ class missing for tag '%s' (%s)", tags[0].c_str(), kVehicleTagRules[r].shortName);
-                            break;
-                        }
+        Call net("/Script/Engine.Actor.ForceNetUpdate");
+        if (net.ok()) net.run(vehicle);
 
-                        ++viable;
-                        if (SpawnVehicleAt(cls, loc, rot)) {
-                            ++spawned;
-                            spawnedAt.push_back(loc);
-                            LOG("[Vehicles] ✅ %s (tag %s) @ %.0f %.0f %.0f",
-                                kVehicleTagRules[r].shortName, tags[0].c_str(), loc.X, loc.Y, loc.Z);
-                        }
-                        break;
-                    }
+        // سجّل سعة المقاعد
+        Call get("/Script/Engine.Actor.GetComponentByClass");
+        void* seatCls = FindObj("/Script/FortniteGame.FortVehicleSeatComponent");
+        if (seatCls && get.ok() && get.set("ComponentClass", seatCls) && get.run(vehicle)) {
+            void* sc = get.result<void*>();
+            if (sc && !IsBadPtr(sc)) {
+                void* psProp = GetProp("/Script/FortniteGame.FortVehicleSeatComponent.PlayerSlots");
+                if (psProp) {
+                    Array slots = Read<Array>(GetField(sc, psProp));
+                    LOG("[Vehicles] seat slots=%d", slots.Count);
                 }
             }
         }
+
+        if (set == 0) LOG("[Vehicles] ⚠️ no activation bits found");
+        else LOG("[Vehicles] ✅ %d activation bits set", set);
     }
 
-    // ---- Pass 2: AFortAthenaVehicleSpawner (standalone needs this) ----
-    {
-        void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
-        if (!spawnerCls) spawnerCls = LoadClass("/Script/FortniteGame.FortAthenaVehicleSpawner", "/Script/Engine.Actor");
-        std::vector<void*> spawners;
-        if (spawnerCls && GetAllActorsOfClassRaw(spawnerCls, spawners) && !spawners.empty()) {
-            LOG("[Vehicles] spawner actors: %zu", spawners.size());
-            for (void* spawner : spawners) {
-                if (!spawner || IsBadPtr(spawner)) continue;
-
-                void* vehicleClass = nullptr;
-                { Call c("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass"); if (c.ok() && c.run(spawner)) vehicleClass = c.result<void*>(); }
-                if (!vehicleClass || IsBadPtr(vehicleClass)) continue;
-                ++viable;
-
-                void* cachedDef = GetObjField(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.CachedFortVehicleItemDef");
-                bool forced = GetBool(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.bForceSpawnAlways");
-                if (cachedDef && !IsBadPtr(cachedDef) && !forced) {
-                    float mn = 100.0f, mx = 100.0f;
-                    void* minProp = GetProp("/Script/FortniteGame.FortVehicleItemDefinition.VehicleMinSpawnPercent");
-                    void* maxProp = GetProp("/Script/FortniteGame.FortVehicleItemDefinition.VehicleMaxSpawnPercent");
-                    if (minProp && Read<int>(minProp, profile::PropElementSize) >= 4) mn = Read<float>(GetField(cachedDef, minProp));
-                    if (maxProp && Read<int>(maxProp, profile::PropElementSize) >= 4) mx = Read<float>(GetField(cachedDef, maxProp));
-                    double lo = std::clamp((double)mn * 0.01, 0.0, 1.0);
-                    double hi = std::clamp((double)mx * 0.01, 0.0, 1.0);
-                    if (hi < lo) hi = lo;
-                    double spawnPercent = lo + (hi - lo) * (rand() / (float)RAND_MAX);
-                    if ((rand() / (float)RAND_MAX) > spawnPercent) continue;
-                }
-
-                Vector loc{}; Rotator rot{};
-                if (!ActorLocation(spawner, loc)) continue;
-                { Call c("/Script/Engine.Actor.K2_GetActorRotation"); if (c.ok() && c.run(spawner)) rot = c.result<Rotator>(); }
-
-                bool dup = false;
-                for (auto& s : spawnedAt) {
-                    double dx = s.X - loc.X, dy = s.Y - loc.Y;
-                    if (dx*dx + dy*dy < 600.0 * 600.0) { dup = true; break; }
-                }
-                if (dup) continue;
-
-                if (SpawnVehicleAt(vehicleClass, loc, rot)) {
-                    ++spawned;
-                    spawnedAt.push_back(loc);
-                    LOG("[Vehicles] ✅ %s @ %.0f %.0f %.0f", ObjName(vehicleClass).c_str(), loc.X, loc.Y, loc.Z);
-                }
-            }
-        }
-    }
-
-    // ---- Commit semantics ----
-    if (spawned > 0 && spawned >= viable) {
-        session.vehicles_spawned = true;
-        LOG("[Vehicles] ✅ complete: %d vehicles total (attempts=%d)", (int)spawnedAt.size(), session.vehicle_attempts);
-    } else if (spawned > 0) {
-        LOG("[Vehicles] partial: +%d this pass, %d total, viable=%d — retrying (attempts=%d)", spawned, (int)spawnedAt.size(), viable, session.vehicle_attempts);
-    } else if (session.vehicle_attempts >= 12) {
-        session.vehicles_spawned = true;
-        LOG("[Vehicles] retry window exhausted: %d vehicles total", (int)spawnedAt.size());
-    } else {
-        LOG("[Vehicles] pass %d: no vehicles yet — will retry", session.vehicle_attempts);
-    }
+    return true;
 }
 
 // [F45] 21.30 wall-climb / mantle assist — standalone has no mantle path, so
@@ -5621,16 +5582,17 @@ void Athena::GiveVehicleWeapon(void* weaponDef, int seatIdx) {
     if (!weaponDef || IsBadPtr(weaponDef) || !session.pawn || !session.inventory) return;
     if (session.vehicle_weapon_active && seatIdx == session.vehicle_weapon_seat) return;
     if (session.vehicle_weapon_active && seatIdx != session.vehicle_weapon_seat) RemoveVehicleWeapon(false);
+
     void* cur = Read<void*>(session.pawn, profile::FortPawn_CurrentWeapon);
     if (cur && !IsBadPtr(cur)) {
         void* p = GetProp("/Script/FortniteGame.FortWeapon.ItemEntryGuid");
         Guid cg = p ? Read<Guid>(GetField(cur, p)) : Guid{};
         if (!memcmp(&cg, &session.vehicle_weapon_guid, sizeof(Guid))) {
-            session.vehicle_weapon_active = true;   // already holding it
+            session.vehicle_weapon_active = true;
             return;
         }
         if (!session.vehicle_weapon_active)
-            session.previous_weapon_guid = cg;      // remembered for re-equip
+            session.previous_weapon_guid = cg;
     }
     Guid guid = GuidOfDefInInventory(weaponDef);
     if (!(guid.A | guid.B | guid.C | guid.D)) {
@@ -5667,6 +5629,34 @@ void Athena::RemoveVehicleWeapon(bool reequip) {
         session.previous_weapon_guid = Guid{};
     }
 }
+// cache دالة GetVehicleActor — يمنع name-walk كل 0.5s (كان spam بالآلاف)
+static void* g_getVehicleFn = nullptr;
+static bool  g_getVehicleTried = false;
+static void* GetVehicleFn() {
+    if (!g_getVehicleTried) {
+        g_getVehicleTried = true;
+        for (const char* p : {
+            "/Script/FortniteGame.FortPlayerPawnAthena.GetVehicleActor",
+            "/Script/FortniteGame.FortPawn.GetVehicleActor",
+            "/Script/FortniteGame.FortPlayerPawnAthena.GetVehicle",
+            "/Script/FortniteGame.FortPawn.GetVehicle"
+        }) {
+            void* f = FindObj(p);
+            if (f && !IsBadPtr(f)) { g_getVehicleFn = f; LOG("[Vehicle] cached GetVehicleActor=%p", f); break; }
+        }
+        if (!g_getVehicleFn) LOG("[Vehicle] ⚠️ GetVehicleActor not found");
+    }
+    return g_getVehicleFn;
+}
+static void* GetVehicleFromPawn() {
+    void* fn = GetVehicleFn();
+    if (!fn || !session.pawn || !orig_PE) return nullptr;
+    Guard g;
+    uint8_t buf[16]{};
+    orig_PE(session.pawn, fn, buf);
+    void* v = Read<void*>(buf);
+    return (v && !IsBadPtr(v)) ? v : nullptr;
+}
 
 void Athena::TickVehicleSeats() {
     if (!session.pawn) return;
@@ -5674,15 +5664,10 @@ void Athena::TickVehicleSeats() {
     double now = Monotonic();
     if (now < nextPoll) return;
     nextPoll = now + 0.5;
-    void* vehicle = nullptr;
-    for (const char* name : {"GetVehicleActor", "GetVehicle"}) {
-        Call c((std::string("/Script/FortniteGame.FortPlayerPawnAthena.") + name).c_str());
-        if (!c.ok()) c = Call((std::string("/Script/FortniteGame.FortPawn.") + name).c_str());
-        if (c.ok() && c.run(session.pawn)) vehicle = c.result<void*>();
-        if (vehicle && !IsBadPtr(vehicle)) break;
-        vehicle = nullptr;
-    }
+
+    void* vehicle = GetVehicleFromPawn();
     if (!vehicle) { RemoveVehicleWeapon(true); return; }
+
     void* seatComp = nullptr, *wpnComp = nullptr;
     {
         Call get("/Script/Engine.Actor.GetComponentByClass");
@@ -5696,40 +5681,43 @@ void Athena::TickVehicleSeats() {
             }
         }
     }
-    // [F28] seat index via PlayerSlots (Erbium FindSeatIndex 1:1)
+    if (!seatComp) { RemoveVehicleWeapon(true); return; }
+
     int seatIdx = -1;
-    if (seatComp && !IsBadPtr(seatComp)) {
-        void* slotsProp = GetProp("/Script/FortniteGame.FortVehicleSeatComponent.PlayerSlots");
-        void* playerProp = GetProp("/Script/FortniteGame.AthenaCarPlayerSlot.Player");
-        if (slotsProp && playerProp) {
-            int stride = Read<int>(slotsProp, profile::PropElementSize);
-            Array slots = Read<Array>(GetField(seatComp, slotsProp));
-            if (stride >= 8 && slots.Count >= 0 && slots.Count < 32 && slots.Data && !IsBadPtr(slots.Data)) {
-                for (int i = 0; i < slots.Count; ++i) {
-                    void* row = (char*)slots.Data + (size_t)i * stride;
-                    void* player = ResolveWeak(GetField(row, playerProp));
-                    if (player == session.pawn) { seatIdx = i; break; }
-                }
-            }
-        }
+    {
+        Call find("/Script/FortniteGame.FortVehicleSeatComponent.FindSeatIndex");
+        if (find.ok() && find.set("Pawn", session.pawn) && find.run(seatComp))
+            seatIdx = find.result<int>();
     }
     if (seatIdx < 0) { RemoveVehicleWeapon(true); return; }
     if (!wpnComp || IsBadPtr(wpnComp)) { RemoveVehicleWeapon(true); return; }
+
+    void* activeSeatProp = GetProp("/Script/FortniteGame.FortVehicleSeatWeaponComponent.ActiveSeatIdx");
+    if (activeSeatProp && Read<int>(activeSeatProp, profile::PropElementSize) == 4)
+        Write<int32>(GetField(wpnComp, activeSeatProp), 0, seatIdx);
+
     void* wsdProp = GetProp("/Script/FortniteGame.FortVehicleSeatWeaponComponent.WeaponSeatDefinitions");
     if (!wsdProp) { RemoveVehicleWeapon(true); return; }
     int stride = Read<int>(wsdProp, profile::PropElementSize);
-    void* inner = Read<void*>(wsdProp, 0x70);                 // FArrayProperty.Inner
-    void* sStruct = inner ? Read<void*>(inner, 0x70) : nullptr; // FStructProperty.Struct
+    void* inner = Read<void*>(wsdProp, 0x70);
+    void* sStruct = inner ? Read<void*>(inner, 0x70) : nullptr;
     int seatOff = sStruct ? PropOffsetOn(sStruct, "SeatIndex") : -1;
     int wpnOff  = sStruct ? PropOffsetOn(sStruct, "VehicleWeapon") : -1;
     if (stride < 16 || seatOff < 0 || wpnOff < 0) { RemoveVehicleWeapon(true); return; }
+
     Array defs = Read<Array>(GetField(wpnComp, wsdProp));
     if (!defs.Data || IsBadPtr(defs.Data) || defs.Count < 0 || defs.Count > 16) { RemoveVehicleWeapon(true); return; }
+
     for (int i = 0; i < defs.Count; ++i) {
         void* row = (char*)defs.Data + (size_t)i * stride;
         if (Read<int32>(row, seatOff) != seatIdx) continue;
         void* wdef = Read<void*>(row, wpnOff);
-        if (wdef && !IsBadPtr(wdef)) { GiveVehicleWeapon(wdef, seatIdx); return; }
+        if (wdef && !IsBadPtr(wdef)) {
+            GiveVehicleWeapon(wdef, seatIdx);
+            int lewOff = sStruct ? PropOffsetOn(sStruct, "LastEquippedVehicleWeapon") : -1;
+            if (lewOff >= 0) Write<void*>(row, lewOff, wdef);
+            return;
+        }
         break;
     }
     RemoveVehicleWeapon(true);
