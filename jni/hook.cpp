@@ -415,6 +415,7 @@ struct TScriptInterface { void* Object; void* Interface; };
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
 namespace local_loot { int TableCount(); }   // [F92] heartbeat accessor
+static FName StringToFName(const char* str);
 static bool ApplyAbilitySet(void* pawn, void* abilitySet);
 static bool IsA(void* obj, void* type);
 static bool SubclassOfFast(void* klass, void* targetClass);
@@ -1365,7 +1366,7 @@ namespace Athena {
     void InitStaminaAttributes();
     void RefreshHUD();
     void ApplySprintSpeed();
-    void TickMovementAnimation()
+    void TickMovementAnimation();
     void SetupTacticalSprint();
     void SetTacticalSprinting(bool sprinting);
     void SpawnSafeZoneIndicator();
@@ -1455,67 +1456,6 @@ static void* GetASC(void* actor) {
     return asc;
 }
 // تبحث في قدرات اللاعب عن قدرة باسم يحتوي على hint ثم تفعّلها
-static bool TryActivateHinted(void* asc, const char* hint) {
-    if (!asc || IsBadPtr(asc) || !hint) return false;
-
-    // 1. جرّب أنماط التفعيل المباشرة أولاً
-    static const char* const directNames[] = {
-        "GA_Athena_RealitySapling_C", "GA_RealitySapling_C",
-        "GA_DoorBash_C", "GA_Athena_DoorBash_C",
-        "GA_Athena_Player_Slide_C", "GA_SlideImpulse_C",
-        nullptr
-    };
-    for (int i = 0; directNames[i]; ++i) {
-        if (!strstr(directNames[i], hint)) continue;
-        void* cls = ByShortName(directNames[i]);
-        if (!cls || IsBadPtr(cls)) continue;
-        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
-        if (c.ok()) {
-            bool bAllow = true;
-            if (c.set("InAbilityToActivate", cls) && c.set("bAllowRemoteActivation", bAllow)) {
-                if (c.run(asc)) { LOG("[Ability] ✅ direct activate %s", directNames[i]); return true; }
-            }
-        }
-    }
-
-    // 2. ابحث في قدرات ASC المسجّلة
-    void* actProp = GetProp("/Script/GameplayAbilities.AbilitySystemComponent.ActivatableAbilities");
-    if (!actProp) return false;
-    void* container = GetField(asc, actProp);
-    if (!container) return false;
-    void* itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.Items");
-    if (!itemsProp) itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.ActivatableAbilities");
-    if (!itemsProp) return false;
-    int stride = Read<int>(itemsProp, profile::PropElementSize);
-    void* inner = Read<void*>(itemsProp, 0x70);
-    void* specStruct = inner ? Read<void*>(inner, 0x70) : nullptr;
-    if (!specStruct || stride <= 0) return false;
-    int abilityOff = PropOffsetOn(specStruct, "Ability");
-    if (abilityOff < 0) return false;
-
-    Array arr = Read<Array>(GetField(container, itemsProp));
-    if (arr.Count < 0 || arr.Count > 256 || !arr.Data) return false;
-
-    for (int i = 0; i < arr.Count; ++i) {
-        void* row = (char*)arr.Data + (size_t)i * stride;
-        void* ability = Read<void*>(row, abilityOff);
-        if (!ability || IsBadPtr(ability)) continue;
-        void* abilityClass = Read<void*>(ability, profile::ObjectClass);
-        if (!abilityClass) continue;
-        std::string n = ObjName(abilityClass);
-        if (n.find(hint) == std::string::npos) continue;
-
-        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
-        if (c.ok()) {
-            bool bAllow = true;
-            if (c.set("InAbilityToActivate", abilityClass) && c.set("bAllowRemoteActivation", bAllow)) {
-                if (c.run(asc)) { LOG("[Ability] ✅ activate %s", n.c_str()); return true; }
-            }
-        }
-    }
-    return false;
-}
-
 // إرسال GameplayEvent (بديل لـ TryActivate — لبعض القدرات التي تعتمد على event)
 static bool SendGameplayEvent(void* asc, const char* eventTagName) {
     if (!asc || IsBadPtr(asc) || !eventTagName) return false;
