@@ -1457,14 +1457,49 @@ void Athena::GrantAbility(void* klass) {
     if (!klass || !session.pawn) return;
     void* asc = GetASC(session.pawn);
     if (!asc) { LOG("[Ability] no ASC"); return; }
-    // [F13] TryActivateAbilityByClass is the only reflected activation entry
-    // point in 21.30 (GiveAbility/K2_GiveAbility do not exist).
-    Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
-    if (!c.ok()) return;
-    bool bAllow = true;
-    if (c.set("InAbilityToActivate", klass) && c.set("bAllowRemoteActivation", bAllow)) {
-        c.run(asc);
-        LOG("[Ability] Activated: %s", ObjName(klass).c_str());
+
+    // المحاولة 1: TryActivateAbilityByClass (تعمل إذا كان الـ spec موجوداً
+    // مسبقاً عبر EquipFortAbilitySet — مثل Sprint/Jump)
+    {
+        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
+        if (c.ok()) {
+            bool bAllow = true;
+            if (c.set("InAbilityToActivate", klass) && c.set("bAllowRemoteActivation", bAllow)) {
+                if (c.run(asc)) {
+                    LOG("[Ability] activated existing spec: %s", ObjName(klass).c_str());
+                    return;
+                }
+            }
+        }
+    }
+
+    // المحاولة 2: منح القدرة عبر FortAbilitySet مؤقت (المسار الفعلي)
+    // EquipFortAbilitySet هو الذي يستدعي native GiveAbility داخلياً
+    void* setCls = FindObj("/Script/FortniteGame.FortAbilitySet");
+    if (!setCls) { LOG("[Ability] FortAbilitySet class missing"); return; }
+
+    void* set = Fn<void*(*)(void*, void*)>(profile::SpawnObject)(setCls, session.pawn);
+    if (!set || IsBadPtr(set)) { LOG("[Ability] temp set creation failed"); return; }
+
+    void* abProp = GetProp("/Script/FortniteGame.FortAbilitySet.GameplayAbilities");
+    if (!abProp) { LOG("[Ability] GameplayAbilities prop missing"); return; }
+
+    Array* arr = reinterpret_cast<Array*>(GetField(set, abProp));
+    if (!arr || arr->Count != 0) { LOG("[Ability] temp set array unavailable"); return; }
+
+    Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, abProp, &klass);
+
+    if (ApplyAbilitySet(session.pawn, set)) {
+        LOG("[Ability] ✅ granted+activated via set: %s", ObjName(klass).c_str());
+        // بعد المنح، نحاول التفعيل مرة أخرى (اختياري)
+        Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
+        if (c.ok()) {
+            bool bAllow = true;
+            if (c.set("InAbilityToActivate", klass) && c.set("bAllowRemoteActivation", bAllow))
+                c.run(asc);
+        }
+    } else {
+        LOG("[Ability] ❌ EquipFortAbilitySet failed for %s", ObjName(klass).c_str());
     }
 }
 
