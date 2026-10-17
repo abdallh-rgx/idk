@@ -1299,6 +1299,7 @@ struct Session {
     int32 pawn_weak_serial = 0;
     // [F40] match state (alive players / players-left HUD)
     bool  match_state_ready = false;
+    bool  climb_assist = true;          // [F45-r1] era.climb on|off — kill switch for the crash report
     // [F-door r1/r2] doors we opened stay open until the next interact closes
     // them again; the sprint fast-open path caches nearby walls so the scan
     // costs nothing unless the player is actively sprinting.
@@ -5447,7 +5448,12 @@ void Athena::SpawnVehicles() {
 // a jump pressed against a wall relaunches the pawn up+forward (climb-over
 // feel, Grapple-Glove-era mobility). Pure movement impulse — safe.
 void Athena::TickMantleAssist() {
-    if (!session.pawn) return;
+    if (!session.climb_assist) return;           // [F45-r1] era.climb off
+    if (!session.pawn || IsBadPtr(session.pawn) || !IsReadable(session.pawn, 0x120)) return;
+    // [F45-r1] never assist mid-skydive — a LaunchCharacter while falling from
+    // the bus path was a plausible contributor to the climb crash report; the
+    // assist only makes sense against a wall near the ground anyway.
+    if (GetBool(session.pawn, "/Script/FortniteGame.FortPlayerPawn.bIsSkydiving")) return;
     static double next = 0, lastBoost = 0;
     double now = Monotonic();
     if (now < next) return;
@@ -6245,6 +6251,14 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
             session.vehicles_spawned = false;
             session.vehicle_attempts = 0;
             Athena::SpawnVehicles();
+        } else if (normalized == "era.climb off") {
+            // [F45-r1] crash-report kill switch: turning the mantle assist off
+            // survives full matches; run `era.climb on` to restore.
+            session.climb_assist = false;
+            LOG("era.climb OFF — mantle assist disabled (F45 kill switch)");
+        } else if (normalized == "era.climb on") {
+            session.climb_assist = true;
+            LOG("era.climb ON — mantle assist live");
         } else if (normalized == "era.debug") {
             Athena::DebugDump();   // [F42] quickbars/inventory/match-state dump
         } else if (normalized == "era.fix" && session.world && session.finalized) {
