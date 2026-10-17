@@ -414,9 +414,8 @@ struct TScriptInterface { void* Object; void* Interface; };
 // ============================================================================
 static void* FindObj(const std::string& path);
 static std::string ObjName(void* obj);
-namespace local_loot { int TableCount(); 
-// forward decl — ApplyAbilitySet تُعرَّف لاحقاً لكن GrantAbility تحتاجها
-static bool ApplyAbilitySet(void* pawn, void* abilitySet);}   // [F92] heartbeat accessor
+namespace local_loot { int TableCount(); }   // [F92] heartbeat accessor
+static bool ApplyAbilitySet(void* pawn, void* abilitySet);
 static bool IsA(void* obj, void* type);
 static bool SubclassOfFast(void* klass, void* targetClass);
 static void* GetProp(const char* path);
