@@ -2950,7 +2950,9 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: InitializeInventory"); InitializeInventory();
     LOG("SetupWorld: ResetStaleContainers"); ResetStaleContainers();   // [F34]
     LOG("SetupWorld: SpawnFloorLoot"); SpawnFloorLoot();
-    LOG("SetupWorld: SpawnVehicles"); SpawnVehicles();                 // [F28]
+    // Vehicles are deferred until FinalizePlayer: spawning actors while the
+    // loading transition is still changing possession/world state is unsafe.
+    LOG("SetupWorld: vehicle spawning deferred until FinalizePlayer");
     LOG("SetupWorld: ApplySprintSpeed"); ApplySprintSpeed();
     LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
     // [F38] SpawnBuildPreviews removed — the hidden hand-rolled preview actors
@@ -5379,6 +5381,10 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
 
 void Athena::SpawnVehicles() {
     if (!session.world || session.vehicles_spawned) return;
+    // Never create vehicle actors during SetupWorld/loading. The world may be
+    // valid enough for enumeration while possession, streaming and match phase
+    // are still transitioning; defer until FinalizePlayer has completed.
+    if (!session.finalized || !session.pawn || IsBadPtr(session.pawn)) return;
     if (!WorldIsStandalone(session.world)) return;
     // [F41] The flag is only committed when spawners are actually found —
     // the map streams its spawners in over time, and the old code marked the
@@ -6385,8 +6391,8 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                 if (!def) LOG("Give: asset not found: %s", asset);
                 else LOG("Give result=%d", (int)Athena::GiveItem(def, count, slot, slot >= 0 && slot < 6 ? 0 : (uint8_t)-1, false));
             }
-        } else if (normalized == "era.vehicles" && session.world) {
-            // [F28] manual re-run of the vehicle spawner pass
+        } else if (normalized == "era.vehicles" && session.world && session.finalized) {
+            // [F28] manual re-run only after FinalizePlayer
             session.vehicles_spawned = false;
             session.vehicle_attempts = 0;
             Athena::SpawnVehicles();
