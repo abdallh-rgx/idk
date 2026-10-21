@@ -498,6 +498,45 @@
 //            WinningTeam/WinningPlayerState + OnReps, PlayWinEffects →
 //            ClientNotifyWon → ClientNotifyTeamWon (the Victory Royale
 //            banner). era.die / era.win force either flow for testing.
+//  [G18] WAVE 7 — the user's report: "Alive Player is fake — do it like
+//        Erbium: alone you never win immediately; alone the win window
+//        appears when you die; if someone joins and you stay last the win
+//        window appears; from match start alone you simply never win until
+//        you die. Plus climbing / building / vehicle / buttons / QuickBars /
+//        Inventory / Building are dead."
+//        (a) [G18-a] ALIVE PLAYERS ARE REAL — the G17 virtual lobby + paced
+//            elimination curve is DELETED. PlayersLeft now counts REAL
+//            player states (GameState->PlayerArray walk, dead = Place>0,
+//            local-player fallback when the array is empty). Alone the
+//            counter reads 1 and stays 1 — no fake curve. Win rules are the
+//            game's own: dying alone → Place=1 → the win window fires WITH
+//            the death flow; win-while-alive requires players_ever >= 2
+//            (a real second player joined and was eliminated). era.players
+//            N stays as an explicit FAKE floor for testing (0 = real only),
+//            era.alive prints the real state.
+//        (b) [G18-b] QUICKBAR SLOTS THROUGH THE CLIENT'S OWN API — the
+//            layered binder now leads with AFortPlayerController::
+//            AddItemToQuickBars(ItemDefinition, QuickBarType, SlotIndex)
+//            (SDK-verified, FortniteGame_functions.cpp:76307 — the exact
+//            BlueprintCallable the real client uses), then QuickBars::
+//            ServerAddItemInternal (Erbium GiveItem parity), then the
+//            manual surgery. Every bind ends with a GetItemInQuickbarSlot
+//            read-back so the log states whether the HUD can SEE the slot.
+//            A self-healing watch (TickQuickBarWatch, 10s × 12) re-binds
+//            any slot the HUD still cannot see; era.qb forces a pass. This
+//            is the fix for empty QuickBars + dead slot/build buttons (the
+//            build palette reads the Secondary bar the same way).
+//        (c) [G18-c] WALL CLIMB v2 — the old assist only boosted while
+//            FALLING (vel.Z < 0), so jumping INTO a wall never climbed.
+//            v2 boosts in BOTH phases when pressed against an obstacle
+//            (rising: hSpeed < 300 collapsed by the wall; falling:
+//            hSpeed < 480), chains every 0.45s while jump is held, capped
+//            at 4 boosts per air-time (no infinite flight), LaunchCharacter
+//            override-mode so fast falls cannot eat the boost.
+//        (d) [G18-d] VEHICLE ENTER LADDER — native interact → verify →
+//            ForceSeatSinglePawn → ForceSeatPawns({pawn}) (SDK-verified
+//            TArray form) → OnPawnEnterVehicle(pawn,0) dispatch, each step
+//            verified through GetVehicleActor before the next runs.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -2339,18 +2378,23 @@ struct Session {
     double last_door_scan = 0;
     // [F-cities] building-instruction handler load attempts (streaming window)
     int   building_load_attempts = 0;
-    // [G17] death / win / solo match simulation
+    // [G17/G18] death / win / REAL alive-players state
     bool  death_handled = false;        // one-shot death flow latch
     bool  win_handled = false;          // one-shot victory flow latch
-    bool  sim_started = false;          // virtual lobby seeded
-    int   sim_lobby_size = 0;           // era.players override (0 = playlist/100)
-    int   sim_players_left = 0;         // tracked PlayersLeft copy
-    double sim_next_elim = 0;           // next virtual elimination time
-    int   sim_elim_total = 0;           // virtual eliminations so far
+    int   players_override = 0;         // era.players N testing floor (0 = REAL counting only)
+    int   real_alive = -1;              // last real alive count (-1 = not counted yet)
+    int   players_ever = 0;             // highest real player count ever observed (win-while-alive gate)
+    int   alive_source = 0;             // 1 = PlayerArray, 2 = local fallback
     float last_known_health = 0.0f;    // death edge detection — only a REAL observed-alive → dead transition counts
     int8_t death_zero_streak = 0;      // debounce: two consecutive zero polls required
     double last_health_poll = 0;        // 0.5s death-watch cadence
-    double last_sim_poll = 0;           // 1s match-sim cadence
+    double last_alive_poll = 0;         // 1s real-alive recount cadence
+    // [G18-b] quickbar self-healing watch
+    int   qb_watch_tries = 0;
+    bool  qb_slots_verified = false;
+    double last_qb_watch = 0;
+    // [G18-c] climb assist chain cap (reset on leaving Falling)
+    int   climb_boosts = 0;
     // [G17-a] mesh-network / playlist levels
     bool  mesh_network_fixed = false;
     int   mesh_network_attempts = 0;
@@ -2431,7 +2475,7 @@ namespace Athena {
     void FixBus();
     void InitializeInventory();
     bool GiveItem(void* def, int count, int slot, uint8_t bar, bool require_new, int loadedAmmo = -1, int level = 1); // [F17/F31]
-    void AddToInventory(void* def, int count, int slot);
+    bool AddToInventory(void* def, int count, int slot);
     void InventoryUpdate();
     void GrantDefaultAbilities();
     void ActivateAbilityByClass(void* klass);   // [G03] activation helper — granting flows through the sets
@@ -2508,6 +2552,7 @@ namespace Athena {
 
     // [F36] QuickBars native binding (ServerAddItemInternal parity)
     bool QBAddItem(Guid guid, bool bSecondary, int slot);
+    bool QBBindController(void* def, uint8_t bar, int slot);   // [G18-b] AddItemToQuickBars
     void QBActivateSlot(bool bSecondary, int slot);
     void QBRemoveItem(Guid guid, int slot);
 
@@ -2527,11 +2572,13 @@ namespace Athena {
     void TickDeathWatch();
     void HandlePlayerDeath(bool forced);
 
-    // [G17-d] solo match simulation — paced virtual eliminations
-    void TickMatchSim();
+    // [G18-a] REAL alive-players system (Erbium PlayersLeft parity)
+    void TickRealAlive();
+    int  CountRealAlivePlayers(int* totalOut);
+    void TickQuickBarWatch();   // [G18-b] self-healing slot verification
 
     // [G17-e] Erbium win parity — Victory Royale banner
-    void HandleVictory();
+    void HandleVictory(bool onDeath = false);
 
     void DebugDump();
 }
@@ -3697,6 +3744,21 @@ void Athena::VerifyHUDReadPath() {
     }
 }
 
+// [G18-b] GetItemInQuickbarSlot read-back, tolerant of the enum's reflected
+// size (UE byte-enums marshal as 1; some builds widen to 4). Returns the
+// HUD-visible item for a bar/slot or null — THE definitive "can the HUD see
+// this slot?" answer (the mobile hotbar reads slots through exactly this).
+static void* QBQuerySlot(int bar, int slot) {
+    if (!session.controller) return nullptr;
+    Call q("/Script/FortniteGame.FortPlayerController.GetItemInQuickbarSlot");
+    if (!q.ok()) return nullptr;
+    bool ok = q.set("QuickBarType", bar) || q.set<uint8_t>("QuickBarType", (uint8_t)bar);
+    ok = ok && (q.set("SlotIndex", slot) || q.set<int32_t>("SlotIndex", slot));
+    if (!ok || !q.run(session.controller)) return nullptr;
+    void* item = q.result<void*>();
+    return (item && !IsBadPtr(item)) ? item : nullptr;
+}
+
 // [F19] Bind through the native Kismet helper, then verify by reading the
 // slot back. EquipItemToQuickBarSlot(WorldContextObject, ItemDefinition,
 // ItemVariantGuid, QuickBarType, SlotIndex) exists in 21.30.
@@ -3760,10 +3822,7 @@ bool Athena::BindSlot(void* item, int slot, uint8_t bar) {
         LOG("[QB] Standalone slot repair bar=%u slot=%d guid_verified=%d", bar, slot, (int)matched);
     }
     // [F19] Read back through the controller API for a definitive answer.
-    Call query("/Script/FortniteGame.FortPlayerController.GetItemInQuickbarSlot");
-    void* actual = nullptr;
-    if (query.ok() && query.set("QuickBarType", bar) && query.set("SlotIndex", slot) && query.run(session.controller))
-        actual = query.result<void*>();
+    void* actual = QBQuerySlot(bar, slot);
     if (actual) matched = matched || (actual == item);
     LOG("[QB] Slot bar=%u slot=%d verified=%d", bar, slot, (int)matched);
     return matched;
@@ -3797,6 +3856,10 @@ void Athena::ForceUpdateQuickBars() {
 // no manual slot surgery needed. Every helper degrades to the manual path
 // when the UFunction is absent on this build.
 // ============================================================================
+// [G18-b] forward declarations (definitions live in the inventory section)
+static void* ItemDefinitionOf(void* item);
+static Guid  ItemGuidOf(void* item);
+
 bool Athena::QBAddItem(Guid guid, bool bSecondary, int slot) {
     void* qb = session.quickbars;
     if (!qb || IsBadPtr(qb) || !(guid.A | guid.B | guid.C | guid.D)) return false;
@@ -3813,6 +3876,85 @@ bool Athena::QBAddItem(Guid guid, bool bSecondary, int slot) {
     if (!add.run(qb)) return false;
     LOG("[QB] ✅ ServerAddItemInternal bar=%d slot=%d", (int)bSecondary, slot);
     return true;
+}
+
+// [G18-b] PRIMARY SLOT PATH — AFortPlayerController::AddItemToQuickBars(
+// UFortItemDefinition* ItemDefinition, EEFortQuickBars QuickBarType, int32
+// SlotIndex) — SDK-verified (FortniteGame_functions.cpp:76307, BlueprintCallable
+// + Native). This is the CLIENT'S OWN quickbar bookkeeping: it resolves the
+// owning QuickBars actor, places the definition in the slot AND refreshes the
+// HUD — no raw array surgery, no guessed native conventions. Enum size is tried
+// both ways (reflected enums are commonly u8; some builds widen to u32).
+bool Athena::QBBindController(void* def, uint8_t bar, int slot) {
+    if (!def || !session.controller || slot < 0) return false;
+    Call c("/Script/FortniteGame.FortPlayerController.AddItemToQuickBars");
+    if (!c.ok()) { LOG("[QB] AddItemToQuickBars not present"); return false; }
+    if (!c.set("ItemDefinition", def)) { LOG("[QB] AddItemToQuickBars: ItemDefinition bind failed"); return false; }
+    bool typeOk = c.set("QuickBarType", (int)bar) || c.set<uint8_t>("QuickBarType", bar);
+    if (!typeOk) {
+        // Positional fallback: QuickBarType is the 2nd non-return param.
+        int barVal = bar;
+        typeOk = c.bind_at(1, &barVal, c.param_at_size(1) > 0 ? c.param_at_size(1) : 1);
+    }
+    bool slotOk = c.set("SlotIndex", slot) || c.set<int32_t>("SlotIndex", slot);
+    if (!slotOk) {
+        int slotVal = slot;
+        slotOk = c.bind_at(2, &slotVal, c.param_at_size(2) > 0 ? c.param_at_size(2) : 4);
+    }
+    if (!typeOk || !slotOk) { LOG("[QB] AddItemToQuickBars: param bind failed (type=%d slot=%d)", (int)typeOk, (int)slotOk); return false; }
+    if (!c.run(session.controller)) return false;
+    LOG("[QB] ✅ AddItemToQuickBars bar=%u slot=%d def=%s", bar, slot, ObjName(def).c_str());
+    return true;
+}
+
+// [G18-b] SELF-HEALING SLOT WATCH — the mobile HUD reads every hotbar/build
+// slot through GetItemInQuickbarSlot; if that returns nothing the slot is
+// INVISIBLE no matter what the raw arrays hold. This pass re-checks the whole
+// starter layout every 10s (up to 12 passes ≈ 2 min) and re-binds anything the
+// HUD still cannot see — covering late HUD init, world-travel re-pairs and
+// the client rebuilding its quickbar after a loading screen drop.
+void Athena::TickQuickBarWatch() {
+    if (!session.finalized || !session.controller || !session.inventory_ready) return;
+    if (session.qb_slots_verified) return;
+    double now = Monotonic();
+    if (now - session.last_qb_watch < 10.0) return;
+    session.last_qb_watch = now;
+    if (session.qb_watch_tries++ > 12) return;
+
+    // Count HUD-visible slots on both bars through the NATIVE read path.
+    int visible[2] = {0, 0};
+    {
+        Call probe("/Script/FortniteGame.FortPlayerController.GetItemInQuickbarSlot");
+        if (!probe.ok()) return;   // no native read path on this build — watch is useless
+    }
+    for (int bar = 0; bar < 2; ++bar)
+        for (int s = 0; s < 6; ++s)
+            if (QBQuerySlot(bar, s)) ++visible[bar];
+    int expectedPrimary = 0, expectedSecondary = 0;
+    for (int s = 0; s < 6; ++s) { if (session.slots[s]) ++expectedPrimary; }
+    for (int s = 0; s < 6; ++s) { if (session.secondary_slots[s]) ++expectedSecondary; }
+    LOG("[QB] watch pass %d: HUD-visible %d/%d primary, %d/%d secondary",
+        session.qb_watch_tries, visible[0], expectedPrimary, visible[1], expectedSecondary);
+
+    if (visible[0] >= expectedPrimary && expectedPrimary > 0 && visible[1] >= expectedSecondary) {
+        session.qb_slots_verified = true;
+        LOG("[QB] ✅ all starter slots HUD-visible — watch complete");
+        return;
+    }
+    // Re-bind every slot the HUD cannot see through the layered binder.
+    int rebound = 0;
+    for (int bar = 0; bar < 2; ++bar) {
+        auto& src = bar == 0 ? session.slots : session.secondary_slots;
+        for (int s = 0; s < 6; ++s) {
+            if (!src[s]) continue;
+            if (QBQuerySlot(bar, s)) continue;   // already visible
+            void* def = ItemDefinitionOf(src[s]);
+            if (!def) continue;
+            if (QBBindController(def, (uint8_t)bar, s)) ++rebound;
+        }
+    }
+    ForceUpdateQuickBars();
+    if (rebound) LOG("[QB] watch re-bound %d slot(s)", rebound);
 }
 
 void Athena::QBActivateSlot(bool bSecondary, int slot) {
@@ -4906,7 +5048,7 @@ void Athena::Tick() {
         }
         int hbSpecs = gas::CountActivatableSpecs();
         float hbHp = session.pawn ? PawnHealth(session.pawn) : -1.0f;
-        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d death=%d won=%d meshnet=%d plvl=%d",
+        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d ever=%d qbok=%d death=%d won=%d meshnet=%d plvl=%d",
             (int)session.quickbars_initialized,
             (qbLink == session.quickbars ? (session.quickbars ? "ok" : "n/a") : "BAD"),
             (unsigned)hbGate, hbP, hbS,
@@ -4923,7 +5065,9 @@ void Athena::Tick() {
             gas::ApplyCharacterCustomization ? 1 : 0,
             (gas::SendRequestNow && orig_SendRequestNow) ? 1 : 0,   // [G10]
             hbHp,
-            session.sim_players_left,
+            session.real_alive,
+            session.players_ever,
+            (int)session.qb_slots_verified,
             (int)session.death_handled,
             (int)session.win_handled,
             (int)session.mesh_network_fixed,
@@ -4981,7 +5125,8 @@ void Athena::Tick() {
         TickFloorLootStreaming();  // [F-loot-auto] roll floor loot as spawners stream in
         TickMeshNetwork();         // [G17-a] NodeType retry window (subsystem streams in late)
         TickDeathWatch();          // [G17-c] health → 0 edge runs the server death flow
-        TickMatchSim();            // [G17-d] virtual elimination curve + win trigger
+        TickRealAlive();             // [G18-a] REAL alive recount + Erbium win rules
+        TickQuickBarWatch();         // [G18-b] self-healing quickbar slot verification
     }
     // [F28/F41] one-shot vehicle spawning with a retry window (vehicle spawners
     // stream in after the world is ready — 12 attempts × 15 s ≈ 3 min max).
@@ -5197,9 +5342,23 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
 
     if (slot >= 0 && slot < 6) {
         (bar == 0 ? session.slots : session.secondary_slots)[(size_t)slot] = inst;
-        // [F36] Native binding first (Erbium ServerAddItemInternal parity),
-        // manual slot surgery only as the fallback.
-        if (!QBAddItem(guid, bar == 1, slot)) BindSlot(inst, slot, bar);
+        // [G18-b] LAYERED SLOT BINDING — three independent paths, first win:
+        //   1. AFortPlayerController.AddItemToQuickBars (SDK-verified client
+        //      API, FortniteGame_functions.cpp:76307 — the exact function the
+        //      real client uses to place an item definition in a quickbar slot)
+        //   2. QuickBars.ServerAddItemInternal (Erbium GiveItem parity)
+        //   3. EquipItemToQuickBarSlot + raw slot surgery (manual fallback)
+        // Every path ends with a GetItemInQuickbarSlot read-back so the log
+        // always states whether the HUD can actually SEE the item.
+        bool bound = QBBindController(def, bar, slot);
+        const char* via = bound ? "AddItemToQuickBars" : nullptr;
+        if (!bound && QBAddItem(guid, bar == 1, slot)) { bound = true; via = "ServerAddItemInternal"; }
+        if (!bound && BindSlot(inst, slot, bar))       { bound = true; via = "manual"; }
+        if (bound) {
+            void* visible = QBQuerySlot(bar, slot);
+            LOG("[QB] bind bar=%u slot=%d via=%s HUD-read=%s", bar, slot, via,
+                visible ? "✅" : "❌ (slot empty)");
+        } else LOG("[QB] ⚠️ bind bar=%u slot=%d FAILED on all paths", bar, slot);
     }
     LOG("Inventory inserted %s count=%d slot=%d bar=%u indices=%d/%d",
         ObjName(def).c_str(), count, slot, bar, idx, entryIdx);
@@ -5207,9 +5366,9 @@ bool Athena::GiveItem(void* def, int count, int slot, uint8_t bar, bool require_
 }
 
 // Legacy direct-add kept for ammo/resources (no quickbar binding).
-void Athena::AddToInventory(void* def, int count, int slot) {
-    if (IsBadPtr(def) || !session.inventory) return;
-    GiveItem(def, count, (slot >= 0 && slot < 6) ? slot : -1, 0, false);
+bool Athena::AddToInventory(void* def, int count, int slot) {
+    if (IsBadPtr(def) || !session.inventory) return false;
+    return GiveItem(def, count, (slot >= 0 && slot < 6) ? slot : -1, 0, false);
 }
 
 // [F19] Two-bar starter loadout: pickaxe + weapons on Primary(0), building
@@ -5299,13 +5458,17 @@ void Athena::InitializeInventory() {
         {"/Game/Items/Weapons/BuildingTools/BuildingItemData_Stair_W.BuildingItemData_Stair_W",  "BuildingItemData_Stair_W",  2},
         {"/Game/Items/Weapons/BuildingTools/BuildingItemData_RoofS.BuildingItemData_RoofS",      "BuildingItemData_RoofS",    3},
     };
+    int buildsGiven = 0;
     for (auto& t : tools) {
         void* def = LoadAsset(t.path);
         if (!def) def = ByShortName(t.shortName);
-        if (def) GiveItem(def, 1, t.slot, 1, false);
+        if (def) { if (GiveItem(def, 1, t.slot, 1, false)) ++buildsGiven; }
+        else LOG("[Loadout] ⚠️ %s NOT FOUND (path + short-name both missed — build palette will miss this piece)", t.shortName);
     }
     session.edit_tool = LoadAsset("/Game/Items/Weapons/BuildingTools/EditTool.EditTool");
-    if (session.edit_tool) GiveItem(session.edit_tool, 1, 4, 1, false);
+    bool editGiven = false;
+    if (session.edit_tool) editGiven = GiveItem(session.edit_tool, 1, 4, 1, false);
+    else LOG("[Loadout] ⚠️ EditTool NOT FOUND");
 
     const char* ammo[] = {
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight",
@@ -5313,17 +5476,26 @@ void Athena::InitializeInventory() {
         "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsHeavy.AthenaAmmoDataBulletsHeavy",
         "/Game/Athena/Items/Ammo/AthenaAmmoDataShells.AthenaAmmoDataShells",
         "/Game/Athena/Items/Ammo/AmmoDataRockets.AmmoDataRockets", nullptr};
-    for (int i = 0; ammo[i]; ++i) { void* def = LoadAsset(ammo[i]); if (def) AddToInventory(def, 999, -1); }
+    int ammoGiven = 0, resGiven = 0;
+    for (int i = 0; ammo[i]; ++i) { void* def = LoadAsset(ammo[i]); if (def && AddToInventory(def, 999, -1)) ++ammoGiven; }
     const char* resources[] = {
         "/Game/Items/ResourcePickups/WoodItemData.WoodItemData",
         "/Game/Items/ResourcePickups/StoneItemData.StoneItemData",
         "/Game/Items/ResourcePickups/MetalItemData.MetalItemData", nullptr};
-    for (int i = 0; resources[i]; ++i) { void* def = LoadAsset(resources[i]); if (def) AddToInventory(def, 500, -1); }
+    for (int i = 0; resources[i]; ++i) { void* def = LoadAsset(resources[i]); if (def && AddToInventory(def, 500, -1)) ++resGiven; }
+
+    // [G18-b] one-line loadout verdict — the device log answers "is anything
+    // actually in the inventory?" without scrolling 40 GiveItem lines.
+    LOG("[Loadout] pickaxe=%d weapon1=%d builds=%d/4 edit=%d ammo=%d/5 mats=%d/3 (qb=%p)",
+        (int)(session.slots[0] != nullptr), (int)(session.slots[1] != nullptr),
+        buildsGiven, (int)editGiven, ammoGiven, resGiven, session.quickbars);
 
     InventoryUpdate();
     ForceUpdateQuickBars();
     ActivateQuickBarSlot(0, 0);
     session.inventory_ready = true;
+    session.qb_watch_tries = 0;     // [G18-b] arm the self-healing watch
+    session.qb_slots_verified = false;
     EquipSlot(0);
 }
 
@@ -7281,42 +7453,24 @@ void Athena::SetupMatchState() {
     if (session.state && !IsBadPtr(session.state)) {
         void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
         if (plProp && Read<int>(plProp, profile::PropElementSize) == 4) {
-            int cur = Read<int>(GetField(session.state, plProp));
-            if (cur < 2) {
-                // [G17-d] Erbium seeds PlayersLeft per joining player (→ 1 in
-                // solo). That freezes the alive counter at "1" forever — no
-                // opponents exist to eliminate. Seed a virtual solo lobby
-                // instead (playlist MaxPlayers, else 100; era.players N
-                // overrides) so the counter runs a real match curve and the
-                // victory flow is reachable.
-                int lobby = session.sim_lobby_size;
-                if (lobby <= 0) {
-                    // CurrentPlaylistInfo is an EMBEDDED struct — resolve its
-                    // data pointer, then the playlist pointers inside it.
-                    void* playlist = nullptr;
-                    void* infoProp = GetProp("/Script/FortniteGame.FortGameStateAthena.CurrentPlaylistInfo");
-                    void* info = infoProp ? GetField(session.state, infoProp) : nullptr;
-                    if (info && !IsBadPtr(info)) {
-                        playlist = GetObjField(info, "/Script/FortniteGame.PlaylistPropertyArray.BasePlaylist");
-                    }
-                    if (!playlist || IsBadPtr(playlist))
-                        playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
-                    if (playlist && !IsBadPtr(playlist)) {
-                        void* klass = Read<void*>(playlist, profile::ObjectClass);
-                        void* mp = klass ? FindChildProp(klass, "MaxPlayers") : nullptr;
-                        if (mp && Read<int>(mp, profile::PropElementSize) == 4) {
-                            int v = Read<int>(GetField(playlist, mp));
-                            if (v >= 1 && v <= 200) lobby = v;
-                        }
-                    }
-                }
-                if (lobby < 2) lobby = 100;
-                Write<int>(GetField(session.state, plProp), 0, lobby);
-                Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
-                if (n.ok()) n.run(session.state);
-                session.sim_players_left = lobby;
-                LOG("[MatchState] PlayersLeft=%d (virtual solo lobby) + OnRep (was %d)", lobby, cur);
-            }
+            // [G18-a] REAL counting (Erbium parity: PlayersLeft++ per joining
+            // player). No virtual lobby, no fake curve — the counter shows the
+            // number of REAL alive player states (1 when alone). The win rules
+            // follow the game: alone you never win while alive; dying alone
+            // places you #1 and shows the win window; a real 2nd player that
+            // ever joined makes last-standing trigger the victory banner.
+            int total = 0;
+            int alive = CountRealAlivePlayers(&total);
+            if (session.players_override > 0 && alive < session.players_override)
+                alive = session.players_override;   // era.players N testing floor
+            if (alive < 1) alive = 1;
+            Write<int>(GetField(session.state, plProp), 0, alive);
+            Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+            if (n.ok()) n.run(session.state);
+            session.real_alive = alive;
+            if (total > session.players_ever) session.players_ever = total;
+            LOG("[MatchState] PlayersLeft=%d (REAL — %d player state(s), source=%s)",
+                alive, total, session.alive_source == 1 ? "PlayerArray" : "local-fallback");
         }
         leftDone = true;
     }
@@ -7687,68 +7841,120 @@ void Athena::HandlePlayerDeath(bool forced) {
         Write<int>(GetField(session.state, plProp), 0, left);
         Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
         if (n.ok()) n.run(session.state);
-        session.sim_players_left = left;
+        session.real_alive = left;
     }
     LOG("[Death] ✅ complete: place=%d playersLeft=%d itemsDropped=%d", place, playersLeft - 1, dropped);
+    // [G18-a] THE GAME'S RULE (user-specified Erbium behaviour): if you were
+    // the ONLY player, you never win while alive — the win window appears
+    // exactly when you die (Place == 1). Fire the victory flow post-death.
+    if (place == 1 && !session.win_handled) {
+        LOG("[Death] solo death — Place #1 → win window (game rules)");
+        HandleVictory(true /*onDeath*/);
+    }
 }
 
 // ============================================================================
-// [G17-d] SOLO MATCH SIMULATION — paced virtual eliminations so the alive
-// counter runs a real BR curve and the victory flow is REACHABLE (with zero
-// opponents Erbium's server would end the match the moment you spawn).
-// Pacing: fast early game, slow top-10 — a full lobby drains in ~18 minutes.
+// [G18-a] REAL ALIVE PLAYERS — Erbium parity (FortPlayerControllerAthena.cpp
+// 2094: PlayersLeft++ per join; ClientOnPawnDied: Place = PlayersLeft pre-
+// decrement, then RemoveFromAlivePlayers decrements). No fake curve, no
+// virtual lobby: the HUD counter is fed by the number of REAL alive player
+// states in the world. When alone it reads 1 and stays 1 — the victory flow
+// is reachable ONLY through death (Place=1 → win window) or a real second
+// player joining and being eliminated (players_ever >= 2 → last-standing win).
 // ============================================================================
-void Athena::TickMatchSim() {
+int Athena::CountRealAlivePlayers(int* totalOut) {
+    if (totalOut) *totalOut = 0;
+    int alive = 0, total = 0;
+    // Primary source: GameState->PlayerArray (TArray<APlayerState*>).
+    if (session.state && !IsBadPtr(session.state)) {
+        void* paProp = GetProp("/Script/Engine.GameStateBase.PlayerArray");
+        if (!paProp) paProp = GetProp("/Script/Engine.GameState.PlayerArray");
+        if (paProp) {
+            Array arr = Read<Array>(GetField(session.state, paProp));
+            if (arr.Count > 0 && arr.Count < 256 && arr.Data && !IsBadPtr(arr.Data)) {
+                session.alive_source = 1;
+                for (int i = 0; i < arr.Count; ++i) {
+                    void* ps = Read<void*>(arr.Data, (size_t)i * 8);
+                    if (!ps || IsBadPtr(ps)) continue;
+                    ++total;
+                    // Dead = a placement was recorded (Erbium sets Place only
+                    // on elimination). Anything else counts as alive.
+                    bool dead = false;
+                    void* placeProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.Place");
+                    if (placeProp && Read<int>(placeProp, profile::PropElementSize) == 4)
+                        dead = Read<int>(GetField(ps, placeProp)) > 0;
+                    if (!dead) ++alive;
+                }
+            }
+        }
+    }
+    // Fallback: the local player ALWAYS exists even when PlayerArray has not
+    // been populated (standalone never runs the server-side AddPlayerState).
+    if (total == 0) {
+        session.alive_source = 2;
+        bool dead = false;
+        if (session.player_state && !IsBadPtr(session.player_state)) {
+            void* placeProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.Place");
+            if (placeProp && Read<int>(placeProp, profile::PropElementSize) == 4)
+                dead = Read<int>(GetField(session.player_state, placeProp)) > 0;
+        }
+        total = 1;
+        alive = dead ? 0 : 1;
+    }
+    if (totalOut) *totalOut = total;
+    return alive;
+}
+
+void Athena::TickRealAlive() {
     if (!session.finalized || !session.state) return;
     void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
     if (!plProp || Read<int>(plProp, profile::PropElementSize) != 4) return;
     double now = Monotonic();
-    if (now - session.last_sim_poll < 1.0) return;
-    session.last_sim_poll = now;
-    int left = Read<int>(GetField(session.state, plProp));
-    if (!session.sim_started) {
-        if (!session.match_state_ready) return;   // waits for the seeding pass
-        session.sim_players_left = left;
-        session.sim_started = true;
-        session.sim_next_elim = now + 8.0 + (double)(rand() % 7);
-        LOG("[MatchSim] seeded: %d alive — virtual elimination curve armed", left);
-        return;
-    }
-    session.sim_players_left = left;
+    if (now - session.last_alive_poll < 1.0) return;
+    session.last_alive_poll = now;
+    if (!session.match_state_ready) return;   // waits for the seeding pass
+    int total = 0;
+    int alive = CountRealAlivePlayers(&total);
+    if (total > session.players_ever) session.players_ever = total;
+    // era.players N — explicit FAKE floor for device testing (default: real only).
+    if (session.players_override > 0 && alive < session.players_override)
+        alive = session.players_override;
+    session.real_alive = alive;
     if (session.death_handled || session.win_handled) return;   // game over — freeze
-    if (left <= 1) { HandleVictory(); return; }
-    if (now < session.sim_next_elim) return;
-    int newLeft = left - 1;
-    Write<int>(GetField(session.state, plProp), 0, newLeft);
-    Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
-    if (n.ok()) n.run(session.state);
-    session.sim_players_left = newLeft;
-    ++session.sim_elim_total;
-    double base;
-    if (newLeft > 60)      base = 3.0 + (double)(rand() % 4);    // 3-6s
-    else if (newLeft > 30) base = 6.0 + (double)(rand() % 7);    // 6-12s
-    else if (newLeft > 10) base = 12.0 + (double)(rand() % 14);  // 12-25s
-    else if (newLeft > 3)  base = 25.0 + (double)(rand() % 21);  // 25-45s
-    else                    base = 45.0 + (double)(rand() % 31); // 45-75s
-    session.sim_next_elim = now + base;
-    if (newLeft % 10 == 0 || newLeft <= 5)
-        LOG("[MatchSim] alive=%d (virtual elims=%d)", newLeft, session.sim_elim_total);
-    if (newLeft <= 1) HandleVictory();
+    int cur = Read<int>(GetField(session.state, plProp));
+    if (cur != alive) {
+        Write<int>(GetField(session.state, plProp), 0, alive);
+        Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+        if (n.ok()) n.run(session.state);
+        LOG("[Alive] REAL count %d → %d (ever=%d, source=%s)",
+            cur, alive, session.players_ever,
+            session.alive_source == 1 ? "PlayerArray" : "local-fallback");
+    }
+    // Win-while-alive ONLY when a real second player joined this match and
+    // every other player is gone (the game's last-standing rule).
+    if (alive == 1 && session.players_ever >= 2) {
+        LOG("[Alive] last player standing (players_ever=%d) — victory", session.players_ever);
+        HandleVictory();
+    }
 }
 
 // ============================================================================
-// [G17-e] HandleVictory — Erbium win parity (ClientOnPawnDied lines 1262-
-// 1301): when the last opponent dies the server notifies the winner —
+// [G17-e/G18-a] HandleVictory — Erbium win parity (ClientOnPawnDied lines
+// 1262-1301): when the last opponent dies the server notifies the winner —
 //   PlayWinEffects (v16+) → ClientNotifyWon → ClientNotifyTeamWon,
 //   GameState->WinningTeam = TeamIndex + OnRep,
 //   GameState->WinningPlayerState + OnRep.
-// Our solo win trigger is the match sim reaching PlayersLeft == 1.
+// Triggers: (a) [G18-a] death with Place == 1 — the game shows the win window
+// exactly when the last (only) player dies; (b) real last-standing (a second
+// real player joined and was eliminated); (c) era.win for device testing.
 // ============================================================================
-void Athena::HandleVictory() {
-    if (session.win_handled || session.death_handled) return;
+void Athena::HandleVictory(bool onDeath) {
+    if (session.win_handled) return;
+    if (session.death_handled && !onDeath) return;   // alive-win only before death
     if (!session.finalized || !session.controller) return;
     session.win_handled = true;
-    LOG("[Victory] 🏆 last player standing — running Erbium win flow");
+    LOG("[Victory] 🏆 %s — running Erbium win flow",
+        onDeath ? "died as the last player (Place #1 — game rules)" : "last player standing");
     int teamIndex = 3;
     // Place 1 + bIsAWinner (when the build still reflects it).
     if (session.player_state && !IsBadPtr(session.player_state)) {
@@ -7857,8 +8063,9 @@ void Athena::DebugDump() {
         void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
         if (plProp) LOG("PlayersLeft=%d", Read<int>(GetField(session.state, plProp)));
     }
-    LOG("death=%d win=%d alive=%d hp=%.0f meshnet=%d(attempts=%d) plvl=%d",
-        (int)session.death_handled, (int)session.win_handled, session.sim_players_left,
+    LOG("death=%d win=%d alive=%d ever=%d qbw=%d hp=%.0f meshnet=%d(attempts=%d) plvl=%d",
+        (int)session.death_handled, (int)session.win_handled, session.real_alive,
+        session.players_ever, session.qb_watch_tries,
         (session.pawn ? PawnHealth(session.pawn) : -1.0f),
         (int)session.mesh_network_fixed, session.mesh_network_attempts,
         (int)session.playlist_levels_done);
@@ -8069,36 +8276,54 @@ void Athena::SpawnVehicles() {
     }
 }
 
-// [F45] 21.30 wall-climb / mantle assist — standalone has no mantle path, so
-// a jump pressed against a wall relaunches the pawn up+forward (climb-over
-// feel, Grapple-Glove-era mobility). Pure movement impulse — safe.
+// [F45/G18-c] WALL CLIMB — v2. The old assist only fired while FALLING
+// (vel.Z < 0), so jumping INTO a wall (vel.Z > 0 on the way up) never
+// boosted: climbing felt dead. v2 fires in BOTH phases whenever the pawn is
+// pressed against an obstacle (horizontal speed collapsed) with jump held:
+//   • upward phase (vel.Z >= 0): hSpeed < 300 → blocked by the wall → boost
+//   • falling phase (vel.Z < 0): hSpeed < 480 → falling into the face → boost
+// Boosts chain every 0.45s while jump is held (hold-to-climb), capped at 4
+// per air-time (reset the moment the pawn leaves MOVE_Falling) so open-air
+// jumps can never turn into flight.
 void Athena::TickMantleAssist() {
     if (!session.pawn) return;
-    static double next = 0, lastBoost = 0;
-    double now = Monotonic();
-    if (now < next) return;
-    next = now + 0.1;
-    if (now - lastBoost < 0.8) return;
     void* movement = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
     if (!movement || IsBadPtr(movement)) return;
     uint8_t mode = Read<uint8_t>(movement, profile::CharacterMovement_MovementMode);
-    if (mode != 3) return;                       // MOVE_Falling only
+    if (mode != 3) { session.climb_boosts = 0; return; }   // MOVE_Falling only; reset chain on ground
+    if (session.climb_boosts >= 4) return;                 // chain cap — no infinite flight
     if (!GetBool(session.pawn, "/Script/Engine.Character.bPressedJump")) return;
+    static double next = 0;
+    double now = Monotonic();
+    if (now < next) return;
     Vector vel{};
     void* velProp = GetProp("/Script/Engine.MovementComponent.Velocity");
     if (velProp && Read<int>(velProp, profile::PropElementSize) == 24)
         vel = Read<Vector>(GetField(movement, velProp));
-    if (vel.Z >= 0.0) return;                    // must be falling into the wall
+    if (!std::isfinite(vel.X) || !std::isfinite(vel.Y) || !std::isfinite(vel.Z)) return;
     double hSpeed = std::sqrt(vel.X * vel.X + vel.Y * vel.Y);
-    if (hSpeed > 480.0) return;                  // not pushing into it
+    // Wall evidence: while moving INTO an obstacle the engine zeroes the
+    // horizontal velocity — falling with residual speed OR rising with a
+    // collapsed speed both mean "pressed against a wall".
+    bool againstWall = (vel.Z >= 0.0 && hSpeed < 300.0) || (vel.Z < 0.0 && hSpeed < 480.0);
+    if (!againstWall) return;
     Vector fwd{};
     { Call f("/Script/Engine.Actor.GetActorForwardVector"); if (f.ok() && f.run(session.pawn)) fwd = f.result<Vector>(); }
-    Vector launch{ fwd.X * 180.0, fwd.Y * 180.0, 640.0 };
+    if (!std::isfinite(fwd.X) || !std::isfinite(fwd.Y)) return;
+    Vector launch{ fwd.X * 160.0, fwd.Y * 160.0, 640.0 };
     Call l("/Script/Engine.Character.LaunchCharacter");
-    if (l.ok() && l.set("LaunchVelocity", launch) && l.run(session.pawn)) {
-        lastBoost = now;
-        static bool logged = false;
-        if (!logged) { logged = true; LOG("[Climb] ✅ mantle assist live (jump against wall = climb)"); }
+    // Override both components — a predictable boost regardless of the
+    // current fall speed (additive mode was eaten by fast falls).
+    bool xy = true, z = true;
+    if (l.ok() && l.set("LaunchVelocity", launch)) {
+        l.set("bXYOverride", xy);
+        l.set("bZOverride", z);
+        if (l.run(session.pawn)) {
+            ++session.climb_boosts;
+            next = now + 0.45;
+            static bool logged = false;
+            if (!logged) { logged = true; LOG("[Climb] ✅ wall-climb v2 live (hold jump against a wall to climb)"); }
+        }
     }
 }
 
@@ -8820,25 +9045,28 @@ static void pe_hook(void* obj, void* func, void* params) {
                     LOG("[Interact] target=%p class=%s", target, ObjName(targetCls).c_str());
                     if (bcCls && SubclassOfFast(targetCls, bcCls)) Athena::Loot(target);
                     else if (IsVehicleTarget(targetCls)) {
-                        // [G15-c] VEHICLE ENTER — Erbium parity: the NATIVE
+                        // [G15-c/G18-d] VEHICLE ENTER — Erbium parity: the NATIVE
                         // ServerAttemptInteract seats the pawn (Erbium's own
                         // vehicle branch in ServerAttemptInteract_ is
                         // commented out — they rely on the OG call). Run the
                         // native FIRST, verify the seat took through
-                        // FortPlayerPawnAthena.GetVehicleActor, and fall back
-                        // to the SDK-verified BlueprintCallable
-                        // AFortAthenaVehicle::ForceSeatSinglePawn when the
-                        // native path declines (driver seat 0).
+                        // FortPlayerPawnAthena.GetVehicleActor, then fall back
+                        // through the full ladder:
+                        //   1. ForceSeatSinglePawn (SDK-verified BlueprintCallable)
+                        //   2. ForceSeatPawns({pawn}) (SDK-verified, TArray form)
+                        //   3. OnPawnEnterVehicle(pawn, 0) dispatch on the vehicle
+                        //      (the server notification the native path would send)
                         orig_PE(obj, func, params);
-                        bool seated = false;
-                        {
+                        auto verifySeated = []() -> bool {
                             Call v("/Script/FortniteGame.FortPlayerPawnAthena.GetVehicleActor");
                             if (!v.ok()) v = Call("/Script/FortniteGame.FortPawn.GetVehicleActor");
                             if (v.ok() && session.pawn && v.run(session.pawn)) {
                                 void* cur = v.result<void*>();
-                                seated = cur && !IsBadPtr(cur);
+                                return cur && !IsBadPtr(cur);
                             }
-                        }
+                            return false;
+                        };
+                        bool seated = verifySeated();
                         if (!seated && session.pawn) {
                             Call f("/Script/FortniteGame.FortAthenaVehicle.ForceSeatSinglePawn");
                             if (!f.ok()) f = Call("/Script/FortniteGame.FortCharacterVehicle.ForceSeatSinglePawn");
@@ -8848,6 +9076,43 @@ static void pe_hook(void* obj, void* func, void* params) {
                                     LOG("[Vehicle] ✅ force-seated into %s (native interact declined)",
                                         ObjName(targetCls).c_str());
                                     Athena::TickVehicleSeats(true);   // seat weapon path, instantly
+                                    seated = true;
+                                }
+                            }
+                        }
+                        if (!seated && session.pawn) {
+                            // [G18-d] ForceSeatPawns(TArray<AFortPlayerPawn*>) —
+                            // SDK-verified sibling; bind the array by reflection
+                            // (16-byte TArray = {Data, Count, Max}).
+                            Call fp("/Script/FortniteGame.FortAthenaVehicle.ForceSeatPawns");
+                            if (!fp.ok()) fp = Call("/Script/FortniteGame.FortCharacterVehicle.ForceSeatPawns");
+                            if (fp.ok()) {
+                                static void* cell = nullptr;      // persistent backing store
+                                cell = session.pawn;
+                                struct TArr { void* data; int32_t n; int32_t max; } ta{ &cell, 1, 1 };
+                                if (fp.set_bytes("PawnsToSeat", &ta, sizeof(ta)) || fp.bind_at(0, &ta, sizeof(ta))) {
+                                    fp.run(target);
+                                    seated = verifySeated();
+                                    if (seated) {
+                                        LOG("[Vehicle] ✅ ForceSeatPawns seated into %s", ObjName(targetCls).c_str());
+                                        Athena::TickVehicleSeats(true);
+                                    }
+                                }
+                            }
+                        }
+                        if (!seated && session.pawn) {
+                            // [G18-d] last resort: dispatch the enter notification
+                            // on the vehicle ourselves — OnPawnEnterVehicle(pawn,
+                            // seat) is the server→client seat bookkeeping event
+                            // (params: AFortPlayerPawn* @0, int32 SeatIdx @8).
+                            Call enter("/Script/FortniteGame.FortCharacterVehicle.OnPawnEnterVehicle");
+                            if (enter.ok() && enter.set("PlayerPawn", session.pawn)) {
+                                int seatIdx = 0;
+                                enter.set("SeatIdx", seatIdx);
+                                if (enter.run(target)) {
+                                    LOG("[Vehicle] OnPawnEnterVehicle dispatched on %s (verify next tick)",
+                                        ObjName(targetCls).c_str());
+                                    Athena::TickVehicleSeats(true);
                                 }
                             } else {
                                 LOG("[Vehicle] enter fallback unavailable for %s", ObjName(targetCls).c_str());
@@ -9117,22 +9382,44 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
         } else if (normalized == "era.win" && session.world && session.finalized) {
             // [G17-e] force the Victory Royale banner
             Athena::HandleVictory();
+        } else if (normalized == "era.alive" && session.world) {
+            // [G18-a] real alive-players diagnostic
+            int total = 0;
+            int alive = Athena::CountRealAlivePlayers(&total);
+            int shown = -1;
+            void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+            if (plProp && session.state) shown = Read<int>(GetField(session.state, plProp));
+            LOG("[Alive] real=%d total_ever=%d PlayersLeft=%d override=%d source=%s death=%d win=%d",
+                alive, total, shown, session.players_override,
+                session.alive_source == 1 ? "PlayerArray" : "local-fallback",
+                (int)session.death_handled, (int)session.win_handled);
+        } else if (normalized == "era.qb" && session.controller) {
+            // [G18-b] force a quickbar rebind + verify pass
+            session.qb_slots_verified = false;
+            session.qb_watch_tries = 0;
+            session.last_qb_watch = 0;   // bypass the 10s rate limiter
+            Athena::TickQuickBarWatch();
         } else if (normalized.rfind("era.players ", 0) == 0 && session.world) {
-            // [G17-d] virtual lobby size override (works before AND during a match)
+            // [G18-a] FAKE testing floor override — the REAL system counts
+            // actual player states; this forces the counter to pretend a
+            // bigger lobby (0 disables the override, back to real counting).
             int n = 0;
-            if (sscanf(normalized.c_str(), "era.players %d", &n) == 1 && n >= 1 && n <= 200) {
-                session.sim_lobby_size = n;
+            if (sscanf(normalized.c_str(), "era.players %d", &n) == 1 && n >= 0 && n <= 200) {
+                session.players_override = n;
                 if (session.state && session.finalized && !session.death_handled && !session.win_handled) {
                     void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
                     if (plProp && Read<int>(plProp, profile::PropElementSize) == 4) {
-                        Write<int>(GetField(session.state, plProp), 0, n);
+                        int total = 0;
+                        int alive = Athena::CountRealAlivePlayers(&total);
+                        if (n > 0 && alive < n) alive = n;
+                        if (alive < 1) alive = 1;
+                        Write<int>(GetField(session.state, plProp), 0, alive);
                         Call r("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
                         if (r.ok()) r.run(session.state);
-                        session.sim_players_left = n;
-                        session.sim_next_elim = Monotonic() + 3.0;
+                        session.real_alive = alive;
                     }
                 }
-                LOG("era.players: virtual lobby = %d", n);
+                LOG("era.players: override = %d (0 = REAL counting only)", n);
             }
         } else if (normalized.rfind("era.spawn ", 0) == 0 && session.world && session.pawn) {
             char path[512]{};
@@ -9152,7 +9439,7 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                     } else LOG("era.spawn: nothing found at %s", path);
                 }
             }
-        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles | era.loot | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
+        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.alive | era.qb | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.players N | era.vehicles | era.loot | era.die | era.win | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
