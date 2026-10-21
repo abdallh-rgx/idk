@@ -693,6 +693,40 @@
 //  [G26] VICTORY CROWN (Erbium FortPlayerControllerAthena.cpp:1277-1292,
 //        v19+ 1:1): the winner receives AGID_VictoryCrown after the banner
 //        chain.
+//  [G27] ROUND-11 CRASH — the native init convention matrix is OFF by default
+//        (kTryNativeGasInit=false): conv #3 killed the process with NO
+//        FAULTED line (SIGABRT/stack-overflow class — uncatchable by
+//        sigsetjmp), the third session in a row, while the reflection
+//        EquipFortAbilitySet path is proven on-device. PLUS: the fault guard
+//        now runs on a per-thread sigaltstack (SA_ONSTACK + re-arm after a
+//        caught fault) so guard-page stack-overflow SIGSEGVs become
+//        recoverable instead of silent process death.
+//  [G28] CREATURES — llama / vending machines / wildlife (boar, wolf,
+//        chicken, frog, crow, shark, Klombo/Buttercake): a GObjects class
+//        scanner (Actor-subclass + name-needle filter, resident-only, no sync
+//        loads) feeds a spawn rollout (4 passes: +20s/+60s/+150s/+300s after
+//        finalize) plus era.llama/era.animals/era.vending/era.klombo commands.
+//        Wildlife get SpawnDefaultController (best effort). Llama loot group
+//        aliases to Loot_AthenaTreasure so piñatas always yield.
+//  [G29] AUTO-GLIDER — LineTraceSingle (reflected, HitResult layout resolved
+//        live from /Script/Engine.HitResult) measures ground distance every
+//        0.3s while free-falling and deploys the glider under 1500uu via the
+//        OpenGlider/CloseGlider ladder + bParachuteOpen property fallback.
+//        ServerToggleParachute-family RPCs are intercepted in pe_hook (the
+//        client's own auto-deploy button finally lands somewhere). era.glider
+//        toggles manually.
+//  [G30] EMOTES — PlayEmoteItem order flipped: the LOCAL montage plays first
+//        (standalone needs no replication), the scanner-resolved native
+//        GiveAbilityAndActivateOnce is the last resort only. era.emote cycles
+//        five classic EIDs; the victory flow auto-dances (EID_DanceMoves).
+//  [G31] MISSING-FUNCTION RESEARCH — era.class <needle> dumps every class
+//        whose name matches plus up to 120 of its UFunctions each (the
+//        SetIsDoorOpen-class knowledge the user asked for); era.mark probes
+//        the marker RPC family and dumps params; every NEW interact target
+//        class is logged once per session.
+//  [G32] LOOT FROM BREAKING — pickaxe damage on an unsearched BuildingContainer
+//        (chest / ammo box / llama piñata) rolls its loot immediately via the
+//        guarded interact pipeline (bAlreadySearched keeps it once-only).
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -704,6 +738,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
 #include <cmath>
 #include <ctime>
@@ -1756,6 +1791,26 @@ static volatile int g_guardDepth = 0;        // [G23-b] nested-guard depth
 static volatile bool g_gasPrevInternal = false;
 static pthread_t g_guardOwner = 0;           // [G23-b] thread that owns the recovery point
 
+// [G27-b] ALTERNATE SIGNAL STACK — the round-11 death (conv #3, no FAULTED
+// line) includes the stack-overflow class: a SIGSEGV on the stack guard page
+// cannot run ANY handler on the exhausted stack (kernel kills the process
+// before our longjmp machinery ever sees it). SA_ONSTACK + a per-thread
+// sigaltstack lets the handler run on private memory and recover. Registered
+// lazily by whichever thread first owns an outermost guard (game thread +
+// worker); buffer is intentionally never freed (max a handful of threads).
+static thread_local void* t_altStack = nullptr;
+static bool EnsureAltStack() {
+    if (t_altStack) return true;
+    const size_t kAltStackSize = 64 * 1024;   // >> MINSIGSTKSZ + our handler
+    void* m = malloc(kAltStackSize);
+    if (!m) return false;
+    stack_t ss{};
+    ss.ss_sp = m; ss.ss_size = kAltStackSize; ss.ss_flags = 0;
+    if (sigaltstack(&ss, nullptr) != 0) { free(m); return false; }
+    t_altStack = m;
+    return true;
+}
+
 static void NativeFaultForward(int sig, siginfo_t* info, void* uctx) {
     struct sigaction* old = sig == SIGSEGV ? &g_oldSegv : (sig == SIGBUS ? &g_oldBus : &g_oldIll);
     if (old->sa_flags & SA_SIGINFO) { old->sa_sigaction(sig, info, uctx); return; }
@@ -1785,7 +1840,11 @@ static bool InstallFaultGuards() {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = NativeFaultHandler;
-    sa.sa_flags = SA_SIGINFO;
+    // [G27-b] SA_ONSTACK: if the faulting thread registered an altstack
+    // (EnsureAltStack below), the handler runs there — stack-overflow SIGSEGVs
+    // become recoverable instead of silent process death. Threads without an
+    // altstack keep the old on-current-stack behaviour.
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     g_gasGuardsUp = sigaction(SIGSEGV, &sa, &g_oldSegv) == 0 &&
                     sigaction(SIGBUS, &sa, &g_oldBus) == 0 &&
@@ -1815,6 +1874,14 @@ static bool RunGuarded(const char* tag, FnT fn, ArgsT... args) {
         g_internal = g_gasPrevInternal;
         g_guardDepth = 0;
         g_inNativeCall = 0;
+        // [G27-b] after siglongjmp out of a handler that ran on the altstack,
+        // the kernel may leave SS_ONSTACK sticky — re-register the same
+        // region so the NEXT fault on this thread is recoverable too.
+        if (t_altStack) {
+            stack_t ss{};
+            ss.ss_sp = t_altStack; ss.ss_size = 64 * 1024; ss.ss_flags = 0;
+            sigaltstack(&ss, nullptr);
+        }
         LOG("[%s] ⚠️ native call FAULTED — sig=%d pc=0x%llx addr=0x%llx (call abandoned, fallback continues)",
             tag, (int)g_faultSig, (unsigned long long)g_faultPc, (unsigned long long)g_faultAddr);
         return false;
@@ -1823,6 +1890,7 @@ static bool RunGuarded(const char* tag, FnT fn, ArgsT... args) {
     g_internal = true;        // engine callbacks fired during the native stay internal
     g_inNativeCall = 1;
     g_guardOwner = pthread_self();   // [G23-b] this thread owns the recovery point
+    EnsureAltStack();                // [G27-b] overflow faults must reach the handler
     g_guardDepth = 1;
     fn(args...);
     g_guardDepth = 0;
@@ -2739,6 +2807,16 @@ struct Session {
     bool  has_spawn_loc = false;
     int   void_rescues = 0;
     double last_void_rescue = 0;
+    // [G28] creatures / llama / vending / wildlife rollout state
+    int   creature_passes = 0;          // 0 = scan pending, 1 = classes scanned, 2 = spawned
+    double last_creature_pass = 0;
+    int   creatures_spawned = 0;
+    // [G29] auto-glider near ground
+    bool  glider_forced_open = false;   // re-armed whenever a new skydive begins
+    double last_glider_check = 0;
+    int   glider_opens = 0;             // total auto/manual opens this session
+    // [G30] emote cycle index for era.emote
+    int   emote_cycle = 0;
 } session;
 
 static double Monotonic() {
@@ -2886,6 +2964,16 @@ namespace Athena {
     void DiagnoseWorldPartition();                         // [G22] WP probes + activation attempts
     void TickStreamingSources();                            // [G23-e] bIsStreamingSource forcing + FlushLevelStreaming
     void TickVoidGuard();                                   // [G24] fall-through rescue (below-map teleport)
+    // [G28] creatures / llama / vending / wildlife
+    void TickCreatures();                                   // scan classes (pass 1) then auto-spawn (pass 2)
+    bool SpawnCreature(const char* kind, int count, float distance, bool near);   // era.llama / era.animals / era.vending
+    void DumpClassFunctions(const char* needle);            // [G31] era.class — missing-function research dumper
+    // [G29] glider
+    void TickGliderAuto();                                  // auto-deploy near ground while falling
+    bool OpenGliderLadder(bool open);                       // OpenGlider/CloseGlider + bParachuteOpen + OnRep
+    // [G30] emote convenience + map marker
+    void EmoteCycle();                                      // era.emote — EID discovery + PlayEmoteItem
+    void TryPlaceMarker();                                  // era.mark — candidate RPC probe + log
     void ForceSublevels();                                 // [G19-d] sublevel geometry (missing cities)
     void ReturnToLobby(void* world);   // [F24]
     void TeleportToReticle();          // [F24]
@@ -3208,8 +3296,29 @@ static void NativeGaaCall(void* asc, void* outHandle, void* spec) {
 // gas_native_failed is only set when EVERY self-valid attempt faulted.
 static int gas_working_conv = -1;      // [G14] remembered non-faulting convention
 struct SIShapeProxy { void* obj; void* iface; };   // [G25] TScriptInterface pair
+// [G27-a] NATIVE INIT PROBE — OFF BY DEFAULT, by device evidence:
+//   round-9  : conv matrix faulted (caught) through every convention
+//   round-10 : conv1-4 garbage pcs, conv5 real-code fault (caught)
+//   round-11 (this log): conv1 ran clean but granted nothing, conv2 faulted
+//   (caught), conv3 ("ps-iface + PlayerStateOrProxy") KILLED THE PROCESS with
+//   no FAULTED line — a death class sigsetjmp/siglongjmp can never catch
+//   (SIGABRT from an engine check()/heap abort, or a guard-page stack
+//   overflow). Three sessions in a row died inside this probe while the
+//   reflection EquipFortAbilitySet path is PROVEN on-device (49 specs, world
+//   abilities 5/5, full gameplay loop). The probe now ships disabled; flip
+//   this constant only with a new fault-analysis round behind it.
+static constexpr bool kTryNativeGasInit = false;
 static bool NativeInitializePlayerGameplayAbilities() {
     if (!InitializePlayerGameplayAbilities) return false;
+    if (!kTryNativeGasInit) {
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            LOG("[GAS] native init probe OFF [G27] — reflection grant only "
+                "(probe killed 3 sessions: uncatchable death in conv #3)");
+        }
+        return false;
+    }
     if (gas_native_failed) { LOG("[GAS] native path disabled (previous fault)"); return false; }
     void* ifaceType = FindObj("/Script/FortniteGame.FortAbilitySystemInterface");
     if (!ifaceType) ifaceType = FindObj("/Script/FortniteGame.FortPlayerState.FortAbilitySystemInterface");
@@ -5355,7 +5464,7 @@ void Athena::Tick() {
         }
         int hbSpecs = gas::CountActivatableSpecs();
         float hbHp = session.pawn ? PawnHealth(session.pawn) : -1.0f;
-        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d ever=%d qbok=%d death=%d won=%d meshnet=%d plvl=%d voids=%d src=%d wpp=%d",
+        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d ever=%d qbok=%d death=%d won=%d meshnet=%d plvl=%d voids=%d src=%d wpp=%d cr=%d/%d gli=%d nativeinit=%d",
             (int)session.quickbars_initialized,
             (qbLink == session.quickbars ? (session.quickbars ? "ok" : "n/a") : "BAD"),
             (unsigned)hbGate, hbP, hbS,
@@ -5381,7 +5490,11 @@ void Athena::Tick() {
             (int)session.playlist_levels_done,
             session.void_rescues,          // [G24] void-guard rescues
             session.src_force_passes,      // [G23-e] streaming-source passes
-            session.wp_diag_passes);       // [G22] WP diagnostic passes
+            session.wp_diag_passes,        // [G22] WP diagnostic passes
+            session.creatures_spawned,     // [G28] creatures spawned
+            session.creature_passes,       // [G28] scan passes done
+            session.glider_opens,          // [G29] glider opens
+            (int)gas::kTryNativeGasInit);  // [G27] native init probe enabled?
     }
     // [F94-a] reviewer note (1): state can change after FinalizePlayer — the
     // internal 60s rate-limit makes this call free next to the heartbeat.
@@ -5434,6 +5547,8 @@ void Athena::Tick() {
         TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
         TickStreamingSources();    // [G23-e] pawn/controller as WP streaming sources (own ticker)
         TickVoidGuard();           // [G24] fall-through rescue (below-map teleport)
+        TickCreatures();           // [G28] llama/vending/wildlife scan + spawn rollout
+        TickGliderAuto();          // [G29] auto-deploy the glider near ground
         // [G22] World Partition diagnostics — 3 passes (first ~5 s after
         // finalize, then 45 s apart): what loaded, whether a WorldPartition
         // object exists, data-layer states + activation, streaming-source fix.
@@ -7137,6 +7252,13 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
     }
     if (group == "Loot_Treasure") group = "Loot_AthenaTreasure";
     if (group == "Loot_Ammo") group = "Loot_AthenaAmmoLarge";
+    // [G28] llamas are containers with their own tier group name — any group
+    // carrying "lama" aliases to the treasure table so a spawned piñata
+    // ALWAYS yields (the alternative was "group not ported" + empty llama).
+    if (group.find("lama") != std::string::npos) {
+        group = "Loot_AthenaTreasure";
+        LOG("[Loot] llama group aliased to Loot_AthenaTreasure [G28]");
+    }
 
     std::vector<local_loot::Drop> drops;
     // [G20] deep = interactive opens (chest/ammo box): the roll may sync-load
@@ -7795,6 +7917,25 @@ void Athena::SpawnBuildPreviews() {
 void Athena::HandleDamageServer(void* actor, void* func, void* params) {
     if (!actor || !func || !params || !session.controller || !session.inventory) return;
     if (!IsReadable(actor, 0x60) || !IsReadable(params, 0x20)) return;
+    // [G32] CONTAINERS BROKEN BY PICKAXE — "chests don't throw loot when I
+    // break them": damage on an unsearched BuildingContainer (chest / ammo
+    // box / llama) rolls its loot NOW, exactly like an interact search. The
+    // bAlreadySearched gate keeps it once-only, so smashing and then
+    // searching cannot duplicate drops.
+    {
+        static void* s_bcCls = nullptr;
+        if (!s_bcCls) s_bcCls = FindObj("/Script/FortniteGame.BuildingContainer");
+        void* ccls = Read<void*>(actor, profile::ObjectClass);
+        if (s_bcCls && ccls && SubclassOfFast(ccls, s_bcCls)) {
+            Vector cloc{};
+            if (ActorLocation(actor, cloc) && NearPlayer(cloc, 600.0f)) {
+                LOG("[Loot] container under attack — break-roll [G32]");
+                bool clean = gas::RunGuarded("[Loot] break-roll", [&] { Athena::Loot(actor); });
+                if (!clean) LOG("[Loot] ⚠️ break-roll faulted at stage '%s' [G32]", g_lootStage);
+            }
+            return;   // containers never take the SMActor harvest path
+        }
+    }
     static void* smCls = nullptr;
     if (!smCls) smCls = FindObj("/Script/FortniteGame.BuildingSMActor");
     if (!smCls) return;
@@ -8656,6 +8797,17 @@ void Athena::HandleVictory(bool onDeath) {
             else
                 LOG("[Victory] ⚠️ crown grant failed");
         } else LOG("[Victory] crown asset not resident — skipped");
+    }
+    // [G30] victory dance — the classic default emote, resident-first with one
+    // interactive sync load fallback (PlayEmoteItem plays the LOCAL montage).
+    if (pawn && PawnStillValid(pawn)) {
+        void* emote = FindObj("/Game/Athena/Items/Cosmetics/Dances/EID_DanceMoves.EID_DanceMoves");
+        if (!emote) emote = LoadAsset("/Game/Athena/Items/Cosmetics/Dances/EID_DanceMoves.EID_DanceMoves",
+                                      "/Script/FortniteGame.AthenaDanceItemDefinition");
+        if (emote && !IsBadPtr(emote)) {
+            PlayEmoteItem(emote);
+            LOG("[Victory] 💃 victory dance dispatched [G30]");
+        } else LOG("[Victory] dance asset not resident — skipped [G30]");
     }
     LOG("[Victory] ✅ banner dispatched (team=%d place=1)", teamIndex);
 }
@@ -9577,15 +9729,64 @@ void Athena::RemoveNetDebugUI() {
 }
 
 // ============================================================================
-// EMOTES — [G07] Erbium ServerPlayEmoteItem parity + [F09] montage fallback
+// EMOTES — [G30] ORDER FLIP + [G07] Erbium ServerPlayEmoteItem parity
 // ============================================================================
+// [G30] The LOCAL montage now plays FIRST. Reason: the round-11 crash class
+// is an engine check()/heap abort inside a scanner-resolved native call —
+// a death the sigsetjmp guard can NEVER catch. Standalone needs no emote
+// replication (single player), so the [F09] montage path is not just a
+// fallback, it is the complete feature. The native GiveAbilityAndActivateOnce
+// path is kept below as the LAST resort for defs whose montage cannot be
+// resolved, and remains fault-guarded + session-disabled on first fault.
 void Athena::PlayEmoteItem(void* item) {
     if (!item || !session.pawn) return;
 
-    // [G07] NATIVE PATH (Erbium ServerPlayEmoteItem 1:1): build the ability
+    // [F09/G30] PRIMARY: 21.30 signature BodyType/Gender/PawnContext.
+    {
+        void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
+        if (mesh) {
+            Call anim("/Script/Engine.SkeletalMeshComponent.GetAnimInstance");
+            if (anim.ok() && anim.run(mesh)) {
+                void* ai = anim.result<void*>();
+                if (ai) {
+                    Call ref("/Script/FortniteGame.FortMontageItemDefinitionBase.GetAnimationHardReference");
+                    void* montage = nullptr;
+                    if (ref.ok()) {
+                        // EEFortCustomBodyType / EEFortCustomGender are uint8 enums; try the
+                        // female/male combinations and fall back gracefully.
+                        struct Combo { uint8_t body; uint8_t gender; };
+                        const Combo combos[] = {{1, 1}, {0, 0}, {1, 0}, {0, 1}};
+                        for (auto& cb : combos) {
+                            if (ref.set("BodyType", cb.body) && ref.set("Gender", cb.gender) &&
+                                ref.set("PawnContext", session.pawn) && ref.run(item)) {
+                                montage = ref.result<void*>();
+                                if (montage) break;
+                            }
+                        }
+                    }
+                    if (montage) {
+                        Call play("/Script/Engine.AnimInstance.Montage_Play");
+                        if (play.ok()) {
+                            play.set("MontageToPlay", montage);
+                            float rate = 1.0f; play.set("InPlayRate", rate);
+                            float start = 0.0f; play.set("InTimeToStartMontageAt", start);
+                            bool bStop = true; play.set("bStopAllMontages", bStop);
+                            if (play.run(ai)) {
+                                LOG("[Emote] ✅ %s (local montage — primary path) [G30]", ObjName(montage).c_str());
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        LOG("[Emote] montage unresolvable for %s — native GAA last resort [G30]",
+            ObjName(item).c_str());
+    }
+
+    // [G07] LAST RESORT (Erbium ServerPlayEmoteItem 1:1): build the ability
     // spec, hand it to GiveAbilityAndActivateOnce, and replicate the emote —
-    // this plays through GAS (montage + replication + moving-emote support)
-    // instead of a bare local Montage_Play.
+    // plays through GAS (montage + replication + moving-emote support).
     if (gas::GiveAbilityAndActivateOnce) {
         // [G13] Erbium ServerPlayEmoteItem parity: the PlayerState's ASC owns
         // emotes (fallback to the pawn's ASC when the prop read fails).
@@ -9640,45 +9841,16 @@ void Athena::PlayEmoteItem(void* item) {
                     LOG("[Emote] ✅ native GiveAbilityAndActivateOnce (handle=0x%X)", (unsigned)outHandle);
                     return;
                 }
-                LOG("[Emote] native GiveAbilityAndActivateOnce faulted — disabled for the session, montage fallback");
+                LOG("[Emote] native GiveAbilityAndActivateOnce faulted — disabled for the session");
                 gas::GiveAbilityAndActivateOnce = 0;
             }
-            LOG("[Emote] native path incomplete — montage fallback");
+            LOG("[Emote] native path incomplete");
         }
     }
-
-    // [F09] Montage fallback: 21.30 signature BodyType/Gender/PawnContext.
-    void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
-    if (!mesh) return;
-    Call anim("/Script/Engine.SkeletalMeshComponent.GetAnimInstance");
-    if (!anim.ok() || !anim.run(mesh)) return;
-    void* ai = anim.result<void*>();
-    if (!ai) return;
-    Call ref("/Script/FortniteGame.FortMontageItemDefinitionBase.GetAnimationHardReference");
-    void* montage = nullptr;
-    if (ref.ok()) {
-        // EEFortCustomBodyType / EEFortCustomGender are uint8 enums; try the
-        // female/male combinations and fall back gracefully.
-        struct Combo { uint8_t body; uint8_t gender; };
-        const Combo combos[] = {{1, 1}, {0, 0}, {1, 0}, {0, 1}};
-        for (auto& cb : combos) {
-            if (ref.set("BodyType", cb.body) && ref.set("Gender", cb.gender) &&
-                ref.set("PawnContext", session.pawn) && ref.run(item)) {
-                montage = ref.result<void*>();
-                if (montage) break;
-            }
-        }
-    }
-    if (!montage) { LOG("[Emote] no montage hard reference resolved"); return; }
-    Call play("/Script/Engine.AnimInstance.Montage_Play");
-    if (play.ok()) {
-        play.set("MontageToPlay", montage);
-        float rate = 1.0f; play.set("InPlayRate", rate);
-        float start = 0.0f; play.set("InTimeToStartMontageAt", start);
-        bool bStop = true; play.set("bStopAllMontages", bStop);
-        play.run(ai);
-        LOG("[Emote] playing %s", ObjName(montage).c_str());
-    }
+    // [G30] the old trailing montage fallback is gone — the montage now runs
+    // FIRST (see the top of this function); reaching here means both the
+    // montage and the native GAA path could not resolve this def.
+    LOG("[Emote] ❌ no playable path for %s [G30]", ObjName(item).c_str());
 }
 
 // [F11] ExitForceBehavior is EETryExitVehicleBehavior (uint8).
@@ -9689,6 +9861,476 @@ void Athena::OnExitVehicle() {
         uint8_t ExitForce = 0; bool bDestroy = false;
         if (v.set("ExitForceBehavior", ExitForce) && v.set("bDestroyVehicleWhenForced", bDestroy)) v.run(session.pawn);
     }
+}
+
+// ============================================================================
+// [G28] CREATURES — llama / vending machines / wildlife / Klombo (Buttercake)
+// ============================================================================
+// The user-facing feature set of round-11: llamas, vending machines, boars,
+// wolves, chickens, frogs, crows, sharks and the Klombo. No hardcoded class
+// guesses are trusted blindly — a GObjects scanner finds every resident
+// Actor-subclass whose name matches a needle (BP _C classes stream in with
+// their POI packages, so the scan runs FOUR times over the session and the
+// rollout picks up late streamers). Resident-only in the auto path: the
+// round-17 lesson (batch sync-loads = ANR/OOM kill) applies. The era.*
+// commands MAY sync-load one package (interactive single load, the same
+// policy as chest opens).
+namespace creatures {
+    struct KindInfo {
+        const char* kind;
+        const char* needles[4];    // class-name substrings (first hit wins)
+        const char* paths[4];      // known asset paths (resident probes + interactive loads)
+        bool wildlife;             // try SpawnDefaultController after spawn
+    };
+    static const KindInfo kKinds[] = {
+        { "Llama",    {"Llama"},          {"/Game/Athena/Items/Gameplay/Llama/BGA_SupplyLlama.BGA_SupplyLlama_C",
+                                           "/Game/Athena/Items/Gameplay/Llama/Athena_Llama.Athena_Llama_C",
+                                           "/Game/Athena/Items/Gameplay/Llama/Llama/BGA_Llama.BGA_Llama_C"}, false },
+        { "Vending",  {"Vending", "Vend"},{"/Game/Athena/Items/Gameplay/VendingMachine/BGA_VendingMachine.BGA_VendingMachine_C",
+                                           "/Game/Athena/Environments/Blueprints/VendingMachine/BGA_Athena_VendingMachine.BGA_Athena_VendingMachine_C"}, false },
+        { "Boar",     {"Boar"},           {"/Game/Athena/Items/Gameplay/Wildlife/Boar/BGA_Boar.BGA_Boar_C"}, true },
+        { "Wolf",     {"Wolf"},           {"/Game/Athena/Items/Gameplay/Wildlife/Wolf/BGA_Wolf.BGA_Wolf_C"}, true },
+        { "Chicken",  {"Chicken", "Hen"}, {"/Game/Athena/Items/Gameplay/Wildlife/Chicken/BGA_Chicken.BGA_Chicken_C"}, true },
+        { "Frog",     {"Frog"},           {}, true },
+        { "Crow",     {"Crow"},           {}, true },
+        { "Shark",    {"Shark"},          {}, true },
+        { "Klombo",   {"Klombo", "Butter"}, {"/Game/Athena/Items/Gameplay/Wildlife/Klombo/BGA_Klombo.BGA_Klombo_C"}, true },
+    };
+    static std::map<std::string, std::vector<void*>> g_classes;   // kind -> resident classes
+
+    // ONE GObjects walk for every needle. Only UClass objects (metaclass
+    // check) get a name call; only Actor subclasses are kept — a garbage
+    // candidate cannot fake the Class metaclass pointer, so ObjName never
+    // touches untrusted memory (the round-10 lesson).
+    static void ScanAll() {
+        GObjects_t* go = GObjectArray();
+        if (!go) { LOG("[Creatures] GObjects unavailable"); return; }
+        void* classMeta = FindObj("/Script/CoreUObject.Class");
+        void* actorClass = FindObj("/Script/Engine.Actor");
+        if (!classMeta || !actorClass) { LOG("[Creatures] metaclasses unresolved"); return; }
+        g_classes.clear();
+        int classesSeen = 0;
+        double t0 = Monotonic();
+        for (int32 i = 0; i < go->NumElements; ++i) {
+            void* o = go->GetById((uint32)i);
+            if (!o || IsBadPtr(o)) continue;
+            void* c = Read<void*>(o, profile::ObjectClass);
+            if (c != classMeta) continue;               // o must BE a UClass
+            ++classesSeen;
+            std::string n = ObjName(o);
+            if (n.empty() || n.size() >= 64) continue;
+            if (n.rfind("Default__", 0) == 0 || n.rfind("Reinst_", 0) == 0 ||
+                n.rfind("SKEL_", 0) == 0 || n.rfind("TR_", 0) == 0) continue;
+            // asset-flavour classes are noise for actor spawning
+            if (n.find("Component") != std::string::npos || n.find("Definition") != std::string::npos ||
+                n.find("Anim") != std::string::npos || n.find("Sound") != std::string::npos ||
+                n.find("Data") != std::string::npos || n.find("Widget") != std::string::npos ||
+                n.find("Texture") != std::string::npos || n.find("Photo") != std::string::npos) continue;
+            bool matched = false;
+            for (auto& k : kKinds) {
+                bool hit = false;
+                for (int ni = 0; k.needles[ni] && !hit; ++ni)
+                    if (n.find(k.needles[ni]) != std::string::npos) hit = true;
+                if (!hit) continue;
+                if (!SubclassOfFast(o, actorClass)) break;   // must be an Actor subclass
+                auto& vec = g_classes[k.kind];
+                if (vec.size() < 6) vec.push_back(o);
+                matched = true;
+                break;   // one kind per class
+            }
+            (void)matched;
+        }
+        // merge resident known paths (FindObj only — NO sync loads here)
+        for (auto& k : kKinds) {
+            for (int pi = 0; k.paths[pi]; ++pi) {
+                void* cls = FindObj(k.paths[pi]);
+                if (!cls || IsBadPtr(cls)) continue;
+                auto& vec = g_classes[k.kind];
+                bool dup = false;
+                for (void* v : vec) if (v == cls) { dup = true; break; }
+                if (!dup && vec.size() < 8) vec.push_back(cls);
+            }
+        }
+        std::string summary;
+        for (auto& k : kKinds) {
+            auto it = g_classes.find(k.kind);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%s=%d ", k.kind,
+                     it == g_classes.end() ? 0 : (int)it->second.size());
+            summary += buf;
+        }
+        LOG("[Creatures] scan pass: %d classes walked in %.1fs — %s[G28]",
+            classesSeen, Monotonic() - t0, summary.c_str());
+        for (auto& k : kKinds) {
+            auto it = g_classes.find(k.kind);
+            if (it == g_classes.end() || it->second.empty()) continue;
+            std::string names;
+            int shown = 0;
+            for (void* c : it->second) {
+                if (shown++) names += ",";
+                names += ObjName(c);
+                if (shown >= 3) break;
+            }
+            LOG("[Creatures] %s: [%s]", k.kind, names.c_str());
+        }
+    }
+} // namespace creatures
+
+bool Athena::SpawnCreature(const char* kind, int count, float distance, bool nearPlayer) {
+    (void)nearPlayer;   // distance carries the placement intent
+    if (!session.world || !session.pawn) { LOG("[Creature] no world/pawn"); return false; }
+    if (!PawnStillValid(session.pawn)) return false;
+    if (count < 1) count = 1;
+    if (count > 8) count = 8;
+    if (distance < 100.0f) distance = 100.0f;
+    std::string k(kind);
+    void* klass = nullptr;
+    std::string via;
+    {
+        auto it = creatures::g_classes.find(k);
+        if (it != creatures::g_classes.end() && !it->second.empty()) {
+            klass = it->second.front();
+            via = "scan";
+        }
+    }
+    if (!klass) {
+        for (auto& info : creatures::kKinds) {
+            if (k != info.kind) continue;
+            for (int pi = 0; info.paths[pi] && !klass; ++pi) {
+                void* c = FindObj(info.paths[pi]);          // resident-only probe
+                if (c && !IsBadPtr(c)) { klass = c; via = info.paths[pi]; }
+            }
+        }
+    }
+    if (!klass) {
+        // interactive command path: one guarded sync load (chest-open policy)
+        for (auto& info : creatures::kKinds) {
+            if (k != info.kind) continue;
+            for (int pi = 0; info.paths[pi] && !klass; ++pi) {
+                void* c = LoadClass(info.paths[pi], "/Script/Engine.Actor");
+                if (c && !IsBadPtr(c)) { klass = c; via = "sync-load"; }
+            }
+        }
+    }
+    if (!klass || IsBadPtr(klass)) {
+        LOG("[Creature] %s class NOT found (not shipped/resident in this session — see [Creatures] scan) [G28]", kind);
+        return false;
+    }
+    Vector base{};
+    if (!ActorLocation(session.pawn, base)) return false;
+    bool wildlife = false;
+    for (auto& info : creatures::kKinds) if (k == info.kind) wildlife = info.wildlife;
+    int spawned = 0;
+    for (int i = 0; i < count; ++i) {
+        double ang = (double)i * (6.28318530718 / (double)count) + 0.7;
+        Vector loc{ base.X + std::cos(ang) * (double)distance,
+                    base.Y + std::sin(ang) * (double)distance,
+                    base.Z + 150.0 };
+        Transform t{};
+        t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
+        void* actor = SpawnActor(session.world, klass, nullptr, t);
+        if (!actor || IsBadPtr(actor)) continue;
+        ++spawned;
+        ++session.creatures_spawned;
+        if (wildlife) {
+            // AI controller — wildlife BPs are Pawns; without a controller
+            // they stand frozen. Best effort (guarded by Call::run).
+            Call sd("/Script/Engine.Pawn.SpawnDefaultController");
+            if (sd.ok() && sd.run(actor))
+                LOG("[Creature] %s #%d: AI controller spawned", kind, i);
+            else
+                LOG("[Creature] ⚠️ %s #%d: no controller (SpawnDefaultController unavailable) — may stand still [G28]", kind, i);
+        }
+        LOG("[Creature] ✅ %s #%d @ %.0f %.0f %.0f (%s) [G28]",
+            ObjName(klass).c_str(), i, loc.X, loc.Y, loc.Z, via.c_str());
+    }
+    if (!spawned) LOG("[Creature] ⚠️ %s spawn failed (class resolved, actor spawn declined)", kind);
+    return spawned > 0;
+}
+
+void Athena::TickCreatures() {
+    if (!session.finalized || !session.pawn || session.death_handled) return;
+    if (session.finalize_at <= 0) return;
+    double age = Monotonic() - session.finalize_at;
+    static const double kSchedule[4] = { 20.0, 60.0, 150.0, 300.0 };
+    if (session.creature_passes >= 4) return;
+    if (age < kSchedule[session.creature_passes]) return;
+    ++session.creature_passes;
+    LOG("[Creatures] pass %d/4 (age %.0fs) [G28]", session.creature_passes, age);
+    if (!gas::RunGuarded("[Creatures] scan", [] { creatures::ScanAll(); }))
+        return;   // scan faulted — try again next pass
+    // auto-spawn the showcase set, once per kind (later passes only add
+    // kinds whose packages just streamed in)
+    struct AutoSpawn { const char* kind; int count; float dist; };
+    static const AutoSpawn kAuto[] = {
+        { "Llama",   1, 1400.0f },   // close enough to walk to in seconds
+        { "Vending", 2, 2600.0f },
+        { "Boar",    2, 2200.0f },
+        { "Wolf",    1, 3400.0f },
+        { "Chicken", 2, 1800.0f },
+        { "Klombo",  1, 5200.0f },   // the dinosaur deserves an entrance
+    };
+    static std::set<std::string> s_done;
+    for (auto& a : kAuto) {
+        std::string k(a.kind);
+        if (s_done.count(k)) continue;
+        auto it = creatures::g_classes.find(k);
+        if (it == creatures::g_classes.end() || it->second.empty()) continue;   // not resident yet
+        s_done.insert(k);
+        SpawnCreature(a.kind, a.count, a.dist, true);
+    }
+}
+
+// ============================================================================
+// [G31] era.class — MISSING-FUNCTION RESEARCH DUMPER
+// ============================================================================
+// Walks GObjects once: every UClass whose name contains the needle (max 6)
+// plus every UFunction whose OUTER is one of those classes (max 120 each).
+// This is the "find the missing functions" tool — run "era.class door" on
+// device and the log lists every door-ish function this build actually has
+// (SetIsDoorOpen & friends), same for vending/llama/marker/vehicle shapes.
+void Athena::DumpClassFunctions(const char* needle) {
+    GObjects_t* go = GObjectArray();
+    if (!go) { LOG("[Funcs] GObjects unavailable"); return; }
+    void* classMeta = FindObj("/Script/CoreUObject.Class");
+    void* funcMeta  = FindObj("/Script/CoreUObject.Function");
+    if (!classMeta || !funcMeta) { LOG("[Funcs] Class/Function metaclasses unresolved"); return; }
+    std::string nd(needle);
+    for (auto& ch : nd) ch = (char)::tolower((unsigned char)ch);
+    struct Hit { void* cls; std::string name; };
+    std::vector<Hit> hits;
+    double t0 = Monotonic();
+    bool scanClean = gas::RunGuarded("[Funcs] class-scan", [&] {
+    for (int32 i = 0; i < go->NumElements && hits.size() < 6; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o)) continue;
+        if (Read<void*>(o, profile::ObjectClass) != classMeta) continue;
+        std::string n = ObjName(o);
+        if (n.empty() || n.size() >= 64) continue;
+        if (n.rfind("Default__", 0) == 0 || n.rfind("Reinst_", 0) == 0 ||
+            n.rfind("SKEL_", 0) == 0 || n.rfind("TR_", 0) == 0) continue;
+        std::string ln = n;
+        for (auto& ch : ln) ch = (char)::tolower((unsigned char)ch);
+        if (ln.find(nd) == std::string::npos) continue;
+        hits.push_back({ o, n });
+    }
+    });   // guard
+    if (!scanClean) { LOG("[Funcs] class scan faulted — partial results only"); }
+    if (hits.empty()) {
+        LOG("[Funcs] no class name contains '%s' (%d objects, %.1fs)", needle, go->NumElements, Monotonic() - t0);
+        return;
+    }
+    std::map<void*, std::vector<std::string>> fns;
+    int total = 0;
+    bool fnClean = gas::RunGuarded("[Funcs] function-scan", [&] {
+    for (int32 i = 0; i < go->NumElements && total < 720; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o)) continue;
+        if (Read<void*>(o, profile::ObjectClass) != funcMeta) continue;
+        void* outer = Read<void*>(o, profile::ObjectOuter);
+        if (!outer || IsBadPtr(outer)) continue;
+        bool mine = false;
+        for (auto& h : hits) if (h.cls == outer) { mine = true; break; }
+        if (!mine) continue;
+        std::string fn = ObjName(o);
+        if (fn.empty()) continue;
+        if (fns[outer].size() < 120) { fns[outer].push_back(fn); ++total; }
+    }
+    });   // guard
+    if (!fnClean) LOG("[Funcs] function scan faulted — partial list");
+    for (auto& h : hits) {
+        auto it = fns.find(h.cls);
+        int n = it == fns.end() ? 0 : (int)it->second.size();
+        LOG("[Funcs] === %s: %d functions ===", h.name.c_str(), n);
+        if (it != fns.end())
+            for (auto& f : it->second) LOG("[Funcs:%s] %s", h.name.c_str(), f.c_str());
+    }
+    LOG("[Funcs] dump done: %d functions across %zu classes, %.1fs",
+        total, hits.size(), Monotonic() - t0);
+}
+
+// ============================================================================
+// [G29] GLIDER — auto-deploy near ground + the open/close ladder
+// ============================================================================
+bool Athena::OpenGliderLadder(bool open) {
+    if (!session.pawn || !PawnStillValid(session.pawn)) return false;
+    // 1) reflected UFunction ladder (three class scopes, Erbium-era names)
+    static const char* const kScopes[] = {
+        "/Script/FortniteGame.FortPlayerPawnAthena",
+        "/Script/FortniteGame.FortPlayerPawn",
+        "/Script/FortniteGame.FortPawn",
+    };
+    const char* want = open ? "OpenGlider" : "CloseGlider";
+    for (const char* scope : kScopes) {
+        std::string fullPath = std::string(scope) + "." + want;
+        Call c(fullPath.c_str());
+        if (c.ok() && c.run(session.pawn)) {
+            LOG("[Glider] ✅ %s via %s.%s [G29]", open ? "open" : "close", scope, want);
+            session.glider_forced_open = open;
+            if (open) ++session.glider_opens;
+            return true;
+        }
+    }
+    // 2) property fallback — bParachuteOpen + OnRep on whichever scope has it
+    static const char* const kPropPaths[] = {
+        "/Script/FortniteGame.FortPlayerPawnAthena.bParachuteOpen",
+        "/Script/FortniteGame.FortPlayerPawn.bParachuteOpen",
+        "/Script/FortniteGame.FortPawn.bParachuteOpen",
+    };
+    for (const char* p : kPropPaths) {
+        if (!GetProp(p)) continue;
+        SetBool(session.pawn, p, open);
+        std::string cls(p);
+        size_t dot = cls.rfind('.');
+        std::string onrep = cls.substr(0, dot) + ".OnRep_bParachuteOpen";
+        Call r(onrep.c_str());
+        if (r.ok()) r.run(session.pawn);
+        LOG("[Glider] %s via property %s [G29]", open ? "open" : "close", p);
+        session.glider_forced_open = open;
+        if (open) ++session.glider_opens;
+        return true;
+    }
+    LOG("[Glider] ⚠️ no OpenGlider/CloseGlider/bParachuteOpen path — run 'era.class glider' [G29]");
+    return false;
+}
+
+void Athena::TickGliderAuto() {
+    if (!session.finalized || !session.pawn || session.death_handled) return;
+    if (!PawnStillValid(session.pawn)) return;
+    double now = Monotonic();
+    if (now - session.last_glider_check < 0.3) return;
+    session.last_glider_check = now;
+    // vertical speed decides everything (skydive ≈ -1000+, glide ≈ -550)
+    Vector vel{};
+    bool haveVel = false;
+    { Call v("/Script/Engine.Actor.GetVelocity"); if (v.ok() && v.run(session.pawn)) { vel = v.result<Vector>(); haveVel = true; } }
+    if (!haveVel) return;
+    if (session.glider_forced_open) {
+        if (vel.Z > -250.0f) session.glider_forced_open = false;   // landed/closed — re-arm
+        return;
+    }
+    if (vel.Z > -650.0f) return;   // not free-falling
+    // ground distance via reflected LineTraceSingle; the FHitResult layout is
+    // resolved LIVE from /Script/Engine.HitResult (never hardcoded)
+    struct HitLayout { int size, offTime, offDist, offBlock; };
+    static HitLayout s_hl = { 0, -1, -1, -1 };
+    if (s_hl.size == 0) {
+        s_hl.size = -1;
+        void* hrs = FindObj("/Script/Engine.HitResult");
+        if (hrs && !IsBadPtr(hrs)) {
+            int sz = TableRowSizeOf(hrs, nullptr, 0);
+            int t = PropOffsetOn(hrs, "Time");
+            int d = PropOffsetOn(hrs, "Distance");
+            int b = PropOffsetOn(hrs, "bBlockingHit");
+            if (sz > 0 && sz <= 512 && t >= 0 && d >= 0) {
+                s_hl.size = sz; s_hl.offTime = t; s_hl.offDist = d; s_hl.offBlock = b;
+                LOG("[Glider] HitResult layout: size=%d Time@%d Distance@%d bBlockingHit@%d [G29]", sz, t, d, b);
+            }
+        }
+        if (s_hl.size < 0) LOG("[Glider] ⚠️ HitResult layout unresolved — auto-deploy off (era.glider works) [G29]");
+    }
+    if (s_hl.size < 0) return;
+    Call lt("/Script/Engine.KismetSystemLibrary.LineTraceSingle");
+    if (!lt.ok()) return;
+    Vector loc{};
+    if (!ActorLocation(session.pawn, loc)) return;
+    Vector end{ loc.X, loc.Y, loc.Z - 3000.0 };
+    std::vector<uint8_t> hitBuf((size_t)s_hl.size, 0);
+    uint8_t channel = 1;      // TraceTypeQuery1 (Visibility)
+    bool complex = false;
+    uint8_t drawDebug = 0;    // EDrawDebugTrace::None
+    bool ignoreSelf = true;
+    if (!lt.set("WorldContextObject", session.world)) return;
+    if (!lt.set("Start", loc) || !lt.set("End", end)) return;
+    lt.set("TraceChannel", channel);
+    lt.set("bTraceComplex", complex);
+    lt.set("DrawDebugType", drawDebug);
+    lt.set_bytes("OutHit", hitBuf.data(), s_hl.size);
+    lt.set("bIgnoreSelf", ignoreSelf);
+    if (!lt.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"))) return;
+    void* slot = lt.param_slot("OutHit");
+    if (!slot) return;
+    bool blocking = s_hl.offBlock >= 0 && Read<uint8_t>(slot, s_hl.offBlock) != 0;
+    float dist = Read<float>(slot, s_hl.offDist);
+    float time = Read<float>(slot, s_hl.offTime);
+    float ground = -1.0f;
+    if (dist > 0.0f && dist <= 3000.0f) ground = dist;
+    else if (time > 0.0f && time <= 1.0f) ground = time * 3000.0f;
+    if (!blocking || ground < 0.0f) return;
+    if (ground < 1500.0f) {
+        LOG("[Glider] auto-deploy: falling %.0f uu/s, ground %.0f uu below — opening [G29]", vel.Z, ground);
+        OpenGliderLadder(true);
+    }
+}
+
+// ============================================================================
+// [G30] EMOTE CYCLE + [G31] MAP MARKER PROBE
+// ============================================================================
+void Athena::EmoteCycle() {
+    struct E { const char* name; const char* path; };
+    static const E kEmotes[] = {
+        { "EID_DanceMoves",  "/Game/Athena/Items/Cosmetics/Dances/EID_DanceMoves.EID_DanceMoves" },
+        { "EID_Wave",        "/Game/Athena/Items/Cosmetics/Dances/EID_Wave.EID_Wave" },
+        { "EID_Floss",       "/Game/Athena/Items/Cosmetics/Dances/EID_Floss.EID_Floss" },
+        { "EID_Zany",        "/Game/Athena/Items/Cosmetics/Dances/EID_Zany.EID_Zany" },
+        { "EID_Breakdance",  "/Game/Athena/Items/Cosmetics/Dances/EID_Breakdance.EID_Breakdance" },
+    };
+    if (!session.pawn || !PawnStillValid(session.pawn)) { LOG("[Emote] no pawn"); return; }
+    int n = (int)(sizeof(kEmotes) / sizeof(kEmotes[0]));
+    void* def = nullptr;
+    const char* used = nullptr;
+    for (int t = 0; t < n && !def; ++t) {
+        const E& e = kEmotes[(size_t)((session.emote_cycle + t) % n)];
+        def = LoadAsset(e.path, "/Script/FortniteGame.AthenaDanceItemDefinition");
+        if (!def) def = LoadAsset(e.path);   // generic FortItemDefinition fallback
+        if (def) { used = e.name; session.emote_cycle = (session.emote_cycle + t + 1) % n; }
+    }
+    if (!def) {
+        LOG("[Emote] no EID asset resolved (%d tried) — cosmetics packages not resident; walk near a POI and retry [G30]", n);
+        return;
+    }
+    LOG("[Emote] playing %s [G30]", used);
+    PlayEmoteItem(def);
+}
+
+void Athena::TryPlaceMarker() {
+    if (!session.controller || !session.pawn) { LOG("[Mark] no controller/pawn"); return; }
+    // knowledge first: dump every Marker-ish class + its functions
+    DumpClassFunctions("Marker");
+    static const char* const kScopes[] = {
+        "/Script/FortniteGame.FortPlayerControllerAthena",
+        "/Script/FortniteGame.FortPlayerController",
+        "/Script/Engine.PlayerController",
+    };
+    static const char* const kFuncs[] = {
+        "ServerPlaceMarker", "PlaceMarker", "ServerAttemptPlaceMarker",
+        "ServerPlaceWorldMarker", "ServerPlaceMapMarker",
+    };
+    for (const char* scope : kScopes) {
+        for (const char* f : kFuncs) {
+            std::string p = std::string(scope) + "." + f;
+            void* fn = FindObj(p);
+            if (!fn) continue;
+            LOG("[Mark] found %s [G31]", p.c_str());
+            Call c(p.c_str());
+            if (!c.ok()) continue;
+            c.dump("Mark");
+            Vector loc{};
+            ActorLocation(session.pawn, loc);
+            bool boundVec = c.set_any(loc, "Location", "WorldLocation", "MarkerLocation", "Position");
+            // conservative gate: only dispatch when a location-ish param bound
+            // (unbound complex params + a blind call is the uncatchable-abort
+            // risk class we just buried in G27)
+            if (boundVec) {
+                bool okc = c.run(session.controller);
+                LOG("[Mark] %s dispatched=%d [G31]", p.c_str(), (int)okc);
+                return;
+            }
+            LOG("[Mark] %s found but no location param bound — signature dumped above, wire next round [G31]", p.c_str());
+            return;
+        }
+    }
+    LOG("[Mark] no candidate function on PC scopes — see [Funcs:...] dump for the real shape [G31]");
 }
 
 // ============================================================================
@@ -10101,6 +10743,25 @@ static void pe_hook(void* obj, void* func, void* params) {
             if (SubclassOfFast(cls, g_aircraftClass)) { Athena::HandleJumpFromHudStart(); return orig_PE(obj, func, params); }
         }
 
+        // [G29] PARACHUTE/GLIDER RPC — the client's own near-ground auto-deploy
+        // and the manual glider button land here in standalone (the net layer
+        // would drop them, which is why the glider never opened and every
+        // skydive ended as fall damage). Run our ladder; params dumped once
+        // so the real shape is on record.
+        if ((fn == "ServerToggleParachute" || fn == "ServerSetParachuteOpen" ||
+             fn == "ServerToggleGlider") && params && session.finalized && (isPawn || isPC)) {
+            static bool s_dumpedChute = false;
+            if (!s_dumpedChute) { s_dumpedChute = true; DumpRpcParams(func, params, "Parachute"); }
+            bool open = !session.glider_forced_open;   // toggle semantics by default
+            if (void* b = incoming(func, params, "bOpen", 1)) open = Read<uint8_t>(b) != 0;
+            else if (void* b = incoming(func, params, "bIsOpen", 1)) open = Read<uint8_t>(b) != 0;
+            else if (void* b = incoming(func, params, "bOpenParachute", 1)) open = Read<uint8_t>(b) != 0;
+            LOG("[Glider] RPC %s on %s — open=%d [G29]", fn.c_str(),
+                isPawn ? "pawn" : "controller", (int)open);
+            Athena::OpenGliderLadder(open);
+            return;   // server RPC — net no-op standalone; the ladder replaces it
+        }
+
         // [G19-b] VEHICLE ENTER RPC — caught by NAME on ANY receiver (PC,
         // pawn, vehicle component): the ability dispatches it, the net layer
         // would drop it, and before G19 the hook had NO handler at all — the
@@ -10240,6 +10901,23 @@ static void pe_hook(void* obj, void* func, void* params) {
                     void* bcCls   = FindObj("/Script/FortniteGame.BuildingContainer");
                     void* targetCls = Read<void*>(target, profile::ObjectClass);
                     LOG("[Interact] target=%p class=%s", target, ObjName(targetCls).c_str());
+                    // [G28] knowledge logger — every interact target class we
+                    // have not seen this session gets one line (era.class <name>
+                    // then dumps its functions on demand). Vending machines and
+                    // llamas get their full RPC shape dumped the first time.
+                    {
+                        std::string cn = ObjName(targetCls);
+                        static std::set<std::string> s_seenClasses;
+                        bool special = cn.find("ending") != std::string::npos ||   // Vending
+                                       cn.find("lama") != std::string::npos;      // Llama
+                        if (special) {
+                            static bool s_dumpedSpecial = false;
+                            if (!s_dumpedSpecial) { s_dumpedSpecial = true; DumpRpcParams(func, params, "Vending-Llama-Interact"); }
+                        }
+                        if ((special || s_seenClasses.size() < 60) && s_seenClasses.insert(cn).second)
+                            LOG("[Interact] %s target class: %s — 'era.class %s' dumps its functions [G28]",
+                                special ? "SPECIAL" : "new", cn.c_str(), cn.substr(0, 24).c_str());
+                    }
                     if (bcCls && SubclassOfFast(targetCls, bcCls)) Athena::Loot(target);
                     else if (IsVehicleTarget(targetCls)) {
                         // [G15-c/G18-d] VEHICLE ENTER — Erbium parity: the NATIVE
@@ -10640,7 +11318,41 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                     } else LOG("era.spawn: nothing found at %s", path);
                 }
             }
-        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.alive | era.qb | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.players N | era.vehicles | era.loot | era.die | era.win | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
+        } else if (normalized == "era.emote" && session.world && session.pawn) {
+            // [G30] cycle five classic emotes (plays the local montage)
+            Athena::EmoteCycle();
+        } else if (normalized == "era.glider" && session.world && session.pawn) {
+            // [G29] manual glider toggle
+            Athena::OpenGliderLadder(!session.glider_forced_open);
+        } else if (normalized.rfind("era.llama", 0) == 0 && session.world && session.pawn) {
+            // [G28] supply llama — spawns near the player
+            int n = 1;
+            if (sscanf(normalized.c_str(), "era.llama %d", &n) != 1 || n < 1) n = 1;
+            Athena::SpawnCreature("Llama", n, 1400.0f, true);
+        } else if (normalized == "era.animals" && session.world && session.pawn) {
+            // [G28] wildlife set — boars, wolf, chickens, frog
+            Athena::SpawnCreature("Boar", 2, 2200.0f, true);
+            Athena::SpawnCreature("Wolf", 1, 3400.0f, true);
+            Athena::SpawnCreature("Chicken", 2, 1800.0f, true);
+            Athena::SpawnCreature("Frog", 1, 1200.0f, true);
+        } else if (normalized.rfind("era.vending", 0) == 0 && session.world && session.pawn) {
+            // [G28] vending machines
+            int n = 2;
+            if (sscanf(normalized.c_str(), "era.vending %d", &n) != 1 || n < 1) n = 2;
+            Athena::SpawnCreature("Vending", n, 2600.0f, true);
+        } else if (normalized == "era.klombo" && session.world && session.pawn) {
+            // [G28] the dinosaur (Buttercake) — if this build still ships it
+            Athena::SpawnCreature("Klombo", 1, 5200.0f, true);
+        } else if (normalized.rfind("era.class ", 0) == 0) {
+            // [G31] missing-function research: dump classes + their UFunctions
+            char needle[64]{};
+            if (sscanf(cmd.c_str(), "%*s %63s", needle) == 1 && needle[0])
+                Athena::DumpClassFunctions(needle);
+            else LOG("usage: era.class <name-part>   (e.g. era.class door, era.class vending)");
+        } else if (normalized == "era.mark" && session.controller) {
+            // [G31] map marker probe
+            Athena::TryPlaceMarker();
+        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.alive | era.qb | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.players N | era.vehicles | era.loot | era.die | era.win | era.spawn /Game/Path | era.emote | era.glider | era.llama [N] | era.animals | era.vending [N] | era.klombo | era.class <name> | era.mark | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
@@ -10721,6 +11433,7 @@ static int InspectCb(dl_phdr_info* info, size_t, void*) {
 
 static void* Worker(void*) {
     LOG("=== EraCH3 starting — multi-version build (auto-detected profiles) ===");
+    LOG("[Build] wave-11 [G27-G32]: native-init probe OFF, creatures/llama/Klombo, auto-glider, emotes, break-loot, era.class dumper");
     LOG("sizeof(Vector)=%zu sizeof(Rotator)=%zu sizeof(Transform)=%zu", sizeof(Vector), sizeof(Rotator), sizeof(Transform));
     for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
         dl_iterate_phdr(InspectCb, nullptr);
