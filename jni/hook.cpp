@@ -537,6 +537,55 @@
 //            ForceSeatSinglePawn → ForceSeatPawns({pawn}) (SDK-verified
 //            TArray form) → OnPawnEnterVehicle(pawn,0) dispatch, each step
 //            verified through GetVehicleActor before the next runs.
+//
+//  [G19] CRASH + VEHICLE + LOOT + MISSING GEOMETRY (device round 16):
+//        (a) [G19-a] DEATH-FLOW HARDENING — the device log ended at
+//            "[Death] health reached 0" with NO completion line: one of the
+//            native death steps faulted and killed the process. EVERY step
+//            (inventory drops, DeathInfo/Place OnReps, DisableMovement,
+//            ClientOnPawnDied, HandleIsDying, PlayersLeft, and the whole
+//            victory banner chain) now runs under the proven RunGuarded
+//            fault guard (the same net that saved the GAS/ACC calls) with a
+//            per-step log — a faulting call is abandoned and the remaining
+//            steps still run. Pawn-touching steps are additionally gated by
+//            PawnStillValid(): when the engine already destroyed the pawn
+//            (KillZ / fast eliminate during our 1s debounce) the controller
+//            no longer references it, and any native call on it would crash.
+//            After the flow a staleness watch clears the cached pawn so no
+//            later ticker calls into freed memory.
+//        (b) [G19-b] ServerAttemptEnterVehicle HAD NO HANDLER — the enter
+//            ability dispatched the Server RPC, the hook ignored it, the net
+//            layer dropped it: "button does nothing". It is now caught by
+//            NAME on any receiver (before the PC/pawn gate) with named-param
+//            extraction (Vehicle/VehicleActor/TargetVehicle + SeatIdx), a
+//            one-shot param dump for the device log, and the shared
+//            EnterVehicleDirect() ladder (verify → ForceSeatSinglePawn →
+//            ForceSeatPawns → OnPawnEnterVehicle → seat weapon). Any
+//            unhandled HUD/controller function with "Vehicle"+"Enter" in
+//            the name is logged once and routed to the nearest vehicle as
+//            the mobile-button fallback.
+//        (c) [G19-c] LOOT TIER ROWS LIVED IN PARENT TABLES — device: 252 tier
+//            rows read → 1 cached (1717/2149 packages). The composite
+//            DataTables keep most rows in PARENT tables; the hard-coded
+//            ParentTables@0xB0/0xC0 found nothing on this build. Parents
+//            are now DISCOVERED dynamically (scan the object for
+//            TArray<UDataTable*> candidates whose elements share our
+//            RowStruct — cached per table) and searched first. The UFunction
+//            fallback now honors its boolean return (false = miss, not an
+//            empty row), and the curated table became a SAFETY NET: any roll
+//            that produces zero drops falls back to it, so containers and
+//            floor loot are never empty again.
+//        (d) [G19-d] MISSING CITIES/BUILDINGS — two causes removed: (1)
+//            DestroyLods (a SERVER-side Erbium habit) deleted the client's
+//            FortHLODSMActor stand-ins that draw distant POIs — disabled.
+//            (2) ForceSublevels(): every ULevelStreaming in the world is now
+//            forced bShouldBeLoaded+bShouldBeVisible (applied by the
+//            engine's own UpdateLevelStreaming pass, retried 6× as levels
+//            appear). (3) FixMeshNetwork rewritten: the GObjects name scan
+//            silently never ran — the subsystem is now resolved through
+//            UGameplayStatics::GetGameInstanceSubsystem (multiple class
+//            path candidates) and NodeType=2 (Erbium POI streaming fix)
+//            finally applies.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -2058,23 +2107,53 @@ static uint8_t* RowMapFindImpl(void* table, const FName& row, int rowSize, int d
             if (val && IsReadable(val, rowSize > 0 ? (size_t)rowSize : 8)) return val;
         }
     }
-    // [G15-f] Composite fallback — rows live in the parent tables.
+    // [G19-c] Composite parent tables — the hard-coded ParentTables@0xB0 /
+    // OldParentTables@0xC0 found NOTHING on this build (device: 252 tier rows
+    // enumerated → 1 cached; 2149 package rows → 1717 — every parent-only
+    // row failed both the RowMap walk AND the UFunction). DISCOVER the parent
+    // list dynamically instead: scan the object for TArray candidates whose
+    // elements are real UDataTables sharing OUR RowStruct (same row type — a
+    // strong filter that rejects every non-table array), then search those.
+    // Results are cached per table pointer.
     if (depth < 3) {
-        static void* s_compositeCls = nullptr;
-        static bool s_clsTried = false;
-        if (!s_clsTried) { s_clsTried = true; s_compositeCls = FindObj("/Script/Engine.CompositeDataTable"); }
-        if (s_compositeCls && IsA(table, s_compositeCls)) {
-            for (int arr = 0; arr < 2; ++arr) {   // ParentTables @0xB0, OldParentTables @0xC0
-                Array parents = Read<Array>(table, arr == 0 ? 0xB0 : 0xC0);
-                if (!parents.Data || IsBadPtr(parents.Data) || parents.Count <= 0 || parents.Count > 64) continue;
-                for (int i = 0; i < parents.Count; ++i) {
-                    void* parent = Read<void*>(parents.Data, (size_t)i * 8);
-                    if (!parent || IsBadPtr(parent)) continue;
-                    if (uint8_t* hit = RowMapFindImpl(parent, row, rowSize, depth + 1))
-                        return hit;
+        static std::map<void*, std::vector<void*>> s_parents;   // per-table cache
+        auto it = s_parents.find(table);
+        if (it == s_parents.end()) {
+            std::vector<void*> found;
+            void* myRowStruct = Read<void*>(table, 0x28);
+            static void* s_dtCls = nullptr;
+            if (!s_dtCls) s_dtCls = FindObj("/Script/Engine.DataTable");
+            if (s_dtCls && myRowStruct && !IsBadPtr(myRowStruct)) {
+                for (size_t off = 0x80; off <= 0x1A0; off += 8) {
+                    Array cand = Read<Array>(table, off);
+                    if (!cand.Data || cand.Count <= 0 || cand.Count > 64) continue;
+                    if (!IsReadable(cand.Data, (size_t)cand.Count * 8)) continue;
+                    std::vector<void*> tables;
+                    for (int i = 0; i < cand.Count; ++i) {
+                        void* p = Read<void*>(cand.Data, (size_t)i * 8);
+                        if (!p || p == table || IsBadPtr(p)) continue;
+                        void* cls = Read<void*>(p, profile::ObjectClass);
+                        if (!cls || IsBadPtr(cls) || !IsA(cls, s_dtCls)) continue;
+                        if (Read<void*>(p, 0x28) != myRowStruct) continue;   // same row type
+                        tables.push_back(p);
+                    }
+                    if (!tables.empty() && tables.size() >= (size_t)cand.Count / 2)
+                        for (void* t : tables)
+                            if (std::find(found.begin(), found.end(), t) == found.end())
+                                found.push_back(t);
                 }
             }
+            static bool s_pLogged = false;
+            if (!s_pLogged) {
+                s_pLogged = true;
+                LOG("[Loot][G19] parent-table discovery: %zu parent(s) under %p",
+                    found.size(), table);
+            }
+            it = s_parents.emplace(table, found).first;
         }
+        for (void* parent : it->second)
+            if (uint8_t* hit = RowMapFindImpl(parent, row, rowSize, depth + 1))
+                return hit;
     }
     return nullptr;
 }
@@ -2136,6 +2215,17 @@ static bool DataTableRow(void* table, const FName& row, void* dst, int rowSize) 
     void* cdo = FindObj("/Script/Engine.Default__DataTableFunctionLibrary");
     if (!cdo) { diagnose("Default__DataTableFunctionLibrary CDO unresolved"); return false; }
     if (!c.run(cdo)) { diagnose("run() rejected/failed on the CDO"); return false; }
+    // [G19-c] the native RETURNS bool ("row found"). A zeroed OutRow with a
+    // false return is a MISS, not an empty row — returning true here fed the
+    // cache zero bytes that the junk-row guard then silently dropped.
+    if (!c.result<bool>()) {
+        static bool s_missLogged = false;
+        if (!s_missLogged) {
+            s_missLogged = true;
+            LOG("[Loot][G19] GetDataTableRowFromName returned false (row not in the native map)");
+        }
+        return false;
+    }
     // [G15-f] GetDataTableRowFromName's OutRow is an OutParm POINTER (SDK:
     // "struct FTableRowBase* OutRow (Parm, OutParm)") — the native writes
     // the row pointer INTO the slot. The legacy GetDataTableRow wrote the
@@ -2399,6 +2489,9 @@ struct Session {
     bool  mesh_network_fixed = false;
     int   mesh_network_attempts = 0;
     bool  playlist_levels_done = false;
+    // [G19-d] sublevel force passes / post-death pawn staleness guard
+    int   sublevel_passes = 0;
+    bool  pawn_cleared = false;
 } session;
 
 static double Monotonic() {
@@ -2440,6 +2533,24 @@ static void* FindScriptStructNamed(const char* name, const char* mustA, const ch
         return o;
     }
     return nullptr;
+}
+
+// [G19-a] Post-death pawn sanity. The engine may have already destroyed the
+// pawn (KillZ / fast eliminate) while our 1s death debounce was running —
+// any native call on a freed actor is a guaranteed crash. The controller's
+// own Pawn reference is authoritative: destroyed ⇒ unpossessed ⇒ null or a
+// different pawn. Class/vtable readability is the second gate.
+static bool PawnStillValid(void* pawn) {
+    if (!pawn || IsBadPtr(pawn)) return false;
+    void* cls = Read<void*>(pawn, profile::ObjectClass);
+    if (!cls || IsBadPtr(cls)) return false;
+    void* vt = Read<void*>(pawn, 0);
+    if (!vt || IsBadPtr(vt)) return false;
+    if (session.controller) {
+        void* cur = GetPawn(session.controller);
+        if (cur != pawn) return false;   // unpossessed / replaced — stale
+    }
+    return true;
 }
 
 // [G17] Read the pawn's current health through the public accessor.
@@ -2521,6 +2632,9 @@ namespace Athena {
     void OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mirrored);
     void PlayEmoteItem(void* item);
     void OnExitVehicle();
+    bool EnterVehicleDirect(void* vehicle, int seatIdx);   // [G19-b] shared verified seat ladder
+    void* NearestVehicle(float radius);                    // [G19-b] HUD-button fallback target
+    void ForceSublevels();                                 // [G19-d] sublevel geometry (missing cities)
     void ReturnToLobby(void* world);   // [F24]
     void TeleportToReticle();          // [F24]
     void ApplyCheats(const std::string& cmd); // [F24] fly/walk/ghost/god
@@ -4926,7 +5040,11 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: SetupTacticalSprint"); SetupTacticalSprint();
     LOG("SetupWorld: EnableMovementFeatures"); EnableMovementFeatures();
     LOG("SetupWorld: ShowSkin"); ShowSkin();
-    LOG("SetupWorld: DestroyLods"); DestroyLods();
+    // [G19-d] DestroyLods DISABLED — FortHLODSMActor is the CLIENT's distant
+    // POI stand-in mesh; deleting it (a server-side Erbium memory habit)
+    // punched visible holes into cities whose real sublevels had not streamed
+    // in. The HLODs stay; ForceSublevels now drives the real geometry.
+    LOG("SetupWorld: ForceSublevels (DestroyLods disabled — G19-d)"); ForceSublevels();
     LOG("SetupWorld: InitializeInventory"); InitializeInventory();
     LOG("SetupWorld: ResetStaleContainers"); ResetStaleContainers();   // [F34]
     LOG("SetupWorld: SpawnFloorLoot"); SpawnFloorLoot();
@@ -4939,7 +5057,7 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
     LOG("SetupWorld: SpawnBattleBus"); SpawnBattleBus();
     LOG("SetupWorld: RemoveNetDebugUI"); RemoveNetDebugUI();
-    LOG("SetupWorld: FixMeshNetwork"); FixMeshNetwork();            // [G17-a] Erbium NodeType=2 — missing cities
+    LOG("SetupWorld: FixMeshNetwork"); FixMeshNetwork();            // [G17-a/G19-d] Erbium NodeType=2 — missing cities
     LOG("SetupWorld: StreamPlaylistLevels"); StreamPlaylistLevels(); // [G17-a] Erbium additional playlist levels
     // [F23] Free building + direct readiness bit (standalone-safe fallbacks).
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bBuildFree", true);
@@ -5127,6 +5245,16 @@ void Athena::Tick() {
         TickDeathWatch();          // [G17-c] health → 0 edge runs the server death flow
         TickRealAlive();             // [G18-a] REAL alive recount + Erbium win rules
         TickQuickBarWatch();         // [G18-b] self-healing quickbar slot verification
+        // [G19-a] post-death staleness: once the engine unpossesses/destroys
+        // the pawn, every cached session.pawn user becomes a use-after-free
+        // risk. Clear it once, loudly, so the later ticks null-check out.
+        if (session.death_handled && !session.pawn_cleared && session.pawn) {
+            if (!PawnStillValid(session.pawn)) {
+                session.pawn_cleared = true;
+                LOG("[Death] pawn unpossessed/destroyed — clearing cached pawn (use-after-free guard)");
+                session.pawn = nullptr;
+            }
+        }
     }
     // [F28/F41] one-shot vehicle spawning with a retry window (vehicle spawners
     // stream in after the world is ready — 12 attempts × 15 s ≈ 3 min max).
@@ -5134,6 +5262,14 @@ void Athena::Tick() {
     if (session.finalized && session.world && now - lastVehicleTry > 15.0) {
         lastVehicleTry = now;
         if (!session.vehicles_spawned && session.vehicle_attempts < 12) SpawnVehicles();
+    }
+    // [G19-d] sublevel force retry — streaming levels appear over the first
+    // minutes of play as the world settles; re-force until the set stabilises
+    // (6 passes × 30 s). Empty (World Partition) worlds stop after pass 1.
+    static double lastSublevelTry = 0;
+    if (session.finalized && session.world && now - lastSublevelTry > 30.0) {
+        lastSublevelTry = now;
+        if (session.sublevel_passes < 6) { session.sublevel_passes++; ForceSublevels(); }
     }
 }
 
@@ -5146,6 +5282,44 @@ void Athena::DestroyLods() {
     Call c("/Script/Engine.CheatManager.DestroyAll");
     if (c.ok() && c.set("aClass", cls)) c.run(cm);
     LOG("DestroyLods: done");
+}
+
+// ============================================================================
+// [G19-d] SUBLEVEL GEOMETRY — "some cities/buildings never spawn, I fell
+// through a hole where the building should be". Streaming sublevels normally
+// load from the SERVER's streaming decisions; standalone they never do, so
+// every POI that lives in its own sublevel is a hole in the collision. Force
+// each ULevelStreaming in the world to loaded+visible — the engine's own
+// UpdateLevelStreaming pass applies the flags asynchronously (memory-safe
+// pacing) on its next ticks.
+// ============================================================================
+void Athena::ForceSublevels() {
+    if (!session.world || IsBadPtr(session.world)) return;
+    void* levelsProp = GetProp("/Script/Engine.World.StreamingLevels");
+    if (!levelsProp) {
+        LOG("[Levels] ⚠️ World.StreamingLevels not reflected on this build");
+        return;
+    }
+    Array levels = Read<Array>(GetField(session.world, levelsProp));
+    if (!levels.Data || levels.Count <= 0 || levels.Count > 256 || IsBadPtr(levels.Data)) {
+        // Not an error: World Partition maps stream by distance instead.
+        LOG("[Levels] StreamingLevels empty — World Partition drives this map's cells");
+        session.sublevel_passes = 100;   // nothing to force — stop retrying
+        return;
+    }
+    int changed = 0, already = 0;
+    for (int i = 0; i < levels.Count; ++i) {
+        void* ls = Read<void*>(levels.Data, (size_t)i * 8);
+        if (!ls || IsBadPtr(ls)) continue;
+        bool wasLoaded  = GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeLoaded");
+        bool wasVisible = GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible");
+        if (wasLoaded && wasVisible) { ++already; continue; }
+        SetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeLoaded", true);
+        SetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible", true);
+        ++changed;
+    }
+    LOG("[Levels] sublevels: %d total, %d forced loaded+visible, %d already on (pass %d)",
+        (int)levels.Count, changed, already, session.sublevel_passes);
 }
 
 void Athena::DropLoadingScreen() {
@@ -6287,6 +6461,19 @@ namespace local_loot {
         LOG("[Loot] row sizes: tier=%d (walk, raw@0x54=%d) pkg=%d (walk, raw@0x54=%d) [F94-b]",
             tierRowSize, tierRaw, pkgRowSize, pkgRaw);
         if (tierRowSize <= 0 || tierRowSize > 512 || pkgRowSize <= 0 || pkgRowSize > 512) { LOG("[Loot] ⚠️ bad row sizes %d/%d", tierRowSize, pkgRowSize); g_cache.failAt = Monotonic(); return; }
+        // [G19-c] own-map size snapshot — with the parent discovery active,
+        // the split "own rows vs parent rows" is now visible in one line
+        // (previous device run: tier own=1 of 252, pkg own=1717 of 2149).
+        {
+            static bool s_ownLogged = false;
+            if (!s_ownLogged) {
+                s_ownLogged = true;
+                int tierOwn = Read<int32>((char*)tierTable + 0x38);   // RowMap@0x30 → ArrayNum@+8
+                int pkgOwn  = Read<int32>((char*)pkgTable  + 0x38);
+                LOG("[Loot][G19] own RowMap rows: tier=%d pkg=%d (rest live in parent tables)",
+                    tierOwn, pkgOwn);
+            }
+        }
 
         int toNum  = PropOffsetOn(tierStruct, "NumLootPackageDrops");
         int toGrp  = PropOffsetOn(tierStruct, "TierGroup");
@@ -6670,7 +6857,11 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
 
     std::vector<local_loot::Drop> drops;
     bool usedTables = local_loot::RollGroup(group, drops);
-    if (!usedTables) {
+    // [G19-c] the curated table is now a SAFETY NET, not just a missing-table
+    // fallback: a DataTable roll that finds no tier row for this group (or
+    // rolls zero categories) must not leave the container EMPTY — that is
+    // the "no loot anywhere on the ground" symptom in one line.
+    if (!usedTables || drops.empty()) {
         // Curated fallback (DataTable roll unavailable).
         const local_loot::Tier* tier = nullptr;
         for (auto& t : local_loot::tiers)
@@ -7499,32 +7690,61 @@ void Athena::SetupMatchState() {
 // ============================================================================
 void Athena::FixMeshNetwork() {
     if (session.mesh_network_fixed || !session.world) return;
-    GObjects_t* go = GObjectArray();
-    if (!go) return;
-    void* classClass = FindObj("/Script/CoreUObject.Class");
-    void* subsystem = nullptr;
-    for (int32 i = 0; i < go->NumElements; ++i) {
-        void* o = go->GetById((uint32)i);
-        if (!o || IsBadPtr(o)) continue;
-        if (classClass && IsA(o, classClass)) continue;   // skip the UClass object itself
-        if (ObjName(o) != "MeshNetworkSubsystem") continue;
-        subsystem = o;
-        break;
+    // [G19-d] REWRITTEN — the old GObjects name scan never produced a single
+    // log line on device (meshnet=0 forever): it bailed silently before the
+    // scan on every attempt. Resolve the subsystem the canonical way instead
+    // — UGameplayStatics::GetGameInstanceSubsystem(WorldContextObject, Class)
+    // runs entirely through StaticFindObject + ProcessEvent, both proven on
+    // this build — with the CDO (Default__X) as the class discovery fallback.
+    static void* s_class = nullptr;
+    static bool s_classTried = false;
+    if (!s_classTried) {
+        s_classTried = true;
+        const char* candidates[] = {
+            "/Script/FortniteGame.MeshNetworkSubsystem",
+            "/Script/FortniteGame.FortMeshNetworkSubsystem",
+            "/Script/FortniteGame.MeshNetworkSubsystemBase",
+        };
+        for (const char* path : candidates) {
+            s_class = FindObj(path);
+            if (s_class) break;
+        }
+        if (!s_class) {
+            // CDO fallback: Default__X is an instance OF the class — its
+            // ClassPrivate pointer IS the class we need.
+            void* cdo = FindObj("/Script/FortniteGame.Default__MeshNetworkSubsystem");
+            if (!cdo) cdo = FindObj("/Script/FortniteGame.Default__FortMeshNetworkSubsystem");
+            if (cdo && !IsBadPtr(cdo)) s_class = Read<void*>(cdo, profile::ObjectClass);
+        }
+        LOG("[MeshNet] class lookup: %p%s", s_class, s_class ? "" : " (unresolved)");
     }
-    if (!subsystem) {
-        LOG("[MeshNet] subsystem not present yet (attempt %d)", session.mesh_network_attempts);
+    void* subsystem = nullptr;
+    if (s_class) {
+        Call g("/Script/Engine.GameplayStatics.GetGameInstanceSubsystem");
+        if (g.ok() && g.set("WorldContextObject", session.world) && g.set("Class", s_class)) {
+            if (g.run(FindObj("/Script/Engine.Default__GameplayStatics")))
+                subsystem = g.result<void*>();
+        }
+    }
+    if (!subsystem || IsBadPtr(subsystem)) {
+        LOG("[MeshNet] subsystem not resolved yet (attempt %d)", session.mesh_network_attempts);
         return;
     }
     void* klass = Read<void*>(subsystem, profile::ObjectClass);
     int sz = 0;
     void* nt = klass ? FindChildProp(klass, "NodeType", &sz) : nullptr;
     if (!nt || sz != 1) {
-        LOG("[MeshNet] NodeType property not found — stopping (feature off)");
+        LOG("[MeshNet] NodeType property not found on %s — stopping (feature off)",
+            ObjName(klass).c_str());
         session.mesh_network_fixed = true;   // cannot act; do not retry forever
         return;
     }
     int off = Read<int>(nt, profile::PropOffset);
-    if (off < 0 || off > 0x8000) { session.mesh_network_fixed = true; return; }
+    if (off < 0 || off > 0x8000) {
+        LOG("[MeshNet] NodeType offset insane (%d) — stopping", off);
+        session.mesh_network_fixed = true;
+        return;
+    }
     uint8_t old = Read<uint8_t>(subsystem, (size_t)off);
     if (old == 2) {
         LOG("[MeshNet] NodeType already 2 (self-sufficient)");
@@ -7660,7 +7880,7 @@ void Athena::StreamPlaylistLevels() {
 // Erbium server death flow.
 void Athena::TickDeathWatch() {
     if (!session.finalized || session.death_handled || session.win_handled) return;
-    if (!session.pawn || IsBadPtr(session.pawn)) return;
+    if (!session.pawn || !PawnStillValid(session.pawn)) return;   // [G19-a] freed pawn = no polls
     double now = Monotonic();
     if (now - session.last_health_poll < 0.5) return;
     session.last_health_poll = now;
@@ -7692,14 +7912,18 @@ void Athena::TickDeathWatch() {
 void Athena::HandlePlayerDeath(bool forced) {
     if (session.death_handled || !session.finalized || !session.controller) return;
     session.death_handled = true;   // one-shot: re-entry is impossible
-    LOG("[Death] %s — running Erbium server death flow",
+    LOG("[Death] %s — running Erbium server death flow (G19-a guarded)",
         forced ? "forced (era.die)" : "health reached 0");
     Vector loc{};
-    if (session.pawn && !ActorLocation(session.pawn, loc)) loc = Vector{};
+    // [G19-a] the engine may have already destroyed the pawn (KillZ / fast
+    // eliminate) while our 1s debounce ran — gate every pawn-touching step.
+    bool pawnOk = PawnStillValid(session.pawn);
+    if (pawnOk && session.pawn && !ActorLocation(session.pawn, loc)) loc = Vector{};
+    if (!pawnOk) LOG("[Death] ⚠️ pawn stale/destroyed (KillZ?) — pawn steps skipped");
 
     // ---- 1) Drop every droppable item as a pickup (Erbium inventory drop) --
     int dropped = 0;
-    {
+    if (pawnOk) gas::RunGuarded("[Death] drops", [&] {
         void* invProp       = GetProp("/Script/FortniteGame.FortInventory.Inventory");
         void* instProp      = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
         void* entryProp     = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
@@ -7749,7 +7973,8 @@ void Athena::HandlePlayerDeath(bool forced) {
                 }
             }
         }
-    }
+    });
+    LOG("[Death] step1 drops done (%d)", dropped);
 
     // ---- 2) PlayerState DeathInfo + PawnDeathLocation (Erbium 1:1) --------
     if (session.player_state && !IsBadPtr(session.player_state)) {
@@ -7778,10 +8003,13 @@ void Athena::HandlePlayerDeath(bool forced) {
                 // Killer / Downer / FinisherOrDowner / tags stay zeroed — the
                 // world killed us (storm/fall), not another player.
             }
-            Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_DeathInfo");
-            if (r.ok()) r.run(session.player_state);
+            gas::RunGuarded("[Death] OnRep_DeathInfo", [&] {
+                Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_DeathInfo");
+                if (r.ok()) r.run(session.player_state);
+            });
         }
     }
+    LOG("[Death] step2 death-info done");
 
     // ---- 3) Place = PlayersLeft BEFORE the decrement (Erbium order) -------
     int place = 1;
@@ -7797,22 +8025,28 @@ void Athena::HandlePlayerDeath(bool forced) {
         void* placeProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.Place");
         if (placeProp && Read<int>(placeProp, profile::PropElementSize) == 4) {
             Write<int>(GetField(session.player_state, placeProp), 0, place);
-            Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_Place");
-            if (r.ok()) r.run(session.player_state);
+            gas::RunGuarded("[Death] OnRep_Place", [&] {
+                Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_Place");
+                if (r.ok()) r.run(session.player_state);
+            });
         }
     }
+    LOG("[Death] step3 place=%d done", place);
 
     // ---- 4) Freeze movement (Erbium v15+: DisableMovement) ----------------
-    if (session.pawn && !IsBadPtr(session.pawn)) {
+    if (pawnOk && session.pawn && !IsBadPtr(session.pawn)) {
         void* movement = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
         if (movement && !IsBadPtr(movement)) {
-            Call d("/Script/Engine.CharacterMovementComponent.DisableMovement");
-            if (d.ok()) d.run(movement);
+            gas::RunGuarded("[Death] DisableMovement", [&] {
+                Call d("/Script/Engine.CharacterMovementComponent.DisableMovement");
+                if (d.ok()) d.run(movement);
+            });
         }
     }
+    LOG("[Death] step4 movement frozen=%d", (int)pawnOk);
 
     // ---- 5) The client RPC body — death UI / camera / spectate switch -----
-    {
+    gas::RunGuarded("[Death] ClientOnPawnDied", [&] {
         Call c("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnDied");
         if (c.ok()) {
             int psize = c.param_size("DeathReport");
@@ -7826,21 +8060,27 @@ void Athena::HandlePlayerDeath(bool forced) {
             }
             c.run(session.controller);
         }
-    }
+    });
+    LOG("[Death] step5 ClientOnPawnDied dispatched");
 
     // ---- 6) Pawn dying state (ragdoll/death anim attempt) -----------------
-    if (session.pawn && !IsBadPtr(session.pawn)) {
-        Call h("/Script/FortniteGame.FortPawn.HandleIsDying");
-        if (h.ok()) h.run(session.pawn);
+    if (pawnOk && session.pawn && !IsBadPtr(session.pawn)) {
+        gas::RunGuarded("[Death] HandleIsDying", [&] {
+            Call h("/Script/FortniteGame.FortPawn.HandleIsDying");
+            if (h.ok()) h.run(session.pawn);
+        });
     }
+    LOG("[Death] step6 is-dying done");
 
     // ---- 7) PlayersLeft-- + OnRep (native RemoveFromAlivePlayers parity) --
     if (haveLeft) {
         int left = playersLeft - 1;
         if (left < 0) left = 0;
         Write<int>(GetField(session.state, plProp), 0, left);
-        Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
-        if (n.ok()) n.run(session.state);
+        gas::RunGuarded("[Death] OnRep_PlayersLeft", [&] {
+            Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+            if (n.ok()) n.run(session.state);
+        });
         session.real_alive = left;
     }
     LOG("[Death] ✅ complete: place=%d playersLeft=%d itemsDropped=%d", place, playersLeft - 1, dropped);
@@ -7998,7 +8238,9 @@ void Athena::HandleVictory(bool onDeath) {
         }
     }
     // Erbium order: PlayWinEffects → ClientNotifyWon → ClientNotifyTeamWon.
-    void* pawn = (session.pawn && !IsBadPtr(session.pawn)) ? session.pawn : nullptr;
+    // [G19-a] each banner call is fault-guarded — a faulting win effect must
+    // not take the placement window down with it.
+    void* pawn = (session.pawn && PawnStillValid(session.pawn)) ? session.pawn : nullptr;
     void* noWeapon = nullptr;
     uint8_t cause = 0;
     {
@@ -8009,7 +8251,7 @@ void Athena::HandleVictory(bool onDeath) {
             bound = e.set_any(cause, "DeathCause", "Cause") && bound;
             bool audioOnly = false;
             bound = e.set_any(audioOnly, "bAudioOnly", "AudioOnly") && bound;
-            if (bound) e.run(session.controller);
+            if (bound) gas::RunGuarded("[Victory] PlayWinEffects", [&] { e.run(session.controller); });
         }
     }
     {
@@ -8018,7 +8260,7 @@ void Athena::HandleVictory(bool onDeath) {
             bool bound = w.set_any(pawn, "FinisherPawn", "Pawn", "Finisher");
             bound = w.set_any(noWeapon, "FinishingWeapon", "Weapon") && bound;
             bound = w.set_any(cause, "DeathCause", "Cause") && bound;
-            if (bound) w.run(session.controller);
+            if (bound) gas::RunGuarded("[Victory] ClientNotifyWon", [&] { w.run(session.controller); });
         }
     }
     {
@@ -8027,7 +8269,7 @@ void Athena::HandleVictory(bool onDeath) {
             bool bound = t.set_any(pawn, "FinisherPawn", "Pawn", "Finisher");
             bound = t.set_any(noWeapon, "FinishingWeapon", "Weapon") && bound;
             bound = t.set_any(cause, "DeathCause", "Cause") && bound;
-            if (bound) t.run(session.controller);
+            if (bound) gas::RunGuarded("[Victory] ClientNotifyTeamWon", [&] { t.run(session.controller); });
         }
     }
     LOG("[Victory] ✅ banner dispatched (team=%d place=1)", teamIndex);
@@ -8783,6 +9025,106 @@ void Athena::OnExitVehicle() {
     }
 }
 
+// ============================================================================
+// [G19-b] THE VEHICLE ENTER LADDER — shared by the enter RPC catch and the
+// interact path. ServerAttemptEnterVehicle had NO handler before: the ability
+// dispatched the Server RPC, the hook ignored it, the net layer dropped it —
+// "the enter button does nothing". Each step is verified through
+// FortPlayerPawnAthena.GetVehicleActor before the next runs, exactly like the
+// G18-d interact ladder.
+// ============================================================================
+bool Athena::EnterVehicleDirect(void* vehicle, int seatIdx) {
+    if (!vehicle || IsBadPtr(vehicle) || !IsReadable(vehicle, 0x60)) return false;
+    if (!session.pawn || !PawnStillValid(session.pawn)) return false;
+    void* targetCls = Read<void*>(vehicle, profile::ObjectClass);
+    if (!IsVehicleTarget(targetCls)) {
+        LOG("[Vehicle] ⚠️ enter target is not a vehicle: %s", ObjName(targetCls).c_str());
+        return false;
+    }
+    auto verifySeated = []() -> bool {
+        Call v("/Script/FortniteGame.FortPlayerPawnAthena.GetVehicleActor");
+        if (!v.ok()) v = Call("/Script/FortniteGame.FortPawn.GetVehicleActor");
+        if (v.ok() && session.pawn && v.run(session.pawn)) {
+            void* cur = v.result<void*>();
+            return cur && !IsBadPtr(cur);
+        }
+        return false;
+    };
+    if (verifySeated()) {   // already in a seat (double tap / re-entry)
+        Athena::TickVehicleSeats(true);
+        return true;
+    }
+    // 1) ForceSeatSinglePawn(PawnToSeat, SeatIndex) — SDK-verified
+    {
+        Call f("/Script/FortniteGame.FortAthenaVehicle.ForceSeatSinglePawn");
+        if (!f.ok()) f = Call("/Script/FortniteGame.FortCharacterVehicle.ForceSeatSinglePawn");
+        if (f.ok() && f.set("PawnToSeat", session.pawn) && f.set("SeatIndex", seatIdx) && f.run(vehicle)) {
+            if (f.result<bool>() || verifySeated()) {
+                LOG("[Vehicle] ✅ seated into %s seat %d (ForceSeatSinglePawn)",
+                    ObjName(targetCls).c_str(), seatIdx);
+                Athena::TickVehicleSeats(true);
+                return true;
+            }
+        }
+    }
+    // 2) ForceSeatPawns(TArray<AFortPlayerPawn*>) — SDK-verified sibling
+    {
+        Call fp("/Script/FortniteGame.FortAthenaVehicle.ForceSeatPawns");
+        if (!fp.ok()) fp = Call("/Script/FortniteGame.FortCharacterVehicle.ForceSeatPawns");
+        if (fp.ok()) {
+            static void* cell = nullptr;      // persistent backing store
+            cell = session.pawn;
+            struct TArr { void* data; int32_t n; int32_t max; } ta{ &cell, 1, 1 };
+            if (fp.set_bytes("PawnsToSeat", &ta, sizeof(ta)) || fp.bind_at(0, &ta, sizeof(ta))) {
+                fp.run(vehicle);
+                if (verifySeated()) {
+                    LOG("[Vehicle] ✅ seated into %s (ForceSeatPawns)", ObjName(targetCls).c_str());
+                    Athena::TickVehicleSeats(true);
+                    return true;
+                }
+            }
+        }
+    }
+    // 3) OnPawnEnterVehicle(pawn, seat) — the server→client seat bookkeeping
+    //    notification as the last resort.
+    {
+        Call enter("/Script/FortniteGame.FortCharacterVehicle.OnPawnEnterVehicle");
+        if (enter.ok() && enter.set("PlayerPawn", session.pawn)) {
+            enter.set("SeatIdx", seatIdx);
+            if (enter.run(vehicle)) {
+                LOG("[Vehicle] OnPawnEnterVehicle dispatched on %s (verify next tick)",
+                    ObjName(targetCls).c_str());
+                Athena::TickVehicleSeats(true);
+                return true;
+            }
+        }
+    }
+    LOG("[Vehicle] ⚠️ enter ladder exhausted for %s", ObjName(targetCls).c_str());
+    return false;
+}
+
+// [G19-b] Nearest vehicle to the pawn (mobile HUD-button fallback when the
+// button fires a function that carries no vehicle parameter).
+void* Athena::NearestVehicle(float radius) {
+    if (!session.pawn) return nullptr;
+    void* cls = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+    if (!cls) return nullptr;
+    std::vector<void*> actors;
+    if (!GetAllActorsOfClassRaw(cls, actors)) return nullptr;
+    void* best = nullptr;
+    double bestD2 = double(radius) * double(radius);
+    Vector origin{};
+    if (!ActorLocation(session.pawn, origin)) return nullptr;
+    for (void* a : actors) {
+        Vector loc{};
+        if (!a || IsBadPtr(a) || !ActorLocation(a, loc)) continue;
+        double dx = loc.X - origin.X, dy = loc.Y - origin.Y, dz = loc.Z - origin.Z;
+        double d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 <= bestD2) { bestD2 = d2; best = a; }
+    }
+    return best;
+}
+
 void Athena::CheatScript(const char* script) {
     if (!script || !session.pawn) return;
     std::string s = script;
@@ -8894,6 +9236,29 @@ static bool PrologueMatchPE(const char* label, uintptr_t rva) {
     return true;
 }
 
+// [G19-b] One-shot RPC param dump — ServerAttemptEnterVehicle's cooked
+// signature is build-specific; the first device call logs every parm
+// (name/offset/size + raw qwords) so the exact layout is on record.
+static void DumpRpcParams(void* func, void* params, const char* tag) {
+    if (!func || IsBadPtr(func)) return;
+    int total = Read<uint16_t>(func, profile::FunctionParamSize);
+    LOG("[%s] param dump: size=%d", tag, total);
+    auto walk = [&](void* p, uint32 nameOff, bool ffield) {
+        for (int i = 0; p && !IsBadPtr(p) && i < 24; ++i, p = Read<void*>(p, ffield ? profile::FFieldNext : profile::FieldNext)) {
+            if (!(Read<uint64_t>(p, profile::PropFlags) & profile::CPF_Parm)) continue;
+            std::string n;
+            if (!SafeFieldName(p, nameOff, n)) continue;
+            int offset = Read<int>(p, profile::PropOffset);
+            int size   = Read<int>(p, profile::PropElementSize);
+            uint64_t v = 0;
+            if (params && offset >= 0 && offset + 8 <= total) v = Read<uint64_t>(params, (size_t)offset);
+            LOG("[%s]   parm '%s' off=%d size=%d qword=0x%llx", tag, n.c_str(), offset, size, (unsigned long long)v);
+        }
+    };
+    walk(Read<void*>(func, profile::StructChildren), profile::ObjectName, false);
+    walk(profile::HasFField ? Read<void*>(func, profile::StructChildProps) : nullptr, profile::FFieldName, true);
+}
+
 static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
     if (!g_internal && func && g_gameTid.load() == (int)gettid()) {
@@ -8945,6 +9310,49 @@ static void pe_hook(void* obj, void* func, void* params) {
         if (g_aircraftClass && obj && fn == "ServerAttemptAircraftJump") {
             void* cls = Read<void*>(obj, profile::ObjectClass);
             if (SubclassOfFast(cls, g_aircraftClass)) { Athena::HandleJumpFromHudStart(); return orig_PE(obj, func, params); }
+        }
+
+        // [G19-b] VEHICLE ENTER RPC — caught by NAME on ANY receiver (PC,
+        // pawn, vehicle component): the ability dispatches it, the net layer
+        // would drop it, and before G19 the hook had NO handler at all — the
+        // whole "enter button does nothing" bug in one missing branch.
+        if (fn == "ServerAttemptEnterVehicle" && params && session.finalized) {
+            static bool s_dumpedEnter = false;
+            if (!s_dumpedEnter) { s_dumpedEnter = true; DumpRpcParams(func, params, "Vehicle-RPC"); }
+            void* slot = incoming(func, params, "Vehicle", 8);
+            if (!slot) slot = incoming(func, params, "VehicleActor", 8);
+            if (!slot) slot = incoming(func, params, "TargetVehicle", 8);
+            void* vehicle = slot ? Read<void*>(slot) : nullptr;
+            int seatIdx = 0;
+            if (void* s2 = incoming(func, params, "SeatIdx", 4)) seatIdx = Read<int32>(s2);
+            else if (void* s2 = incoming(func, params, "SeatIndex", 4)) seatIdx = Read<int32>(s2);
+            else if (void* s2 = incoming(func, params, "Seat", 4)) seatIdx = Read<int32>(s2);
+            LOG("[Vehicle] enter RPC: receiver=%s vehicle=%p seat=%d",
+                ObjName(Read<void*>(obj, profile::ObjectClass)).c_str(), vehicle, seatIdx);
+            if (!vehicle || IsBadPtr(vehicle) || !IsReadable(vehicle, 0x60)) {
+                // No sane vehicle in the params — nearest vehicle fallback.
+                vehicle = Athena::NearestVehicle(900.0f);
+                LOG("[Vehicle] param vehicle unusable — nearest fallback %p", vehicle);
+            }
+            if (vehicle) Athena::EnterVehicleDirect(vehicle, seatIdx);
+            return;   // server RPC — the native client body is a net no-op; ladder replaces it
+        }
+
+        // [G19-b] HUD/controller vehicle-enter BUTTON whose function name we
+        // do not know yet (mobile builds route buttons through the HUD context
+        // like JumpFromHudStart): ADDITIVELY run the seat ladder (OG still
+        // dispatches — this is a client function, not a dead RPC) and log the
+        // exact name + params once so the next iteration pins the real path.
+        if (session.finalized && params != nullptr && fn != "OnPawnEnterVehicle" && fn != "OnPawnExitVehicle" &&
+            fn.find("ehicle") != std::string::npos &&
+            (fn.find("nter") != std::string::npos || fn.rfind("Attempt", 0) == 0)) {
+            static bool s_btnLogged = false;
+            LOG("[Vehicle] enter-ish function '%s' on %s",
+                fn.c_str(), ObjName(Read<void*>(obj, profile::ObjectClass)).c_str());
+            if (!s_btnLogged) { s_btnLogged = true; DumpRpcParams(func, params, "Vehicle-BTN"); }
+            void* cls = Read<void*>(obj, profile::ObjectClass);
+            void* vehicle = IsVehicleTarget(cls) ? obj : Athena::NearestVehicle(900.0f);
+            if (vehicle) Athena::EnterVehicleDirect(vehicle, 0);   // additive — OG runs below
         }
 
         if (!g_interactionClass) g_interactionClass = FindObj("/Script/FortniteGame.FortControllerComponent_Interaction");
