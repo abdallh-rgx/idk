@@ -586,6 +586,61 @@
 //            UGameplayStatics::GetGameInstanceSubsystem (multiple class
 //            path candidates) and NodeType=2 (Erbium POI streaming fix)
 //            finally applies.
+//  [G20] LOOT-ROLL CRASH (device round 17 — the log died right after "tables:
+//        tiers=252 packages=2149", i.e. the FIRST roll with real table data):
+//        (a) RESIDENT-FIRST soft resolution — TSoftObjectPtr paths are now
+//            parsed to strings (UE5.0 FSoftObjectPath = FString AssetPathName,
+//            strictly validated; the 5.1 FName-pair layout fails validation
+//            cleanly and falls through) and resolved with StaticFindObject.
+//            The batch drain NEVER calls LoadAsset_Blocking anymore: 12 sync
+//            disk loads per tick = multi-second frame stall = ANR kill / OOM
+//            on a phone, plus the unguarded native-call crash window. The
+//            sync load survives ONLY on interactive chest opens (one at a
+//            time, under the fault guard).
+//        (b) GUARDED DRAIN — every spawner roll (DataTable pipeline + BP
+//            fallback + destroy) runs inside ONE RunGuarded scope: a fault
+//            skips that spawner and the flow continues. A stage tracker
+//            (g_lootStage) names the exact phase that faulted. Circuit
+//            breaker: 8 consecutive faults suspend the drain 120 s and put
+//            the cache on a 600 s hold (curated fallback covers the gap).
+//            8 ms wall-clock budget per tick, batch 12→8.
+//        (c) BuildCache: per-loop progress logs every 250 rows (a fault is
+//            now pinpointable to a row range) + junk-row counters + the pkg
+//            LootPackageCall FString read hardened (count clamped ≤64,
+//            kernel-validated readable) + the interactive Athena::Loot path
+//            is fault-guarded too (first chest could build the cache).
+//        (d) AmmoCountFor: the raw IGameplayTagAssetInterface vtable call
+//            (+0x10) — the one unguarded native call inside the roll — now
+//            validates both the interface pointer and the code pointer with
+//            kernel probes before calling (it already runs under the drain
+//            guard; this removes the fault in the common case).
+//        (e) Curated minimum: a matched curated tier that rolls 0 of
+//            everything (weaponsMin=ammoMin=resources=0, the Warmup group)
+//            still yields one weapon + one ammo — "roll produced no drops"
+//            can never fire while tables are alive.
+//  [G21] VEHICLE ENTRY/EXIT — the enter button STILL never reached a hooked
+//        function (no [Vehicle] lines at all in round 17): the mobile touch
+//        HUD routes buttons through AthenaHUDContext (the JumpFromHudStart
+//        pattern) with names we have not met. (a) Every unique function the
+//        HUD context dispatches is now LOGGED once (vocabulary discovery);
+//        (b) interact-ish HUD functions dispatch a full interact: nearest
+//        BuildingContainer (350uu) first, else nearest vehicle (900uu) →
+//        EnterVehicleDirect; (c) 'ehicle'+'xit' names run the new
+//        ExitVehicleDirect ladder (OnPawnExitVehicle + seat-weapon restore);
+//        (d) every 'ehicle' function name seen anywhere is logged once.
+//  [G22] MISSING POIs / WORLD PARTITION (round 17: "0 playlist levels", holes
+//        in the terrain where POIs plug in) — Artemis_Terrain is a World
+//        Partition map: POIs live in runtime cells streaming around sources.
+//        New DiagnoseWorldPartition() (3 passes): (A) World->Levels /
+//        StreamingLevels counts (what actually loaded); (B) the UWorldPartition
+//        object itself (reflected prop, then a validated memory scan) + its
+//        reflected member dump; (C) ADataLayerManager actors + per-layer
+//        effective state + activation attempt through any resolvable
+//        SetDataLayer* UFunction; plus two safe attempts: bIsStreamingSource
+//        forced true on pawn+controller (the flag WP's source iterator keys
+//        on, when reflected) and a "FlushLevelStreaming" console pass.
+//        StreamPlaylistLevels now logs the resolved playlist name + the size
+//        of every levels array it inspects.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -2039,6 +2094,21 @@ static void* LoadSoftPtr(const void* bytes, int stride) {
     void* out = load.result<void*>();
     return (out && !IsBadPtr(out)) ? out : nullptr;
 }
+// [G20] TSoftObjectPtr → "/Package/Object" string WITHOUT any native call.
+// UE5.0 FSoftObjectPath = { FString AssetPathName; FString SubPathString; }
+// (5.1 replaced the FString with an FName pair — on those builds the parse
+// fails validation cleanly and the caller falls back, so this is layout-
+// agnostic by construction). Every read is kernel-validated: a wrong layout
+// yields an empty string, never a crash.
+static std::string SoftObjectPathString(const void* soft, int stride) {
+    if (!soft || stride < 16 || !IsReadable(soft, 16)) return {};
+    FStringNative fs = Read<FStringNative>(soft, 0);
+    if (!fs.Data || fs.Count < 3 || fs.Count > 512 || IsBadPtr(fs.Data)) return {};
+    if (!IsReadable(fs.Data, (size_t)std::min(fs.Count, 256) * 2)) return {};
+    std::string s = Narrow((const char16_t*)fs.Data, fs.Count);
+    if (s.size() < 5 || s[0] != '/' || s.find('.') == std::string::npos) return {};
+    return s;
+}
 // [F32] UDataTable row enumeration through the engine Kismet library — works
 // regardless of the RowMap key type (FName on stock builds, int on FNE forks).
 static bool DataTableRowNames(void* table, std::vector<FName>& out) {
@@ -2492,6 +2562,8 @@ struct Session {
     // [G19-d] sublevel force passes / post-death pawn staleness guard
     int   sublevel_passes = 0;
     bool  pawn_cleared = false;
+    // [G22] World Partition diagnostic passes
+    int   wp_diag_passes = 0;
 } session;
 
 static double Monotonic() {
@@ -2633,7 +2705,10 @@ namespace Athena {
     void PlayEmoteItem(void* item);
     void OnExitVehicle();
     bool EnterVehicleDirect(void* vehicle, int seatIdx);   // [G19-b] shared verified seat ladder
+    bool ExitVehicleDirect();                              // [G21] exit ladder (OnPawnExitVehicle + weapon restore)
     void* NearestVehicle(float radius);                    // [G19-b] HUD-button fallback target
+    void DispatchHudInteract();                            // [G21] HUD interact button → nearest target dispatch
+    void DiagnoseWorldPartition();                         // [G22] WP probes + activation attempts
     void ForceSublevels();                                 // [G19-d] sublevel geometry (missing cities)
     void ReturnToLobby(void* world);   // [F24]
     void TeleportToReticle();          // [F24]
@@ -5240,6 +5315,16 @@ void Athena::Tick() {
         TickRealityProximity();    // [F44] reality tree proximity effect
         TickSprintDoorAssist();    // [G16-a] safe bash-through (open-only)
         TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
+        // [G22] World Partition diagnostics — 3 passes (first ~5 s after
+        // finalize, then 45 s apart): what loaded, whether a WorldPartition
+        // object exists, data-layer states + activation, streaming-source fix.
+        {
+            static double lastWpDiag = 0.0;
+            if (session.wp_diag_passes < 3 && now - lastWpDiag > (session.wp_diag_passes == 0 ? 5.0 : 45.0)) {
+                lastWpDiag = now;
+                DiagnoseWorldPartition();
+            }
+        }
         TickFloorLootStreaming();  // [F-loot-auto] roll floor loot as spawners stream in
         TickMeshNetwork();         // [G17-a] NodeType retry window (subsystem streams in late)
         TickDeathWatch();          // [G17-c] health → 0 edge runs the server death flow
@@ -6265,6 +6350,13 @@ void Athena::DropInventoryItem(Guid guid, int count) {
 }
 
 // ============================================================================
+// [G20] Loot pipeline fault-stage tracker — updated at every phase of the
+// roll/spawn pipeline; included in the fault log when a guarded spawner roll
+// aborts, so the device log names the exact phase that faulted.
+// ============================================================================
+static const char* g_lootStage = "-";
+
+// ============================================================================
 // LOOT — [F20/F32] Erbium pipeline 1:1: DataTable-driven roll
 // (ChooseLootForContainer + SetupLDSForPackage over the real cooked tables)
 // with the curated table kept as a last-resort fallback.
@@ -6379,6 +6471,7 @@ namespace local_loot {
         std::string call;               // LootPackageCall (recursion target)
         uint8_t soft[64]{};             // TSoftObjectPtr bytes (lazy resolve)
         int softStride = 0;
+        std::string path;               // [G20] parsed soft path (resident-first resolve)
         int32 count = 0, category = -1, minW = -1, maxW = -1;
         void* def = nullptr;
     };
@@ -6396,6 +6489,7 @@ namespace local_loot {
         std::map<std::string, std::vector<LPkgRow*>> pkgIndex;
         bool ready = false;
         double failAt = -1000.0;
+        double holdUntil = -1000.0;   // [G20] fault backoff — BuildCache skipped while now < holdUntil
     };
     static Cache g_cache;
 
@@ -6410,10 +6504,21 @@ namespace local_loot {
         if (lvl < 0 || lvl > 64) lvl = 0;
         return lvl;
     }
-    static void* ResolveSoft(LPkgRow& r) {
+    static void* ResolveSoft(LPkgRow& r, bool allowSyncLoad) {
         if (r.def) return r.def;
         if (!r.softStride) return nullptr;
-        r.def = LoadSoftPtr(r.soft, r.softStride);
+        // [G20] RESIDENT-FIRST: parse the soft path to a string once and
+        // StaticFindObject it — zero native calls. The batch drain must never
+        // pay a synchronous LoadAsset_Blocking (multi-second stall → ANR/OOM
+        // kill, the round-17 crash pattern); a resident miss in batch mode
+        // falls to the next package row / the curated net instead.
+        if (r.path.empty()) r.path = SoftObjectPathString(r.soft, r.softStride);
+        if (!r.path.empty()) {
+            void* res = FindObj(r.path.c_str());
+            if (res && !IsBadPtr(res)) { r.def = res; return r.def; }
+        }
+        if (!allowSyncLoad) return nullptr;
+        r.def = LoadSoftPtr(r.soft, r.softStride);   // interactive opens only (guarded)
         return r.def;
     }
     template<class T> static T* PickWeighted(std::vector<T*>& rows) {
@@ -6431,7 +6536,9 @@ namespace local_loot {
 
     static void BuildCache() {
         if (g_cache.ready) return;
+        if (Monotonic() < g_cache.holdUntil) return;       // [G20] fault backoff
         if (Monotonic() - g_cache.failAt < 30.0) return;   // retry window
+        g_lootStage = "cache-open";                        // [G20]
         auto pickTable = [&](const char* athena, const char* base) -> void* {
             void* t = FindObj(athena);
             if (!t) t = LoadAsset(athena, "/Script/Engine.DataTable");
@@ -6499,7 +6606,6 @@ namespace local_loot {
         std::vector<FName> tierNames, pkgNames;
         if (!DataTableRowNames(tierTable, tierNames) || !DataTableRowNames(pkgTable, pkgNames)) { LOG("[Loot] ⚠️ row enumeration failed"); g_cache.failAt = Monotonic(); return; }
         LOG("[Loot] tables: tiers=%d rows, packages=%d rows", (int)tierNames.size(), (int)pkgNames.size());
-
         // Erbium dedupe: tiers by (TierGroup, LootPackage) — later rows
         // override; packages by row key — later rows override.
         std::map<uint64_t, LTierRow> tierDedupe;
@@ -6513,7 +6619,11 @@ namespace local_loot {
                 for (int i = 0; i < a.Count; ++i) v.push_back(Read<int32>(a.Data, (size_t)i * 4));
             return v;
         };
+        int tierScanned = 0, tierJunk = 0;   // [G20] progress + junk counters
         for (auto& n : tierNames) {
+            g_lootStage = "cache-tier-rows";               // [G20] fault stage
+            if (++tierScanned % 250 == 0)
+                LOG("[Loot] tier row scan %d/%d [G20]", tierScanned, (int)tierNames.size());
             memset(buf, 0, sizeof(buf));
             if (!DataTableRow(tierTable, n, buf, tierRowSize)) continue;
             LTierRow r;
@@ -6525,26 +6635,35 @@ namespace local_loot {
             r.wArr  = readArr(buf, toWA);
             r.minArr = readArr(buf, toMin);
             r.maxArr = readArr(buf, toMax);
-            if (r.group.empty()) continue;   // [F94] junk-row guard — self-filtering
+            if (r.group.empty()) { ++tierJunk; continue; }   // [F94] junk-row guard — self-filtering
             uint32_t gIdx = Read<uint32>(buf, toGrp);
             uint32_t pIdx = Read<uint32>(buf, toPkg);
             tierDedupe[(uint64_t(gIdx) << 32) | pIdx] = r;
         }
+        int pkgScanned = 0, pkgJunk = 0;   // [G20] progress + junk counters
         for (auto& n : pkgNames) {
+            g_lootStage = "cache-pkg-rows";                // [G20] fault stage
+            if (++pkgScanned % 250 == 0)
+                LOG("[Loot] pkg row scan %d/%d [G20]", pkgScanned, (int)pkgNames.size());
             memset(buf, 0, sizeof(buf));
             if (!DataTableRow(pkgTable, n, buf, pkgRowSize)) continue;
             LPkgRow r;
             r.weight = Read<float>(buf, poWgt);
             r.id     = FNameToString(buf + poId);
-            if (r.id.empty()) continue;   // [F94] junk-row guard — self-filtering
+            if (r.id.empty()) { ++pkgJunk; continue; }   // [F94] junk-row guard — self-filtering
             if (poCal >= 0) {
                 // [F94] The FString bytes are ENGINE-OWNED row memory (the
                 // buffer is a shallow copy) — freeing Data here would corrupt
                 // the table heap the moment direct row reads went live.
-                // Narrow only, never Free.
+                // Narrow only, never Free. [G20] the count is clamped to 64
+                // (LootPackageCall names are short) and the buffer is
+                // kernel-validated readable before Narrow touches it.
                 FStringNative fs = Read<FStringNative>(buf, poCal);
-                if (fs.Data && !IsBadPtr(fs.Data) && fs.Count > 0)
-                    r.call = Narrow(fs.Data, std::min(fs.Count, 256));
+                int callLen = fs.Count;
+                if (callLen < 0) callLen = 0;
+                if (callLen > 64) callLen = 64;
+                if (fs.Data && !IsBadPtr(fs.Data) && callLen > 0 && IsReadable(fs.Data, (size_t)callLen * 2))
+                    r.call = Narrow(fs.Data, callLen);
             }
             if (poDef >= 0) {
                 r.softStride = defStride;
@@ -6562,7 +6681,8 @@ namespace local_loot {
         for (auto& r : g_cache.packages) g_cache.pkgIndex[r.id].push_back(&r);
         g_cache.ready = !g_cache.tiers.empty() && !g_cache.packages.empty();
         if (!g_cache.ready) g_cache.failAt = Monotonic();
-        LOG("[Loot] cache ready=%d tiers=%zu packages=%zu", (int)g_cache.ready, g_cache.tiers.size(), g_cache.packages.size());
+        LOG("[Loot] cache ready=%d tiers=%zu packages=%zu (junk tier=%d pkg=%d)",
+            (int)g_cache.ready, g_cache.tiers.size(), g_cache.packages.size(), tierJunk, pkgJunk);
     }
 
     // [F33] Ammo companion entry (Erbium SetupLDSForPackage step 5): match the
@@ -6597,9 +6717,16 @@ namespace local_loot {
         if (!ifaceType) ifaceType = FindObj("/Script/GameplayAbilities.IGameplayTagAssetInterface");
         if (ifaceType) {
             void* iface = ResolveInterface(ammoDef, ifaceType);
-            if (iface && !IsBadPtr(iface)) {
+            // [G20] both the interface proxy AND the code pointer are
+            // kernel-validated before the raw vtable call (the one unguarded
+            // native call in the roll pipeline; it also runs under the
+            // drain/interact fault guard — this removes the common case).
+            if (iface && !IsBadPtr(iface) && IsReadable(iface, 0x18)) {
                 auto getTags = (void(*)(void*, void*))Read<uintptr_t>(iface, 0x10);
-                if (getTags && !IsBadPtr((void*)getTags)) { getTags(iface, tags); haveTags = true; }
+                if (getTags && !IsBadPtr((void*)getTags) && IsReadable((void*)getTags, 4)) {
+                    getTags(iface, tags);
+                    haveTags = true;
+                }
             }
         }
         bool found = false;
@@ -6674,7 +6801,7 @@ namespace local_loot {
         return best;
     }
 
-    static void SetupLDSForPackage(std::vector<Drop>& out, const std::string& package, int category, int worldLevel) {
+    static void SetupLDSForPackage(std::vector<Drop>& out, const std::string& package, int category, int worldLevel, bool deep) {
         auto it = g_cache.pkgIndex.find(package);
         if (it == g_cache.pkgIndex.end() || it->second.empty()) return;
         std::vector<LPkgRow*> rows;
@@ -6691,10 +6818,11 @@ namespace local_loot {
         if (!pkg) return;
         if (pkg->call.size() > 1) {
             int times = pkg->count > 0 ? pkg->count : 1;
-            for (int i = 0; i < times; ++i) SetupLDSForPackage(out, pkg->call, 0, worldLevel);   // Erbium recursion
+            for (int i = 0; i < times; ++i) SetupLDSForPackage(out, pkg->call, 0, worldLevel, deep);   // Erbium recursion
             return;
         }
-        void* def = ResolveSoft(*pkg);
+        g_lootStage = "resolve-def";   // [G20]
+        void* def = ResolveSoft(*pkg, deep);
         if (!def) return;
         // [F33] ammo companion entry
         Drop ammoDrop{nullptr, 0, 0};
@@ -6736,7 +6864,7 @@ namespace local_loot {
 
     // Erbium ChooseLootForContainer 1:1 (weighted tier row → DropCount with
     // probabilistic fraction → category min/max bumping → package execution).
-    static void ChooseLootForContainer(std::vector<Drop>& out, const std::string& tierGroup, int lootTier, int worldLevel) {
+    static void ChooseLootForContainer(std::vector<Drop>& out, const std::string& tierGroup, int lootTier, int worldLevel, bool deep) {
         auto it = g_cache.tierIndex.find(tierGroup);
         if (it == g_cache.tierIndex.end() || it->second.empty()) return;
         std::vector<LTierRow*> rows;
@@ -6776,16 +6904,24 @@ namespace local_loot {
         }
         for (auto& kv : numMap)                                    // ascending categories
             for (int i = 0; i < kv.second; ++i)
-                SetupLDSForPackage(out, tier->package, kv.first, worldLevel);
+                SetupLDSForPackage(out, tier->package, kv.first, worldLevel, deep);
     }
 
     // Entry point for SearchContainer — true when the DataTable path exists.
-    static bool RollGroup(const std::string& group, std::vector<Drop>& out) {
+    // deep: interactive opens may sync-load missing item defs (one at a time,
+    // under the caller's fault guard); the batch drain is resident-only.
+    static bool RollGroup(const std::string& group, std::vector<Drop>& out, bool deep) {
+        g_lootStage = "cache";   // [G20]
         BuildCache();
         if (!g_cache.ready) return false;
-        ChooseLootForContainer(out, group, -1, WorldLevelNow());
+        g_lootStage = "roll";   // [G20]
+        ChooseLootForContainer(out, group, -1, WorldLevelNow(), deep);
         return true;
     }
+    // [G20] fault backoff control — called by the drain circuit breaker when
+    // spawner rolls keep faulting with the cache unbuilt (BuildCache retrying
+    // into the same fault forever would spin the guard).
+    static void HoldCache(double seconds) { g_cache.holdUntil = Monotonic() + seconds; }
 }
 
 // [F32] GetAllActorsOfClass with a CORRECT out-param read. The old code used
@@ -6844,6 +6980,7 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
     if (!force && GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) return true;
 
     // Read the container's loot tier group (FName).
+    g_lootStage = "group-read";   // [G20]
     std::string group;
     void* groupProp = GetProp("/Script/FortniteGame.BuildingContainer.SearchLootTierGroup");
     if (groupProp) {
@@ -6856,12 +6993,16 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
     if (group == "Loot_Ammo") group = "Loot_AthenaAmmoLarge";
 
     std::vector<local_loot::Drop> drops;
-    bool usedTables = local_loot::RollGroup(group, drops);
+    // [G20] deep = interactive opens (chest/ammo box): the roll may sync-load
+    // a missing item def, one at a time, under the caller's fault guard. The
+    // batch drain is RESIDENT-ONLY — no LoadAsset_Blocking, ever.
+    bool usedTables = local_loot::RollGroup(group, drops, /*deep=*/!floorLoot);
     // [G19-c] the curated table is now a SAFETY NET, not just a missing-table
     // fallback: a DataTable roll that finds no tier row for this group (or
     // rolls zero categories) must not leave the container EMPTY — that is
     // the "no loot anywhere on the ground" symptom in one line.
     if (!usedTables || drops.empty()) {
+        g_lootStage = "curated";   // [G20]
         // Curated fallback (DataTable roll unavailable).
         const local_loot::Tier* tier = nullptr;
         for (auto& t : local_loot::tiers)
@@ -6879,8 +7020,34 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
         for (int i = 0; i < tier->resources; ++i)
             if (void* def = local_loot::pickRow(local_loot::resources, sizeof(local_loot::resources) / sizeof(local_loot::Row)))
                 drops.push_back({def, 50, 0});
+        // [G20] curated minimum — a matched tier that rolled 0 of everything
+        // (all minimums zero, e.g. the Warmup group) still yields one weapon
+        // + one ammo: "roll produced no drops" must never fire while the
+        // tables are alive.
+        if (drops.empty()) {
+            if (void* def = local_loot::pickWeapon(tier->rarityBoost)) drops.push_back({def, 1, 0});
+            if (void* def = local_loot::pickRow(local_loot::ammo, sizeof(local_loot::ammo) / sizeof(local_loot::Row)))
+                drops.push_back({def, 30 + (int)(local_loot::random01() * 60.0f), 0});
+            if (!drops.empty()) LOG("[Loot] curated minimum applied for %s [G20]", group.c_str());
+        }
     }
     if (drops.empty()) { LOG("[Loot] roll produced no drops for %s", group.c_str()); return false; }
+
+    // [G20] one-shot first-roll summary — proves the pipeline end-to-end on
+    // the device log (or names the stage where it stopped producing).
+    static bool s_firstRollLogged = false;
+    if (!s_firstRollLogged) {
+        s_firstRollLogged = true;
+        std::string defs;
+        int shown = 0;
+        for (auto& d : drops) {
+            if (shown++) defs += ",";
+            defs += ObjName(d.def);
+            if (shown >= 3) break;
+        }
+        LOG("[Loot] first roll: group=%s tables=%d drops=%zu defs=[%s] — pipeline live [G20]",
+            group.c_str(), (int)usedTables, drops.size(), defs.c_str());
+    }
 
     // [F33] Container-relative placement (Erbium SpawnPickup(Container) 1:1):
     // container origin offset by LootSpawnLocation_Athena along F/R/U axes.
@@ -6889,6 +7056,7 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
     // spawners (≈9500 native calls of pure waste in the batch stall).
     Vector fwd{1.0, 0.0, 0.0}, right{0.0, 1.0, 0.0}, up{0.0, 0.0, 1.0};
     Vector off{60.0, 0.0, 40.0};
+    g_lootStage = "place";   // [G20]
     if (!floorLoot) {
         {
             Call c("/Script/Engine.Actor.GetActorForwardVector");
@@ -6936,6 +7104,7 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
         if (group.find("Ammo") != std::string::npos) spawnSource = 4; // AmmoBox
         void* pickup = nullptr;
         {
+            g_lootStage = "spawn";   // [G20]
             void* klass = FindObj("/Script/FortniteGame.FortPickupAthena");
             Transform t{};
             t.Location[0] = loc.X; t.Location[1] = loc.Y; t.Location[2] = loc.Z;
@@ -6966,6 +7135,7 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
                 // "weird random placement" and a large part of the phone
                 // choke. Chests/ammo boxes keep the toss (authentic).
                 if (!floorLoot) {
+                    g_lootStage = "toss";   // [G20]
                     Call tp("/Script/FortniteGame.FortPickup.TossPickup");
                     if (tp.ok()) {
                         bool bound = tp.set("FinalLocation", loc) || tp.set("InTargetLoc", loc) || tp.set("TargetLoc", loc);
@@ -6991,6 +7161,7 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bo
         }
         spawned.push_back(pickup);
     }
+    g_lootStage = "consume";   // [G20]
     SetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
     Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched"); if (r1.ok()) r1.run(actor);
     if (!floorLoot) {
@@ -7010,7 +7181,18 @@ void Athena::Loot(void* actor) {
 
     // Local roll first (offline-deterministic); fall back to the native
     // BP_SpawnLoot when the group is not ported.
-    if (haveLoc && SearchContainer(actor, location)) return;
+    // [G20] the whole interactive roll is fault-guarded: the first chest of
+    // the session can be the one that builds the DataTable cache, and a
+    // fault there must degrade to the native BP path, not kill the process.
+    bool opened = false;
+    if (haveLoc) {
+        bool clean = gas::RunGuarded("[Interact] loot", [&] {
+            opened = SearchContainer(actor, location, /*force=*/false, /*floorLoot=*/false);
+        });
+        if (!clean)
+            LOG("[Loot] ⚠️ interactive roll faulted at stage '%s' — native fallback [G20]", g_lootStage);
+    }
+    if (opened) return;
     Call spawn("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
     if (spawn.ok()) {
         if (spawn.set("PlayerPawn", session.pawn)) {
@@ -7078,10 +7260,19 @@ namespace flo {
         return added;
     }
 
-    // Roll up to `budget` spawners this tick. Each roll = the full DataTable
-    // pipeline (now live via [F94]) with authentic static placement
-    // ([F-loot-place]), then the spawner is destroyed (Erbium ≥11).
+    // [G20] Roll up to `budget` spawners this tick, EVERY spawner inside one
+    // fault-guard scope (DataTable pipeline + BP fallback + destroy): a fault
+    // skips that spawner, names the stage, and the flow continues. Circuit
+    // breaker: 8 consecutive faults suspend the drain for 120 s (and hold an
+    // unbuilt cache for 600 s) so a persistent fault cannot spin the guard.
+    // Wall-clock cap 8 ms per tick — the roll is resident-only ([G20] no sync
+    // loads) but the pickup spawn still costs native calls.
     static void Drain(int budget) {
+        static double holdUntil = 0.0;
+        static int  consecutiveFaults = 0;
+        double now = Monotonic();
+        if (now < holdUntil) return;
+        const double deadline = now + 0.008;   // 8 ms per tick
         while (budget > 0 && !pending.empty()) {
             void* spawner = pending.back();
             pending.pop_back();
@@ -7096,18 +7287,35 @@ namespace flo {
                 return;
             }
             bool ok = false;
-            Vector loc{};
-            if (ActorLocation(spawner, loc))
-                ok = Athena::SearchContainer(spawner, loc, /*force=*/true, /*floorLoot=*/true);
-            if (!ok) {
-                // Native BP path second (it rolls the real cooked tables).
-                Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
-                if (bp.ok() && bp.set("PlayerPawn", session.pawn)) ok = bp.run(spawner);
+            {
+                Vector loc{};
+                bool clean = gas::RunGuarded("[Loot] spawner", [&] {
+                    if (ActorLocation(spawner, loc))
+                        ok = Athena::SearchContainer(spawner, loc, /*force=*/true, /*floorLoot=*/true);
+                    if (!ok) {
+                        // Native BP path second (it rolls the real cooked tables).
+                        Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
+                        if (bp.ok() && bp.set("PlayerPawn", session.pawn)) ok = bp.run(spawner);
+                    }
+                });
+                if (!clean) {
+                    if (++consecutiveFaults >= 8) {
+                        LOG("[Loot] ⚠️ %d consecutive spawner faults (last stage '%s') — drain suspended 120 s [G20]",
+                            consecutiveFaults, g_lootStage);
+                        if (!local_loot::TableCount()) local_loot::HoldCache(600.0);
+                        consecutiveFaults = 0;
+                        holdUntil = Monotonic() + 120.0;
+                        return;
+                    }
+                } else {
+                    consecutiveFaults = 0;
+                }
             }
             if (ok) ++spawned; else ++failed;
             Call d("/Script/Engine.Actor.K2_DestroyActor");   // [F20 1:1] spawner removed after rolling
             if (d.ok() && d.run(spawner)) ++destroyed;
             --budget;
+            if (Monotonic() > deadline) break;
         }
         if (spawned + failed - lastProgress >= 300) {
             lastProgress = spawned + failed;
@@ -7801,6 +8009,21 @@ void Athena::StreamPlaylistLevels() {
             playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
     }
     if (!playlist || IsBadPtr(playlist)) { LOG("[PlaylistLevels] no playlist resolved"); return; }
+    // [G22] per-source visibility — WHICH playlist object resolved and the
+    // size of every levels array we inspect (the round-17 "0 levels streamed"
+    // was silent about whether the playlist was real and the arrays empty).
+    LOG("[PlaylistLevels] playlist resolved: %s (class %s)",
+        ObjName(playlist).c_str(), ObjName(Read<void*>(playlist, profile::ObjectClass)).c_str());
+    {
+        auto logArrSize = [&](const char* propPath) {
+            void* prop = GetProp(propPath);
+            if (!prop) { LOG("[PlaylistLevels] %s: not reflected", propPath); return; }
+            Array arr = Read<Array>(GetField(playlist, prop));
+            LOG("[PlaylistLevels] %s: %d entries", propPath, arr.Count);
+        };
+        logArrSize("/Script/FortniteGame.FortPlaylistAthena.AdditionalLevels");
+        logArrSize("/Script/FortniteGame.FortPlaylistAthena.AdditionalLevelsServerOnly");
+    }
     int streamed = 0;
     // Streams a TSoftObjectPtr<UWorld> array off an owner object.
     auto streamArray = [&](void* owner, const char* propPath) {
@@ -8846,6 +9069,172 @@ void Athena::TickBuildingLoads() {
 }
 
 // ============================================================================
+// [G22] WORLD PARTITION / MISSING POIs — diagnostics + activation attempts
+// ============================================================================
+// Symptom (round 17): terrain loads (persistent level) but NO POI buildings
+// stream in, and the landscape has open holes where POI geometry plugs into
+// the terrain (the player fell through one and died). Artemis_Terrain is a
+// World Partition map: POIs live in runtime cells that stream around
+// streaming sources (the local player). This pass logs the exact WP state
+// and makes every SAFE activation attempt available to us without the engine
+// binaries:
+//   A. World->Levels / StreamingLevels counts (what actually loaded)
+//   B. the UWorldPartition object itself (reflected property, then a
+//      kernel-validated memory scan of the World) + its reflected member dump
+//   C. ADataLayerManager actors + per-data-layer effective state + an
+//      activation attempt through any resolvable SetDataLayer* UFunction
+//   1. bIsStreamingSource forced true on pawn+controller (the reflected flag
+//      WP's streaming-source iterator keys on, when present)
+//   2. a "FlushLevelStreaming" console pass (forces a streaming update)
+void Athena::DiagnoseWorldPartition() {
+    if (!session.world || IsBadPtr(session.world)) return;
+    LOG("[WP] === World Partition diagnostic pass %d === [G22]", session.wp_diag_passes + 1);
+    void* worldCls = Read<void*>(session.world, profile::ObjectClass);
+    // ---- A. what is actually loaded ------------------------------------
+    if (worldCls && !IsBadPtr(worldCls)) {
+        int levelsOff = PropOffsetOn(worldCls, "Levels");
+        if (levelsOff >= 0) {
+            Array levels = Read<Array>((char*)session.world + levelsOff);
+            int named = 0;
+            for (int i = 0; levels.Data && !IsBadPtr(levels.Data) && i < levels.Count && i < 6; ++i) {
+                void* lvl = Read<void*>(levels.Data, (size_t)i * 8);
+                if (!lvl || IsBadPtr(lvl) || !IsReadable(lvl, 0x20)) continue;
+                LOG("[WP]   loaded level[%d]: %s", i, ObjName(lvl).c_str());
+                ++named;
+            }
+            LOG("[WP] Levels array: %d loaded (%d named above)", levels.Count, named);
+        } else LOG("[WP] UWorld.Levels not reflected");
+        int ssOff = PropOffsetOn(worldCls, "StreamingLevels");
+        if (ssOff >= 0) {
+            Array ss = Read<Array>((char*)session.world + ssOff);
+            LOG("[WP] StreamingLevels: %d", ss.Count);
+        } else LOG("[WP] UWorld.StreamingLevels not reflected");
+    }
+    // ---- B. the WorldPartition object ----------------------------------
+    void* partition = nullptr;
+    {
+        static const char* const kPartProps[] = {
+            "/Script/Engine.World.WorldPartition", "/Script/Engine.World.Partition"
+        };
+        for (const char* pp : kPartProps) {
+            void* prop = GetProp(pp);
+            if (prop) {
+                void* p = Read<void*>(GetField(session.world, prop));
+                if (p && !IsBadPtr(p)) partition = p;
+                break;
+            }
+        }
+        if (partition) LOG("[WP] Partition object via reflection: %p", partition);
+        if (!partition) {
+            // memory scan: any member pointer whose object's class is a
+            // WorldPartition — every dereference kernel-validated
+            for (size_t off = 0x40; off <= 0x800 && !partition; off += 8) {
+                void* p = Read<void*>((char*)session.world + off, 0);
+                if (!p || IsBadPtr(p) || ((uintptr_t)p & 7) || !IsReadable(p, 0x20)) continue;
+                void* cls = Read<void*>(p, profile::ObjectClass);
+                if (!cls || IsBadPtr(cls) || !IsReadable(cls, 0x20)) continue;
+                std::string cn = ObjName(cls);
+                if (cn.find("WorldPartition") != std::string::npos) {
+                    partition = p;
+                    LOG("[WP] Partition object found via scan @ World+0x%zX: class=%s", off, cn.c_str());
+                }
+            }
+        }
+        if (partition && !IsBadPtr(partition) && IsReadable(partition, 0x40)) {
+            int dumped = 0;
+            void* u = partition;
+            for (int hop = 0; u && !IsBadPtr(u) && hop < 4 && dumped < 24; ++hop) {
+                void* f = (profile::HasFField ? Read<void*>(u, profile::StructChildProps) : nullptr);
+                for (int i = 0; f && !IsBadPtr(f) && i < 64 && dumped < 24; ++i, f = Read<void*>(f, profile::FFieldNext)) {
+                    std::string n;
+                    if (!SafeFieldName(f, profile::FFieldName, n)) continue;
+                    LOG("[WP]   member '%s' off=%d size=%d", n.c_str(),
+                        Read<int>(f, profile::PropOffset), Read<int>(f, profile::PropElementSize));
+                    ++dumped;
+                }
+                void* c = Read<void*>(u, profile::StructChildren);
+                for (int i = 0; c && !IsBadPtr(c) && i < 64 && dumped < 24; ++i, c = Read<void*>(c, profile::FieldNext)) {
+                    std::string n;
+                    if (!SafeFieldName(c, profile::ObjectName, n)) continue;
+                    LOG("[WP]   member '%s' off=%d size=%d", n.c_str(),
+                        Read<int>(c, profile::PropOffset), Read<int>(c, profile::PropElementSize));
+                    ++dumped;
+                }
+                void* next = Read<void*>(u, profile::StructSuper);
+                if (next == u) break;
+                u = next;
+            }
+            LOG("[WP] partition reflected member dump: %d properties", dumped);
+        } else {
+            LOG("[WP] ⚠️ NO WorldPartition object found on this world — WP streaming never initialized");
+        }
+    }
+    // ---- C. data layers ---------------------------------------------------
+    int layersActivated = 0;
+    {
+        void* dlmCls = FindObj("/Script/Engine.DataLayerManager");
+        if (!dlmCls) LOG("[WP] DataLayerManager class not present");
+        else {
+            std::vector<void*> managers;
+            if (GetAllActorsOfClassRaw(dlmCls, managers) && !managers.empty()) {
+                for (void* m : managers) {
+                    if (!m || IsBadPtr(m)) continue;
+                    void* dlProp = GetProp("/Script/Engine.DataLayerManager.DataLayers");
+                    if (!dlProp) { LOG("[WP] DataLayers property not reflected"); continue; }
+                    Array layers = Read<Array>(GetField(m, dlProp));
+                    LOG("[WP] DataLayerManager %p: %d data layers", m, layers.Count);
+                    for (int i = 0; layers.Data && !IsBadPtr(layers.Data) && i < layers.Count && i < 64; ++i) {
+                        void* layer = Read<void*>(layers.Data, (size_t)i * 8);
+                        if (!layer || IsBadPtr(layer) || !IsReadable(layer, 0x20)) continue;
+                        bool effective = GetBool(layer, "/Script/Engine.DataLayer.bIsEffective");
+                        LOG("[WP]   layer[%d] '%s' effective=%d", i, ObjName(layer).c_str(), (int)effective);
+                    }
+                    // activation attempt — first resolvable SetDataLayer* UFunction
+                    static const char* const kAct[] = {
+                        "SetDataLayerRuntimeState", "SetDataLayerState", "SetDataLayerIsEffective",
+                        "ActivateDataLayer", "SetDataLayerActive"
+                    };
+                    for (const char* act : kAct) {
+                        Call c((std::string("/Script/Engine.DataLayerManager.") + act).c_str());
+                        if (!c.ok()) continue;
+                        LOG("[WP] activation attempt via %s", act);
+                        for (int i = 0; layers.Data && !IsBadPtr(layers.Data) && i < layers.Count && i < 64; ++i) {
+                            void* layer = Read<void*>(layers.Data, (size_t)i * 8);
+                            if (!layer || IsBadPtr(layer) || !IsReadable(layer, 0x20)) continue;
+                            bool bound = c.set("DataLayer", layer) || c.set("InDataLayer", layer) || c.set("Layer", layer);
+                            if (!bound) continue;
+                            bool on = true;
+                            c.set("bIsEffective", on); c.set("RuntimeState", on); c.set("bActive", on); c.set("NewState", on);
+                            if (c.run(m)) ++layersActivated;
+                        }
+                        break;   // first resolvable function only
+                    }
+                }
+            } else LOG("[WP] no DataLayerManager actors");
+        }
+    }
+    // ---- attempts 1 & 2 ---------------------------------------------------
+    {
+        void* srcProp = GetProp("/Script/Engine.Actor.bIsStreamingSource");
+        if (srcProp) {
+            if (session.pawn) SetBool(session.pawn, "/Script/Engine.Actor.bIsStreamingSource", true);
+            if (session.controller) SetBool(session.controller, "/Script/Engine.Actor.bIsStreamingSource", true);
+            LOG("[WP] ✅ bIsStreamingSource forced on pawn+controller (reflected)");
+        } else LOG("[WP] bIsStreamingSource not reflected on this build");
+        Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
+        if (f.ok()) {
+            auto cmd = ToWide("FlushLevelStreaming");
+            FStringNative command{(TCHAR*)cmd.data(), (int32)cmd.size() + 1, (int32)cmd.size() + 1};
+            if (f.set("WorldContextObject", session.world) && f.set("Command", command) && f.set("SpecificPlayer", session.controller))
+                f.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
+            LOG("[WP] FlushLevelStreaming console pass dispatched");
+        }
+    }
+    if (layersActivated > 0) LOG("[WP] ✅ %d data layers activated [G22]", layersActivated);
+    ++session.wp_diag_passes;
+}
+
+// ============================================================================
 // FLOOR LOOT WHILE STREAMING — [F-loot-batch r2]
 // ============================================================================
 // Drains the spawner queue a few entries per tick (no frame stalls), keeps
@@ -8854,7 +9243,7 @@ void Athena::TickBuildingLoads() {
 // rollout here — the second 2958-actor storm that finished the phone off.
 void Athena::TickFloorLootStreaming() {
     if (!session.finalized) return;
-    flo::Drain(12);   // [F-loot-batch] a few spawners per tick
+    flo::Drain(8);   // [G20] 8/tick + 8 ms wall-clock cap (was 12, unbounded)
     double now = Monotonic();
     if (flo::lastRediscover < 0) flo::lastRediscover = now;   // arm on first tick
     if (flo::rediscoveries < 10 && now - flo::lastRediscover >= 15.0) {
@@ -9125,6 +9514,80 @@ void* Athena::NearestVehicle(float radius) {
     return best;
 }
 
+// [G21] Vehicle exit ladder — mirrors the enter ladder's shape: find the
+// current vehicle through the pawn's own accessor, dispatch the server→
+// client bookkeeping event (OnPawnExitVehicle) on it, restore the held
+// weapon (ServerOnExitVehicle parity), and the seat event above handles the
+// instant weapon removal when the engine dispatches it itself.
+bool Athena::ExitVehicleDirect() {
+    static bool s_inExit = false;   // [G21] reentrancy latch — our own OnPawnExitVehicle dispatch re-enters pe_hook
+    if (s_inExit) return true;
+    if (!session.pawn || !PawnStillValid(session.pawn)) return false;
+    void* vehicle = nullptr;
+    for (const char* name : {"GetVehicleActor", "GetVehicle"}) {
+        Call c((std::string("/Script/FortniteGame.FortPlayerPawnAthena.") + name).c_str());
+        if (!c.ok()) c = Call((std::string("/Script/FortniteGame.FortPawn.") + name).c_str());
+        if (c.ok() && c.run(session.pawn)) { vehicle = c.result<void*>(); if (vehicle && !IsBadPtr(vehicle)) break; vehicle = nullptr; }
+    }
+    if (!vehicle) { LOG("[Vehicle] exit: not currently in a vehicle"); return false; }
+    void* vehicleCls = Read<void*>(vehicle, profile::ObjectClass);
+    LOG("[Vehicle] exiting %s", ObjName(vehicleCls).c_str());
+    {
+        Call x("/Script/FortniteGame.FortCharacterVehicle.OnPawnExitVehicle");
+        if (!x.ok()) x = Call("/Script/FortniteGame.FortAthenaVehicle.OnPawnExitVehicle");
+        if (x.ok()) {
+            bool bound = x.set("PlayerPawn", session.pawn) || x.set("Pawn", session.pawn);
+            int seat = session.vehicle_weapon_seat >= 0 ? session.vehicle_weapon_seat : 0;
+            x.set("SeatIdx", seat);
+            x.set("SeatIndex", seat);
+            s_inExit = true;
+            bool ran = bound && x.run(vehicle);
+            s_inExit = false;
+            if (ran) LOG("[Vehicle] ✅ OnPawnExitVehicle dispatched");
+        }
+    }
+    Athena::RemoveVehicleWeapon(true);   // event-driven removal parity
+    return true;
+}
+
+// [G21] HUD interact dispatch — the touch button gives us no target, so we
+// resolve it exactly like the client would: nearest interactable in range
+// (an un-searched container 350uu beats a vehicle 900uu — chest prompts
+// always win in-game).
+void Athena::DispatchHudInteract() {
+    if (!session.pawn || !PawnStillValid(session.pawn)) return;
+    Vector pawnLoc{};
+    if (!ActorLocation(session.pawn, pawnLoc)) return;
+    void* container = nullptr;
+    double bestC = 350.0 * 350.0;
+    {
+        void* cls = FindObj("/Script/FortniteGame.BuildingContainer");
+        std::vector<void*> actors;
+        if (cls && GetAllActorsOfClassRaw(cls, actors)) {
+            for (void* a : actors) {
+                if (!a || IsBadPtr(a)) continue;
+                if (GetBool(a, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) continue;
+                Vector l{};
+                if (!ActorLocation(a, l)) continue;
+                double dx = l.X - pawnLoc.X, dy = l.Y - pawnLoc.Y, dz = l.Z - pawnLoc.Z;
+                double d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 < bestC) { bestC = d2; container = a; }
+            }
+        }
+    }
+    if (container) {
+        LOG("[HUD] interact → container %p [G21]", container);
+        Athena::Loot(container);
+        return;
+    }
+    if (void* vehicle = Athena::NearestVehicle(900.0f)) {
+        LOG("[HUD] interact → vehicle [G21]");
+        Athena::EnterVehicleDirect(vehicle, 0);
+        return;
+    }
+    LOG("[HUD] interact pressed — nothing in range [G21]");
+}
+
 void Athena::CheatScript(const char* script) {
     if (!script || !session.pawn) return;
     std::string s = script;
@@ -9280,6 +9743,55 @@ static void pe_hook(void* obj, void* func, void* params) {
         // Direct receiver match (original behaviour retained for safety).
         if (isPC && fn == "JumpFromHudStart") { Athena::HandleJumpFromHudStart(); return orig_PE(obj, func, params); }
 
+        // [G21] MOBILE HUD VOCABULARY + INTERACT DISPATCH. JumpFromHudStart
+        // proved the touch buttons live on AthenaHUDContext — the interact /
+        // vehicle / edit button names are siblings we have not met yet (the
+        // round-17 log shows the enter attempt reached NO hooked function).
+        // (a) every unique HUD-context function name is logged once;
+        // (b) interact-ish names dispatch a full interact: nearest container
+        //     (350uu) first, else nearest vehicle (900uu) → EnterVehicleDirect.
+        //     Additive — the OG body still runs below.
+        if (g_hudContextClass && obj && fn != "JumpFromHudStart" && fn.size() < 64) {
+            void* hudCls = Read<void*>(obj, profile::ObjectClass);
+            if (hudCls && SubclassOfFast(hudCls, g_hudContextClass)) {
+                static std::set<std::string> s_hudFns;
+                if (s_hudFns.size() < 80 && s_hudFns.insert(fn).second)
+                    LOG("[HUD] context function: '%s' [G21]", fn.c_str());
+                bool interactish = fn.find("nteract") != std::string::npos ||
+                                   fn.find("UseFromHud") != std::string::npos ||
+                                   fn == "Use" || fn == "Interact" || fn == "UseHud";
+                if (interactish && session.finalized && session.pawn && !session.death_handled) {
+                    LOG("[HUD] interact button '%s' — dispatching interact [G21]", fn.c_str());
+                    Athena::DispatchHudInteract();
+                }
+            }
+        }
+
+        // [G21] vehicle vocabulary + EXIT. Every 'ehicle' function name seen
+        // anywhere is logged once (the enter RPC still has not shown up in a
+        // device log — this reveals the real names the client dispatches).
+        // 'ehicle'+'xit' names run the exit ladder additively (OG still runs
+        // below — the client body may animate the dismount locally).
+        if (fn.find("ehicle") != std::string::npos) {
+            static std::set<std::string> s_vehFns;
+            if (s_vehFns.size() < 60 && s_vehFns.insert(fn).second)
+                LOG("[Vehicle] fn seen: '%s' on %s [G21]", fn.c_str(),
+                    ObjName(Read<void*>(obj, profile::ObjectClass)).c_str());
+            // The engine's own seat bookkeeping events are consumed by the
+            // [G09] branch below — never re-drive the ladder from inside them
+            // (OnPawnExitVehicle dispatched by ExitVehicleDirect itself would
+            // re-enter this catch recursively otherwise).
+            if (session.finalized && session.pawn &&
+                fn != "OnPawnEnterVehicle" && fn != "OnPawnExitVehicle" &&
+                fn.find("xit") != std::string::npos && fn.find("nter") == std::string::npos) {
+                static bool s_exitDumped = false;
+                if (!s_exitDumped) { s_exitDumped = true; DumpRpcParams(func, params, "Vehicle-EXIT"); }
+                LOG("[Vehicle] exit request '%s' on %s [G21]", fn.c_str(),
+                    ObjName(Read<void*>(obj, profile::ObjectClass)).c_str());
+                Athena::ExitVehicleDirect();
+            }
+        }
+
         // [G09] Vehicle seat events are dispatched ON the vehicle actor —
         // outside the PC/pawn receiver gate below. Enter: instant seat-weapon
         // grant (no 0.5s poll wait). Exit: instant removal + re-equip.
@@ -9344,7 +9856,7 @@ static void pe_hook(void* obj, void* func, void* params) {
         // dispatches — this is a client function, not a dead RPC) and log the
         // exact name + params once so the next iteration pins the real path.
         if (session.finalized && params != nullptr && fn != "OnPawnEnterVehicle" && fn != "OnPawnExitVehicle" &&
-            fn.find("ehicle") != std::string::npos &&
+            fn.find("ehicle") != std::string::npos && fn.find("xit") == std::string::npos &&
             (fn.find("nter") != std::string::npos || fn.rfind("Attempt", 0) == 0)) {
             static bool s_btnLogged = false;
             LOG("[Vehicle] enter-ish function '%s' on %s",
@@ -9780,7 +10292,11 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                 for (void* c : actors) {
                     Vector loc{};
                     if (!c || IsBadPtr(c) || !ActorLocation(c, loc) || !NearPlayer(loc, 3000.0f)) continue;
-                    if (Athena::SearchContainer(c, loc)) ++n;
+                    // [G20] fault-guarded like every other roll entry point
+                    bool rolled = false;
+                    if (!gas::RunGuarded("era.loot", [&] { rolled = Athena::SearchContainer(c, loc, false, false); }))
+                        LOG("[Loot] ⚠️ era.loot roll faulted at stage '%s' [G20]", g_lootStage);
+                    if (rolled) ++n;
                 }
                 LOG("era.loot: %d containers rolled", n);
             }
