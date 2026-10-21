@@ -212,7 +212,16 @@
 //        state probe. The manual bit-pack write stays ONLY as fallback —
 //        the native path sets bDoorOpen + OnRep + collision + animation
 //        with server authority, so doors STAY OPEN exactly like the live
-//        game (TickDoorPins remains the re-assert safety net).
+//        game.
+//  [G15-b] DOORS ARE NATIVE-ONLY NOW. The device run proved the native
+//        interact already toggles doors on its own (log: "CLOSED (was
+//        native-open)") — our full toggle on top of it produced a
+//        DOUBLE-TOGGLE (user: "the door closes by itself"), and the
+//        pin re-assertion fought the DoorBash ability ("breaks when
+//        bashing"). Removed: TickDoorPins, TickSprintDoors, door_pins.
+//        Kept: an OPEN-ASSIST on closed doors only (idempotent with the
+//        native open). Closing an open door is purely the native
+//        interact's business — exactly like the live game.
 //  [G07] ANIMATIONS: FixBodyAndAnimations now finishes with the native
 //        ApplyCharacterCustomization (PlayerState, Pawn) after the part
 //        pipeline; PlayEmoteItem first tries GiveAbilityAndActivateOnce
@@ -341,6 +350,66 @@
 //        (e) LATE-STREAMING SETS — AS_HillScramble/AS_SlideImpulse were not
 //            resident at grant time; they queue and retry from Tick (~8s
 //            cadence, ~3 min window) once the main grant has committed.
+//  [G15] FOURTH-RUN REGRESSION + ROOT-CAUSE FIXES (user: "the door closes by
+//        itself / breaks when bashing; no features; can't build, ride or
+//        climb; reverse progress"):
+//        (a) [G15-b] DOORS DE-HACKED. The device log proved the native
+//            ServerAttemptInteract ALREADY toggles doors ("CLOSED (was
+//            native-open)") — our full toggle on top of it was a
+//            DOUBLE-TOGGLE ("the door closes by itself"), and the 0.3s pin
+//            re-assertion fought the DoorBash slam ("breaks when bashing",
+//            "re-asserted 19 pinned doors" every frame). Removed:
+//            TickDoorPins, TickSprintDoors, door_pins bookkeeping. Kept:
+//            open-ASSIST on closed doors only (idempotent with the native
+//            open) — closing is purely native, like the live game.
+//        (b) [G15-a] F92 CACHE — GetVehicleActor was name-walked 4×/0.5s
+//            from TickVehicleSeats (per-frame log spam + class-chain walks
+//            on a phone). Null-receiver Call resolutions now cache
+//            (positives forever, negatives 30s TTL so late-streaming
+//            UFunctions still resolve).
+//        (c) [G15-c] VEHICLE ENTER — Erbium's own vehicle branch is
+//            commented out (the OG native interact seats the pawn). We now
+//            run the native FIRST, verify via GetVehicleActor, and fall
+//            back to the SDK-verified BlueprintCallable
+//            AFortAthenaVehicle::ForceSeatSinglePawn(pawn, seat 0) +
+//            instant seat-weapon equip when the native declines.
+//        (d) [G15-d] VEHICLE SPAWNERS ROLL ONCE — the retry pass re-rolled
+//            the spawn percent every 15s (low percents → +2..9 per pass,
+//            48/359 after 12 passes, "partial — retrying" forever). Each
+//            spawner now rolls exactly once (Erbium world-init parity);
+//            completion = every known spawner rolled.
+//        (e) [G15-e] ABILITY SETS NEVER GIVE UP — the 22-try (~3 min)
+//            window expired before distant POI sublevels streamed in
+//            ("giving up on AS_HillScramble" = no climbing, ever). The
+//            pump retries forever (StaticLoadObject only 10×/set — pak
+//            index walks are measurable on a phone — then the cheap
+//            loaded-object scan at a 20s cadence) with a substring-name
+//            fallback. GrantWorldAbilities now grants INCREMENTALLY (the
+//            old "core pair" gate withheld the slide ability because
+//            GA_AthenaEnterVehicle_C never streamed in) and scans BATCHED
+//            (one GObjects pass for all five names, was five full passes).
+//        (f) [G15-f] LOOT CACHE — the loot tables are UCompositeDataTables:
+//            their OWN RowMap is empty and the 252/2149 rows live in
+//            ParentTables (@0xB0, SDK-verified) — GetDataTableRowNames
+//            merges parents natively, which is why the count resolved while
+//            every RowMapFind missed ("cache ready=0" → random loot).
+//            RowMapFind now walks the parents (depth ≤3). The UFunction
+//            fallback uses the UE5.0 name GetDataTableRowFromName (the old
+//            GetDataTableRow no longer exists in 21.30) and handles its
+//            OutRow-as-POINTER OutParm.
+//        (g) [G15-g] TRUE SPEC STRIDE = 0xE8 (232) — the engine's own array
+//            ElementSize (Items→Inner FStructProperty), NOT
+//            align8(PropertiesSize=111)=112. Device proofs: the valid #29
+//            spec (Default__GA_Athena_Grenade_Rethrow_C) sits at byte
+//            3248 = 14×232 exactly, and slot0's bytes only parse under the
+//            Erbium FFastArraySerializerItem layout (RepID@0/Key@4/
+//            MostRecent@8, Handle@0xC, Ability@0x10, Level@0x18,
+//            InputID@0x1C, SourceObject@0x20, ContainerInterface@0x28,
+//            Triggers@0x70={ptr,Num,Max}). The 40 "<bad-ability>" slots
+//            were a MISREAD, not corruption — the specs were valid all
+//            along. BuildSpec now allocates the full 232 bytes (the old
+//            112-byte buffer was a 120-byte heap overread in the emote
+//            path) and the dump validates the stride against 2-of-4 slots.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -962,6 +1031,21 @@ static bool IsA(void* obj, void* type) {
     if (!klass || IsBadPtr(klass)) return false;
     return SubclassOfFast(klass, type);
 }
+// [G15-c] Vehicle target probe for the interact hook: AFortAthenaVehicle
+// (Valet/Nevada/Meatball BP vehicles derive from it) or AFortCharacterVehicle.
+static bool IsVehicleTarget(void* klass) {
+    if (!klass || IsBadPtr(klass)) return false;
+    static void* s_athenaVeh = nullptr, *s_charVeh = nullptr;
+    static bool s_tried = false;
+    if (!s_tried) {
+        s_tried = true;
+        s_athenaVeh = FindObj("/Script/FortniteGame.FortAthenaVehicle");
+        s_charVeh  = FindObj("/Script/FortniteGame.FortCharacterVehicle");
+    }
+    if (s_athenaVeh && SubclassOfFast(klass, s_athenaVeh)) return true;
+    if (s_charVeh && SubclassOfFast(klass, s_charVeh)) return true;
+    return false;
+}
 static GObjects_t* GObjectArray() {
     if (!g_base) return nullptr;
     GObjects_t* go = Read<GObjects_t*>((void*)(g_base + profile::GObjects));
@@ -1199,6 +1283,28 @@ public:
         // machinery GetProp uses successfully everywhere. Receiver instance →
         // its Class; otherwise the class object named in the path itself.
         if (!m_func) {
+            // [G15-a] Resolution cache (NULL-RECEIVER calls only — the
+            // receiver-driven walk is class-specific and must not be cached
+            // by path). The device log showed the F92 name-walk re-running
+            // FOUR TIMES PER 0.5s poll (FortPlayerPawnAthena.GetVehicleActor
+            // from TickVehicleSeats + the FortPawn fallback ×2 names) — each
+            // walk traverses the full class chain's FField/child lists and
+            // logs a line: per-frame log spam + measurable walk cost on a
+            // phone. Positive results cache forever; NEGATIVE results expire
+            // after 30s so a UFunction whose class streams in late still
+            // resolves.
+            static std::map<std::string, std::pair<void*, double>> s_f92Cache;
+            double nowSec = 0;
+            bool skipWalk = false;
+            if (!event_receiver) {
+                { struct timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts); nowSec = (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec; }
+                auto cit = s_f92Cache.find(std::string(path));
+                if (cit != s_f92Cache.end()) {
+                    if (cit->second.first) m_func = cit->second.first;            // cached hit
+                    else if (nowSec - cit->second.second < 30.0) skipWalk = true; // recent negative
+                }
+            }
+            if (!m_func && !skipWalk) {
             std::string p(path);
             auto dot = p.rfind('.');
             std::string clsPath = (dot != std::string::npos) ? p.substr(0, dot) : std::string();
@@ -1233,6 +1339,8 @@ public:
                 if (!m_func) klass = Read<void*>(klass, profile::StructSuper);
             }
             if (m_func) LOG("[Call] [F92] name-resolved '%s' (StaticFindObject missed it)", fname.c_str());
+            if (!event_receiver) s_f92Cache[std::string(path)] = { m_func, nowSec };   // [G15-a] cache pos+neg
+            }
         }
         if (!m_func) return;
         // [F16] Blueprint override resolution: walk the receiver's super
@@ -1582,29 +1690,59 @@ static bool DataTableRowNames(void* table, std::vector<FName>& out) {
 // HashNextId(4), HashIndex(4) }. Free slots are skipped via NumFreeIndices
 // and the allocation bit-array; a key match is only trusted when the value
 // pointer is sane.
+// [G15-f] COMPOSITE TABLES: AthenaLootTierData_Client / AthenaLootPackages_
+// Client are UCompositeDataTables — their OWN RowMap is EMPTY and the rows
+// live in ParentTables (@0xB0, TArray<UDataTable*>, SDK-verified 21.30
+// layout; OldParentTables @0xC0 as backup). That is why GetDataTableRowNames
+// (which merges parents natively) reported 252/2149 rows while every
+// RowMapFind missed: the walk below only ever saw the composite's own empty
+// map. The miss now falls through to the parent tables (depth ≤ 3).
+static uint8_t* RowMapFindImpl(void* table, const FName& row, int rowSize, int depth);
 static uint8_t* RowMapFind(void* table, const FName& row, int rowSize) {
+    return RowMapFindImpl(table, row, rowSize, 0);
+}
+static uint8_t* RowMapFindImpl(void* table, const FName& row, int rowSize, int depth) {
     if (!table || IsBadPtr(table) || !row.CompIdx) return nullptr;
     uint8_t* m = (uint8_t*)table + 0x30;
     void* elems = Read<void*>(m, 0x00);
     int32_t num = Read<int32>(m, 0x08);
-    if (!elems || IsBadPtr(elems) || num <= 0 || num > 200000) return nullptr;
-    int32_t numFree = Read<int32>(m, 0x14);
-    void* flags = Read<void*>(m, 0x18);
-    int32_t numBits = Read<int32>(m, 0x20);
-    bool flagsOk = flags && !IsBadPtr(flags) && numBits >= num && numBits <= num + 64;
-    for (int32_t i = 0; i < num; ++i) {
-        if (numFree != 0) {   // sparse array has holes — skip free slots
-            if (flagsOk) {
-                uint32_t word = Read<uint32>(flags, (size_t)(i >> 5) * 4);
-                if (!((word >> (i & 31)) & 1)) continue;
+    if (elems && !IsBadPtr(elems) && num > 0 && num <= 200000) {
+        int32_t numFree = Read<int32>(m, 0x14);
+        void* flags = Read<void*>(m, 0x18);
+        int32_t numBits = Read<int32>(m, 0x20);
+        bool flagsOk = flags && !IsBadPtr(flags) && numBits >= num && numBits <= num + 64;
+        for (int32_t i = 0; i < num; ++i) {
+            if (numFree != 0) {   // sparse array has holes — skip free slots
+                if (flagsOk) {
+                    uint32_t word = Read<uint32>(flags, (size_t)(i >> 5) * 4);
+                    if (!((word >> (i & 31)) & 1)) continue;
+                }
+            }
+            uint8_t* el = (uint8_t*)elems + (size_t)i * 24;
+            if (Read<uint32>(el, 0) != row.CompIdx || Read<uint32>(el, 4) != row.DispIdx) continue;
+            uint8_t* val = Read<uint8_t*>(el, 8);
+            // [F94] kernel-validated probe — a layout mismatch can only degrade
+            // to "row not found" (curated fallback), never a wild memcpy.
+            if (val && IsReadable(val, rowSize > 0 ? (size_t)rowSize : 8)) return val;
+        }
+    }
+    // [G15-f] Composite fallback — rows live in the parent tables.
+    if (depth < 3) {
+        static void* s_compositeCls = nullptr;
+        static bool s_clsTried = false;
+        if (!s_clsTried) { s_clsTried = true; s_compositeCls = FindObj("/Script/Engine.CompositeDataTable"); }
+        if (s_compositeCls && IsA(table, s_compositeCls)) {
+            for (int arr = 0; arr < 2; ++arr) {   // ParentTables @0xB0, OldParentTables @0xC0
+                Array parents = Read<Array>(table, arr == 0 ? 0xB0 : 0xC0);
+                if (!parents.Data || IsBadPtr(parents.Data) || parents.Count <= 0 || parents.Count > 64) continue;
+                for (int i = 0; i < parents.Count; ++i) {
+                    void* parent = Read<void*>(parents.Data, (size_t)i * 8);
+                    if (!parent || IsBadPtr(parent)) continue;
+                    if (uint8_t* hit = RowMapFindImpl(parent, row, rowSize, depth + 1))
+                        return hit;
+                }
             }
         }
-        uint8_t* el = (uint8_t*)elems + (size_t)i * 24;
-        if (Read<uint32>(el, 0) != row.CompIdx || Read<uint32>(el, 4) != row.DispIdx) continue;
-        uint8_t* val = Read<uint8_t*>(el, 8);
-        // [F94] kernel-validated probe — a layout mismatch can only degrade
-        // to "row not found" (curated fallback), never a wild memcpy.
-        if (val && IsReadable(val, rowSize > 0 ? (size_t)rowSize : 8)) return val;
     }
     return nullptr;
 }
@@ -1623,7 +1761,8 @@ static bool DataTableRow(void* table, const FName& row, void* dst, int rowSize) 
         memcpy(dst, src, (size_t)rowSize);
         return true;
     }
-    Call c("/Script/Engine.DataTableFunctionLibrary.GetDataTableRow");
+    Call c("/Script/Engine.DataTableFunctionLibrary.GetDataTableRowFromName");   // [G15-f] UE5.0 rename —
+    if (!c.ok()) c = Call("/Script/Engine.DataTableFunctionLibrary.GetDataTableRow");   // pre-5.0 name
     static bool dumped = false;   // one diagnosis per process — 2401 failures, 1 log
     auto diagnose = [&](const char* why) {
         if (dumped) return;
@@ -1662,6 +1801,16 @@ static bool DataTableRow(void* table, const FName& row, void* dst, int rowSize) 
     void* cdo = FindObj("/Script/Engine.Default__DataTableFunctionLibrary");
     if (!cdo) { diagnose("Default__DataTableFunctionLibrary CDO unresolved"); return false; }
     if (!c.run(cdo)) { diagnose("run() rejected/failed on the CDO"); return false; }
+    // [G15-f] GetDataTableRowFromName's OutRow is an OutParm POINTER (SDK:
+    // "struct FTableRowBase* OutRow (Parm, OutParm)") — the native writes
+    // the row pointer INTO the slot. The legacy GetDataTableRow wrote the
+    // row bytes inline. Handle both: read the slot as a pointer first; if
+    // it is not a sane row pointer, treat the slot itself as inline bytes.
+    void* rowPtr = Read<void*>(slot);
+    if (rowPtr && IsReadable(rowPtr, (size_t)rowSize) && ((uintptr_t)rowPtr & 7) == 0) {
+        memcpy(dst, rowPtr, (size_t)rowSize);
+        return true;
+    }
     memcpy(dst, slot, (size_t)rowSize);
     return true;
 }
@@ -1888,13 +2037,6 @@ struct Session {
     int32 pawn_weak_serial = 0;
     // [F40] match state (alive players / players-left HUD)
     bool  match_state_ready = false;
-    // [F-door r1/r2] doors we opened stay open until the next interact closes
-    // them again; the sprint fast-open path caches nearby walls so the scan
-    // costs nothing unless the player is actively sprinting.
-    struct PinnedDoor { void* wall; };
-    std::vector<PinnedDoor> door_pins;
-    std::vector<void*>      sprint_doors;   // closed BuildingWalls within reach
-    double last_door_scan = 0;
     // [F-cities] building-instruction handler load attempts (streaming window)
     int   building_load_attempts = 0;
 } session;
@@ -1975,8 +2117,7 @@ namespace Athena {
     bool LocalPickup(void* pickup);    // [F18]
     void Loot(void* actor);
     void HandleDoor(void* door);
-    void TickDoorPins();               // [F-door r1] stay-open guard
-    void TickSprintDoors();            // [F-door r2] sprint fast-open
+    void GrantWorldAbilities();       // [F52/F67/G15-e] slide/vehicle/emote abilities
     void OnServerCreateBuildingActor(void* params);
     bool LocalBuild();                 // [F21]
     bool SpawnBuildingActor(void* klass, const Vector& loc, const Rotator& rot, bool mirrored, int level); // [F30]
@@ -2096,13 +2237,42 @@ static bool ResolveSpecLayout(SpecLayout& out) {
 // Erbium's manual spec fill (GiveAbility fallback shape): zeroed buffer,
 // FastArraySerializer keys = -1, Handle = rand, Ability = CDO, Level = 1,
 // InputID = -1 (input binding comes from the native set paths). Caller frees.
+// [G15-g] TRUE sizeof(FGameplayAbilitySpec): the Items property's Inner
+// FStructProperty carries the engine's own ElementSize for the array — the
+// number TArray<FGameplayAbilitySpec> advances per element. PropertiesSize
+// (@0x54 → 111) is only the REFLECTED property end; the native members
+// (ContainerInterface/Triggers/Fortnite extras) extend the real size to
+// 0xE8 = 232 on this build. Device proofs: the valid #29 spec
+// (Default__GA_Athena_Grenade_Rethrow_C) sits at byte 3248 = 14 × 232
+// exactly, and slot0's byte pattern only parses under the Erbium
+// FFastArraySerializerItem layout (RepID@0/Key@4/MostRecent@8, Handle@0xC,
+// Ability@0x10, Level@0x18, InputID@0x1C, SourceObject@0x20,
+// ContainerInterface@0x28, Triggers@0x70={ptr,Num,Max}).
+static int SpecArrayStride() {
+    static int s_stride = -2;
+    if (s_stride != -2) return s_stride;
+    s_stride = 0;
+    void* itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.Items");
+    if (itemsProp) {
+        void* inner = Read<void*>(itemsProp, 0x70);            // FArrayProperty::Inner
+        if (inner && !IsBadPtr(inner)) {
+            int es = Read<int>(inner, profile::PropElementSize);
+            if (es >= 0x40 && es <= 0x400) s_stride = es;
+        }
+    }
+    return s_stride;
+}
 static void* BuildSpec(void* abilityCdo, void* sourceObject) {
     static SpecLayout layout; static bool resolved = false;
     if (!resolved) { resolved = true; if (!ResolveSpecLayout(layout)) LOG("[GAS] ⚠️ GameplayAbilitySpec reflection missing"); }
     if (!layout.ok() || !abilityCdo) return nullptr;
-    // [G14] sizeof = align8(PropertiesSize): the engine reads the full padded
-    // struct out of this buffer (111 would under-allocate by one byte).
-    size_t specBytes = (size_t)std::max((layout.Size + 7) & ~7, 0x40);
+    // [G15-g] sizeof = the ENGINE's array ElementSize (232 on this build) —
+    // the native GiveAbilityAndActivateOnce reads sizeof(FGameplayAbilitySpec)
+    // bytes out of this buffer; the old align8(PropertiesSize)=112 sizing
+    // UNDER-ALLOCATED by 120 bytes (heap overread). Fall back to align8(props)
+    // only when the Inner ElementSize is unavailable.
+    int trueStride = SpecArrayStride();
+    size_t specBytes = (size_t)std::max(trueStride > 0 ? trueStride : ((layout.Size + 7) & ~7), 0x40);
     void* spec = malloc(specBytes);
     if (!spec) return nullptr;
     memset(spec, 0, specBytes);
@@ -2510,27 +2680,35 @@ static void DumpSpecs(const char* tag) {
     }
     LOG("[Specs] %s: %d specs", tag, items.Count);
     if (!layout.ok()) return;
-    // [G14-a] Stride resolution: align8(PropertiesSize) first, then the
-    // plausible neighbors — a candidate must make THREE consecutive slots
-    // look like real specs. With fewer than 3 specs validation is impossible;
-    // align8(props) is the best-grounded value then.
+    // [G15-g] Stride resolution, priority order:
+    //   1. The engine's own array ElementSize (Items→Inner FStructProperty) —
+    //      sizeof(FGameplayAbilitySpec) = 0xE8 = 232 on this build. Device
+    //      proof: the valid #29 spec sits at byte 3248 = 14 × 232 exactly,
+    //      while every 112-strided slot between #1 and #28 read FastArray
+    //      garbage ("_Med" UTF-16 fragments, stale pointers) — the array was
+    //      NEVER corrupt, the stride was.
+    //   2..N. Plausible neighbors, validated by SpecSlotSane. Validation is
+    //      RELAXED to "2 of the first 4 slots sane" — a spec may legally
+    //      carry a NULL Ability (engine AddDefaulted slack), so demanding 3
+    //      consecutive sane slots rejected the true stride too.
     int propsRaw = (layout.Size >= 0x20 && layout.Size <= 0x400) ? layout.Size : 0x70;
     int aligned = (propsRaw + 7) & ~7;
+    int engineStride = SpecArrayStride();
     int stride = 0;
-    if (items.Count >= 3) {
-        int cand[6] = { aligned, 0x70, 0x78, 0x68, 0x60, 0x80 };
-        for (int ci = 0; ci < 6 && !stride; ++ci) {
+    if (items.Count >= 2) {
+        int cand[8] = { engineStride, 0xE8, aligned, 0x70, 0x78, 0x80, 0xB0, 0x60 };
+        for (int ci = 0; ci < 8 && !stride; ++ci) {
             if (cand[ci] < 0x20 || cand[ci] > 0x400) continue;
-            if (SpecSlotSane(items, cand[ci], 0, layout) &&
-                SpecSlotSane(items, cand[ci], 1, layout) &&
-                SpecSlotSane(items, cand[ci], 2, layout))
-                stride = cand[ci];
+            int sane = 0;
+            for (int k = 0; k < 4 && k < items.Count; ++k)
+                if (SpecSlotSane(items, cand[ci], k, layout)) ++sane;
+            if (sane >= 2) stride = cand[ci];
         }
     }
     if (!stride) {
-        stride = aligned;
-        LOG("[Specs] ⚠️ stride auto-validation failed — using align8(props=%d)=%d, raw slot bytes follow:",
-            propsRaw, stride);
+        stride = engineStride > 0 ? engineStride : aligned;
+        LOG("[Specs] ⚠️ stride auto-validation failed — using %s=%d, raw slot bytes follow:",
+            engineStride > 0 ? "engine ElementSize" : "align8(props)", stride);
         for (int s = 0; s < 2 && s < items.Count; ++s) {   // ground truth for the next run
             uint8_t* p = (uint8_t*)items.Data + (size_t)s * (size_t)stride;
             if (!IsReadable(p, 0x40)) continue;
@@ -2539,7 +2717,7 @@ static void DumpSpecs(const char* tag) {
             LOG("[Specs]  slot%d @%p: %s", s, p, hex);
         }
     }
-    LOG("[Specs] stride=%d (spec size, props=%d) data=%p", stride, propsRaw, items.Data);
+    LOG("[Specs] stride=%d (engine ElementSize=%d, props=%d) data=%p", stride, engineStride, propsRaw, items.Data);
     int cap = items.Count > 128 ? 128 : items.Count;
     for (int i = 0; i < cap; ++i) {
         uint8_t* spec = (uint8_t*)items.Data + (size_t)i * (size_t)stride;
@@ -2638,10 +2816,15 @@ static bool ApplyAbilitySet(void* pawn, void* abilitySet) {
 }
 
 // ============================================================================
-// [G14-e] LATE-STREAMING ABILITY SETS — AS_HillScramble/AS_SlideImpulse were
-// not resident at grant time on the device (they load with the terrain's
-// streaming levels). Once GrantAllAbilitySets has committed, the queue below
-// retries them from Tick until the asset lands (or ~3 minutes pass).
+// [G14-e/G15-e] LATE-STREAMING ABILITY SETS — AS_HillScramble/AS_SlideImpulse
+// were not resident at grant time on the device (they load with the terrain's
+// streaming levels). The queue below retries them from Tick until the asset
+// lands. [G15-e] NEVER GIVES UP: the old 22-try window (~3 min) expired
+// before distant POI sublevels streamed in ("giving up on AS_HillScramble"
+// in the device log = no climbing, ever). StaticLoadObject is attempted only
+// 10 times per set (each miss can walk the pak index — measurable on a
+// phone); after that the cheap loaded-object scan carries the retry at a
+// relaxed 20s cadence, forever.
 // ============================================================================
 struct PendingAbilitySet { const char* path; const char* shortName; int tries; };
 static std::vector<PendingAbilitySet> s_pendingSets;
@@ -2650,28 +2833,47 @@ static void QueuePendingAbilitySet(const char* path, const char* shortName) {
         if (strcmp(p.shortName, shortName) == 0) return;   // already queued
     s_pendingSets.push_back({ path, shortName, 0 });
 }
+// [G15-e] Partial-name scan: the set may be resident under a slightly
+// different object name on mobile (suffixes/renames) — match by substring.
+static void* FindLoadedAbilitySetLike(const std::string& wanted) {
+    GObjects_t* go = GObjectArray();
+    void* type = FindObj("/Script/FortniteGame.FortAbilitySet");
+    if (!go || !type) return nullptr;
+    std::string needle = wanted;
+    for (auto& ch : needle) ch = (char)::tolower((unsigned char)ch);
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* object = go->GetById((uint32)i);
+        if (!object || IsBadPtr(object)) continue;
+        if (!IsA(object, type)) continue;
+        std::string n = ObjName(object);
+        for (auto& ch : n) ch = (char)::tolower((unsigned char)ch);
+        if (n.find(needle) != std::string::npos) return object;
+    }
+    return nullptr;
+}
 static void PumpPendingAbilitySets() {
     if (s_pendingSets.empty() || !session.pawn) return;
+    static double s_lastPump = 0;
+    double now = Monotonic();
+    if (now - s_lastPump < 20.0) return;   // [G15-e] relaxed cadence — the retry is forever now
+    s_lastPump = now;
     for (size_t i = 0; i < s_pendingSets.size(); ) {
         PendingAbilitySet& p = s_pendingSets[i];
-        void* set = LoadAsset(p.path, "/Script/FortniteGame.FortAbilitySet");
+        void* set = (p.tries < 10) ? LoadAsset(p.path, "/Script/FortniteGame.FortAbilitySet") : nullptr;
         if (!set) set = FindLoadedObjectOfType("/Script/FortniteGame.FortAbilitySet", p.shortName);
+        if (!set) set = FindLoadedAbilitySetLike(p.shortName);   // [G15-e] substring fallback
         if (set && !IsBadPtr(set)) {
             bool already = std::find(session.granted_ability_sets.begin(),
                                      session.granted_ability_sets.end(), set)
                            != session.granted_ability_sets.end();
             if (!already && ApplyAbilitySet(session.pawn, set)) {
                 session.granted_ability_sets.push_back(set);
-                LOG("[Abilities] ✅ Applied late set: %s", p.shortName);
+                LOG("[Abilities] ✅ Applied late set: %s (tries=%d)", p.shortName, p.tries);
             }
             s_pendingSets.erase(s_pendingSets.begin() + i);
             continue;
         }
-        if (++p.tries > 22) {   // ~3 min at the 8s Tick cadence
-            LOG("[Abilities] giving up on %s (never became resident)", p.shortName);
-            s_pendingSets.erase(s_pendingSets.begin() + i);
-            continue;
-        }
+        ++p.tries;   // [G15-e] no give-up: POI sublevels stream in over many minutes
         ++i;
     }
 }
@@ -3399,7 +3601,7 @@ void Athena::FixBodyAndAnimations() {
 // Erbium way: build a mini FortAbilitySet and Equip it, so the ASC creates
 // real ability specs with input bindings.
 void Athena::GrantWorldAbilities() {
-    if (session.world_abilities_granted || !session.pawn) return;
+    if (!session.pawn) return;
     static const char* const names[] = {
         "GA_Athena_Player_Slide_C",     // core — slide
         "GA_AthenaEnterVehicle_C",      // core (exact 21.30 spelling)
@@ -3408,17 +3610,46 @@ void Athena::GrantWorldAbilities() {
         "GAB_Emote_Generic_C",          // best-effort (emote input)
         nullptr
     };
-    std::vector<void*> classes;
-    for (int i = 0; names[i]; ++i) {
-        if (void* k = FindAbilityClassNamed(names[i])) classes.push_back(k);
-        else if (i < 2) {
-            // [G-log] log each missing core class ONCE — this retried every
-            // 8 s while the POI sublevels streamed in (log spam).
-            static bool said[2] = { false, false };
-            if (!said[i]) { said[i] = true; LOG("[World] ability class not resident yet: %s (silent retries until it streams in)", names[i]); }
+    // [G15-e] INCREMENTAL: the old gate demanded the FULL core pair before
+    // granting anything — GA_AthenaEnterVehicle_C never streamed in on the
+    // device, so the slide ability was withheld forever too (wabilities=0
+    // in every heartbeat). Now every class that IS resident gets granted,
+    // and late arrivals are granted on later passes. The scan is BATCHED:
+    // one GObjects pass matches all five names (was: five full passes).
+    static std::set<void*> s_grantedWorldAbilities;
+    static double s_lastScan = 0;
+    double now = Monotonic();
+    if (now - s_lastScan < 20.0) return;
+    s_lastScan = now;
+    std::vector<void*> fresh;
+    {
+        GObjects_t* go = GObjectArray();
+        void* gaCls = FindObj("/Script/GameplayAbilities.GameplayAbility");
+        void* classClass = FindObj("/Script/CoreUObject.Class");
+        if (!go || !gaCls || !classClass) return;
+        std::vector<void*> found;   // parallel to names[]
+        found.resize(5, nullptr);
+        for (int32 i = 0; i < go->NumElements; ++i) {
+            void* object = go->GetById((uint32)i);
+            if (!object || IsBadPtr(object)) continue;
+            if (!IsA(object, classClass)) continue;
+            if (!SubclassOfFast(object, gaCls)) continue;
+            std::string n = ObjName(object);
+            for (int j = 0; names[j]; ++j) {
+                if (found[(size_t)j]) continue;
+                if (n == names[j]) { found[(size_t)j] = object; break; }
+            }
+        }
+        for (int j = 0; names[j]; ++j) {
+            void* k = found[(size_t)j];
+            if (!k) continue;
+            if (s_grantedWorldAbilities.count(k)) continue;
+            if (j < 2)
+                LOG("[World] ability class became resident: %s", names[j]);
+            fresh.push_back(k);
         }
     }
-    if (classes.size() < 2) return;   // wait for the core pair to stream in
+    if (fresh.empty()) return;
 
     void* setCls = FindObj("/Script/FortniteGame.FortAbilitySet");
     if (!setCls) { LOG("[World] FortAbilitySet class missing"); return; }
@@ -3428,13 +3659,15 @@ void Athena::GrantWorldAbilities() {
     if (!abProp) { LOG("[World] GameplayAbilities property missing"); return; }
     Array* arr = reinterpret_cast<Array*>(GetField(set, abProp));
     if (!arr || arr->Count != 0) { LOG("[World] mini set array unavailable"); return; }
-    for (void* k : classes) {
+    for (void* k : fresh) {
         if (!k || IsBadPtr(k)) continue;
         Fn<int(*)(void*, void*, const void*)>(profile::GenericArrayAdd)(arr, abProp, &k);
     }
     if (ApplyAbilitySet(session.pawn, set)) {
+        for (void* k : fresh) s_grantedWorldAbilities.insert(k);
         session.world_abilities_granted = true;
-        LOG("[World] ✅ %zu world abilities delivered through EquipFortAbilitySet", classes.size());
+        LOG("[World] ✅ %zu world abilities delivered through EquipFortAbilitySet (total granted: %zu)",
+            fresh.size(), s_grantedWorldAbilities.size());
     }
 }
 
@@ -3689,109 +3922,30 @@ static void DoorCloseApply(void* wall) {
 }
 
 void Athena::HandleDoor(void* door) {
+    // [G15-b] NATIVE-ONLY DOORS. The native ServerAttemptInteract (which
+    // still runs via orig_PE after us) toggles doors itself on this build —
+    // the device log proved it with "CLOSED (was native-open)" doors that
+    // nothing of ours had opened. Our old full toggle produced a
+    // double-toggle (user: "the door closes by itself") and the pin
+    // re-assertion fought the DoorBash slam ("breaks when bashing").
+    // We now ONLY assist the OPEN side of a CLOSED door — idempotent with
+    // the native open — and let closing be entirely native, exactly like
+    // the live game.
     if (!door || IsBadPtr(door)) return;
     static void* wallCls = nullptr;
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
-
-    const bool open = DoorIsOpen(door);   // [G06] IsDoorOpen() probe
-
-    // Interact toggle: closing removes the stay-open pin first; opening
-    // registers it so TickDoorPins can re-assert if anything slams it shut.
-    bool wasPinned = false;
-    for (auto it = session.door_pins.begin(); it != session.door_pins.end(); ++it) {
-        if (it->wall == door) { wasPinned = true; session.door_pins.erase(it); break; }
-    }
-    if (!open && !wasPinned) {
-        DoorOpenApply(door, /*fast=*/false);
-        session.door_pins.push_back({door});
-        if (session.door_pins.size() > 64) session.door_pins.erase(session.door_pins.begin());   // cap runaway growth
-        LOG("[Door] OPEN (pinned, pins=%zu)", session.door_pins.size());
-    } else {
-        DoorCloseApply(door);
-        LOG("[Door] CLOSED (was %s)", wasPinned ? "pinned" : "native-open");
-    }
-
-    // [F16] Blueprint event — resolve the receiver's override.
-    Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", door);
-    if (interact.ok() && session.pawn) {
-        if (interact.set("InteractingPawn", session.pawn)) interact.run(door);
-    }
+    if (DoorIsOpen(door)) return;   // open → the native interact closes it
+    DoorOpenApply(door, /*fast=*/false);
+    LOG("[Door] open-assist (native toggle continues)");
 }
 
-// [F-door r1] stay-open guard: whatever slams a door back shut on this build
-// (trigger volume, replication reset, edit path), we only act when bDoorOpen
-// actually flipped — doors we closed, and doors nobody touched, stay as-is.
-void Athena::TickDoorPins() {
-    if (session.door_pins.empty()) return;
-    static double last = 0;
-    double now = Monotonic();
-    if (now - last < 0.30) return;
-    last = now;
-    int reasserted = 0;
-    for (auto it = session.door_pins.begin(); it != session.door_pins.end(); ) {
-        void* wall = it->wall;
-        if (!wall || IsBadPtr(wall)) { it = session.door_pins.erase(it); continue; }
-        uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
-        if (!(*pack & 0x20)) {
-            DoorOpenApply(wall, false);
-            ++reasserted;
-        }
-        ++it;
-    }
-    if (reasserted) LOG("[Door] [F-door] re-asserted %d pinned doors", reasserted);
-}
-
-// [F-door r2] sprint fast-open (bFastOpenRequested — the 21.30 native behaviour
-// pair of AutoOpenDoorInputMagnitude/AutoOpenDoorTraceDistance): while the
-// player is tactically sprinting, closed BuildingWalls within 400 uu are
-// queued (2 s scan throttle) and any one reached within 150 uu opens with the
-// fast flag. Doors opened this way land in door_pins, so interact-close still
-// works and the stay-open guard keeps them from slamming back.
-static bool GetAllActorsOfClassRaw(void* klass, std::vector<void*>& out);   // [F-door r2] defined below
-void Athena::TickSprintDoors() {
-    if (!session.tactical_sprint || !session.pawn) return;
-    if (IsBadPtr(session.tactical_sprint)) return;
-    double now = Monotonic();
-    const bool sprinting = (Read<uint8_t>(session.tactical_sprint, profile::TacticalSprint_Flags)
-                            & profile::TacticalSprint_Bit_IsSprinting) != 0;
-    if (!sprinting) return;
-
-    if (now - session.last_door_scan > 2.0) {
-        session.last_door_scan = now;
-        session.sprint_doors.clear();
-        void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
-        if (!wallCls) return;
-        std::vector<void*> walls;
-        if (GetAllActorsOfClassRaw(wallCls, walls)) {
-            for (void* w : walls) {
-                if (!w || IsBadPtr(w)) continue;
-                uint8_t* pack = (uint8_t*)w + profile::BuildingWall_bDoorOpen_Byte;
-                if (*pack & 0x20) continue;                     // already open
-                Vector loc{};
-                if (!ActorLocation(w, loc) || !NearPlayer(loc, 400.0f)) continue;
-                session.sprint_doors.push_back(w);
-                if (session.sprint_doors.size() >= 32) break;   // tiny working set only
-            }
-        }
-    }
-    int opened = 0;
-    for (void* w : session.sprint_doors) {
-        if (!w || IsBadPtr(w)) continue;
-        uint8_t* pack = (uint8_t*)w + profile::BuildingWall_bDoorOpen_Byte;
-        if (*pack & 0x20) continue;
-        Vector loc{};
-        if (!ActorLocation(w, loc) || !NearPlayer(loc, 150.0f)) continue;
-        static void* wallCls = nullptr;
-        if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
-        if (!wallCls || !IsA(w, wallCls)) continue;
-        DoorOpenApply(w, /*fast=*/true);
-        session.door_pins.push_back({w});
-        if (session.door_pins.size() > 64) session.door_pins.erase(session.door_pins.begin());
-        ++opened;
-    }
-    if (opened) LOG("[Door] [F-door] sprint fast-open %d", opened);
-}
+// [G15-b] DELETED: TickDoorPins / TickSprintDoors. The pin re-assertion ran
+// every 0.3s and fought BOTH the native door state machine and the DoorBash
+// ability; the sprint fast-open hack re-implemented what the granted
+// AS_DoorBash ability already does natively (AutoOpenDoorInputMagnitude /
+// AutoOpenDoorTraceDistance + the slam CVar path). Their tick calls and the
+// session bookkeeping (door_pins / sprint_doors / last_door_scan) are gone.
 
 // ============================================================================
 // COSMETICS — [F22] locker sync through the MCP context, with the menu-hero
@@ -4367,8 +4521,6 @@ void Athena::Tick() {
         ProcessPendingPickups();   // [F35] fly-time → inventory transfer
         TickMantleAssist();        // [F45] 21.30 wall climb assist
         TickRealityProximity();    // [F44] reality tree proximity effect
-        TickDoorPins();            // [F-door r1] doors stay open until we close them
-        TickSprintDoors();         // [F-door r2] sprint fast-open
         TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
         TickFloorLootStreaming();  // [F-loot-auto] roll floor loot as spawners stream in
     }
@@ -6769,7 +6921,7 @@ void Athena::SpawnVehicles() {
     ++session.vehicle_attempts;
     static std::vector<Vector> spawnedAt;   // [F43] dedupe across passes
     int spawned = 0;
-    int viable = 0;                         // [F85] resolvable-class targets this pass
+    int viable = 0;                         // [F85] resolvable-class targets this pass (diagnostics)
 
     // ---- Pass 1 (Erbium 1:1): LivingWorld providers matched by GameplayTag ----
     {
@@ -6826,21 +6978,33 @@ void Athena::SpawnVehicles() {
     }
 
     // ---- Pass 2: AFortAthenaVehicleSpawner (kept from [F28]) ----
+    // [G15-d] ROLL-ONCE semantics (Erbium parity). The old code re-rolled the
+    // spawn percent on EVERY retry pass: with low percents (2-15%) each pass
+    // spawned only a handful (+2..+9) and the completion test
+    // (spawned >= viable) could never fire — the device run stalled at 48/359
+    // after 12 passes. Erbium rolls each spawner exactly ONCE at world init;
+    // retry passes now only pick up spawners that streamed in later.
+    static std::vector<void*> s_rolledSpawners;   // [G15-d] rolled in an earlier pass
+    auto alreadyRolled = [](void* spawner) {
+        return std::find(s_rolledSpawners.begin(), s_rolledSpawners.end(), spawner) != s_rolledSpawners.end();
+    };
     {
         void* spawnerCls = FindObj("/Script/FortniteGame.FortAthenaVehicleSpawner");
         if (!spawnerCls) spawnerCls = LoadClass("/Script/FortniteGame.FortAthenaVehicleSpawner", "/Script/Engine.Actor");
         std::vector<void*> spawners;
         if (spawnerCls && GetAllActorsOfClassRaw(spawnerCls, spawners) && !spawners.empty()) {
-            LOG("[Vehicles] spawner actors: %zu", spawners.size());   // [F85] density diagnostics
+            LOG("[Vehicles] spawner actors: %zu (rolled so far: %zu)", spawners.size(), s_rolledSpawners.size());
             for (void* spawner : spawners) {
                 if (!spawner || IsBadPtr(spawner)) continue;
+                if (alreadyRolled(spawner)) continue;   // [G15-d] rolled before — outcome stands
                 void* vehicleClass = nullptr;
                 {
                     Call c("/Script/FortniteGame.FortAthenaVehicleSpawner.GetVehicleClass");
                     if (c.ok() && c.run(spawner)) vehicleClass = c.result<void*>();
                 }
-                if (!vehicleClass || IsBadPtr(vehicleClass)) continue;
+                if (!vehicleClass || IsBadPtr(vehicleClass)) continue;   // class not streamed yet — next pass
                 ++viable;   // [F85] class resolved — this spawner counts
+                s_rolledSpawners.push_back(spawner);   // [G15-d] roll exactly once
                 // [F28] spawn-percent roll (Erbium 1:1): only when a definition is
                 // cached AND the spawner is not forced.
                 void* cachedDef = GetObjField(spawner, "/Script/FortniteGame.FortAthenaVehicleSpawner.CachedFortVehicleItemDef");
@@ -6873,26 +7037,22 @@ void Athena::SpawnVehicles() {
                     LOG("[Vehicles] ✅ %s @ %.0f %.0f %.0f", ObjName(vehicleClass).c_str(), loc.X, loc.Y, loc.Z);
                 }
             }
+            // [G15-d] Completion: every currently-known spawner has been
+            // rolled at least once. Density now equals Erbium's one-shot
+            // world-init roll instead of an ever-growing re-roll spiral.
+            if (s_rolledSpawners.size() >= spawners.size()) {
+                session.vehicles_spawned = true;
+                LOG("[Vehicles] ✅ complete: %zu spawners rolled once, %d vehicles (attempts=%d)",
+                    s_rolledSpawners.size(), (int)spawnedAt.size(), session.vehicle_attempts);
+            } else if (session.vehicle_attempts >= 12) {
+                session.vehicles_spawned = true;   // streaming window exhausted — stop cleanly
+                LOG("[Vehicles] retry window exhausted: %zu/%zu rolled, %d vehicles",
+                    s_rolledSpawners.size(), spawners.size(), (int)spawnedAt.size());
+            } else {
+                LOG("[Vehicles] partial: +%d this pass, %d total, rolled %zu/%zu (viable=%d) — retrying (attempts=%d)",
+                    spawned, (int)spawnedAt.size(), s_rolledSpawners.size(), spawners.size(), viable, session.vehicle_attempts);
+            }
         }
-    }
-
-    // [F85] Commit semantics fix (root cause of the user's 1/325 symptom):
-    // the old code set vehicles_spawned on the FIRST pass with ANY success.
-    // Spawner classes stream in late, so pass 1 spawns exactly 1 car, the
-    // flag commits, and the remaining spawners never spawn again. Now the
-    // flag commits ONLY when a pass fully covers its viable targets, or the
-    // F41 retry window (12 attempts) is exhausted. Rolled-skip targets are
-    // re-rolled on every retry pass (density per Erbium spawn-percent).
-    if (spawned > 0 && spawned >= viable) {
-        session.vehicles_spawned = true;
-        LOG("[Vehicles] ✅ complete: %d vehicles total (attempts=%d)", (int)spawnedAt.size(), session.vehicle_attempts);
-    } else if (spawned > 0) {
-        LOG("[Vehicles] partial: +%d this pass, %d total, viable=%d — retrying (attempts=%d)", spawned, (int)spawnedAt.size(), viable, session.vehicle_attempts);
-    } else if (session.vehicle_attempts >= 12) {
-        session.vehicles_spawned = true;   // [F85] window exhausted — stop cleanly
-        LOG("[Vehicles] retry window exhausted: %d vehicles total", (int)spawnedAt.size());
-    } else {
-        LOG("[Vehicles] pass %d: no vehicles yet — will retry", session.vehicle_attempts);
     }
 }
 
@@ -7649,6 +7809,42 @@ static void pe_hook(void* obj, void* func, void* params) {
                     LOG("[Interact] target=%p class=%s", target, ObjName(targetCls).c_str());
                     if (bcCls && SubclassOfFast(targetCls, bcCls)) Athena::Loot(target);
                     else if (wallCls && SubclassOfFast(targetCls, wallCls)) Athena::HandleDoor(target);
+                    else if (IsVehicleTarget(targetCls)) {
+                        // [G15-c] VEHICLE ENTER — Erbium parity: the NATIVE
+                        // ServerAttemptInteract seats the pawn (Erbium's own
+                        // vehicle branch in ServerAttemptInteract_ is
+                        // commented out — they rely on the OG call). Run the
+                        // native FIRST, verify the seat took through
+                        // FortPlayerPawnAthena.GetVehicleActor, and fall back
+                        // to the SDK-verified BlueprintCallable
+                        // AFortAthenaVehicle::ForceSeatSinglePawn when the
+                        // native path declines (driver seat 0).
+                        orig_PE(obj, func, params);
+                        bool seated = false;
+                        {
+                            Call v("/Script/FortniteGame.FortPlayerPawnAthena.GetVehicleActor");
+                            if (!v.ok()) v = Call("/Script/FortniteGame.FortPawn.GetVehicleActor");
+                            if (v.ok() && session.pawn && v.run(session.pawn)) {
+                                void* cur = v.result<void*>();
+                                seated = cur && !IsBadPtr(cur);
+                            }
+                        }
+                        if (!seated && session.pawn) {
+                            Call f("/Script/FortniteGame.FortAthenaVehicle.ForceSeatSinglePawn");
+                            if (!f.ok()) f = Call("/Script/FortniteGame.FortCharacterVehicle.ForceSeatSinglePawn");
+                            int seatIdx = 0;
+                            if (f.ok() && f.set("PawnToSeat", session.pawn) && f.set("SeatIndex", seatIdx) && f.run(target)) {
+                                if (f.result<bool>()) {
+                                    LOG("[Vehicle] ✅ force-seated into %s (native interact declined)",
+                                        ObjName(targetCls).c_str());
+                                    Athena::TickVehicleSeats(true);   // seat weapon path, instantly
+                                }
+                            } else {
+                                LOG("[Vehicle] enter fallback unavailable for %s", ObjName(targetCls).c_str());
+                            }
+                        }
+                        return;   // native already dispatched above — skip the trailing orig_PE
+                    }
                     else if (actorCls && SubclassOfFast(targetCls, actorCls)) {
                         // [F16] generic building interaction via BP override.
                         Call interact("/Script/FortniteGame.BuildingActor.BlueprintOnInteract", target);
