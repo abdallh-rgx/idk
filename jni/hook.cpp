@@ -462,6 +462,42 @@
 //            banner. Per-profile: hook prologue words, FField vs pre-FField
 //            param walks, raw-offset systems gated to verified builds,
 //            pre-s20 vehicle/ability-set semantics.
+//  [G17] WAVE 6 — the user's three reports (missing cities/buildings,
+//        dead player stays standing, no win banner + frozen alive counter)
+//        all traced to the same root: the server half of the match never
+//        ran. Four fixes, all Erbium-parity:
+//        (a) [G17-a] MISSING CITIES — Erbium sets MeshNetworkSubsystem
+//            NodeType=2 for every UE4.27+ build (except v20): Chapter 3
+//            geometry (whole POIs, city buildings) streams through the
+//            mesh network, and a client node type waits for server mesh
+//            data that never comes. Ported with reflection (NodeType
+//            offset from the live class) + a 15s×10 retry window, plus
+//            Erbium's StreamAdditionalPlaylistLevels fallback
+//            (LoadLevelInstanceBySoftObjectPtr) for the playlist's
+//            AdditionalLevels / server-only / shared-asset levels.
+//        (b) [G17-b] TeamIndex/SquadId on the PlayerState (Erbium
+//            CreatePlayer parity: solo team 3, squad 0) — without a team
+//            the WinningTeam write can never match the player.
+//        (c) [G17-c] DEATH — the client predicts damage into its local
+//            attribute set, but death is a SERVER decision: 0 HP just
+//            leaves the pawn standing. A 0.5s watcher catches the
+//            health→0 EDGE and runs the full Erbium ClientOnPawnDied
+//            server flow: inventory dropped as pickups + cleared,
+//            DeathInfo + OnRep_DeathInfo, PawnDeathLocation, Place =
+//            PlayersLeft (pre-decrement), CharacterMovement DisableMovement,
+//            the ClientOnPawnDied client-RPC body executed locally (death
+//            UI/camera/spectate), HandleIsDying (ragdoll attempt),
+//            PlayersLeft-- + OnRep_PlayersLeft.
+//        (d) [G17-d/e] ALIVE COUNTER + WIN — SetupMatchState seeds a
+//            virtual solo lobby (playlist MaxPlayers, else 100; era.players
+//            N overrides) instead of Erbium's PlayersLeft=1 (which freezes
+//            the counter forever with no opponents). A paced elimination
+//            curve (fast early game → slow top-10, ~18 min full drain)
+//            decrements PlayersLeft + OnRep every step; reaching 1 alive
+//            fires the Erbium win flow: Place=1, bIsAWinner,
+//            WinningTeam/WinningPlayerState + OnReps, PlayWinEffects →
+//            ClientNotifyWon → ClientNotifyTeamWon (the Victory Royale
+//            banner). era.die / era.win force either flow for testing.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -2303,6 +2339,22 @@ struct Session {
     double last_door_scan = 0;
     // [F-cities] building-instruction handler load attempts (streaming window)
     int   building_load_attempts = 0;
+    // [G17] death / win / solo match simulation
+    bool  death_handled = false;        // one-shot death flow latch
+    bool  win_handled = false;          // one-shot victory flow latch
+    bool  sim_started = false;          // virtual lobby seeded
+    int   sim_lobby_size = 0;           // era.players override (0 = playlist/100)
+    int   sim_players_left = 0;         // tracked PlayersLeft copy
+    double sim_next_elim = 0;           // next virtual elimination time
+    int   sim_elim_total = 0;           // virtual eliminations so far
+    float last_known_health = 0.0f;    // death edge detection — only a REAL observed-alive → dead transition counts
+    int8_t death_zero_streak = 0;      // debounce: two consecutive zero polls required
+    double last_health_poll = 0;        // 0.5s death-watch cadence
+    double last_sim_poll = 0;           // 1s match-sim cadence
+    // [G17-a] mesh-network / playlist levels
+    bool  mesh_network_fixed = false;
+    int   mesh_network_attempts = 0;
+    bool  playlist_levels_done = false;
 } session;
 
 static double Monotonic() {
@@ -2326,6 +2378,32 @@ static bool NearPlayer(const Vector& point, float limit) {
     if (!session.pawn || !ActorLocation(session.pawn, origin)) return false;
     double dx = point.X - origin.X, dy = point.Y - origin.Y, dz = point.Z - origin.Z;
     return dx*dx + dy*dy + dz*dz <= double(limit) * double(limit);
+}
+
+// [G17] Find a UScriptStruct by object name with member validation (module
+// renames across builds break hard-coded /Script/ paths; the members prove
+// identity — used for DeathInfo / FFortPlayerDeathReport layouts).
+static void* FindScriptStructNamed(const char* name, const char* mustA, const char* mustB) {
+    GObjects_t* go = GObjectArray();
+    if (!go) return nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o)) continue;
+        if (ObjName(o) != name) continue;
+        // Must look like a struct with the expected members.
+        if (!FindChildProp(o, mustA)) continue;
+        if (mustB && !FindChildProp(o, mustB)) continue;
+        return o;
+    }
+    return nullptr;
+}
+
+// [G17] Read the pawn's current health through the public accessor.
+static float PawnHealth(void* pawn) {
+    if (!pawn || IsBadPtr(pawn)) return -1.0f;
+    Call h("/Script/FortniteGame.FortPawn.GetHealth");
+    if (!h.ok() || !h.run(pawn)) return -1.0f;
+    return h.result<float>();
 }
 
 // ============================================================================
@@ -2438,6 +2516,23 @@ namespace Athena {
 
     // [F40] alive-players / players-left HUD state
     void SetupMatchState();
+
+    // [G17-a] Erbium UE4.27+ mesh-network parity + additional playlist levels
+    void FixMeshNetwork();
+    void TickMeshNetwork();
+    void StreamPlaylistLevels();
+
+    // [G17-c] death flow — Erbium AFortPlayerControllerAthena::ClientOnPawnDied
+    // server-side parity, driven from a local health watcher
+    void TickDeathWatch();
+    void HandlePlayerDeath(bool forced);
+
+    // [G17-d] solo match simulation — paced virtual eliminations
+    void TickMatchSim();
+
+    // [G17-e] Erbium win parity — Victory Royale banner
+    void HandleVictory();
+
     void DebugDump();
 }
 
@@ -4638,6 +4733,27 @@ void Athena::EnsurePlayerState() {
     { Call r("/Script/Engine.Controller.OnRep_PlayerState"); if (r.ok()) r.run(session.controller); }
     { Call r("/Script/Engine.Pawn.OnRep_PlayerState"); if (r.ok() && session.pawn) r.run(session.pawn); }
 
+    // [G17-b] Erbium team parity (its CreatePlayer flow): TeamIndex = PickTeam
+    // (solo first team = 3), SquadId = TeamIndex - 3. Without a team the
+    // WinningTeam write in the victory flow can never match the player, and
+    // squad HUD widgets stay empty.
+    {
+        void* tiProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.TeamIndex");
+        void* sqProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.SquadId");
+        if (tiProp) {
+            int sz = Read<int>(tiProp, profile::PropElementSize);
+            if (sz == 1) Write<uint8_t>(GetField(state, tiProp), 0, 3);
+            else if (sz == 4) Write<int>(GetField(state, tiProp), 0, 3);
+        }
+        if (sqProp) {
+            int sz = Read<int>(sqProp, profile::PropElementSize);
+            if (sz == 1) Write<uint8_t>(GetField(state, sqProp), 0, 0);
+            else if (sz == 4) Write<int>(GetField(state, sqProp), 0, 0);
+        }
+        { Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_TeamIndex"); if (r.ok()) r.run(state); }
+        { Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_SquadId"); if (r.ok()) r.run(state); }
+    }
+
     // HeroType fallback exactly like Erbium's bot creation.
     void* heroProp = GetProp("/Script/FortniteGame.FortPlayerState.HeroType");
     if (heroProp && !Read<void*>(GetField(state, heroProp))) {
@@ -4681,6 +4797,8 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: DropLoadingScreen"); DropLoadingScreen();
     LOG("SetupWorld: SpawnBattleBus"); SpawnBattleBus();
     LOG("SetupWorld: RemoveNetDebugUI"); RemoveNetDebugUI();
+    LOG("SetupWorld: FixMeshNetwork"); FixMeshNetwork();            // [G17-a] Erbium NodeType=2 — missing cities
+    LOG("SetupWorld: StreamPlaylistLevels"); StreamPlaylistLevels(); // [G17-a] Erbium additional playlist levels
     // [F23] Free building + direct readiness bit (standalone-safe fallbacks).
     SetBool(session.controller, "/Script/FortniteGame.FortPlayerController.bBuildFree", true);
     { uint8_t* ready = (uint8_t*)session.controller + profile::FortPlayerController_ReadyByte;
@@ -4787,7 +4905,8 @@ void Athena::Tick() {
             hbP = p.Count; hbS = s.Count;
         }
         int hbSpecs = gas::CountActivatableSpecs();
-        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d)",
+        float hbHp = session.pawn ? PawnHealth(session.pawn) : -1.0f;
+        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d death=%d won=%d meshnet=%d plvl=%d",
             (int)session.quickbars_initialized,
             (qbLink == session.quickbars ? (session.quickbars ? "ok" : "n/a") : "BAD"),
             (unsigned)hbGate, hbP, hbS,
@@ -4802,7 +4921,13 @@ void Athena::Tick() {
             gas::GiveAbilityAndActivateOnce ? 1 : 0,
             gas::InternalTryActivateAbility ? 1 : 0,
             gas::ApplyCharacterCustomization ? 1 : 0,
-            (gas::SendRequestNow && orig_SendRequestNow) ? 1 : 0);   // [G10]
+            (gas::SendRequestNow && orig_SendRequestNow) ? 1 : 0,   // [G10]
+            hbHp,
+            session.sim_players_left,
+            (int)session.death_handled,
+            (int)session.win_handled,
+            (int)session.mesh_network_fixed,
+            (int)session.playlist_levels_done);
     }
     // [F94-a] reviewer note (1): state can change after FinalizePlayer — the
     // internal 60s rate-limit makes this call free next to the heartbeat.
@@ -4854,6 +4979,9 @@ void Athena::Tick() {
         TickSprintDoorAssist();    // [G16-a] safe bash-through (open-only)
         TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
         TickFloorLootStreaming();  // [F-loot-auto] roll floor loot as spawners stream in
+        TickMeshNetwork();         // [G17-a] NodeType retry window (subsystem streams in late)
+        TickDeathWatch();          // [G17-c] health → 0 edge runs the server death flow
+        TickMatchSim();            // [G17-d] virtual elimination curve + win trigger
     }
     // [F28/F41] one-shot vehicle spawning with a retry window (vehicle spawners
     // stream in after the world is ready — 12 attempts × 15 s ≈ 3 min max).
@@ -7154,11 +7282,40 @@ void Athena::SetupMatchState() {
         void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
         if (plProp && Read<int>(plProp, profile::PropElementSize) == 4) {
             int cur = Read<int>(GetField(session.state, plProp));
-            if (cur < 1) {
-                Write<int>(GetField(session.state, plProp), 0, 1);
+            if (cur < 2) {
+                // [G17-d] Erbium seeds PlayersLeft per joining player (→ 1 in
+                // solo). That freezes the alive counter at "1" forever — no
+                // opponents exist to eliminate. Seed a virtual solo lobby
+                // instead (playlist MaxPlayers, else 100; era.players N
+                // overrides) so the counter runs a real match curve and the
+                // victory flow is reachable.
+                int lobby = session.sim_lobby_size;
+                if (lobby <= 0) {
+                    // CurrentPlaylistInfo is an EMBEDDED struct — resolve its
+                    // data pointer, then the playlist pointers inside it.
+                    void* playlist = nullptr;
+                    void* infoProp = GetProp("/Script/FortniteGame.FortGameStateAthena.CurrentPlaylistInfo");
+                    void* info = infoProp ? GetField(session.state, infoProp) : nullptr;
+                    if (info && !IsBadPtr(info)) {
+                        playlist = GetObjField(info, "/Script/FortniteGame.PlaylistPropertyArray.BasePlaylist");
+                    }
+                    if (!playlist || IsBadPtr(playlist))
+                        playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
+                    if (playlist && !IsBadPtr(playlist)) {
+                        void* klass = Read<void*>(playlist, profile::ObjectClass);
+                        void* mp = klass ? FindChildProp(klass, "MaxPlayers") : nullptr;
+                        if (mp && Read<int>(mp, profile::PropElementSize) == 4) {
+                            int v = Read<int>(GetField(playlist, mp));
+                            if (v >= 1 && v <= 200) lobby = v;
+                        }
+                    }
+                }
+                if (lobby < 2) lobby = 100;
+                Write<int>(GetField(session.state, plProp), 0, lobby);
                 Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
                 if (n.ok()) n.run(session.state);
-                LOG("[MatchState] PlayersLeft=1 + OnRep (was %d)", cur);
+                session.sim_players_left = lobby;
+                LOG("[MatchState] PlayersLeft=%d (virtual solo lobby) + OnRep (was %d)", lobby, cur);
             }
         }
         leftDone = true;
@@ -7168,6 +7325,508 @@ void Athena::SetupMatchState() {
     session.match_state_ready = aliveDone && leftDone;
     if (session.match_state_ready) LOG("[MatchState] ✅ ready (alive + playersleft)");
 }
+
+// ============================================================================
+// [G17-a] MISSING CITIES — Erbium FortGameMode.cpp parity (UE4.27+):
+//
+//   if (VersionInfo.EngineVersion >= 4.27 && floor(FortniteVersion) != 20) {
+//       auto MeshNetworkSubsystem = TUObjectArray::FindFirstObject("MeshNetworkSubsystem");
+//       if (MeshNetworkSubsystem)
+//           *(uint8_t*)(MeshNetworkSubsystem + GetOffset("NodeType")) = 2;
+//   }
+//
+// Chapter 3+ geometry (whole POIs, city buildings) streams through the mesh
+// network. NodeType selects the streaming mode; a standalone client world
+// sits in a client node type that waits for server-driven mesh data that
+// never arrives — distant POIs never materialise ("some cities are missing").
+// NodeType 2 (Erbium's standalone value) makes the subsystem self-sufficient:
+// every mesh loads locally exactly like the Erbium game server does it.
+// v20 is skipped by Erbium ("does some weird stuff") — 21.30 takes the fix.
+// ============================================================================
+void Athena::FixMeshNetwork() {
+    if (session.mesh_network_fixed || !session.world) return;
+    GObjects_t* go = GObjectArray();
+    if (!go) return;
+    void* classClass = FindObj("/Script/CoreUObject.Class");
+    void* subsystem = nullptr;
+    for (int32 i = 0; i < go->NumElements; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o)) continue;
+        if (classClass && IsA(o, classClass)) continue;   // skip the UClass object itself
+        if (ObjName(o) != "MeshNetworkSubsystem") continue;
+        subsystem = o;
+        break;
+    }
+    if (!subsystem) {
+        LOG("[MeshNet] subsystem not present yet (attempt %d)", session.mesh_network_attempts);
+        return;
+    }
+    void* klass = Read<void*>(subsystem, profile::ObjectClass);
+    int sz = 0;
+    void* nt = klass ? FindChildProp(klass, "NodeType", &sz) : nullptr;
+    if (!nt || sz != 1) {
+        LOG("[MeshNet] NodeType property not found — stopping (feature off)");
+        session.mesh_network_fixed = true;   // cannot act; do not retry forever
+        return;
+    }
+    int off = Read<int>(nt, profile::PropOffset);
+    if (off < 0 || off > 0x8000) { session.mesh_network_fixed = true; return; }
+    uint8_t old = Read<uint8_t>(subsystem, (size_t)off);
+    if (old == 2) {
+        LOG("[MeshNet] NodeType already 2 (self-sufficient)");
+        session.mesh_network_fixed = true;
+        return;
+    }
+    Write<uint8_t>(subsystem, (size_t)off, 2);
+    session.mesh_network_fixed = true;
+    LOG("[MeshNet] ✅ NodeType %u → 2 (Erbium 4.27+ parity — POI mesh streaming self-sufficient)",
+        (unsigned)old);
+}
+
+void Athena::TickMeshNetwork() {
+    if (session.mesh_network_fixed) return;
+    static double last = 0;
+    double now = Monotonic();
+    if (now - last < 15.0) return;
+    last = now;
+    if (++session.mesh_network_attempts > 10) {
+        session.mesh_network_fixed = true;   // stop the window
+        LOG("[MeshNet] window closed after 10 attempts");
+        return;
+    }
+    FixMeshNetwork();
+}
+
+// ============================================================================
+// [G17-a] Erbium StreamAdditionalPlaylistLevels parity. The playlist carries
+// extra levels (AdditionalLevels / server-only / shared-asset groups) that a
+// real server streams in at match start — standalone nobody does, so any POI
+// content shipped in those sublevels never appears. Erbium prefers the native
+// StartStreamingAdditionalPlaylistLevel (string-scanned); we use the SAME
+// public fallback Erbium ships for builds without it:
+// ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr, driven entirely
+// through reflection (element stride from the array property, soft-pointer
+// bytes handed to the UFunction untouched).
+// ============================================================================
+void Athena::StreamPlaylistLevels() {
+    if (session.playlist_levels_done || !session.state || !session.world) return;
+    session.playlist_levels_done = true;   // one-shot regardless of outcome
+    // Resolve the playlist (Erbium: OverridePlaylist ?: BasePlaylist).
+    // CurrentPlaylistInfo is an EMBEDDED struct — data pointer first, then
+    // the playlist object pointers live inside it.
+    void* playlist = nullptr;
+    {
+        void* infoProp = GetProp("/Script/FortniteGame.FortGameStateAthena.CurrentPlaylistInfo");
+        void* info = infoProp ? GetField(session.state, infoProp) : nullptr;
+        if (info && !IsBadPtr(info)) {
+            playlist = GetObjField(info, "/Script/FortniteGame.PlaylistPropertyArray.OverridePlaylist");
+            if (!playlist || IsBadPtr(playlist))
+                playlist = GetObjField(info, "/Script/FortniteGame.PlaylistPropertyArray.BasePlaylist");
+        }
+        if (!playlist || IsBadPtr(playlist))
+            playlist = FindObj("/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo");
+    }
+    if (!playlist || IsBadPtr(playlist)) { LOG("[PlaylistLevels] no playlist resolved"); return; }
+    int streamed = 0;
+    // Streams a TSoftObjectPtr<UWorld> array off an owner object.
+    auto streamArray = [&](void* owner, const char* propPath) {
+        if (!owner || IsBadPtr(owner)) return;
+        void* prop = GetProp(propPath);
+        if (!prop) return;
+        int stride = Read<int>(prop, profile::PropElementSize);
+        Array arr = Read<Array>(GetField(owner, prop));
+        if (!arr.Data || arr.Count <= 0 || arr.Count > 64) return;
+        if (stride < 0x20 || stride > 0x40) return;   // TSoftObjectPtr sanity
+        for (int i = 0; i < arr.Count; ++i) {
+            uint8_t* elem = (uint8_t*)arr.Data + (size_t)i * stride;
+            if (!IsReadable(elem, (size_t)stride)) continue;
+            bool any = false;
+            for (int b = 0; b < stride && !any; ++b) any = elem[b] != 0;
+            if (!any) continue;                        // empty slot
+            Call load("/Script/Engine.LevelStreamingDynamic.LoadLevelInstanceBySoftObjectPtr");
+            if (!load.ok()) return;
+            Vector loc{0.0, 0.0, 0.0};
+            Rotator rot{0.0, 0.0, 0.0};
+            bool success = false;
+            FStringNative emptyName{nullptr, 0, 0};
+            bool bound = load.set("WorldContextObject", session.world);
+            bound = load.set_bytes("Level", elem, stride) && bound;
+            bound = load.set("Location", loc) && bound;
+            bound = load.set("Rotation", rot) && bound;
+            // bOutSuccess is a bool* OUT param — the parmbuffer slot holds the
+            // pointer the native dereferences. Bind by reflected size: 8 =
+            // pointer slot (hand it our bool's address), 1 = by-value variant.
+            bool outIsPointer = load.param_size("bOutSuccess") == 8;
+            if (outIsPointer)
+                bound = load.set("bOutSuccess", (void*)&success) && bound;
+            else {
+                bool bv = false;
+                bound = load.set("bOutSuccess", bv) && bound;
+            }
+            bound = load.set("OptionalLevelNameOverride", emptyName) && bound;
+            if (bound && load.run(FindObj("/Script/Engine.Default__LevelStreamingDynamic"))) {
+                bool okLevel = outIsPointer ? success : false;
+                if (!outIsPointer) {
+                    void* slot = load.param_slot("bOutSuccess");
+                    if (slot) okLevel = Read<uint8_t>(slot) != 0;
+                }
+                if (okLevel) ++streamed;
+            }
+        }
+    };
+    streamArray(playlist, "/Script/FortniteGame.FortPlaylistAthena.AdditionalLevels");
+    streamArray(playlist, "/Script/FortniteGame.FortPlaylistAthena.AdditionalLevelsServerOnly");
+    // Shared asset group: SharedAssetsToLoad[] objects each carry SharedAdditionalLevels.
+    {
+        void* group = GetObjField(playlist, "/Script/FortniteGame.FortPlaylistAthena.SharedAssetGroup");
+        if (group && !IsBadPtr(group)) {
+            void* listProp = GetProp("/Script/FortniteGame.FortSharedAssetGroup.SharedAssetsToLoad");
+            if (listProp) {
+                Array assets = Read<Array>(GetField(group, listProp));
+                if (assets.Data && assets.Count > 0 && assets.Count <= 64) {
+                    for (int i = 0; i < assets.Count; ++i) {
+                        void* asset = Read<void*>(assets.Data, (size_t)i * 8);
+                        if (!asset || IsBadPtr(asset)) continue;
+                        streamArray(asset, "/Script/FortniteGame.FortSharedAssetDatum.SharedAdditionalLevels");
+                    }
+                }
+            }
+        }
+    }
+    LOG("[PlaylistLevels] %d additional playlist levels streamed (Erbium parity)", streamed);
+}
+
+// ============================================================================
+// [G17-c] DEATH WATCH
+// ============================================================================
+// [G17-c] 0.5s health poll — the client predicts damage into its local
+// attribute set, but death itself is a server decision. With no server the
+// pawn sits at 0 HP forever ("player stays standing after death"). The
+// watcher is that missing server: on the health → 0 EDGE we run the full
+// Erbium server death flow.
+void Athena::TickDeathWatch() {
+    if (!session.finalized || session.death_handled || session.win_handled) return;
+    if (!session.pawn || IsBadPtr(session.pawn)) return;
+    double now = Monotonic();
+    if (now - session.last_health_poll < 0.5) return;
+    session.last_health_poll = now;
+    float hp = PawnHealth(session.pawn);
+    if (hp < 0.0f) return;                    // accessor not ready — no opinion
+    if (hp > 0.01f) {
+        session.last_known_health = hp;       // observed ALIVE — arm the edge detector
+        session.death_zero_streak = 0;
+        return;
+    }
+    // hp == 0. Only a REAL alive→dead transition fires the flow:
+    //  • we must have observed a positive health at least once (a pawn whose
+    //    attributes never initialised reads 0 forever — that is not a death);
+    //  • two consecutive zero polls (1 s) debounce transient reads.
+    if (session.last_known_health <= 0.01f) return;
+    if (++session.death_zero_streak < 2) return;
+    HandlePlayerDeath(false);
+}
+
+// ============================================================================
+// [G17-c] HandlePlayerDeath — Erbium AFortPlayerControllerAthena::ClientOn-
+// PawnDied server-side parity. Erbium HOOKS the native client RPC to inject
+// its logic around the original; our standalone world never dispatches the
+// RPC at all, so we ARE the server: same order, same writes, and finally the
+// client RPC body itself runs locally through ProcessEvent (client RPCs fall
+// through to local execution on a non-authority actor — the same mechanism
+// every ClientXxx call in this file already relies on).
+// ============================================================================
+void Athena::HandlePlayerDeath(bool forced) {
+    if (session.death_handled || !session.finalized || !session.controller) return;
+    session.death_handled = true;   // one-shot: re-entry is impossible
+    LOG("[Death] %s — running Erbium server death flow",
+        forced ? "forced (era.die)" : "health reached 0");
+    Vector loc{};
+    if (session.pawn && !ActorLocation(session.pawn, loc)) loc = Vector{};
+
+    // ---- 1) Drop every droppable item as a pickup (Erbium inventory drop) --
+    int dropped = 0;
+    {
+        void* invProp       = GetProp("/Script/FortniteGame.FortInventory.Inventory");
+        void* instProp      = GetProp("/Script/FortniteGame.FortItemList.ItemInstances");
+        void* entryProp     = GetProp("/Script/FortniteGame.FortItemList.ReplicatedEntries");
+        void* itemEntryProp = GetProp("/Script/FortniteGame.FortWorldItem.ItemEntry");
+        void* countProp     = GetProp("/Script/FortniteGame.FortItemEntry.Count");
+        void* levelProp     = GetProp("/Script/FortniteGame.FortItemEntry.Level");
+        void* ammoProp      = GetProp("/Script/FortniteGame.FortItemEntry.LoadedAmmo");
+        if (session.inventory && invProp && instProp && entryProp && itemEntryProp && countProp) {
+            void* list = GetField(session.inventory, invProp);
+            if (list && !IsBadPtr(list)) {
+                struct DropRef { void* def; int count; int level; int ammo; };
+                std::vector<DropRef> drops;
+                Array instances = Read<Array>(GetField(list, instProp));
+                for (int i = 0; instances.Data && i < instances.Count && i < 128; ++i) {
+                    void* inst = Read<void*>(instances.Data, (size_t)i * 8);
+                    if (!inst || IsBadPtr(inst)) continue;
+                    // Erbium gate: item must be droppable.
+                    Call cbd("/Script/FortniteGame.FortItem.CanBeDropped");
+                    if (cbd.ok() && cbd.run(inst) && !cbd.result<bool>()) continue;
+                    void* def = ItemDefinitionOf(inst);
+                    if (!def || IsBadPtr(def)) continue;
+                    void* entry = GetField(inst, itemEntryProp);
+                    if (!entry || IsBadPtr(entry)) continue;
+                    int count = Read<int>(GetField(entry, countProp));
+                    if (count <= 0) continue;
+                    int lvl = levelProp ? Read<int>(GetField(entry, levelProp)) : -1;
+                    int ammo = ammoProp ? Read<int>(GetField(entry, ammoProp)) : -1;
+                    if (lvl < 0) lvl = -1;
+                    if (ammo < 0) ammo = -1;
+                    drops.push_back({def, count, lvl, ammo});
+                }
+                for (auto& d : drops) {
+                    Vector tossLoc = loc;
+                    tossLoc.Z += 60.0;
+                    SpawnPickup(d.def, d.count, tossLoc, 1 /*Player*/, 10 /*TossedByPlayer*/, true, d.level, d.ammo);
+                    ++dropped;
+                }
+                // The real server removes the dead player's inventory — mirror
+                // it (Count=0 hides the entries from GC marking and the HUD).
+                if (!drops.empty()) {
+                    Array instances2 = Read<Array>(GetField(list, instProp));
+                    Array replicated = Read<Array>(GetField(list, entryProp));
+                    Array empty{};
+                    if (instances2.Count > 0 && instances2.Count < 4096) Write<Array>(GetField(list, instProp), 0, empty);
+                    if (replicated.Count > 0 && replicated.Count < 4096) Write<Array>(GetField(list, entryProp), 0, empty);
+                    InventoryUpdate();
+                }
+            }
+        }
+    }
+
+    // ---- 2) PlayerState DeathInfo + PawnDeathLocation (Erbium 1:1) --------
+    if (session.player_state && !IsBadPtr(session.player_state)) {
+        {
+            void* pdlProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.PawnDeathLocation");
+            if (pdlProp && Read<int>(pdlProp, profile::PropElementSize) == 24)
+                Write<Vector>(GetField(session.player_state, pdlProp), 0, loc);
+        }
+        void* diProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.DeathInfo");
+        if (diProp) {
+            void* di = GetField(session.player_state, diProp);
+            void* diStruct = FindScriptStructNamed("DeathInfo", "Killer", "bInitialized");
+            if (di && !IsBadPtr(di) && diStruct && !IsBadPtr(diStruct)) {
+                auto sub = [&](const char* name) -> int {
+                    void* p = FindChildProp(diStruct, name);
+                    return p ? Read<int>(p, profile::PropOffset) : -1;
+                };
+                int diSize = Read<int>(diProp, profile::PropElementSize);
+                if (diSize > 0 && diSize <= 256) memset(di, 0, (size_t)diSize);
+                int off;
+                if ((off = sub("bDBNO")) >= 0)          Write<uint8_t>(di, (size_t)off, 0);
+                if ((off = sub("DeathLocation")) >= 0)  Write<Vector>(di, (size_t)off, loc);
+                if ((off = sub("DeathCause")) >= 0)     Write<uint8_t>(di, (size_t)off, 0);
+                if ((off = sub("Distance")) >= 0)       Write<float>(di, (size_t)off, 0.0f);
+                if ((off = sub("bInitialized")) >= 0)   Write<uint8_t>(di, (size_t)off, 1);
+                // Killer / Downer / FinisherOrDowner / tags stay zeroed — the
+                // world killed us (storm/fall), not another player.
+            }
+            Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_DeathInfo");
+            if (r.ok()) r.run(session.player_state);
+        }
+    }
+
+    // ---- 3) Place = PlayersLeft BEFORE the decrement (Erbium order) -------
+    int place = 1;
+    int playersLeft = 1;
+    void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+    bool haveLeft = session.state && plProp && Read<int>(plProp, profile::PropElementSize) == 4;
+    if (haveLeft) {
+        playersLeft = Read<int>(GetField(session.state, plProp));
+        if (playersLeft < 1) playersLeft = 1;
+        place = playersLeft;
+    }
+    if (session.player_state && !IsBadPtr(session.player_state)) {
+        void* placeProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.Place");
+        if (placeProp && Read<int>(placeProp, profile::PropElementSize) == 4) {
+            Write<int>(GetField(session.player_state, placeProp), 0, place);
+            Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_Place");
+            if (r.ok()) r.run(session.player_state);
+        }
+    }
+
+    // ---- 4) Freeze movement (Erbium v15+: DisableMovement) ----------------
+    if (session.pawn && !IsBadPtr(session.pawn)) {
+        void* movement = GetObjField(session.pawn, "/Script/Engine.Character.CharacterMovement");
+        if (movement && !IsBadPtr(movement)) {
+            Call d("/Script/Engine.CharacterMovementComponent.DisableMovement");
+            if (d.ok()) d.run(movement);
+        }
+    }
+
+    // ---- 5) The client RPC body — death UI / camera / spectate switch -----
+    {
+        Call c("/Script/FortniteGame.FortPlayerControllerZone.ClientOnPawnDied");
+        if (c.ok()) {
+            int psize = c.param_size("DeathReport");
+            if (psize > 0 && psize <= 512) {
+                std::vector<uint8_t> rep((size_t)psize, 0);
+                // Zeroed report = "killed by the world" (no killer player
+                // state, no causer) — the native body handles storm deaths
+                // with exactly this shape.
+                if (!c.set_bytes("DeathReport", rep.data(), psize))
+                    c.bind_at(0, rep.data(), psize);
+            }
+            c.run(session.controller);
+        }
+    }
+
+    // ---- 6) Pawn dying state (ragdoll/death anim attempt) -----------------
+    if (session.pawn && !IsBadPtr(session.pawn)) {
+        Call h("/Script/FortniteGame.FortPawn.HandleIsDying");
+        if (h.ok()) h.run(session.pawn);
+    }
+
+    // ---- 7) PlayersLeft-- + OnRep (native RemoveFromAlivePlayers parity) --
+    if (haveLeft) {
+        int left = playersLeft - 1;
+        if (left < 0) left = 0;
+        Write<int>(GetField(session.state, plProp), 0, left);
+        Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+        if (n.ok()) n.run(session.state);
+        session.sim_players_left = left;
+    }
+    LOG("[Death] ✅ complete: place=%d playersLeft=%d itemsDropped=%d", place, playersLeft - 1, dropped);
+}
+
+// ============================================================================
+// [G17-d] SOLO MATCH SIMULATION — paced virtual eliminations so the alive
+// counter runs a real BR curve and the victory flow is REACHABLE (with zero
+// opponents Erbium's server would end the match the moment you spawn).
+// Pacing: fast early game, slow top-10 — a full lobby drains in ~18 minutes.
+// ============================================================================
+void Athena::TickMatchSim() {
+    if (!session.finalized || !session.state) return;
+    void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+    if (!plProp || Read<int>(plProp, profile::PropElementSize) != 4) return;
+    double now = Monotonic();
+    if (now - session.last_sim_poll < 1.0) return;
+    session.last_sim_poll = now;
+    int left = Read<int>(GetField(session.state, plProp));
+    if (!session.sim_started) {
+        if (!session.match_state_ready) return;   // waits for the seeding pass
+        session.sim_players_left = left;
+        session.sim_started = true;
+        session.sim_next_elim = now + 8.0 + (double)(rand() % 7);
+        LOG("[MatchSim] seeded: %d alive — virtual elimination curve armed", left);
+        return;
+    }
+    session.sim_players_left = left;
+    if (session.death_handled || session.win_handled) return;   // game over — freeze
+    if (left <= 1) { HandleVictory(); return; }
+    if (now < session.sim_next_elim) return;
+    int newLeft = left - 1;
+    Write<int>(GetField(session.state, plProp), 0, newLeft);
+    Call n("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+    if (n.ok()) n.run(session.state);
+    session.sim_players_left = newLeft;
+    ++session.sim_elim_total;
+    double base;
+    if (newLeft > 60)      base = 3.0 + (double)(rand() % 4);    // 3-6s
+    else if (newLeft > 30) base = 6.0 + (double)(rand() % 7);    // 6-12s
+    else if (newLeft > 10) base = 12.0 + (double)(rand() % 14);  // 12-25s
+    else if (newLeft > 3)  base = 25.0 + (double)(rand() % 21);  // 25-45s
+    else                    base = 45.0 + (double)(rand() % 31); // 45-75s
+    session.sim_next_elim = now + base;
+    if (newLeft % 10 == 0 || newLeft <= 5)
+        LOG("[MatchSim] alive=%d (virtual elims=%d)", newLeft, session.sim_elim_total);
+    if (newLeft <= 1) HandleVictory();
+}
+
+// ============================================================================
+// [G17-e] HandleVictory — Erbium win parity (ClientOnPawnDied lines 1262-
+// 1301): when the last opponent dies the server notifies the winner —
+//   PlayWinEffects (v16+) → ClientNotifyWon → ClientNotifyTeamWon,
+//   GameState->WinningTeam = TeamIndex + OnRep,
+//   GameState->WinningPlayerState + OnRep.
+// Our solo win trigger is the match sim reaching PlayersLeft == 1.
+// ============================================================================
+void Athena::HandleVictory() {
+    if (session.win_handled || session.death_handled) return;
+    if (!session.finalized || !session.controller) return;
+    session.win_handled = true;
+    LOG("[Victory] 🏆 last player standing — running Erbium win flow");
+    int teamIndex = 3;
+    // Place 1 + bIsAWinner (when the build still reflects it).
+    if (session.player_state && !IsBadPtr(session.player_state)) {
+        {
+            void* placeProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.Place");
+            if (placeProp && Read<int>(placeProp, profile::PropElementSize) == 4) {
+                Write<int>(GetField(session.player_state, placeProp), 0, 1);
+                Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_Place");
+                if (r.ok()) r.run(session.player_state);
+            }
+        }
+        {
+            void* wProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.bIsAWinner");
+            if (wProp) {
+                SetBool(session.player_state, "/Script/FortniteGame.FortPlayerStateAthena.bIsAWinner", true);
+                Call r("/Script/FortniteGame.FortPlayerStateAthena.OnRep_IsAWinner");
+                if (r.ok()) r.run(session.player_state);
+            }
+        }
+        {
+            void* tiProp = GetProp("/Script/FortniteGame.FortPlayerStateAthena.TeamIndex");
+            if (tiProp) {
+                int sz = Read<int>(tiProp, profile::PropElementSize);
+                if (sz == 1) teamIndex = (int)Read<uint8_t>(GetField(session.player_state, tiProp));
+                else if (sz == 4) teamIndex = Read<int>(GetField(session.player_state, tiProp));
+            }
+        }
+    }
+    if (session.state && !IsBadPtr(session.state)) {
+        void* wtProp = GetProp("/Script/FortniteGame.FortGameStateAthena.WinningTeam");
+        if (wtProp && Read<int>(wtProp, profile::PropElementSize) == 4) {
+            Write<int>(GetField(session.state, wtProp), 0, teamIndex);
+            Call r("/Script/FortniteGame.FortGameStateAthena.OnRep_WinningTeam");
+            if (r.ok()) r.run(session.state);
+        }
+        void* wpsProp = GetProp("/Script/FortniteGame.FortGameStateAthena.WinningPlayerState");
+        if (wpsProp && Read<int>(wpsProp, profile::PropElementSize) == 8 && session.player_state) {
+            Write<void*>(GetField(session.state, wpsProp), 0, session.player_state);
+            Call r("/Script/FortniteGame.FortGameStateAthena.OnRep_WinningPlayerState");
+            if (r.ok()) r.run(session.state);
+        }
+    }
+    // Erbium order: PlayWinEffects → ClientNotifyWon → ClientNotifyTeamWon.
+    void* pawn = (session.pawn && !IsBadPtr(session.pawn)) ? session.pawn : nullptr;
+    void* noWeapon = nullptr;
+    uint8_t cause = 0;
+    {
+        Call e("/Script/FortniteGame.FortPlayerControllerAthena.PlayWinEffects");
+        if (e.ok() && pawn) {
+            bool bound = e.set_any(pawn, "FinisherPawn", "Pawn", "Finisher");
+            bound = e.set_any(noWeapon, "FinishingWeapon", "Weapon") && bound;
+            bound = e.set_any(cause, "DeathCause", "Cause") && bound;
+            bool audioOnly = false;
+            bound = e.set_any(audioOnly, "bAudioOnly", "AudioOnly") && bound;
+            if (bound) e.run(session.controller);
+        }
+    }
+    {
+        Call w("/Script/FortniteGame.FortPlayerControllerAthena.ClientNotifyWon");
+        if (w.ok()) {
+            bool bound = w.set_any(pawn, "FinisherPawn", "Pawn", "Finisher");
+            bound = w.set_any(noWeapon, "FinishingWeapon", "Weapon") && bound;
+            bound = w.set_any(cause, "DeathCause", "Cause") && bound;
+            if (bound) w.run(session.controller);
+        }
+    }
+    {
+        Call t("/Script/FortniteGame.FortPlayerControllerAthena.ClientNotifyTeamWon");
+        if (t.ok()) {
+            bool bound = t.set_any(pawn, "FinisherPawn", "Pawn", "Finisher");
+            bound = t.set_any(noWeapon, "FinishingWeapon", "Weapon") && bound;
+            bound = t.set_any(cause, "DeathCause", "Cause") && bound;
+            if (bound) t.run(session.controller);
+        }
+    }
+    LOG("[Victory] ✅ banner dispatched (team=%d place=1)", teamIndex);
+}
+
 
 // [F42] Diagnostics dump — quickbar slots, inventory entries, match state.
 void Athena::DebugDump() {
@@ -7198,6 +7857,11 @@ void Athena::DebugDump() {
         void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
         if (plProp) LOG("PlayersLeft=%d", Read<int>(GetField(session.state, plProp)));
     }
+    LOG("death=%d win=%d alive=%d hp=%.0f meshnet=%d(attempts=%d) plvl=%d",
+        (int)session.death_handled, (int)session.win_handled, session.sim_players_left,
+        (session.pawn ? PawnHealth(session.pawn) : -1.0f),
+        (int)session.mesh_network_fixed, session.mesh_network_attempts,
+        (int)session.playlist_levels_done);
     LOG("=== end dump ===");
 }
 
@@ -8446,6 +9110,29 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                     if (Athena::SearchContainer(c, loc)) ++n;
                 }
                 LOG("era.loot: %d containers rolled", n);
+            }
+        } else if (normalized == "era.die" && session.world && session.finalized) {
+            // [G17-c] force the full death flow (placement, drops, death UI)
+            Athena::HandlePlayerDeath(true);
+        } else if (normalized == "era.win" && session.world && session.finalized) {
+            // [G17-e] force the Victory Royale banner
+            Athena::HandleVictory();
+        } else if (normalized.rfind("era.players ", 0) == 0 && session.world) {
+            // [G17-d] virtual lobby size override (works before AND during a match)
+            int n = 0;
+            if (sscanf(normalized.c_str(), "era.players %d", &n) == 1 && n >= 1 && n <= 200) {
+                session.sim_lobby_size = n;
+                if (session.state && session.finalized && !session.death_handled && !session.win_handled) {
+                    void* plProp = GetProp("/Script/FortniteGame.FortGameStateAthena.PlayersLeft");
+                    if (plProp && Read<int>(plProp, profile::PropElementSize) == 4) {
+                        Write<int>(GetField(session.state, plProp), 0, n);
+                        Call r("/Script/FortniteGame.FortGameStateAthena.OnRep_PlayersLeft");
+                        if (r.ok()) r.run(session.state);
+                        session.sim_players_left = n;
+                        session.sim_next_elim = Monotonic() + 3.0;
+                    }
+                }
+                LOG("era.players: virtual lobby = %d", n);
             }
         } else if (normalized.rfind("era.spawn ", 0) == 0 && session.world && session.pawn) {
             char path[512]{};
