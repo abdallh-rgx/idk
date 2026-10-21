@@ -641,6 +641,58 @@
 //        on, when reflected) and a "FlushLevelStreaming" console pass.
 //        StreamPlaylistLevels now logs the resolved playlist name + the size
 //        of every levels array it inspects.
+//  [G23] ROUND-10 CRASH + UNIVERSAL UFUNCTION GUARD (the log died between
+//        "[WP] StreamingLevels: 993" and part B's first line — and loot never
+//        built, vehicles never retried, meshnet never resolved, because the
+//        crash killed the FIRST finalized tick before those tickers ran):
+//        (a) Call::run now dispatches orig_PE under the fault guard — EVERY
+//            UFunction call in the module (vehicle retries, WP activation,
+//            loot destroy, meshnet, QB updates, death/victory steps) faults
+//            into the guard with the function NAMED in the log instead of
+//            killing the process;
+//        (b) RunGuarded is now NESTABLE — depth counter: only the outermost
+//            guard installs the recovery point, nested guards pass through
+//            (a fault unwinds to the outermost scope which reports it);
+//        (c) DiagnoseWorldPartition: parts A/B/C each run in their own guard;
+//            part B's memory scan no longer calls ObjName() on arbitrary
+//            readable candidates (a garbage FName index walked GNames out of
+//            bounds — THE round-10 crash) — the candidate's class pointer is
+//            compared against the real UWorldPartition class object instead
+//            (zero native name calls on untrusted memory); part A also logs
+//            the streaming-state split (wantLoad / wantVisible / haveLoaded-
+//            Level) — the "holes where buildings should be" evidence;
+//        (d) ForceSublevels: the round-10 log proved StreamingLevels is EMPTY
+//            at ~15 s but holds 993 WP cell streamers by ~30 s — the old
+//            "sublevel_passes = 100" permanent quit on empty was a bug. WP
+//            maps (count > 128) now force bShouldBeVisible ONLY on streamers
+//            that already hold a loaded level (NEVER bShouldBeLoaded on the
+//            whole cell set — that would load the entire map = OOM kill);
+//            classic maps (≤ 128) keep the loaded+visible force;
+//        (e) bIsStreamingSource + FlushLevelStreaming extracted from the WP
+//            diagnostic into TickStreamingSources (4 passes × 30 s) — on
+//            round 10 the diag crashed BEFORE that block ever ran, so the
+//            pawn was never a WP streaming source and cells never streamed
+//            around the player;
+//        (f) flo::Drain: the spawner K2_DestroyActor moved INSIDE the guarded
+//            scope (was the last unguarded UFunction dispatch in the drain).
+//  [G24] VOID GUARD — "fell through a hole where the building should be and
+//        died at the bottom of the map": TickVoidGuard tracks the last
+//        grounded position (sane terrain band, skydive altitudes excluded)
+//        and teleports the pawn back above it when it falls below the map
+//        floor (Z < -2500, 6 s cooldown, loud log); the third rescue re-arms
+//        the streaming-source passes and flushes streaming.
+//  [G25] GAS NATIVE CONVENTION (round-10 evidence): conventions 1-4 faulted
+//        at garbage pcs that are the low 52 bits of a function's first eight
+//        PROLOGUE BYTES read as a pointer (indirect branch through proxy-
+//        derived data), while the nullptr-proxy convention reached REAL code
+//        at fn+0xC faulting on [proxy+8] — arg2 must be a pointer to a
+//        TScriptInterface-shaped pair {ObjectPointer@0, InterfacePointer@8}
+//        (Erbium's own GiveAbilitySet builds exactly this pair for the
+//        sibling EquipFortAbilitySet call). The matrix now leads with the
+//        pair conventions; target address confirmed correct.
+//  [G26] VICTORY CROWN (Erbium FortPlayerControllerAthena.cpp:1277-1292,
+//        v19+ 1:1): the winner receives AGID_VictoryCrown after the banner
+//        chain.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -1680,6 +1732,107 @@ static void* hook_SendRequestNow(void* Arg1, void* MCPData, int /*ContextCredent
 static bool TryInstallMcpHook();
 
 // ============================================================================
+// [G11/G13/G23] NATIVE FAULT GUARD — scoped SIGSEGV/SIGBUS/SIGILL handler
+// (sigsetjmp/siglongjmp with old-handler chaining). A fault logs signal+PC+
+// faulting address and the caller takes its fallback instead of dying.
+// [G23-b] REENTRANCY: Call::run itself is now guarded ([G23-a] — EVERY
+// UFunction dispatch in the module goes through the guard), and many guarded
+// scopes legitimately call Call::run inside them; a single sigjmp buffer
+// would be corrupted by nesting. Depth counter: only the OUTERMOST guard
+// installs the recovery point — nested guards run their body directly, and
+// any fault longjmps to the outermost setjmp which reports "faulted".
+// Semantics preserved: one recovery point per call tree, zero buffer reuse.
+// NOTE: lives here (before class Call) because Call::run needs it; the gas
+// namespace is reopened for the native-call helpers further down.
+// ============================================================================
+namespace gas {
+static sigjmp_buf g_gasJmp;
+static volatile sig_atomic_t g_inNativeCall = 0;
+static struct sigaction g_oldSegv, g_oldBus, g_oldIll;
+static bool g_gasGuardsUp = false;
+static volatile sig_atomic_t g_faultSig = 0;
+static volatile uintptr_t g_faultPc = 0, g_faultAddr = 0;
+static volatile int g_guardDepth = 0;        // [G23-b] nested-guard depth
+static volatile bool g_gasPrevInternal = false;
+static pthread_t g_guardOwner = 0;           // [G23-b] thread that owns the recovery point
+
+static void NativeFaultForward(int sig, siginfo_t* info, void* uctx) {
+    struct sigaction* old = sig == SIGSEGV ? &g_oldSegv : (sig == SIGBUS ? &g_oldBus : &g_oldIll);
+    if (old->sa_flags & SA_SIGINFO) { old->sa_sigaction(sig, info, uctx); return; }
+    if (old->sa_handler && old->sa_handler != SIG_IGN && old->sa_handler != SIG_DFL) { old->sa_handler(sig); return; }
+    struct sigaction dflt;
+    memset(&dflt, 0, sizeof(dflt));
+    dflt.sa_handler = SIG_DFL;
+    sigaction(sig, &dflt, nullptr);
+    raise(sig);
+}
+static void NativeFaultHandler(int sig, siginfo_t* info, void* uctx) {
+    // [G23-b] THREAD-OWNED recovery: with Call::run universally guarded the
+    // protected windows are long — a fault on ANY OTHER thread (render/
+    // streaming/worker) must be forwarded to the real owner, not longjmp'd
+    // onto our game-thread buffer (that would corrupt the faulting thread).
+    if (g_inNativeCall && pthread_self() == g_guardOwner) {
+        g_faultSig  = sig;
+        g_faultPc   = uctx ? (uintptr_t)((ucontext_t*)uctx)->uc_mcontext.pc : 0;
+        g_faultAddr = info ? (uintptr_t)info->si_addr : 0;
+        g_inNativeCall = 0;
+        siglongjmp(g_gasJmp, 1);
+    }
+    NativeFaultForward(sig, info, uctx);   // not ours — chain to the previous owner
+}
+static bool InstallFaultGuards() {
+    if (g_gasGuardsUp) return true;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = NativeFaultHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    g_gasGuardsUp = sigaction(SIGSEGV, &sa, &g_oldSegv) == 0 &&
+                    sigaction(SIGBUS, &sa, &g_oldBus) == 0 &&
+                    sigaction(SIGILL, &sa, &g_oldIll) == 0;
+    return g_gasGuardsUp;
+}
+// Runs fn(args...) under the guard. Returns false when the call faulted —
+// the caller must treat the native as unusable for that call and take its
+// reflection fallback. [G23-b] nested calls are pass-through (see above).
+template <typename FnT, typename... ArgsT>
+static bool RunGuarded(const char* tag, FnT fn, ArgsT... args) {
+    if (!InstallFaultGuards()) {
+        // [G23-b] fail-open: guards cannot be installed (sigaction failed —
+        // theoretical). Run the call bare rather than disabling every UFunction
+        // dispatch in the module (the pre-G23 behavior).
+        fn(args...);
+        return true;
+    }
+    if (g_guardDepth > 0) {              // [G23-b] outer guard owns recovery
+        fn(args...);
+        return true;
+    }
+    if (sigsetjmp(g_gasJmp, 1) != 0) {
+        // Restore the exact pre-call g_internal (captured in a volatile
+        // before the call so it survives the longjmp). Blowing it to false
+        // here would punch a reentrancy hole through the outer tick Guard.
+        g_internal = g_gasPrevInternal;
+        g_guardDepth = 0;
+        g_inNativeCall = 0;
+        LOG("[%s] ⚠️ native call FAULTED — sig=%d pc=0x%llx addr=0x%llx (call abandoned, fallback continues)",
+            tag, (int)g_faultSig, (unsigned long long)g_faultPc, (unsigned long long)g_faultAddr);
+        return false;
+    }
+    g_gasPrevInternal = g_internal;
+    g_internal = true;        // engine callbacks fired during the native stay internal
+    g_inNativeCall = 1;
+    g_guardOwner = pthread_self();   // [G23-b] this thread owns the recovery point
+    g_guardDepth = 1;
+    fn(args...);
+    g_guardDepth = 0;
+    g_inNativeCall = 0;
+    g_internal = g_gasPrevInternal;
+    return true;
+}
+} // namespace gas
+
+// ============================================================================
 // CALL SYSTEM  — [F16] upgraded:
 //   • Blueprint event override resolution (event_receiver) so BP events such
 //     as BuildingActor.BlueprintOnInteract run the receiver's override
@@ -1690,6 +1843,11 @@ static bool TryInstallMcpHook();
 //     duplicate params like "Class" → "Class_0").
 //   • set_at(): positional binding for nameless native params
 //     (e.g. AFortPawn.SetMaxHealth(float)).
+//   • [G23-a] run() dispatches under the gas fault guard — a bad receiver or
+//     a wrong param shape faults into the guard (function named in the log)
+//     instead of killing the process. This single change covers EVERY tick
+//     path: vehicle retries, WP activation, loot spawner destroy, meshnet,
+//     quickbar updates, death/victory steps.
 // ============================================================================
 class Call {
     void* m_func = nullptr;
@@ -1929,8 +2087,15 @@ public:
             return false;
         }
         Guard g;
-        orig_PE(object, m_func, m_data.data());
-        return true;
+        // [G23-a] fault-guarded dispatch — the crash-class fix for every
+        // tick-driven UFunction call (vehicle/WP/loot/meshnet/QB paths).
+        bool clean = gas::RunGuarded("[Call]", [&] {
+            orig_PE(object, m_func, m_data.data());
+        });
+        if (!clean)
+            LOG("[Call] ⚠️ '%s' faulted on receiver %p — abandoned [G23]",
+                ObjName(m_func).c_str(), object);
+        return clean;
     }
 };
 
@@ -2564,6 +2729,16 @@ struct Session {
     bool  pawn_cleared = false;
     // [G22] World Partition diagnostic passes
     int   wp_diag_passes = 0;
+    // [G23-e] streaming-source forcing passes (own ticker — no longer tied
+    // to the WP diagnostic, whose part-B crash used to kill the attempt)
+    int   src_force_passes = 0;
+    // [G24] void-guard (fall-through rescue)
+    Vector last_safe_loc{};
+    bool  has_safe_loc = false;
+    Vector spawn_loc{};
+    bool  has_spawn_loc = false;
+    int   void_rescues = 0;
+    double last_void_rescue = 0;
 } session;
 
 static double Monotonic() {
@@ -2709,6 +2884,8 @@ namespace Athena {
     void* NearestVehicle(float radius);                    // [G19-b] HUD-button fallback target
     void DispatchHudInteract();                            // [G21] HUD interact button → nearest target dispatch
     void DiagnoseWorldPartition();                         // [G22] WP probes + activation attempts
+    void TickStreamingSources();                            // [G23-e] bIsStreamingSource forcing + FlushLevelStreaming
+    void TickVoidGuard();                                   // [G24] fall-through rescue (below-map teleport)
     void ForceSublevels();                                 // [G19-d] sublevel geometry (missing cities)
     void ReturnToLobby(void* world);   // [F24]
     void TeleportToReticle();          // [F24]
@@ -2982,84 +3159,9 @@ static void RediscoverMissing() {
 // Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
 static int CountActivatableSpecs(void* asc = nullptr);
 
-// [G11/G13] NATIVE FAULT GUARD — the first guarded device run caught the
-// fault and PROVED the guard works ("native call FAULTED — sig=11 pc=fn+0x24
-// addr=0x2886b5a5ee1984"), and the reflection fallback then delivered all
-// 42 abilities through EquipFortAbilitySet. Root cause of THAT fault is now
-// known: the old backscan resolved a wrong function start (see arm::
-// BackscanPrologue v2). The guard stays as the permanent safety net for every
-// scanner-resolved native call: scoped SIGSEGV/SIGBUS/SIGILL handler
-// (sigsetjmp/siglongjmp with old-handler chaining). A fault logs
-// signal+PC+faulting address and the caller takes its reflection fallback
-// instead of dying.
-static sigjmp_buf g_gasJmp;
-static volatile sig_atomic_t g_inNativeCall = 0;
-static struct sigaction g_oldSegv, g_oldBus, g_oldIll;
-static bool g_gasGuardsUp = false;
-static volatile sig_atomic_t g_faultSig = 0;
-static volatile uintptr_t g_faultPc = 0, g_faultAddr = 0;
-
-static void NativeFaultForward(int sig, siginfo_t* info, void* uctx) {
-    struct sigaction* old = sig == SIGSEGV ? &g_oldSegv : (sig == SIGBUS ? &g_oldBus : &g_oldIll);
-    if (old->sa_flags & SA_SIGINFO) { old->sa_sigaction(sig, info, uctx); return; }
-    if (old->sa_handler && old->sa_handler != SIG_IGN && old->sa_handler != SIG_DFL) { old->sa_handler(sig); return; }
-    struct sigaction dflt;
-    memset(&dflt, 0, sizeof(dflt));
-    dflt.sa_handler = SIG_DFL;
-    sigaction(sig, &dflt, nullptr);
-    raise(sig);
-}
-static void NativeFaultHandler(int sig, siginfo_t* info, void* uctx) {
-    if (g_inNativeCall) {
-        g_faultSig  = sig;
-        g_faultPc   = uctx ? (uintptr_t)((ucontext_t*)uctx)->uc_mcontext.pc : 0;
-        g_faultAddr = info ? (uintptr_t)info->si_addr : 0;
-        g_inNativeCall = 0;
-        siglongjmp(g_gasJmp, 1);
-    }
-    NativeFaultForward(sig, info, uctx);   // not ours — chain to the previous owner
-}
-static bool InstallFaultGuards() {
-    if (g_gasGuardsUp) return true;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = NativeFaultHandler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    g_gasGuardsUp = sigaction(SIGSEGV, &sa, &g_oldSegv) == 0 &&
-                    sigaction(SIGBUS, &sa, &g_oldBus) == 0 &&
-                    sigaction(SIGILL, &sa, &g_oldIll) == 0;
-    return g_gasGuardsUp;
-}
-// Runs fn(args...) under the guard. Returns false when the call faulted —
-// the caller must treat the native as unusable for that call and take its
-// reflection fallback. NOT reentrant (single sigjmp buffer) — call sites are
-// game-thread and sequential, never nested.
-static volatile bool g_gasPrevInternal = false;
-// [G13] Variadic form — the guard now wraps every scanner-resolved native
-// call (GAS init, ApplyCharacterCustomization, GiveAbilityAndActivateOnce).
-// Call sites are game-thread and SEQUENTIAL (never inside each other); the
-// single sigjmp buffer forbids nesting, which no call site does.
-template <typename FnT, typename... ArgsT>
-static bool RunGuarded(const char* tag, FnT fn, ArgsT... args) {
-    if (!InstallFaultGuards()) return false;
-    if (sigsetjmp(g_gasJmp, 1) != 0) {
-        // Restore the exact pre-call g_internal (captured in a volatile
-        // before the call so it survives the longjmp). Blowing it to false
-        // here would punch a reentrancy hole through the outer tick Guard.
-        g_internal = g_gasPrevInternal;
-        LOG("[%s] ⚠️ native call FAULTED — sig=%d pc=0x%llx addr=0x%llx (call abandoned, fallback continues)",
-            tag, (int)g_faultSig, (unsigned long long)g_faultPc, (unsigned long long)g_faultAddr);
-        return false;
-    }
-    g_gasPrevInternal = g_internal;
-    g_internal = true;        // engine callbacks fired during the native stay internal
-    g_inNativeCall = 1;
-    fn(args...);
-    g_inNativeCall = 0;
-    g_internal = g_gasPrevInternal;
-    return true;
-}
+// [G23] The fault guard itself (sigjmp machinery + RunGuarded with the
+// nested-depth reentrancy fix) now lives BEFORE class Call — Call::run
+// dispatches every UFunction through it. See the [G11/G13/G23] block above.
 static void NativeInitGasCall(void* thisPtr, void* proxyArg) {
     // [G14] 8-arg prototype: the compiler materializes x2..x7 = 0 explicitly.
     // The twin device faults (identical addr, two DIFFERENT x0 values) prove
@@ -3083,24 +3185,29 @@ static void NativeGaaCall(void* asc, void* outHandle, void* spec) {
 // Abilities resolves the pawn/PlayerState DefaultAbilitySets from the CDOs,
 // builds specs WITH their declared InputIDs (GAS-driven anims), and delivers
 // them through the native GiveAbility chain — never a hand-rebuilt spec.
-// [G14] Calling conventions — the third device run settled it: BOTH attempts
-// (interface pointer AND raw PlayerState as x0) faulted at the SAME address
-// (0x2886b5a5ee198c, +8 vs the previous run) with different x0 values, so the
-// faulting load at target+0xC reads a STALE ARGUMENT REGISTER, not our
-// this-pointer. The native's own validation string ("InitializePlayerGameplay-
-// Abilities with invalid P[layerStateOrProxy]") names its second parameter,
-// which this 21.30 Android variant dereferences before anything else.
-// Every attempt now goes through the 8-arg zeroed prototype (x2..x7 = 0) with
-// a real proxy in x1; nullptr trips the function's own null-guard branch (it
-// logs and returns). Matrix, all fault-guarded, first non-faulting convention
-// wins and is remembered for the session:
-//   1. ps-interface + PlayerStateOrProxy (Erbium's receiver, proxy filled in)
-//   2. raw PlayerState + PlayerStateOrProxy (plain member convention)
-//   3. pawn-interface + PlayerStateOrProxy
-//   4. ps-interface + pawn (in case "P" means the pawn)
-//   5. ps-interface + nullptr (guard branch — runs clean, grants nothing)
+// [G25] CONVENTION ANALYSIS (round-10 log): conventions 1–4 all faulted at
+// garbage pcs (0x14ff4a9bd57f6 / 0x157f6f81c0ff7 — the low-52-bits of a
+// function's first 8 PROLOGUE BYTES read as a pointer: an indirect branch
+// through data loaded from the PROXY), while convention 5 (nullptr proxy)
+// reached REAL code at fn+0xC faulting on [proxy+8]. That means:
+//   • the target address is CORRECT (fn+0x5E9A304 executes),
+//   • arg2 must be a POINTER TO A STRUCT with a pointer at +8 — the exact
+//     shape of Erbium's TScriptInterface<IFortAbilitySystemInterface>
+//     { UObject* ObjectPointer@0; void* InterfacePointer@8 } (see their
+//     AbilitySystemComponent.cpp GiveAbilitySet — they build this pair for
+//     the sibling EquipFortAbilitySet call).
+// The round-10 matrix therefore leads with TScriptInterface-shaped pairs:
+//   1. ps-iface + &pair{PlayerState, ps-iface}   (Erbium GiveAbilitySet shape)
+//   2. ps-iface + &pair{ps-iface, PlayerState}   (swapped pair)
+//   3. ps-iface + PlayerState (old conv — kept for continuity)
+//   4. playerstate + PlayerState (plain member convention)
+//   5. pawn-iface + PlayerState
+//   6. ps-iface + pawn
+//   7. ps-iface + nullptr (guard branch — clean, grants nothing)
+// All fault-guarded; first non-faulting convention wins and is remembered.
 // gas_native_failed is only set when EVERY self-valid attempt faulted.
 static int gas_working_conv = -1;      // [G14] remembered non-faulting convention
+struct SIShapeProxy { void* obj; void* iface; };   // [G25] TScriptInterface pair
 static bool NativeInitializePlayerGameplayAbilities() {
     if (!InitializePlayerGameplayAbilities) return false;
     if (gas_native_failed) { LOG("[GAS] native path disabled (previous fault)"); return false; }
@@ -3130,21 +3237,26 @@ static bool NativeInitializePlayerGameplayAbilities() {
     void* psAsc = GetObjField(target, "/Script/FortniteGame.FortPlayerState.AbilitySystemComponent");
     int before = CountActivatableSpecs();
     int beforePs = psAsc ? CountActivatableSpecs(psAsc) : -1;
+    // [G25] the two TScriptInterface pairs — live for the whole probe
+    SIShapeProxy pairA{ ps, psIface };      // { ObjectPointer, InterfacePointer }
+    SIShapeProxy pairB{ psIface, ps };
     struct Conv { void* self; void* proxy; const char* name; };
-    Conv convs[5] = {
+    Conv convs[7] = {
+        { psIface,   &pairA,  "ps-iface + TScriptInterface{ps,iface}" },
+        { psIface,   &pairB,  "ps-iface + TScriptInterface{iface,ps}" },
         { psIface,   ps,      "ps-iface + PlayerStateOrProxy" },
         { target,    ps,      "playerstate + PlayerStateOrProxy" },
         { pawnIface, ps,      "pawn-iface + PlayerStateOrProxy" },
         { psIface,   pawn,    "ps-iface + pawn" },
         { psIface,   nullptr, "ps-iface + nullptr" },
     };
-    int order[5] = { 0, 1, 2, 3, 4 };
-    if (gas_working_conv > 0 && gas_working_conv < 5) {
+    int order[7] = { 0, 1, 2, 3, 4, 5, 6 };
+    if (gas_working_conv > 0 && gas_working_conv < 7) {
         order[0] = gas_working_conv;
         order[gas_working_conv] = 0;
     }
     int faults = 0, ranClean = -1;
-    for (int oi = 0; oi < 5; ++oi) {
+    for (int oi = 0; oi < 7; ++oi) {
         Conv& cv = convs[order[oi]];
         if (!cv.self) continue;
         LOG("[GAS] calling native InitializePlayerGameplayAbilities(%s, this=%p, proxy=%p) — pawn specs=%d ps specs=%d",
@@ -5006,6 +5118,8 @@ bool Athena::TryInitializePlayer(void* world, void* mode, void* controller) {
                 if (std::isfinite(v.X) && std::isfinite(v.Y) && std::isfinite(v.Z)) {
                     t.Location[0] = v.X; t.Location[1] = v.Y; t.Location[2] = v.Z + 100.0;
                     haveSpawn = true;
+                    session.spawn_loc = Vector{v.X, v.Y, v.Z};   // [G24] void-guard fallback target
+                    session.has_spawn_loc = true;
                     LOG("[Init] PlayerStart at (%.0f,%.0f,%.0f)", v.X, v.Y, v.Z);
                 }
             }
@@ -5241,7 +5355,7 @@ void Athena::Tick() {
         }
         int hbSpecs = gas::CountActivatableSpecs();
         float hbHp = session.pawn ? PawnHealth(session.pawn) : -1.0f;
-        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d ever=%d qbok=%d death=%d won=%d meshnet=%d plvl=%d",
+        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d) hp=%.0f alive=%d ever=%d qbok=%d death=%d won=%d meshnet=%d plvl=%d voids=%d src=%d wpp=%d",
             (int)session.quickbars_initialized,
             (qbLink == session.quickbars ? (session.quickbars ? "ok" : "n/a") : "BAD"),
             (unsigned)hbGate, hbP, hbS,
@@ -5264,7 +5378,10 @@ void Athena::Tick() {
             (int)session.death_handled,
             (int)session.win_handled,
             (int)session.mesh_network_fixed,
-            (int)session.playlist_levels_done);
+            (int)session.playlist_levels_done,
+            session.void_rescues,          // [G24] void-guard rescues
+            session.src_force_passes,      // [G23-e] streaming-source passes
+            session.wp_diag_passes);       // [G22] WP diagnostic passes
     }
     // [F94-a] reviewer note (1): state can change after FinalizePlayer — the
     // internal 60s rate-limit makes this call free next to the heartbeat.
@@ -5315,6 +5432,8 @@ void Athena::Tick() {
         TickRealityProximity();    // [F44] reality tree proximity effect
         TickSprintDoorAssist();    // [G16-a] safe bash-through (open-only)
         TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
+        TickStreamingSources();    // [G23-e] pawn/controller as WP streaming sources (own ticker)
+        TickVoidGuard();           // [G24] fall-through rescue (below-map teleport)
         // [G22] World Partition diagnostics — 3 passes (first ~5 s after
         // finalize, then 45 s apart): what loaded, whether a WorldPartition
         // object exists, data-layer states + activation, streaming-source fix.
@@ -5386,10 +5505,37 @@ void Athena::ForceSublevels() {
         return;
     }
     Array levels = Read<Array>(GetField(session.world, levelsProp));
-    if (!levels.Data || levels.Count <= 0 || levels.Count > 256 || IsBadPtr(levels.Data)) {
-        // Not an error: World Partition maps stream by distance instead.
-        LOG("[Levels] StreamingLevels empty — World Partition drives this map's cells");
-        session.sublevel_passes = 100;   // nothing to force — stop retrying
+    if (!levels.Data || levels.Count <= 0 || levels.Count > 4096 || IsBadPtr(levels.Data)) {
+        // [G23-d] NOT an error and NOT permanent: on this build the array is
+        // empty at SetupWorld time (~15 s) and fills to ~993 WP cell streamers
+        // by ~30 s — the old "sublevel_passes = 100" early-quit was a bug
+        // (round-10 log: "StreamingLevels empty" then "[WP] StreamingLevels:
+        // 993"). Keep retrying inside the caller's pass budget.
+        LOG("[Levels] StreamingLevels empty on pass %d — WP cells may still be registering, will re-check",
+            session.sublevel_passes);
+        return;
+    }
+    if (levels.Count > 128) {
+        // [G23-d] WORLD PARTITION MAP — NEVER force bShouldBeLoaded on the
+        // whole cell set (the engine would load the entire map → OOM kill).
+        // Force VISIBILITY ONLY on streamers that already hold a loaded
+        // level: WP can leave cells loaded-but-invisible, which is exactly
+        // the "holes where buildings should be" symptom. The WP runtime
+        // keeps managing loading; newly loaded cells get their visibility
+        // forced on the next pass (30 s apart).
+        int visForced = 0, alreadyVis = 0, loaded = 0;
+        for (int i = 0; i < levels.Count; ++i) {
+            void* ls = Read<void*>(levels.Data, (size_t)i * 8);
+            if (!ls || IsBadPtr(ls) || !IsReadable(ls, 0x10)) continue;
+            void* lv = GetObjField(ls, "/Script/Engine.LevelStreaming.LoadedLevel");
+            if (!lv || IsBadPtr(lv)) continue;                    // not loaded — leave alone
+            ++loaded;
+            if (GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible")) { ++alreadyVis; continue; }
+            SetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible", true);
+            ++visForced;
+        }
+        LOG("[WP] partition map: %d streamers, %d hold loaded levels — visibility forced on %d (%d already visible, pass %d) [G23-d]",
+            (int)levels.Count, loaded, visForced, alreadyVis, session.sublevel_passes);
         return;
     }
     int changed = 0, already = 0;
@@ -7286,7 +7432,7 @@ namespace flo {
                 pending.clear();
                 return;
             }
-            bool ok = false;
+            bool ok = false, destroyedThis = false;
             {
                 Vector loc{};
                 bool clean = gas::RunGuarded("[Loot] spawner", [&] {
@@ -7297,6 +7443,12 @@ namespace flo {
                         Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
                         if (bp.ok() && bp.set("PlayerPawn", session.pawn)) ok = bp.run(spawner);
                     }
+                    // [G23-f] destroy INSIDE the same guard — the teardown is
+                    // a UFunction dispatch too and must never be an unguarded
+                    // crash window in the batch drain (Call::run is guarded
+                    // since G23-a; same-scope keeps one sigsetjmp per spawner).
+                    Call d("/Script/Engine.Actor.K2_DestroyActor");   // [F20 1:1] spawner removed after rolling
+                    if (d.ok() && d.run(spawner)) destroyedThis = true;
                 });
                 if (!clean) {
                     if (++consecutiveFaults >= 8) {
@@ -7312,8 +7464,7 @@ namespace flo {
                 }
             }
             if (ok) ++spawned; else ++failed;
-            Call d("/Script/Engine.Actor.K2_DestroyActor");   // [F20 1:1] spawner removed after rolling
-            if (d.ok() && d.run(spawner)) ++destroyed;
+            if (destroyedThis) ++destroyed;
             --budget;
             if (Monotonic() > deadline) break;
         }
@@ -8495,6 +8646,17 @@ void Athena::HandleVictory(bool onDeath) {
             if (bound) gas::RunGuarded("[Victory] ClientNotifyTeamWon", [&] { t.run(session.controller); });
         }
     }
+    // [G26] Erbium 1:1 (FortPlayerControllerAthena.cpp:1277-1292): the winner
+    // receives the Victory Crown item (v19+) — AGID_VictoryCrown.
+    {
+        void* crown = FindObj("/VictoryCrownsGameplay/Items/AGID_VictoryCrown.AGID_VictoryCrown");
+        if (crown && !IsBadPtr(crown) && session.inventory) {
+            if (GiveItem(crown, 1, -1, 0, false))
+                LOG("[Victory] 👑 Victory Crown granted (Erbium parity)");
+            else
+                LOG("[Victory] ⚠️ crown grant failed");
+        } else LOG("[Victory] crown asset not resident — skipped");
+    }
     LOG("[Victory] ✅ banner dispatched (team=%d place=1)", teamIndex);
 }
 
@@ -9077,42 +9239,70 @@ void Athena::TickBuildingLoads() {
 // World Partition map: POIs live in runtime cells that stream around
 // streaming sources (the local player). This pass logs the exact WP state
 // and makes every SAFE activation attempt available to us without the engine
-// binaries:
-//   A. World->Levels / StreamingLevels counts (what actually loaded)
+// binaries — [G23-c] each part fault-guarded, part B's scan class-verified:
+//   A. World->Levels / StreamingLevels counts + the streaming-state split
+//      (wantLoad / wantVisible / haveLoadedLevel — the holes evidence)
 //   B. the UWorldPartition object itself (reflected property, then a
-//      kernel-validated memory scan of the World) + its reflected member dump
+//      class-verified memory scan of the World — NO name calls on
+//      candidates) + its reflected member dump
 //   C. ADataLayerManager actors + per-data-layer effective state + an
 //      activation attempt through any resolvable SetDataLayer* UFunction
-//   1. bIsStreamingSource forced true on pawn+controller (the reflected flag
-//      WP's streaming-source iterator keys on, when present)
-//   2. a "FlushLevelStreaming" console pass (forces a streaming update)
+// The streaming-source forcing + FlushLevelStreaming moved to their own
+// ticker (TickStreamingSources [G23-e]) — the round-10 part-B crash used to
+// kill them before they ever ran.
 void Athena::DiagnoseWorldPartition() {
     if (!session.world || IsBadPtr(session.world)) return;
-    LOG("[WP] === World Partition diagnostic pass %d === [G22]", session.wp_diag_passes + 1);
+    LOG("[WP] === World Partition diagnostic pass %d === [G22/G23]", session.wp_diag_passes + 1);
     void* worldCls = Read<void*>(session.world, profile::ObjectClass);
     // ---- A. what is actually loaded ------------------------------------
-    if (worldCls && !IsBadPtr(worldCls)) {
-        int levelsOff = PropOffsetOn(worldCls, "Levels");
-        if (levelsOff >= 0) {
-            Array levels = Read<Array>((char*)session.world + levelsOff);
-            int named = 0;
-            for (int i = 0; levels.Data && !IsBadPtr(levels.Data) && i < levels.Count && i < 6; ++i) {
-                void* lvl = Read<void*>(levels.Data, (size_t)i * 8);
-                if (!lvl || IsBadPtr(lvl) || !IsReadable(lvl, 0x20)) continue;
-                LOG("[WP]   loaded level[%d]: %s", i, ObjName(lvl).c_str());
-                ++named;
-            }
-            LOG("[WP] Levels array: %d loaded (%d named above)", levels.Count, named);
-        } else LOG("[WP] UWorld.Levels not reflected");
-        int ssOff = PropOffsetOn(worldCls, "StreamingLevels");
-        if (ssOff >= 0) {
-            Array ss = Read<Array>((char*)session.world + ssOff);
-            LOG("[WP] StreamingLevels: %d", ss.Count);
-        } else LOG("[WP] UWorld.StreamingLevels not reflected");
-    }
+    // [G23-c] part A is fault-guarded too — a bad Levels entry must not
+    // kill the diagnostic (or the process: the whole tick follows it).
+    gas::RunGuarded("[WP] partA", [&] {
+        if (worldCls && !IsBadPtr(worldCls)) {
+            int levelsOff = PropOffsetOn(worldCls, "Levels");
+            if (levelsOff >= 0) {
+                Array levels = Read<Array>((char*)session.world + levelsOff);
+                int named = 0;
+                for (int i = 0; levels.Data && !IsBadPtr(levels.Data) && i < levels.Count && i < 6; ++i) {
+                    void* lvl = Read<void*>(levels.Data, (size_t)i * 8);
+                    if (!lvl || IsBadPtr(lvl) || !IsReadable(lvl, 0x20)) continue;
+                    LOG("[WP]   loaded level[%d]: %s", i, ObjName(lvl).c_str());
+                    ++named;
+                }
+                LOG("[WP] Levels array: %d loaded (%d named above)", levels.Count, named);
+            } else LOG("[WP] UWorld.Levels not reflected");
+            int ssOff = PropOffsetOn(worldCls, "StreamingLevels");
+            if (ssOff >= 0) {
+                Array ss = Read<Array>((char*)session.world + ssOff);
+                // [G23-c] streaming-state split — the "holes where buildings
+                // should be" diagnosis: how many streamers are flagged
+                // loaded/visible vs actually holding a loaded level.
+                int wantLoad = 0, wantVis = 0, haveLevel = 0, checked = 0;
+                for (int i = 0; ss.Data && !IsBadPtr(ss.Data) && i < ss.Count && checked < 256; ++i) {
+                    void* ls = Read<void*>(ss.Data, (size_t)i * 8);
+                    if (!ls || IsBadPtr(ls) || !IsReadable(ls, 0x10)) continue;
+                    ++checked;
+                    if (GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeLoaded")) ++wantLoad;
+                    if (GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible")) ++wantVis;
+                    void* lv = GetObjField(ls, "/Script/Engine.LevelStreaming.LoadedLevel");
+                    if (lv && !IsBadPtr(lv)) ++haveLevel;
+                }
+                LOG("[WP] StreamingLevels: %d (checked %d: wantLoad=%d wantVisible=%d haveLoadedLevel=%d)",
+                    ss.Count, checked, wantLoad, wantVis, haveLevel);
+            } else LOG("[WP] UWorld.StreamingLevels not reflected");
+        }
+    });
     // ---- B. the WorldPartition object ----------------------------------
+    // [G23-c] REWRITTEN — the round-10 crash lived here: the scan called
+    // ObjName() (native FName::ToString) on any readable candidate, and a
+    // garbage-but-readable "class" with an in-range FName index walked
+    // GNames out of bounds → unguarded SIGSEGV → process death (the log
+    // died between "StreamingLevels: 993" and part B's first line). The
+    // scan now COMPARES the candidate's class pointer against the real
+    // UWorldPartition class object — zero native name calls on candidates.
+    // Every part is fault-guarded so even a surprise fault is named + skipped.
     void* partition = nullptr;
-    {
+    gas::RunGuarded("[WP] partB", [&] {
         static const char* const kPartProps[] = {
             "/Script/Engine.World.WorldPartition", "/Script/Engine.World.Partition"
         };
@@ -9126,17 +9316,18 @@ void Athena::DiagnoseWorldPartition() {
         }
         if (partition) LOG("[WP] Partition object via reflection: %p", partition);
         if (!partition) {
-            // memory scan: any member pointer whose object's class is a
-            // WorldPartition — every dereference kernel-validated
+            void* wpClass = FindObj("/Script/Engine.WorldPartition");
+            if (!wpClass) wpClass = FindObj("/Script/Engine.WorldPartitionRuntimeHash");
             for (size_t off = 0x40; off <= 0x800 && !partition; off += 8) {
                 void* p = Read<void*>((char*)session.world + off, 0);
                 if (!p || IsBadPtr(p) || ((uintptr_t)p & 7) || !IsReadable(p, 0x20)) continue;
                 void* cls = Read<void*>(p, profile::ObjectClass);
                 if (!cls || IsBadPtr(cls) || !IsReadable(cls, 0x20)) continue;
-                std::string cn = ObjName(cls);
-                if (cn.find("WorldPartition") != std::string::npos) {
+                // [G23-c] exact class-object comparison — NO ObjName on the
+                // candidate (the round-10 crash class).
+                if (wpClass && cls == wpClass) {
                     partition = p;
-                    LOG("[WP] Partition object found via scan @ World+0x%zX: class=%s", off, cn.c_str());
+                    LOG("[WP] Partition object found via scan @ World+0x%zX (class-verified, no name calls)", off);
                 }
             }
         }
@@ -9168,10 +9359,11 @@ void Athena::DiagnoseWorldPartition() {
         } else {
             LOG("[WP] ⚠️ NO WorldPartition object found on this world — WP streaming never initialized");
         }
-    }
+    });
     // ---- C. data layers ---------------------------------------------------
+    // [G23-c] guarded + class-verified lookups only.
     int layersActivated = 0;
-    {
+    gas::RunGuarded("[WP] partC", [&] {
         void* dlmCls = FindObj("/Script/Engine.DataLayerManager");
         if (!dlmCls) LOG("[WP] DataLayerManager class not present");
         else {
@@ -9212,26 +9404,111 @@ void Athena::DiagnoseWorldPartition() {
                 }
             } else LOG("[WP] no DataLayerManager actors");
         }
-    }
-    // ---- attempts 1 & 2 ---------------------------------------------------
-    {
-        void* srcProp = GetProp("/Script/Engine.Actor.bIsStreamingSource");
-        if (srcProp) {
-            if (session.pawn) SetBool(session.pawn, "/Script/Engine.Actor.bIsStreamingSource", true);
-            if (session.controller) SetBool(session.controller, "/Script/Engine.Actor.bIsStreamingSource", true);
-            LOG("[WP] ✅ bIsStreamingSource forced on pawn+controller (reflected)");
-        } else LOG("[WP] bIsStreamingSource not reflected on this build");
-        Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
-        if (f.ok()) {
-            auto cmd = ToWide("FlushLevelStreaming");
-            FStringNative command{(TCHAR*)cmd.data(), (int32)cmd.size() + 1, (int32)cmd.size() + 1};
-            if (f.set("WorldContextObject", session.world) && f.set("Command", command) && f.set("SpecificPlayer", session.controller))
-                f.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
-            LOG("[WP] FlushLevelStreaming console pass dispatched");
-        }
-    }
+    });
     if (layersActivated > 0) LOG("[WP] ✅ %d data layers activated [G22]", layersActivated);
     ++session.wp_diag_passes;
+}
+
+// ============================================================================
+// [G23-e] STREAMING SOURCES — extracted from the WP diagnostic into its own
+// ticker. Round-10 proof it was needed: the diagnostic crashed in part B
+// BEFORE the old "attempts 1 & 2" block ever ran, so on that entire session
+// the pawn never became a World Partition streaming source — WP streamed
+// around nothing useful and the player fell through unloaded cells. The
+// reflected bIsStreamingSource flag is what the WP streaming-source iterator
+// keys on; forcing it on pawn + controller (4 passes × 30 s, idempotent) plus
+// a FlushLevelStreaming console pass gives the runtime a source at the player
+// for the whole match.
+// ============================================================================
+void Athena::TickStreamingSources() {
+    if (session.src_force_passes >= 4) return;
+    static double lastTry = 0;
+    double now = Monotonic();
+    if (session.src_force_passes > 0 && now - lastTry < 30.0) return;
+    lastTry = now;
+    ++session.src_force_passes;
+    int forced = 0;
+    void* srcProp = GetProp("/Script/Engine.Actor.bIsStreamingSource");
+    if (srcProp) {
+        if (session.pawn && PawnStillValid(session.pawn)) {
+            SetBool(session.pawn, "/Script/Engine.Actor.bIsStreamingSource", true);
+            ++forced;
+        }
+        if (session.controller) {
+            SetBool(session.controller, "/Script/Engine.Actor.bIsStreamingSource", true);
+            ++forced;
+        }
+    }
+    LOG("[WP] streaming-source pass %d/4: %d forced%s",
+        session.src_force_passes, forced,
+        srcProp ? " (pawn+controller)" : " — bIsStreamingSource not reflected");
+    Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
+    if (f.ok()) {
+        auto cmd = ToWide("FlushLevelStreaming");
+        FStringNative command{(TCHAR*)cmd.data(), (int32)cmd.size() + 1, (int32)cmd.size() + 1};
+        if (f.set("WorldContextObject", session.world) && f.set("Command", command) && f.set("SpecificPlayer", session.controller))
+            f.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
+        LOG("[WP] FlushLevelStreaming console pass dispatched");
+    }
+}
+
+// ============================================================================
+// [G24] VOID GUARD — "fell through a hole where the building should be and
+// died at the bottom of the map". The root causes (unstreamed WP cell,
+// loaded-but-invisible geometry) are being fixed at the streaming layer, but
+// the player must never lose their run to a streaming hiccup: this watch
+// records the last grounded position (sane terrain band) and teleports the
+// pawn back above it when it falls far below the map floor — loud log, 6 s
+// cooldown, and the third rescue re-arms the streaming-source passes.
+// ============================================================================
+void Athena::TickVoidGuard() {
+    if (!session.finalized || !session.pawn || session.death_handled || session.win_handled) return;
+    static double lastCheck = 0;
+    double now = Monotonic();
+    if (now - lastCheck < 0.4) return;
+    lastCheck = now;
+    if (!PawnStillValid(session.pawn)) return;
+    Vector loc{};
+    if (!ActorLocation(session.pawn, loc)) return;
+    if (loc.Z > -1000.0 && loc.Z < 3000.0) {          // grounded band (excludes skydive altitudes)
+        session.last_safe_loc = loc;
+        session.has_safe_loc = true;
+        return;
+    }
+    if (loc.Z < -2500.0 && now - session.last_void_rescue > 6.0) {
+        session.last_void_rescue = now;
+        Vector target = session.has_safe_loc ? session.last_safe_loc
+            : (session.has_spawn_loc ? session.spawn_loc : Vector{loc.X, loc.Y, 1000.0});
+        target.Z += 400.0;
+        bool done = false;
+        Call sl("/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+        if (sl.ok()) {
+            bool bSweep = false, bTeleport = true;
+            Rotator rot{};
+            sl.set("NewLocation", target);
+            sl.set("NewRotation", rot);
+            sl.set("bSweep", bSweep);
+            sl.set("bTeleport", bTeleport);
+            done = sl.run(session.pawn);
+        }
+        ++session.void_rescues;
+        LOG("[VoidGuard] 🔁 pawn below the map floor (Z=%.0f) — %s (%.0f, %.0f, %.0f) rescue #%d [G24]",
+            loc.Z, done ? "teleported to last grounded spot" : "teleport dispatch failed (will retry)",
+            target.X, target.Y, target.Z, session.void_rescues);
+        if (session.void_rescues == 3) {
+            // repeated falls — the cell under the player is not streaming in:
+            // re-arm the streaming-source pass budget and flush streaming.
+            session.src_force_passes = 0;
+            LOG("[VoidGuard] repeated falls — streaming-source passes re-armed + FlushLevelStreaming");
+            Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
+            if (f.ok()) {
+                auto cmd = ToWide("FlushLevelStreaming");
+                FStringNative command{(TCHAR*)cmd.data(), (int32)cmd.size() + 1, (int32)cmd.size() + 1};
+                if (f.set("WorldContextObject", session.world) && f.set("Command", command) && f.set("SpecificPlayer", session.controller))
+                    f.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
+            }
+        }
+    }
 }
 
 // ============================================================================
