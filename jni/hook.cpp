@@ -1,8 +1,61 @@
 // ============================================================================
-// EraCH3 — Fortnite 21.30 CL-21088273 Android  (FIXED & COMPLETED)
+// EraCH3 — Fortnite Android  (RUNTIME FUNCTION DISCOVERY BUILD — wave 13)
 // ============================================================================
-// Build ID of target libUnreal.so:
+// Build ID of the reference libUnreal.so (21.30):
 //   5b371871c152651ff2b038c01c9504c1a82de1f8
+//
+// WAVE 13 — "الاكتشاف أولاً" ([G39]-[G44]). The user's verdict on wave 12:
+//   "لا تزال تستخدم ازاحات ثابتة و ليس أثناء التشغيل اكتشف كيف تجد الدوال
+//    و اشرحها في الكود" — and it was TRUE: wave-12 built the fd function-
+//   discovery engine but NEVER WIRED IT INTO THE WORKER (fd::ResolveAll was
+//   dead code; the profile table was still the only address source; even
+//   era.functions/era.explain were never dispatched). This wave makes
+//   runtime discovery THE source of function addresses:
+//  [G39] DISCOVERY-FIRST ADJUDICATION — fd::ResolveAll() now runs on EVERY
+//        build (known or not) BEFORE the hooks install. Every function
+//        address is adjudicated between runtime evidence and the known-build
+//        table: agreement → VERIFIED(runtime=table); SELF-PROVING runtime
+//        evidence (dual string anchors, failure literals referenced from
+//        inside the found body, PE-calibrated vtable consensus, call-graph
+//        cross-links, the two-bar signature) → OVERRIDE — the RUNTIME
+//        address wins and the table entry is retired for the run; a
+//        heuristic-only guess loses to a device-verified table entry (kept,
+//        loudly). Hook targets sourced from runtime are SHAPE-validated
+//        (prologue vocabulary + frame confirmation) instead of word tables,
+//        so Tick/Exec hooks install on ANY build. era.functions prints the
+//        verdict of every address; era.explain prints the methodology.
+//  [G40] L4 DELIVERED (not just claimed): GetPC is now REALLY the engine's
+//        own object graph (World.OwningGameInstance → LocalPlayers[i] →
+//        PlayerController — three reflected reads; the old code jumped
+//        through the table RVA with NO zero guard — on unknown builds that
+//        was a jump to the ELF header), and WorldIsStandalone is REALLY
+//        World.NetMode == NM_Standalone (reflected byte). The discovered/
+//        table natives remain as fallback channels.
+//  [G41] StaticLoadClass — CALL-GRAPH CROSS-LINK discovery: the class loader
+//        is the thunk callee that CALLS the (already adjudicated)
+//        StaticLoadObject inside its window — the wrapper relationship
+//        itself is the proof. No literal, no table.
+//  [G42] QUICKBAR FAMILY FROM THE LIVE GAME — "بصمة البارَّين" (the two-bar
+//        signature): the init is the ONLY FortQuickBarsAthena vtable
+//        override that materializes BOTH reflected bar addresses
+//        (ADD Xd,Xn,#PrimaryQuickBar/#SecondaryQuickBar then BL). One scan
+//        yields the init function, the vtable SLOT (0x738 retired — read
+//        from the live vtable), and the grow helper QuickBarResize (the BL
+//        target shared by BOTH bar sites). GetItemInSlot's slot (0x6f0
+//        retired) is DECODED from the engine's own virtual dispatch:
+//        LDR [this+ClientQuickBars] → LDR [vtable] → LDR [vtable+#slot] →
+//        BLR. The QB init prologue-word memcmp is gone (adjudicated
+//        evidence replaces it); a slot mismatch now direct-calls the
+//        adjudicated address under Guard instead of skipping.
+//  [G43] THE EXPLANATION (اشرحها في الكود) — every discovery function
+//        carries a step-by-step HOW comment (the string anchor chain, the
+//        thunk ladder, the slot-diff voting, the call-graph link, the
+//        two-bar signature, the dispatch decode); era.explain prints the
+//        full methodology on device in Arabic; the fd banner documents the
+//        adjudication trust model itself.
+//  [G44] era.functions / era.explain are now DISPATCHED (they were dead
+//        commands in wave 12) and the ledger counts
+//        verified/override/discovered/fallback/missing as one summary line.
 //
 // This is the corrected version of hook.cpp. All engine-class offsets and
 // function signatures below were verified against the 21.30 MobileDumper-7
@@ -923,89 +976,108 @@ constexpr uint64_t CPF_OutParm    = 0x00000100ULL;
 constexpr uint64_t CPF_ConstParm  = 0x00000200ULL;
 constexpr uint64_t CPF_ReturnParm = 0x00000400ULL;
 
-// FFortItemEntry (21.30 struct layout — verified)
-constexpr unsigned ItemEntry_Count          = 0x0C;
-constexpr unsigned ItemEntry_ItemDefinition = 0x18;
-constexpr unsigned ItemEntry_Durability     = 0x24;
-constexpr unsigned ItemEntry_LoadedAmmo     = 0x2C;
-constexpr unsigned ItemEntry_PhantomAmmo    = 0x30;
-constexpr unsigned ItemEntry_ItemGuid       = 0x68;
-constexpr unsigned ItemEntry_TrackerGuid    = 0x78;
-constexpr unsigned ItemEntry_StateValues    = 0xD0;
+// [G33] OD — OFFSET DISCOVERY. Everything below that CAN be resolved from
+// the engine's own reflection now IS: od::ResolveAll() runs on the worker
+// thread before InstallHooks and overwrites these values with reflection
+// truth (logged per-offset). The compile-time values are ONLY the last-resort
+// fallback for a reflection miss on an unrecognized build — the [OD] report
+// (era.dumper) lists the source of every offset: reflected / discovered /
+// structural / fallback.
 
-// Fortnite classes (verified)
-constexpr unsigned FortPlayerState_HeroType            = 0x0430;
-constexpr unsigned FortPlayerState_CharacterData       = 0x0580;
-constexpr unsigned FortPlayerState_AbilitySystemComp   = 0x09F0;
-constexpr unsigned FortPlayerController_MyPlayerInfo   = 0x2088;
-constexpr unsigned FortPlayerController_ClientQuickBars= 0x1A60;
-constexpr unsigned FortPlayerController_QuickBarReady  = 0x1A68;   // byte after ClientQuickBars, checked by native GetItemInQuickbarSlot gate
-constexpr unsigned FortPlayerController_ReadyByte      = 0x0A28;   // bReadyToStartMatch bitfield byte
-constexpr unsigned FortPlayerController_ReadyBit       = 5;
-constexpr unsigned RegisteredPlayerInfo_HeroInstance   = 0x2D0;    // TempAthenaMenuHeroInstance
-constexpr unsigned FortHero_CharacterParts             = 0x238;
-constexpr unsigned FortHero_Specializations            = 0x218;
-constexpr unsigned FortPlayerPawn_bIsSkydiving         = 0x1A1D;
-constexpr unsigned FortPlayerPawn_bIsParachuteOpen     = 0x1A1E;
-constexpr unsigned FortPlayerPawn_CosmeticLoadout      = 0x2A08;
-constexpr unsigned FortPawn_CurrentWeapon              = 0x07F0;
-constexpr unsigned FortPawn_AbilitySystemComponent     = 0x1008;
-constexpr unsigned BuildingWall_bDoorOpen_Byte         = 0x0FDE;   // plain bool byte (0/1)
-constexpr unsigned PlayerPawn_Athena_Speed_Sprint      = 0x53EC;
+// FFortItemEntry — reflected: /Script/FortniteGame.FortItemEntry.*
+inline unsigned ItemEntry_Count          = 0x0C;
+inline unsigned ItemEntry_ItemDefinition = 0x18;
+inline unsigned ItemEntry_Durability     = 0x24;
+inline unsigned ItemEntry_LoadedAmmo     = 0x2C;
+inline unsigned ItemEntry_PhantomAmmo    = 0x30;
+inline unsigned ItemEntry_ItemGuid       = 0x68;
+inline unsigned ItemEntry_TrackerGuid    = 0x78;
+inline unsigned ItemEntry_StateValues    = 0xD0;
 
-// ⭐ Movement offsets (from SDK)
-constexpr unsigned FortPawn_bWantsToSlide            = 0x1030;
-constexpr unsigned FortPlayerPawn_bIsSliding_Byte    = 0x06DB;
-constexpr unsigned FortPlayerPawn_bIsSliding_Bit     = 3;
-constexpr unsigned FortPlayerPawn_bIsSurfaceSwim_Byte= 0x0770;
-constexpr unsigned FortPlayerPawn_bIsSurfaceSwim_Bit = 4;
-constexpr unsigned CharacterMovement_MovementMode    = 0x019C;
-constexpr unsigned CharacterMovement_CustomMode      = 0x019D;
+// Fortnite classes — all reflected ([G33])
+inline unsigned FortPlayerState_HeroType            = 0x0430;
+inline unsigned FortPlayerState_CharacterData       = 0x0580;
+inline unsigned FortPlayerState_AbilitySystemComp   = 0x09F0;
+inline unsigned FortPlayerController_MyPlayerInfo   = 0x2088;
+inline unsigned FortPlayerController_ClientQuickBars= 0x1A60;
+inline unsigned FortPlayerController_QuickBarReady  = 0x1A68;   // derived: ClientQuickBars+8 (od recomputes)
+inline unsigned FortPlayerController_ReadyByte      = 0x0A28;   // bReadyToStartMatch bitfield byte
+inline unsigned FortPlayerController_ReadyBit       = 5;
+inline unsigned RegisteredPlayerInfo_HeroInstance   = 0x2D0;    // TempAthenaMenuHeroInstance
+inline unsigned FortHero_CharacterParts             = 0x238;
+inline unsigned FortHero_Specializations            = 0x218;
+inline unsigned FortPlayerPawn_bIsSkydiving         = 0x1A1D;   // bitfield byte
+inline unsigned FortPlayerPawn_bIsSkydiving_Mask    = 0x01;
+inline unsigned FortPlayerPawn_bIsParachuteOpen     = 0x1A1E;
+inline unsigned FortPlayerPawn_bIsParachuteOpen_Mask= 0x01;
+inline unsigned FortPlayerPawn_CosmeticLoadout      = 0x2A08;
+inline unsigned FortPawn_CurrentWeapon              = 0x07F0;
+inline unsigned FortPawn_AbilitySystemComponent     = 0x1008;
+inline unsigned BuildingWall_bDoorOpen_Byte         = 0x0FDE;   // plain bool byte (0/1)
+inline unsigned BuildingWall_bDoorOpen_Mask         = 0x20;    // bit5 — [G33] od resolves the true mask
+inline unsigned BuildingWall_bLocalDoorOpen_Byte    = 0x0FDE;   // same pack byte
+inline unsigned BuildingWall_bLocalDoorOpen_Mask     = 0x40;    // bit6
+inline unsigned BuildingWall_bFastOpen_Byte         = 0x0FDF;   // next byte
+inline unsigned BuildingWall_bFastOpen_Mask          = 0x10;    // bit4 (Net|Transient)
+inline unsigned PlayerPawn_Athena_Speed_Sprint      = 0x53EC;
 
-// TacticalSprint (UFortPlayerControllerComponent_TacticalSprint, verified)
-constexpr unsigned TacticalSprint_Flags              = 0xC0;
-constexpr uint8_t TacticalSprint_Bit_Enabled   = 0x01;
-constexpr uint8_t TacticalSprint_Bit_WantsSprint = 0x02;
-constexpr uint8_t TacticalSprint_Bit_IsSprinting = 0x08;
+// ⭐ Movement offsets — reflected ([G33])
+inline unsigned FortPawn_bWantsToSlide            = 0x1030;
+inline unsigned FortPlayerPawn_bIsSliding_Byte    = 0x06DB;
+inline unsigned FortPlayerPawn_bIsSliding_Bit     = 3;
+inline unsigned FortPlayerPawn_bIsSurfaceSwim_Byte= 0x0770;
+inline unsigned FortPlayerPawn_bIsSurfaceSwim_Bit = 4;
+inline unsigned CharacterMovement_MovementMode    = 0x019C;
+inline unsigned CharacterMovement_CustomMode      = 0x019D;
 
-// ⭐ QuickBars (21.30 — libUnreal.so; 0 on other builds = path disabled)
+// TacticalSprint (UFortPlayerControllerComponent_TacticalSprint)
+inline unsigned TacticalSprint_Flags              = 0xC0;
+inline uint8_t TacticalSprint_Bit_Enabled   = 0x01;
+inline uint8_t TacticalSprint_Bit_WantsSprint = 0x02;
+inline uint8_t TacticalSprint_Bit_IsSprinting = 0x08;
+
+// ⭐ QuickBars (F02 reflected struct names "QuickBar"/"QuickBarSlot" — od
+// resolves every one of these from the live UScriptStructs [G33]; [G42] the
+// vtable slots are READ from the live vtables at runtime — two-bar signature
+// for the init slot, virtual-dispatch decode for GetItemInSlot — so the
+// compile-time values are LAST-RESORT fallbacks only, and fd logs the
+// verdict of each one.)
 inline uintptr_t InitializeAthenaQuickBars    = kProfiles[0].InitializeAthenaQuickBars;
-constexpr unsigned  QuickBars_VtableSlot         = 0x738;
-constexpr unsigned  QuickBars_PrimaryOffset      = 0x278;   // FQuickBar.PrimaryQuickBar
-constexpr unsigned  QuickBars_SecondaryOffset    = 0x308;   // FQuickBar.SecondaryQuickBar
-constexpr unsigned  QuickBars_CreativeOffset     = 0x398;   // FQuickBar.CreativeQuickBar
-constexpr unsigned  QuickBar_SlotsOffset         = 0x10;    // FQuickBar.Slots
-constexpr unsigned  QuickBarSlot_ItemsOffset     = 0x00;    // FQuickBarSlot.Items
-constexpr unsigned  QuickBarSlot_EnabledOffset   = 0x10;    // FQuickBarSlot.bEnabled (bit0)
-constexpr unsigned  QuickBarSlot_EnabledBit      = 0x01;
-constexpr unsigned  QuickBarSlot_OccupiedBit     = 0x08;    // bIsOccupied (bit3, same byte)
-constexpr unsigned  QuickBarSlot_SlotSize        = 0x28;
+inline unsigned   QuickBars_VtableSlot         = 0x738;   // [G42] fd re-reads from the live vtable
+inline unsigned  QuickBars_PrimaryOffset      = 0x278;   // FQuickBar.PrimaryQuickBar  [G33]
+inline unsigned  QuickBars_SecondaryOffset    = 0x308;   // FQuickBar.SecondaryQuickBar
+inline unsigned  QuickBars_CreativeOffset     = 0x398;   // FQuickBar.CreativeQuickBar
+inline unsigned  QuickBar_SlotsOffset         = 0x10;    // FQuickBar.Slots
+inline unsigned  QuickBarSlot_ItemsOffset     = 0x00;    // FQuickBarSlot.Items
+inline unsigned  QuickBarSlot_EnabledOffset   = 0x10;    // flags byte: bEnabled(bit0) | bIsOccupied(bit3)
+inline unsigned  QuickBarSlot_EnabledBit      = 0x01;
+inline unsigned  QuickBarSlot_OccupiedBit     = 0x08;
+inline unsigned  QuickBarSlot_SlotSize        = 0x28;    // sizeof(FQuickBarSlot) — struct ElementSize
 inline uintptr_t QuickBarResize               = kProfiles[0].QuickBarResize;  // [F81] engine quickbar slot resize+init (0 on other builds = guarded)
-constexpr unsigned  Controller_ClientQuickBars   = 0x1a60;
-constexpr unsigned  Controller_QuickBarReadyByte = 0x1a68;
-constexpr uintptr_t GetItemInQuickbarSlot_Gate   = 0x06673524;
-constexpr unsigned  QuickBars_VtableSlot_GetItemInSlot = 0x6f0;
-constexpr unsigned  QuickBars_CtxOwner           = 0x138;   // [F94] ctx the native init IsA-casts (0x56607ec: null/fail-cast → silent ret)
+inline unsigned  Controller_ClientQuickBars   = 0x1a60;  // reflected [G33]
+inline unsigned  Controller_QuickBarReadyByte = 0x1a68;  // derived
+inline unsigned   QuickBars_VtableSlot_GetItemInSlot = 0x6f0;  // [G42] fd decodes the engine's own dispatch
+inline unsigned  QuickBars_CtxOwner           = 0x138;   // [F94] ctx the native init IsA-casts
 
-// ⭐ Local building / reticle / touch (AFortPlayerController, verified)
-constexpr unsigned Controller_CurrentBuildableClass = 0x1898;
-constexpr unsigned Controller_BuildPreviewRotIter   = 0x1858;
-constexpr unsigned Controller_BuildPreviewMirrored  = 0x1859;
-constexpr unsigned Controller_bBuildFree            = 0x185B;
-constexpr unsigned Controller_TouchPrimaryFire      = 0x0BB8;
-constexpr unsigned Controller_PreviewSnapLoc        = 0x19B0;   // FVector (LWC)
-constexpr unsigned Controller_PreviewSnapRot        = 0x19C8;   // FRotator (LWC)
-constexpr unsigned Controller_LocationUnderReticle  = 0x24C0;
-constexpr unsigned Controller_InteractionComponent  = 0x28D8;
-constexpr unsigned Controller_CosmeticLoadoutPC     = 0x1E70;   // FFortAthenaLoadout
-constexpr unsigned AFortPickup_PrimaryEntry         = 0x02F8;
-constexpr unsigned AFortPickup_SourceFlags          = 0x0540;
-constexpr unsigned AFortPickup_SpawnSource          = 0x0541;
-constexpr unsigned AFortGameState_GamePhase         = 0x2150;
-constexpr unsigned AFortGameState_SafeZoneIndicator = 0x19A8;
-constexpr unsigned AFortGameState_PlaylistInfo      = 0x2170;   // FPlaylistPropertyArray
-constexpr unsigned EditingTool_EditActor            = 0x1020;
-constexpr unsigned Pickaxe_WeaponDefinition         = 0x0790;
+// ⭐ Local building / reticle / touch (AFortPlayerController) — reflected [G33]
+inline unsigned Controller_CurrentBuildableClass = 0x1898;
+inline unsigned Controller_BuildPreviewRotIter   = 0x1858;
+inline unsigned Controller_BuildPreviewMirrored  = 0x1859;
+inline unsigned Controller_bBuildFree            = 0x185B;
+inline unsigned Controller_TouchPrimaryFire      = 0x0BB8;
+inline unsigned Controller_PreviewSnapLoc        = 0x19B0;   // FVector (LWC)
+inline unsigned Controller_PreviewSnapRot        = 0x19C8;   // FRotator (LWC)
+inline unsigned Controller_LocationUnderReticle  = 0x24C0;
+inline unsigned Controller_InteractionComponent  = 0x28D8;
+inline unsigned Controller_CosmeticLoadoutPC     = 0x1E70;   // FFortAthenaLoadout
+inline unsigned AFortPickup_PrimaryEntry         = 0x02F8;
+inline unsigned AFortPickup_SourceFlags          = 0x0540;
+inline unsigned AFortPickup_SpawnSource          = 0x0541;
+inline unsigned AFortGameState_GamePhase         = 0x2150;
+inline unsigned AFortGameState_SafeZoneIndicator = 0x19A8;
+inline unsigned AFortGameState_PlaylistInfo      = 0x2170;   // FPlaylistPropertyArray
+inline unsigned EditingTool_EditActor            = 0x1020;
+inline unsigned Pickaxe_WeaponDefinition         = 0x0790;
 }
 
 // [G16-f] Apply a build profile to the live namespace. Called once from the
@@ -1144,6 +1216,12 @@ static std::string ReadBuildId() {
 static const BuildProfile* s_activeProfile = &kProfiles[0];
 
 // [G16-f] Detect + apply. Returns the selected profile index (0 = newest).
+// [G33] UNKNOWN BUILD SAFETY: an unrecognized build used to inherit the 21.30
+// RVAs — calling those on a different library means jumping into the middle
+// of unrelated code (the crash class the user kept hitting on new versions).
+// Now an unknown build gets ZERO code RVAs; the OD engine rebuilds what it
+// can (reflection layout, names, GObjects, string-anchored natives) and the
+// engine-only hooks degrade with clear logs instead of crashing.
 static int DetectAndApplyProfile() {
     std::string id = ReadBuildId();
     const BuildProfile* sel = nullptr;
@@ -1152,18 +1230,37 @@ static int DetectAndApplyProfile() {
         for (const auto& p : kProfiles)
             if (id == p.buildId) { sel = &p; matched = 1; break; }
     }
-    if (!sel) sel = &kProfiles[0];   // unknown build → newest profile
+    if (!sel) sel = &kProfiles[0];   // unknown build → newest profile (layout defaults only)
     s_activeProfile = sel;
     InitProfile(*sel);
     LOG("[Profile] build-id=%s", id.empty() ? "<unreadable>" : id.c_str());
-    if (matched)
-        LOG("[Profile] ✅ matched %s — full profile applied", sel->name);
-    else
-        LOG("[Profile] ⚠️ UNRECOGNIZED build — using %s defaults (string-scanned natives still adapt; report this build-id to add a profile)",
-            sel->name);
+    if (matched) {
+        LOG("[Profile] ✅ matched %s — table loaded as CROSS-CHECK "
+            "(fd::ResolveAll re-derives every address from the running game next [G39])", sel->name);
+    } else {
+        LOG("[Profile] ⚠️ UNRECOGNIZED build — code RVAs ZEROED (OD engine takes over: reflection + scans + anchors)");
+        // Zero every executable RVA — nothing may be called blind.
+        profile::ProcessEvent = 0; profile::StaticFindObject = 0;
+        profile::StaticLoadObject = 0; profile::StaticLoadClass = 0;
+        profile::NameAppendString = 0; profile::Free = 0;
+        profile::WorldTick = 0; profile::EngineExec = 0; profile::IsStandalone = 0;
+        profile::GetPlayerController = 0; profile::GetPawnRva = 0; profile::PossessRva = 0;
+        profile::BeginSpawn = 0; profile::FinishSpawn = 0; profile::SpawnObject = 0;
+        profile::GenericArrayAdd = 0; profile::GenericArrayRemove = 0;
+        profile::IsGarbageCollecting = 0; profile::IsSavingPackage = 0;
+        profile::GObjects = 0; profile::Realloc = 0; profile::CopyScriptStruct = 0;
+        profile::GetInterfaceAddress = 0;
+        profile::InitializeAthenaQuickBars = 0; profile::QuickBarResize = 0;
+        // [G42] the QuickBar vtable slots are build-specific too — zeroed
+        // here, re-derived by fd (or left guarded on true failure).
+        profile::QuickBars_VtableSlot = 0; profile::QuickBars_VtableSlot_GetItemInSlot = 0;
+        profile::RawOffsetsVerified = false;
+        // Struct layout candidates stay (engine-stable since 4.22); the OD
+        // meta probe will confirm or replace them.
+    }
     LOG("[Profile] FortniteVersion=%d FField=%s raw-offsets=%s",
         profile::FortniteVersion, profile::HasFField ? "yes" : "no",
-        profile::RawOffsetsVerified ? "verified" : "DISABLED (engine-core only)");
+        profile::RawOffsetsVerified ? "verified" : "DISABLED (discovery-driven)");
     return matched ? (int)(sel - kProfiles) : -1;
 }
 
@@ -1534,6 +1631,16 @@ static void* LoadClass(const char* path, const char* base_path);
 static void* GetPC(void* world, int index);
 static void* incoming(void* function, void* data, const char* key, int expected_size = 0);
 static GObjects_t* GObjectArray();
+static double Monotonic();
+
+// [G33] OD engine accessors — defined after the reflection helpers; used by
+// FindObj/ObjName/GObjectArray as the version-independent fallback layer.
+namespace od {
+    std::string PoolNameOf(void* obj);            // "" when the pool is offline
+    std::string PoolNameAt(const void* fname);    // [G40] name at an ARBITRARY FName address (FField names)
+    void*       FindObjByScan(const std::string& path);
+    GObjects_t* DirectGObjects();                 // structurally-scanned array
+}
 
 // ============================================================================
 // TYPE CHECKS
@@ -1570,12 +1677,15 @@ static bool IsVehicleTarget(void* klass) {
     return false;
 }
 static GObjects_t* GObjectArray() {
-    if (!g_base) return nullptr;
-    GObjects_t* go = Read<GObjects_t*>((void*)(g_base + profile::GObjects));
-    if (!go || IsBadPtr(go)) return nullptr;
-    if (go->NumElements < 0 || go->NumElements > 4000000) return nullptr;
-    if (go->NumChunks < 0 || go->NumChunks > 128) return nullptr;
-    return go;
+    if (g_base && profile::GObjects) {
+        GObjects_t* go = Read<GObjects_t*>((void*)(g_base + profile::GObjects));
+        if (go && !IsBadPtr(go) &&
+            go->NumElements >= 0 && go->NumElements <= 4000000 &&
+            go->NumChunks >= 0 && go->NumChunks <= 128)
+            return go;
+    }
+    // [G33] OD structural fallback — works on any build, no RVA.
+    return od::DirectGObjects();
 }
 
 // ============================================================================
@@ -1588,8 +1698,15 @@ static std::string Narrow(const char16_t* s, int max) {
     return out;
 }
 static void* FindObj(const std::string& path) {
-    auto w = ToWide(path);
-    return Fn<void*(*)(void*, void*, const char16_t*, bool)>(profile::StaticFindObject)(nullptr, nullptr, w.c_str(), false);
+    // [G33] native first (known builds — proven), OD scan fallback (any
+    // build): the engine's StaticFindObject is just a faster way to do what
+    // od::FindObjByScan does by walking GObjects.
+    if (profile::StaticFindObject) {
+        auto w = ToWide(path);
+        if (void* r = Fn<void*(*)(void*, void*, const char16_t*, bool)>(profile::StaticFindObject)(nullptr, nullptr, w.c_str(), false))
+            return r;
+    }
+    return od::FindObjByScan(path);
 }
 static bool SafeFieldName(void* field, uint32 nameOff, std::string& out) {
     if (!field || IsBadPtr(field)) return false;
@@ -1597,6 +1714,15 @@ static bool SafeFieldName(void* field, uint32 nameOff, std::string& out) {
     uint32 dispIdx = Read<uint32>(field, nameOff + 4);
     if (compIdx == 0xFFFFFFFF || compIdx > 0x8000000) return false;
     if (dispIdx == 0xFFFFFFFF || dispIdx > 0x8000000) return false;
+    // [G40] POOL FIRST — this function runs inside every Call construction
+    // and every property walk, i.e. BEFORE any hook exists. On unknown
+    // builds profile::NameAppendString is 0 and the old order called address
+    // 0 (instant SIGSEGV). The pool decodes the identical FName with zero
+    // native involvement; the native pair below is now a known-build
+    // accelerator only (and is guarded).
+    std::string pool = od::PoolNameAt((const char*)field + nameOff);
+    if (!pool.empty()) { out = pool; return true; }
+    if (!profile::NameAppendString || !profile::Free) return false;
     FStringNative ns{};
     Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)((char*)field + nameOff, &ns);
     out = Narrow(ns.Data, 128);
@@ -1615,9 +1741,21 @@ static std::string ObjName(void* obj) {
     auto it = cache.find(obj);
     if (it != cache.end()) { std::string r = it->second; pthread_mutex_unlock(&m); return r; }
     pthread_mutex_unlock(&m);
+    std::string out;
+    // [G33] OD pool path first when the native is unavailable (unknown
+    // builds) or when the pool already proved itself — identical output,
+    // zero native calls, zero engine allocations.
+    out = od::PoolNameOf(obj);
+    if (!out.empty()) {
+        pthread_mutex_lock(&m);
+        if (cache.size() < 200000) cache[obj] = out;
+        pthread_mutex_unlock(&m);
+        return out;
+    }
+    if (!profile::NameAppendString) return {};
     FStringNative s{};
     Fn<void(*)(const void*, FStringNative*)>(profile::NameAppendString)((char*)obj + profile::ObjectName, &s);
-    std::string out = Narrow(s.Data, std::min(std::max(s.Count, 0), 512));
+    out = Narrow(s.Data, std::min(std::max(s.Count, 0), 512));
     if (s.Data) Fn<void(*)(void*)>(profile::Free)(s.Data);
     pthread_mutex_lock(&m);
     if (cache.size() < 200000) cache[obj] = out;
@@ -2631,6 +2769,1585 @@ static bool MakeWeakRef(void* obj, void* weakDst, bool& cached, int32& cIdx, int
 }
 
 // ============================================================================
+// [G33] OD — THE AUTO-OFFSET ENGINE (the "مكتشف ازاحات تلقائي").
+// ----------------------------------------------------------------------------
+// The user's demand: NO hardcoded offsets, gameplay not limited to one
+// version, discovery automatic like Erbium. This engine delivers it in
+// layers, each feeding the next, ALL runtime, ALL self-validating:
+//
+//   L1  NAME POOL (FNamePool, UE4.23+/UE5 layout): the pool's block-0 must
+//       start with the "None" entry (header 0x0008 + "None"); a writable-
+//       memory pointer scan then locates the engine's Blocks[] array. From
+//       that moment FName→string needs NO native call (NameAppendString and
+//       Free become optional). Entry: {uint16 hdr; char bytes[Len]} with
+//       hdr = (Len<<1)|wide, id = (block<<16)|byteOffset.
+//
+//   L2  GOBJECTS (FUObjectArray structural scan): find the global by SHAPE —
+//       ObjObjects chunked array {FUObjectItem** Objects; void* PreAlloc;
+//       int32 Max/Num/MaxChunks/NumChunks} at +0x10, validated by reading
+//       chunk[0][0].Object and proving the UObject class self-loop
+//       (obj->Class->Class == obj->Class). No RVA needed, any build.
+//
+//   L3  FIND-BY-SCAN: with L1+L2 a full StaticFindObject replacement walks
+//       GObjects matching "/Package.Path.Name" through the Outer chain —
+//       unknown builds get a working FindObj even with zero known RVAs.
+//
+//   L4  META-LAYOUT PROBE: the reflection offsets themselves (StructChildren/
+//       ChildProperties/PropOffset/...) are probed from candidates and
+//       validated against known ground truth — the /Script/CoreUObject.Guid
+//       struct's FIRST property must be named "A" at offset 0, sized 8 on
+//       LWC builds (4 pre-LWC) — deciding UE5-FField vs UE4-UProperty layout
+//       and the FProperty offset family without any table.
+//
+//   L5  REFLECTION BULK RESOLVE: every gameplay member offset (profile::)
+//       is re-resolved from the live UClasses/UScriptStructs with candidate
+//       paths; bitfields resolve to byte+mask pairs.
+//
+//   L6  NATIVE ANCHORS: the [G01] ARM scanner finds natives by their own
+//       log strings; ProcessEvent is added here (dual-anchor cross-validated:
+//       "Access None" + "Bad expression index" must backscan to the SAME
+//       function start).
+//
+// Result on the 21.30 build: every [OD] line ends in "reflected"/"discovered"
+// and the known-build table is just a startup accelerator. On an UNKNOWN
+// build: L1-L5 rebuild the entire layout from scratch; only the engine-only
+// natives (WorldTick/EngineExec/QB vtable slots) stay unavailable until
+// anchors are found for them.
+// ============================================================================
+namespace od {
+
+struct Record { const char* name; const char* source; unsigned value; };
+static std::vector<Record> s_records;
+static bool s_peDiscovered = false;   // [G33] ProcessEvent came from dual-anchor discovery
+static void Rec(const char* name, const char* source, unsigned value) {
+    s_records.push_back({name, source, value});
+    LOG("[OD] %-42s %-10s %u (0x%X)", name, source, value, value);
+}
+
+// ---------------------------------------------------------------- L1: names
+static uint8_t** s_blocks = nullptr;      // engine FNamePool Blocks[] (valid: block0..N)
+static int       s_blockCount = 0;        // usable entries (probed)
+static bool      s_namesReady = false;
+
+// Decode one FNameEntryId → string. Number suffix ("_2") like the engine.
+// [perf] No IsReadable here: every block pointer was probed ONCE at
+// discovery, blocks are 64KB allocations (fully mapped), and the offset is
+// masked to 16 bits — this runs per-object during scans (up to 1M calls),
+// a write() syscall per name would cost seconds.
+static bool EntryToString(uint32 compIdx, std::string& out) {
+    if (!s_blocks) return false;
+    uint32 block = compIdx >> 16, off = compIdx & 0xFFFF;
+    if (block >= (uint32)s_blockCount || off > 0x10000 - 512) return false;
+    uint8_t* entry = (uint8_t*)s_blocks[block] + off;
+    uint16 hdr = *(uint16*)entry;
+    uint32 len = (uint32)(hdr >> 1);
+    bool wide = (hdr & 1) != 0;
+    if (len == 0 || len > 255) return false;
+    out.clear();
+    if (wide) { const char16_t* w = (const char16_t*)(entry + 2);
+                for (uint32 i = 0; i < len; ++i) out.push_back((char)(w[i] < 128 ? w[i] : '?')); }
+    else      { const char* a = (const char*)(entry + 2);
+                out.assign(a, a + len); }
+    return true;
+}
+static bool PoolNameOfImpl(void* obj, std::string& out) {
+    if (!s_namesReady || !obj || IsBadPtr(obj)) return false;
+    uint32 compIdx = Read<uint32>(obj, profile::ObjectName);
+    uint32 dispIdx = Read<uint32>(obj, profile::ObjectName + 4);
+    if (compIdx == 0xFFFFFFFF || compIdx > 0x8000000) return false;
+    if (!EntryToString(compIdx, out)) return false;
+    if (dispIdx != 0 && dispIdx != 0xFFFFFFFF) {
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), "_%u", dispIdx);
+        out += suffix;
+    }
+    return true;
+}
+// [G40] Same decode for a name that does NOT live at UObject::ObjectName —
+// FField names sit at their own FFieldName offset. This is what makes
+// SafeFieldName work with ZERO native calls (NameAppendString is now only
+// a known-build accelerator, never a requirement).
+static bool PoolNameAtImpl(const void* fnamePtr, std::string& out) {
+    if (!s_namesReady || !fnamePtr || IsBadPtr((void*)fnamePtr)) return false;
+    uint32 compIdx = *(const uint32*)fnamePtr;
+    uint32 dispIdx = *((const uint32*)fnamePtr + 1);
+    if (compIdx == 0xFFFFFFFF || compIdx > 0x8000000) return false;
+    if (!EntryToString(compIdx, out)) return false;
+    if (dispIdx != 0 && dispIdx != 0xFFFFFFFF) {
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), "_%u", dispIdx);
+        out += suffix;
+    }
+    return true;
+}
+
+// Find "None" (entry 0 of block 0) → the pointer TO it in writable memory is
+// Blocks[0]. Header = (4<<1)|0 = 0x0008. Validate neighbors before trusting.
+static bool InitNamePool() {
+    if (s_namesReady) return true;
+    if (!arm::Init()) return false;
+    double t0 = Monotonic();
+    static const uint8_t kNone[6] = {0x08, 0x00, 'N', 'o', 'n', 'e'};
+    // Candidate block-0 starts: every "08 00 None" in the image.
+    for (const arm::Range& r : arm::s_ranges) {
+        if (r.exec || r.end - r.start < 0x100) continue;      // pool is writable
+        const uint8_t* p = (const uint8_t*)r.start;
+        const uint8_t* e = (const uint8_t*)r.end - 6;
+        while (p <= e) {
+            const uint8_t* hit = (const uint8_t*)memchr(p, 0x08, (size_t)(e - p) + 1);
+            if (!hit) break;
+            if (hit + 6 <= (const uint8_t*)r.end && memcmp(hit, kNone, 6) == 0) {
+                uintptr_t block0 = (uintptr_t)hit;
+                // Blocks[] must live in writable memory and contain this pointer.
+                for (const arm::Range& w : arm::s_ranges) {
+                    if (w.exec || w.end - w.start < 0x40) continue;
+                    // NOTE: direct reads — every PT_LOAD range is mapped by the
+                    // loader (this is the same assumption arm::FindAdrpAddRef
+                    // makes on exec ranges). Per-slot IsReadable would be one
+                    // write() syscall per 8 bytes over ~90MB — minutes.
+                    for (uintptr_t a = w.start; a + 8 <= w.end; a += 8) {
+                        if (*(uintptr_t*)a != block0) continue;
+                        // Validate the following block pointers look like blocks.
+                        uint8_t** cand = (uint8_t**)a;
+                        bool ok = true;
+                        int usable = 1;
+                        for (int b = 1; b < 8; ++b) {
+                            if (!IsReadable((void*)(a + (size_t)b * 8), 8)) { ok = b >= 2; usable = b; break; }
+                            uint8_t* bp = ((uint8_t**)a)[b];
+                            if (!bp || !IsReadable(bp, 2)) { usable = b; break; }
+                            uint16 h2 = *(uint16*)bp;               // first entry header
+                            if ((h2 >> 1) == 0 || (h2 >> 1) > 255) { usable = b; break; }
+                            ++usable;
+                        }
+                        if (ok && usable >= 2) {
+                            // one-time per-block probe (cheap — at most 8)
+                            bool blocksReadable = true;
+                            for (int b = 0; b < usable; ++b)
+                                if (!IsReadable(cand[b], 2)) { blocksReadable = false; break; }
+                            if (blocksReadable) {
+                                s_blocks = cand;
+                                s_blockCount = usable;
+                                s_namesReady = true;
+                                // self-test: id 0 must decode "None"
+                                std::string probe;
+                                if (EntryToString(0, probe) && probe == "None") {
+                                    Rec("NamePool.Blocks", "scan", (unsigned)(a - g_base));
+                                    LOG("[OD] name pool online: blocks=%d (%.2fs) — names no longer need natives",
+                                        usable, Monotonic() - t0);
+                                    return true;
+                                }
+                                s_blocks = nullptr; s_blockCount = 0; s_namesReady = false;
+                            }
+                        }
+                    }
+                    if (s_namesReady) break;
+                }
+            }
+            p = hit + 1;
+        }
+        if (s_namesReady) break;
+    }
+    LOG("[OD] ⚠️ name pool not found (\"None\" entry scan failed) — names stay on the native path");
+    return false;
+}
+
+// ---------------------------------------------------------------- L2: GObjects
+static GObjects_t* s_go = nullptr;        // directly discovered instance
+static bool InitGObjects() {
+    if (s_go) return true;
+    if (!arm::Init()) return false;
+    double t0 = Monotonic();
+    auto valid = [](uintptr_t g) -> bool {
+        if (!IsReadable((void*)(g + 0x30), 0x10)) return false;
+        uintptr_t objs = *(uintptr_t*)(g + 0x10);
+        int32 num   = *(int32*)(g + 0x24);
+        int32 maxc  = *(int32*)(g + 0x28);
+        int32 nch   = *(int32*)(g + 0x2C);
+        if (num < 1000 || num > 8000000) return false;
+        if (maxc < 1 || maxc > 2048 || nch < 1 || nch > maxc) return false;
+        if (!objs || !IsReadable((void*)objs, 8)) return false;
+        for (int c : {0, nch / 2, nch - 1}) {
+            if (c < 0 || c >= nch) continue;
+            void* chunk = ((void**)objs)[c];
+            if (!chunk || !IsReadable(chunk, 0x20)) return false;
+        }
+        void* first = ((FUObjectItem*)((void**)objs)[0])[0].Object;
+        if (!first || !IsReadable(first, 0x28)) return false;
+        void* cls  = *(void**)((char*)first + 0x10);
+        if (!cls || !IsReadable(cls, 0x18)) return false;
+        void* cc   = *(void**)((char*)cls + 0x10);
+        if (cc != cls) return false;                        // Class->Class == Class
+        return true;
+    };
+    // Writable ranges, last-first: the FUObjectArray global lives in .bss
+    // (typically the last RW PT_LOAD). Direct reads inside module PT_LOADs
+    // (mapped by the loader — per-slot IsReadable would be a syscall storm);
+    // valid() itself probes the EXTERNAL pointers (chunk heap memory) only.
+    for (auto it = arm::s_ranges.rbegin(); it != arm::s_ranges.rend(); ++it) {
+        if (it->exec || it->end - it->start < 0x100) continue;
+        for (uintptr_t a = it->end - 0x30; a >= it->start; a -= 8) {
+            if (*(int32*)(a + 0x24) < 1000) continue;       // cheap reject first
+            if (!valid(a)) continue;
+            s_go = (GObjects_t*)a;
+            Rec("GObjects.instance", "scan", (unsigned)(a - g_base));
+            LOG("[OD] GObjects discovered by structure @+0x%llX (num=%d chunks=%d, %.2fs)",
+                (unsigned long long)(a - g_base), *(int32*)(a + 0x24), *(int32*)(a + 0x2C),
+                Monotonic() - t0);
+            return true;
+        }
+    }
+    LOG("[OD] ⚠️ GObjects structural scan found nothing — profile RVA stays primary");
+    return false;
+}
+
+// ---------------------------------------------------------------- L3: find-by-scan
+static pthread_mutex_t s_scanMu = PTHREAD_MUTEX_INITIALIZER;
+static std::map<std::string, void*> s_scanCache;
+static bool ObjPathMatches(void* obj, const std::string& path) {
+    // Compare from the end: leaf name first (cheapest reject), then outers.
+    if (!obj || IsBadPtr(obj)) return false;
+    std::string want = path;
+    void* cur = obj;
+    for (int hop = 0; hop < 12 && !want.empty(); ++hop) {
+        size_t dot = want.rfind('.');
+        std::string leaf = dot == std::string::npos ? want : want.substr(dot + 1);
+        std::string nm;
+        if (!PoolNameOfImpl(cur, nm) || nm != leaf) return false;
+        if (dot == std::string::npos) {
+            // consumed the last component — the outer must be a package (null outer)
+            void* outer = Read<void*>(cur, profile::ObjectOuter);
+            return outer == nullptr;
+        }
+        want = want.substr(0, dot);
+        cur = Read<void*>(cur, profile::ObjectOuter);
+        if (!cur || IsBadPtr(cur)) return false;
+    }
+    return false;
+}
+static void* FindObjByScanImpl(const std::string& path) {
+    if (!s_go || !s_namesReady) return nullptr;
+    pthread_mutex_lock(&s_scanMu);
+    auto it = s_scanCache.find(path);
+    if (it != s_scanCache.end()) { void* r = it->second; pthread_mutex_unlock(&s_scanMu); return r; }
+    pthread_mutex_unlock(&s_scanMu);
+    GObjects_t* go = s_go;
+    void* found = nullptr;
+    int32 n = go->NumElements;
+    for (int32 i = 0; i < n && !found; ++i) {
+        void* o = go->GetById((uint32)i);
+        if (!o || IsBadPtr(o)) continue;
+        if (ObjPathMatches(o, path)) found = o;
+    }
+    pthread_mutex_lock(&s_scanMu);
+    // positive results only — objects stream in continuously, a negative
+    // cache would permanently hide late-loading assets.
+    if (found && s_scanCache.size() < 8192) s_scanCache[path] = found;
+    pthread_mutex_unlock(&s_scanMu);
+    return found;
+}
+static bool ScanReady() { return s_go != nullptr && s_namesReady; }
+
+// [G33] external-linkage accessors for the pre-reflection fallback layer
+// (FindObj / ObjName / GObjectArray run BEFORE this namespace in the file).
+std::string PoolNameOf(void* obj) {
+    std::string out;
+    return PoolNameOfImpl(obj, out) ? out : std::string();
+}
+std::string PoolNameAt(const void* fname) {
+    std::string out;
+    return PoolNameAtImpl(fname, out) ? out : std::string();
+}
+void* FindObjByScan(const std::string& path) { return FindObjByScanImpl(path); }
+GObjects_t* DirectGObjects() { return s_go; }
+bool ProcessEventWasDiscovered() { return s_peDiscovered; }   // [G33] shape-validate instead of word-table
+// [G39-w13] fd::ResolveAll adjudicates PE against the table; when the table
+// independently CONFIRMS the discovered address (VERIFIED) the word-table
+// check stays in force (same address, device-proven check, zero new risk) —
+// the flag is only kept for true overrides / table-less builds.
+void SetPeDiscovered(bool v) { s_peDiscovered = v; }
+
+// ---------------------------------------------------------------- L4: meta probe
+static bool ProbeMetaLayout() {
+    if (!ScanReady()) return false;
+    // -- Object layout: candidates validated via class self-loop + name decode.
+    //    UE4.22+/UE5: {0x10 Class, 0x18 Name, 0x20 Outer}. Alternative older
+    //    shapes tried only when the canonical fails.
+    struct Cand { unsigned cls, name, outer; };
+    static const Cand cands[] = {{0x10, 0x18, 0x20}, {0x8, 0x10, 0x18}, {0x10, 0x18, 0x28}};
+    bool have = false;
+    for (const Cand& c : cands) {
+        void* first = ((FUObjectItem*)s_go->Objects[0])[0].Object;
+        void* cls = Read<void*>((char*)first + c.cls, 0);
+        if (!cls || IsBadPtr(cls)) continue;
+        void* cc = Read<void*>((char*)cls + c.cls, 0);
+        if (cc != cls) continue;
+        profile::ObjectClass = c.cls; profile::ObjectName = c.name; profile::ObjectOuter = c.outer;
+        have = true;
+        Rec("UObject.Class", "probed", c.cls);
+        Rec("UObject.Name", "probed", c.name);
+        Rec("UObject.Outer", "probed", c.outer);
+        break;
+    }
+    if (!have) { LOG("[OD] ⚠️ object layout probe failed"); return false; }
+
+    // -- FField vs UProperty + the FProperty offset family, through Guid ("A"@0).
+    void* guid = FindObjByScan("/Script/CoreUObject.Guid");
+    void* vec  = FindObjByScan("/Script/CoreUObject.Vector");
+    if (!guid && vec) guid = vec;                 // Vector: "X"@0
+    if (!guid) { LOG("[OD] ⚠️ probe struct (Guid/Vector) not found by scan"); return false; }
+    const char* firstProp = vec ? "X" : "A";
+    if (!vec) vec = guid;
+
+    struct Fam { unsigned children, childProps, fFieldName, fFieldNext,
+                         propFlags, propOffset, propElementSize, propArrayDim, paramSize; bool ffield; };
+    static const Fam fams[] = {
+        // UE5 (FField)              child  cProps fName fNext flags off  size  dim  param
+        { 0x48, 0x50, 0x28, 0x20, 0x38, 0x44, 0x34, 0x30, 0xB6, true  },
+        // UE4.22 (UProperty chain)
+        { 0x58, 0x00, 0x00, 0x00, 0x48, 0x54, 0x44, 0x40, 0xAE, false },
+    };
+    for (const Fam& f : fams) {
+        unsigned savedChild  = profile::StructChildren, savedProps = profile::StructChildProps;
+        unsigned savedFN     = profile::FFieldName,    savedFX    = profile::FFieldNext;
+        unsigned savedFlags  = profile::PropFlags, savedOff = profile::PropOffset;
+        unsigned savedSize   = profile::PropElementSize, savedDim = profile::PropArrayDim;
+        unsigned savedParam  = profile::FunctionParamSize;
+        bool savedFF         = profile::HasFField;
+        profile::StructChildren = f.children; profile::StructChildProps = f.childProps;
+        profile::FFieldName = f.fFieldName;   profile::FFieldNext = f.fFieldNext;
+        profile::PropFlags = f.propFlags;     profile::PropOffset = f.propOffset;
+        profile::PropElementSize = f.propElementSize; profile::PropArrayDim = f.propArrayDim;
+        profile::FunctionParamSize = f.paramSize; profile::HasFField = f.ffield;
+        void* prop = GetProp((std::string("/Script/CoreUObject.") +
+                             (vec ? "Vector" : "Guid") + "." + firstProp).c_str());
+        bool pass = false;
+        if (prop && !IsBadPtr(prop)) {
+            int off = Read<int>(prop, profile::PropOffset);
+            int es  = Read<int>(prop, profile::PropElementSize);
+            int dim = Read<int>(prop, profile::PropArrayDim);
+            uint64 fl = Read<uint64>(prop, profile::PropFlags);
+            pass = off == 0 && dim == 1 && (es == 8 || es == 4) && (fl & 0x2 /*CPF_Edit*/) != 0;
+        }
+        if (pass) {
+            Rec("UStruct.ChildProperties", "probed", f.childProps);
+            Rec("FProperty.Offset", "probed", f.propOffset);
+            Rec("FProperty.ElementSize", "probed", f.propElementSize);
+            LOG("[OD] ✅ reflection layout probed: %s family, LWC=%s",
+                f.ffield ? "UE5-FField" : "UE4-UProperty",
+                Read<int>(prop, profile::PropElementSize) == 8 ? "yes" : "no");
+            return true;
+        }
+        // restore for next family
+        profile::StructChildren = savedChild; profile::StructChildProps = savedProps;
+        profile::FFieldName = savedFN;        profile::FFieldNext = savedFX;
+        profile::PropFlags = savedFlags;      profile::PropOffset = savedOff;
+        profile::PropElementSize = savedSize; profile::PropArrayDim = savedDim;
+        profile::FunctionParamSize = savedParam; profile::HasFField = savedFF;
+    }
+    LOG("[OD] ⚠️ reflection family probe failed — profile values stay");
+    return false;
+}
+
+// ---------------------------------------------------------------- L5: bulk resolve
+static unsigned Off(const char* path, const char* name) {
+    void* p = GetProp(path);
+    if (!p || IsBadPtr(p)) { LOG("[OD] ⚠️ %-42s NOT reflected (fallback stays)", name); return UINT32_MAX; }
+    unsigned v = (unsigned)Read<int>(p, profile::PropOffset);
+    if (v > 0x8000) { LOG("[OD] ⚠️ %-42s insane offset %u (fallback stays)", name, v); return UINT32_MAX; }
+    Rec(name, "reflected", v);
+    return v;
+}
+static void Assign(unsigned& dst, unsigned v) { if (v != UINT32_MAX) dst = v; }
+// Bool bitfield: byte + mask from the FBoolProperty.
+static bool BoolOff(const char* path, const char* name, unsigned& byte, unsigned& mask) {
+    void* p = GetProp(path);
+    if (!p || IsBadPtr(p)) { LOG("[OD] ⚠️ %-42s NOT reflected (fallback stays)", name); return false; }
+    int bo = Read<int>(p, profile::BoolByteOffset);
+    uint8 m = Read<uint8>(p, profile::BoolFieldMask);
+    if (bo < 0 || bo > 0x8000 || m == 0) return false;
+    byte = (unsigned)bo; mask = m;
+    LOG("[OD] %-42s reflected  byte=0x%X mask=0x%X", name, byte, mask);
+    return true;
+}
+
+static void ResolveAll() {
+    LOG("[OD] === reflection bulk resolve ===");
+    // FFortItemEntry
+    Assign(profile::ItemEntry_Count,          Off("/Script/FortniteGame.FortItemEntry.Count", "FortItemEntry.Count"));
+    Assign(profile::ItemEntry_ItemDefinition, Off("/Script/FortniteGame.FortItemEntry.ItemDefinition", "FortItemEntry.ItemDefinition"));
+    Assign(profile::ItemEntry_Durability,     Off("/Script/FortniteGame.FortItemEntry.Durability", "FortItemEntry.Durability"));
+    Assign(profile::ItemEntry_LoadedAmmo,     Off("/Script/FortniteGame.FortItemEntry.LoadedAmmo", "FortItemEntry.LoadedAmmo"));
+    Assign(profile::ItemEntry_PhantomAmmo,    Off("/Script/FortniteGame.FortItemEntry.PhantomAmmo", "FortItemEntry.PhantomAmmo"));
+    Assign(profile::ItemEntry_ItemGuid,       Off("/Script/FortniteGame.FortItemEntry.ItemGuid", "FortItemEntry.ItemGuid"));
+    Assign(profile::ItemEntry_TrackerGuid,    Off("/Script/FortniteGame.FortItemEntry.TrackerGuid", "FortItemEntry.TrackerGuid"));
+    Assign(profile::ItemEntry_StateValues,    Off("/Script/FortniteGame.FortItemEntry.StateValues", "FortItemEntry.StateValues"));
+    // PlayerState / Hero
+    Assign(profile::FortPlayerState_HeroType,          Off("/Script/FortniteGame.FortPlayerState.HeroType", "FortPlayerState.HeroType"));
+    Assign(profile::FortPlayerState_CharacterData,     Off("/Script/FortniteGame.FortPlayerState.CharacterData", "FortPlayerState.CharacterData"));
+    Assign(profile::FortPlayerState_AbilitySystemComp, Off("/Script/FortniteGame.FortPlayerState.AbilitySystemComponent", "FortPlayerState.AbilitySystemComponent"));
+    Assign(profile::FortHero_CharacterParts,           Off("/Script/FortniteGame.FortHero.CharacterParts", "FortHero.CharacterParts"));
+    Assign(profile::FortHero_Specializations,          Off("/Script/FortniteGame.FortHero.Specializations", "FortHero.Specializations"));
+    {
+        unsigned v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerRegisteredPlayerInfo.TempAthenaMenuHeroInstance",
+                                 "/Script/FortniteGame.FortPlayerRegisteredPlayerInfo.MenuHeroInstance"})
+            if ((v = Off(path, "RegisteredPlayerInfo.HeroInstance")) != UINT32_MAX) break;
+        Assign(profile::RegisteredPlayerInfo_HeroInstance, v);
+    }
+    // Controller
+    Assign(profile::FortPlayerController_MyPlayerInfo,  Off("/Script/FortniteGame.FortPlayerController.MyPlayerInfo", "PC.MyPlayerInfo"));
+    Assign(profile::FortPlayerController_ClientQuickBars,Off("/Script/FortniteGame.FortPlayerController.ClientQuickBars", "PC.ClientQuickBars"));
+    // QuickBar-ready byte derives from ClientQuickBars (+8 — the native
+    // GetItemInQuickbarSlot gate reads the byte right after the pointer).
+    profile::FortPlayerController_QuickBarReady = profile::FortPlayerController_ClientQuickBars + 8;
+    profile::Controller_ClientQuickBars          = profile::FortPlayerController_ClientQuickBars;
+    profile::Controller_QuickBarReadyByte        = profile::FortPlayerController_QuickBarReady;
+    BoolOff("/Script/FortniteGame.FortPlayerController.bReadyToStartMatch", "PC.bReadyToStartMatch",
+            profile::FortPlayerController_ReadyByte, profile::FortPlayerController_ReadyBit);
+    Assign(profile::Controller_CurrentBuildableClass, Off("/Script/FortniteGame.FortPlayerController.CurrentBuildableClass", "PC.CurrentBuildableClass"));
+    Assign(profile::Controller_bBuildFree,            Off("/Script/FortniteGame.FortPlayerController.bBuildFree", "PC.bBuildFree"));
+    Assign(profile::Controller_LocationUnderReticle,  Off("/Script/FortniteGame.FortPlayerController.LocationUnderReticle", "PC.LocationUnderReticle"));
+    Assign(profile::Controller_CosmeticLoadoutPC,     Off("/Script/FortniteGame.FortPlayerController.CosmeticLoadoutPC", "PC.CosmeticLoadoutPC"));
+    {
+        unsigned v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerController.LastBuildPreviewGridSnapLoc",
+                                 "/Script/FortniteGame.FortPlayerController.BuildPreviewSnapLoc"})
+            if ((v = Off(path, "PC.PreviewSnapLoc")) != UINT32_MAX) break;
+        Assign(profile::Controller_PreviewSnapLoc, v);
+        v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerController.LastBuildPreviewGridSnapRot",
+                                 "/Script/FortniteGame.FortPlayerController.BuildPreviewSnapRot"})
+            if ((v = Off(path, "PC.PreviewSnapRot")) != UINT32_MAX) break;
+        Assign(profile::Controller_PreviewSnapRot, v);
+        v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerController.LastBuildPreviewRotationIterations",
+                                 "/Script/FortniteGame.FortPlayerController.BuildPreviewRotIter"})
+            if ((v = Off(path, "PC.BuildPreviewRotIter")) != UINT32_MAX) break;
+        Assign(profile::Controller_BuildPreviewRotIter, v);
+        v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerController.LastBuildPreviewMirrored",
+                                 "/Script/FortniteGame.FortPlayerController.BuildPreviewMirrored"})
+            if ((v = Off(path, "PC.BuildPreviewMirrored")) != UINT32_MAX) break;
+        Assign(profile::Controller_BuildPreviewMirrored, v);
+    }
+    {
+        unsigned v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerController.InteractionComponent",
+                                 "/Script/FortniteGame.FortPlayerController.CurrentInteractionComponent"})
+            if ((v = Off(path, "PC.InteractionComponent")) != UINT32_MAX) break;
+        Assign(profile::Controller_InteractionComponent, v);
+        v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerController.bIsTouchPrimaryFireActive",
+                                 "/Script/FortniteGame.FortPlayerController.bTouchPrimaryFire"})
+            if ((v = Off(path, "PC.TouchPrimaryFire")) != UINT32_MAX) break;
+        Assign(profile::Controller_TouchPrimaryFire, v);
+    }
+    // Pawn
+    Assign(profile::FortPawn_CurrentWeapon,         Off("/Script/FortniteGame.FortPawn.CurrentWeapon", "FortPawn.CurrentWeapon"));
+    Assign(profile::FortPawn_AbilitySystemComponent,Off("/Script/FortniteGame.FortPawn.AbilitySystemComponent", "FortPawn.ASC"));
+    Assign(profile::FortPlayerPawn_CosmeticLoadout, Off("/Script/FortniteGame.FortPlayerPawn.CosmeticLoadout", "Pawn.CosmeticLoadout"));
+    BoolOff("/Script/FortniteGame.FortPlayerPawn.bIsSkydiving", "Pawn.bIsSkydiving",
+            profile::FortPlayerPawn_bIsSkydiving, profile::FortPlayerPawn_bIsSkydiving_Mask);
+    BoolOff("/Script/FortniteGame.FortPlayerPawn.bIsParachuteOpen", "Pawn.bIsParachuteOpen",
+            profile::FortPlayerPawn_bIsParachuteOpen, profile::FortPlayerPawn_bIsParachuteOpen_Mask);
+    {
+        unsigned byte = 0, bit = 0;
+        if (BoolOff("/Script/FortniteGame.FortPlayerPawn.bIsSliding", "Pawn.bIsSliding", byte, bit)) {
+            profile::FortPlayerPawn_bIsSliding_Byte = byte;
+            unsigned shift = 0; while ((bit >> shift) > 1) ++shift;
+            profile::FortPlayerPawn_bIsSliding_Bit = shift;
+        }
+        if (BoolOff("/Script/FortniteGame.FortPlayerPawn.bIsSurfaceSwimming", "Pawn.bIsSurfaceSwimming", byte, bit)) {
+            profile::FortPlayerPawn_bIsSurfaceSwim_Byte = byte;
+            unsigned shift = 0; while ((bit >> shift) > 1) ++shift;
+            profile::FortPlayerPawn_bIsSurfaceSwim_Bit = shift;
+        } else if (BoolOff("/Script/FortniteGame.FortPlayerPawn.bIsSurfaceSwim", "Pawn.bIsSurfaceSwim", byte, bit)) {
+            profile::FortPlayerPawn_bIsSurfaceSwim_Byte = byte;
+            unsigned shift = 0; while ((bit >> shift) > 1) ++shift;
+            profile::FortPlayerPawn_bIsSurfaceSwim_Bit = shift;
+        }
+    }
+    Assign(profile::FortPawn_bWantsToSlide, Off("/Script/FortniteGame.FortPawn.bWantsToSlide", "Pawn.bWantsToSlide"));
+    {
+        unsigned v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPlayerPawnAthena.Speed_Sprint",
+                                 "/Script/FortniteGame.FortPlayerPawn.Speed_Sprint",
+                                 "/Script/FortniteGame.FortPawn.Speed_Sprint"})
+            if ((v = Off(path, "PawnAthena.Speed_Sprint")) != UINT32_MAX) break;
+        Assign(profile::PlayerPawn_Athena_Speed_Sprint, v);
+    }
+    // Movement
+    Assign(profile::CharacterMovement_MovementMode, Off("/Script/Engine.CharacterMovementComponent.MovementMode", "CMC.MovementMode"));
+    Assign(profile::CharacterMovement_CustomMode,    Off("/Script/Engine.CharacterMovementComponent.CustomMovementMode", "CMC.CustomMovementMode"));
+    // TacticalSprint flags byte
+    {
+        unsigned en = 0, enM = 0, want = 0, wantM = 0, is = 0, isM = 0;
+        bool bEn   = BoolOff("/Script/TacticalSprintRuntime.FortPlayerControllerComponent_TacticalSprint.bEnabled", "TSprint.bEnabled", en, enM);
+        bool bWant = BoolOff("/Script/TacticalSprintRuntime.FortPlayerControllerComponent_TacticalSprint.bWantsToSprint", "TSprint.bWantsToSprint", want, wantM);
+        bool bIs   = BoolOff("/Script/TacticalSprintRuntime.FortPlayerControllerComponent_TacticalSprint.bIsSprinting", "TSprint.bIsSprinting", is, isM);
+        if (bEn && bWant && bIs && en == want && want == is) {
+            profile::TacticalSprint_Flags = en;
+            profile::TacticalSprint_Bit_Enabled = enM;
+            profile::TacticalSprint_Bit_WantsSprint = wantM;
+            profile::TacticalSprint_Bit_IsSprinting = isM;
+        } else LOG("[OD] ⚠️ TacticalSprint flags incomplete (fallback stays: en=%d want=%d is=%d)", (int)bEn, (int)bWant, (int)bIs);
+    }
+    // QuickBars (F02: reflected struct names are "QuickBar" / "QuickBarSlot";
+    // the three bar containers live on the FortQuickBars CLASS)
+    Assign(profile::QuickBars_PrimaryOffset,   Off("/Script/FortniteGame.FortQuickBars.PrimaryQuickBar", "FQuickBar.PrimaryQuickBar"));
+    Assign(profile::QuickBars_SecondaryOffset, Off("/Script/FortniteGame.FortQuickBars.SecondaryQuickBar", "FQuickBar.SecondaryQuickBar"));
+    Assign(profile::QuickBars_CreativeOffset,  Off("/Script/FortniteGame.FortQuickBars.CreativeQuickBar", "FQuickBar.CreativeQuickBar"));
+    Assign(profile::QuickBar_SlotsOffset,      Off("/Script/FortniteGame.QuickBar.Slots", "FQuickBar.Slots"));
+    Assign(profile::QuickBarSlot_ItemsOffset,  Off("/Script/FortniteGame.QuickBarSlot.Items", "FQuickBarSlot.Items"));
+    {
+        unsigned en = 0, enM = 0, occ = 0, occM = 0;
+        bool bEn  = BoolOff("/Script/FortniteGame.QuickBarSlot.bEnabled", "QBSlot.bEnabled", en, enM);
+        bool bOcc = BoolOff("/Script/FortniteGame.QuickBarSlot.bIsOccupied", "QBSlot.bIsOccupied", occ, occM);
+        if (bEn && bOcc && en == occ) {
+            profile::QuickBarSlot_EnabledOffset = en;
+            profile::QuickBarSlot_EnabledBit = enM;
+            profile::QuickBarSlot_OccupiedBit = occM;
+        } else if (bEn) {
+            profile::QuickBarSlot_EnabledOffset = en;
+            profile::QuickBarSlot_EnabledBit = enM;
+        }
+        // sizeof(FQuickBarSlot): the Items array Inner ElementSize is the
+        // engine's own per-element size (also validates the 0x28 default).
+        void* items = GetProp("/Script/FortniteGame.QuickBarSlot.Items");
+        if (items && !IsBadPtr(items)) {
+            void* inner = Read<void*>(items, 0x70);            // FArrayProperty::Inner
+            if (inner && !IsBadPtr(inner)) {
+                int es = Read<int>(inner, profile::PropElementSize);
+                if (es >= 0x10 && es <= 0x100) {
+                    profile::QuickBarSlot_SlotSize = (unsigned)es;
+                    Rec("FQuickBarSlot.sizeof", "reflected", (unsigned)es);
+                }
+            }
+        }
+    }
+    // Pickup / GameState / tools
+    Assign(profile::AFortPickup_PrimaryEntry, Off("/Script/FortniteGame.FortPickup.PrimaryPickupItemEntry", "FortPickup.PrimaryEntry"));
+    {
+        unsigned v = UINT32_MAX;
+        for (const char* path : {"/Script/FortniteGame.FortPickup.SourceTypeFlags", "/Script/FortniteGame.FortPickup.SourceFlags"})
+            if ((v = Off(path, "FortPickup.SourceFlags")) != UINT32_MAX) break;
+        if (v != UINT32_MAX) {
+            profile::AFortPickup_SourceFlags = v;
+            profile::AFortPickup_SpawnSource = v + 1;
+        }
+    }
+    Assign(profile::AFortGameState_GamePhase,         Off("/Script/FortniteGame.FortGameStateAthena.GamePhase", "GameState.GamePhase"));
+    Assign(profile::AFortGameState_SafeZoneIndicator, Off("/Script/FortniteGame.FortGameStateAthena.SafeZoneIndicator", "GameState.SafeZoneIndicator"));
+    Assign(profile::AFortGameState_PlaylistInfo,      Off("/Script/FortniteGame.FortGameStateAthena.CurrentPlaylistInfo", "GameState.CurrentPlaylistInfo"));
+    Assign(profile::EditingTool_EditActor,            Off("/Script/FortniteGame.FortWeap_EditingTool.EditActor", "EditingTool.EditActor"));
+    Assign(profile::Pickaxe_WeaponDefinition,         Off("/Script/FortniteGame.AthenaPickaxeItemDefinition.WeaponDefinition", "Pickaxe.WeaponDefinition"));
+    // Doors — full bit-pack family resolved so the fallback path is
+    // version-independent too ([G37]): bDoorOpen + bLocalDoorOpen +
+    // bFastOpenRequested + the collision verifier.
+    BoolOff("/Script/FortniteGame.BuildingWall.bDoorOpen", "BuildingWall.bDoorOpen",
+            profile::BuildingWall_bDoorOpen_Byte, profile::BuildingWall_bDoorOpen_Mask);
+    BoolOff("/Script/FortniteGame.BuildingWall.bLocalDoorOpen", "BuildingWall.bLocalDoorOpen",
+            profile::BuildingWall_bLocalDoorOpen_Byte, profile::BuildingWall_bLocalDoorOpen_Mask);
+    BoolOff("/Script/FortniteGame.BuildingWall.bFastOpenRequested", "BuildingWall.bFastOpenRequested",
+            profile::BuildingWall_bFastOpen_Byte, profile::BuildingWall_bFastOpen_Mask);
+    LOG("[OD] === bulk resolve done: %zu records ===", s_records.size());
+}
+
+// ---------------------------------------------------------------- L6: natives
+// ProcessEvent anchor discovery (UE5: the script VM is merged into it, so
+// both "Access None" and "Bad expression index" live inside the SAME giant
+// function — agreement between the two backscans is the proof).
+static uintptr_t DiscoverProcessEvent() {
+    if (!arm::Init()) return 0;
+    static const char* const anchorsA[] = {
+        "Access None %s from function %s in %s",
+        "Access None '%s' from function %s in %s",
+        "Access None",
+        nullptr
+    };
+    static const char* const anchorsB[] = {
+        "Bad expression index %d/%d",
+        "Bad expression index",
+        nullptr
+    };
+    uintptr_t a = 0, b = 0;
+    for (int i = 0; anchorsA[i] && !a; ++i) a = arm::FindFunctionByString(anchorsA[i]);
+    for (int i = 0; anchorsB[i] && !b; ++i) b = arm::FindFunctionByString(anchorsB[i]);
+    if (a && b && a == b) {
+        s_peDiscovered = true;
+        Rec("ProcessEvent", "discovered", (unsigned)(a - g_base));
+        return a;
+    }
+    if (a && !b) { LOG("[OD] ⚠️ ProcessEvent single-anchor (no B-agreement) — not trusted"); return 0; }
+    if (b && !a) { LOG("[OD] ⚠️ ProcessEvent B-anchor only — not trusted"); return 0; }
+    LOG("[OD] ⚠️ ProcessEvent anchors not resident/found");
+    return 0;
+}
+
+// ---------------------------------------------------------------- bootstrap
+static bool s_bootstrapped = false;
+static void Bootstrap() {
+    if (s_bootstrapped) return;
+    s_bootstrapped = true;
+    LOG("[OD] === bootstrap: name pool → GObjects → layout probe ===");
+    InitNamePool();
+    InitGObjects();
+    if (ScanReady()) {
+        // If the profile's FindObj/NameAppendString natives are unusable
+        // (unknown build), the scan paths replace them transparently.
+        if (ProbeMetaLayout()) {
+            Rec("FindObj", "scan", 1);
+            Rec("ObjName", "pool", 1);
+        }
+    } else {
+        LOG("[OD] ⚠️ scan layer incomplete — known-build natives stay primary");
+    }
+}
+static void Report() {
+    int reflected = 0, probed = 0, scanned = 0;
+    for (const Record& r : s_records) {
+        if (!strcmp(r.source, "reflected")) ++reflected;
+        else if (!strcmp(r.source, "probed")) ++probed;
+        else if (!strcmp(r.source, "scan") || !strcmp(r.source, "discovered")) ++scanned;
+    }
+    LOG("[OD] report: reflected=%d probed=%d scanned=%d records=%zu "
+        "(every offset NOT in this list = engine-only native, known-build gated)",
+        reflected, probed, scanned, s_records.size());
+}
+static void Dump() {   // era.dumper
+    LOG("=== era.dumper — offset sources ===");
+    for (const Record& r : s_records)
+        LOG("  %-42s %-10s 0x%X", r.name, r.source, r.value);
+    LOG("  %-42s %-10s 0x%X", "QuickBars.VtableSlot", "fd(runtime)", profile::QuickBars_VtableSlot);
+    LOG("  %-42s %-10s 0x%X", "QuickBars.VtableSlot.GetItemInSlot", "fd(runtime)",
+        profile::QuickBars_VtableSlot_GetItemInSlot);
+    LOG("  %-42s %-10s %s", "NamePool", s_namesReady ? "scan" : "native-only", "");
+    LOG("  %-42s %-10s %s", "GObjects", s_go ? "scan" : "profile-rva", "");
+    LOG("=== %zu records — run 'era.functions' for the FUNCTION-ADDRESS report [G39] ===",
+        s_records.size());
+}
+
+} // namespace od
+
+// ============================================================================
+// ============================================================================
+// [G39] FD — RUNTIME FUNCTION DISCOVERY — مكتشف الدوال أثناء التشغيل
+// ============================================================================
+//   لماذا هذا القسم موجود؟ المستخدم طلب: "لا تزال تستخدم ازاحات ثابتة
+//   وليس أثناء التشغيل — اكتشف كيف تجد الدوال واشرحها في الكود".
+//   الجواب: هذا المحرك يجد عناوين الدوال نفسها في الذاكرة وقت التشغيل،
+//   بدون أي جدول عناوين مكتوب مسبقاً، ويشرح كل طريقة بالتفصيل هنا.
+//
+//   WHY FUNCTION ADDRESSES ARE HARD (وضع المشكلة)
+//   libUnreal.so is shipped STRIPPED: the .symtab (function names) is deleted,
+//   so there is no table "ProcessEvent = 0x07611B5C" to read. What survives:
+//     1. .rodata — every UE_LOG/ensureMsgf format string literal (UTF-16LE).
+//     2. vtables — every UObject-derived class ships a full C++ vtable, and
+//        the Class Default Object (CDO) of each class points at it.
+//     3. Reflection — every UFUNCTION carries a `Func` pointer to its native
+//        exec thunk (that is how ProcessEvent dispatches native calls).
+//     4. ARM64 code — deterministic instruction encodings (ADRP+ADD for
+//        literals, BL for calls, STP/SUB SP prologues for function starts).
+//
+//   THE FOUR-LAYER LADDER (السلم الرباعي — نجرّب من الأعلى للأسفل)
+//   L1 — STRING ANCHOR (مرساة النص): find a literal that exists in exactly
+//        one function ("MCP-Profile: Dispatching request to %s" lives only
+//        inside the MCP sender). Find the literal bytes → find the ADRP+ADD
+//        pair that loads its address → walk back to the function start.
+//        This is Erbium's FindStringRef on ARM64, already device-proven
+//        (the [ARM] lines in the user logs: 5/5 hits).
+//   L2 — THUNK LADDER (سلّم الثانك): a native function with a Kismet wrapper
+//        (BlueprintCallable) is reachable from its exec thunk: resolve the
+//        UFunction object by NAME (pure reflection, works on any build),
+//        read its `Func` member (offset probed below — see ProbeFuncOffset),
+//        then decode the thunk's BL instructions. One of the call targets
+//        IS the native we want. Erbium's UFunction::GetImpl() is exactly
+//        this on x86 (scan SETNE + E9/E8 rel32); the ARM64 equivalent is
+//        "scan BL (0x94......)" — done by CollectBlTargets below.
+//   L3 — VTABLE SLOT (خانة الجدول الافتراضي): virtual functions (Tick, Exec)
+//        live in the class's vtable. Get the CDO ("/Script/Engine.Default__X"
+//        — ALWAYS resident), read vtable = *(void**)CDO, and locate the slot:
+//          • ProcessEvent CALIBRATION (Erbium's InitializeProcessEventVft):
+//            PE is itself virtual; scan the vtable for the PE address we
+//            discovered in L1 → its index proves the vtable is genuine and
+//            aligned across classes (every sibling must agree on that index).
+//          • SLOT-DIFF VOTING: a slot where sibling classes (AActor subclasses
+//            that do NOT override Tick) all share ONE value (the base impl)
+//            but UWorld has a DIFFERENT, huge function → that override is
+//            UWorld::Tick (Tick is one of the largest functions in the
+//            engine — the size filter is the tiebreaker).
+//   L4 — REFLECTION REPLACEMENT (الاستغناء بالتأمل): some "needed natives"
+//        are not needed at all — the same job is doable through already-
+//        discovered channels with ZERO extra addresses:
+//          • GetPlayerController → World.OwningGameInstance →
+//            GameInstance.LocalPlayers[i] → Player.PlayerController
+//            (three reflected property reads).
+//          • IsStandalone → World.NetMode == NM_Standalone(0) (property).
+//          • BeginSpawn/FinishSpawn/SpawnObject → the Kismet UFunctions
+//            themselves via Call() — the VM runs the natives for us.
+//          • StaticFindObject → od::FindObjByScan (GObjects walk).
+//          • NameAppendString/Free → od name pool (no allocation at all).
+//
+//   VALIDATION DISCIPLINE (منهج التحقق — درس [G13])
+//   A discovered address is only trusted after: (a) prologue-shape check
+//   (STP callee-saved / STP X29,X30 / SUB SP — NOT mid-function spills),
+//   (b) frame confirmation within 16 words, (c) on KNOWN builds the RVA
+//   is cross-checked against the profile's device-verified value.
+//
+//   [G39-w13] ADJUDICATION — من يحكم عند الاختلاف؟ (the trust model)
+//   Wave-12 built this engine but NEVER CALLED IT — the Worker went straight
+//   from the profile table to InstallHooks, which is exactly what the user
+//   called out ("لا تزال تستخدم ازاحات ثابتة"). From wave 13:
+//     • fd::ResolveAll() runs on EVERY build (known or not) BEFORE hooks.
+//     • Every function address is ADJUDICATED between runtime evidence and
+//       the known-build table:
+//         - both agree            → VERIFIED(runtime=table)
+//         - SELF-PROVING evidence → the RUNTIME address WINS (OVERRIDE) —
+//           the table entry is retired for this run. "Self-proving" means
+//           the method carries its own proof on this device right now:
+//           two independent string anchors agreeing on one start, a failure
+//           literal referenced from inside the found body, a PE-calibrated
+//           vtable consensus, a call-graph cross-link, the two-bar
+//           signature. A fixed table can never outrank live evidence.
+//         - heuristic-only guess  → the table (a real device measurement)
+//           is the stronger evidence and is KEPT (logged loudly).
+//         - no runtime path       → table fallback on known builds;
+//           guarded degradation on unknown builds.
+//     • era.functions prints the verdict of EVERY function address.
+//   This is the الاكتشاف أولاً contract: الجدول مجرد تدقيق، وليس مصدراً.
+// ============================================================================
+namespace fd {
+
+struct FnRecord { const char* name; const char* method; uintptr_t rva; const char* verdict; };
+static std::vector<FnRecord> s_fn;
+static bool s_tickRuntime = false;    // [G39-w13] final WorldTick RVA came from runtime evidence
+static bool s_execRuntime = false;    // [G39-w13] final EngineExec RVA came from runtime evidence
+
+static void RecF(const char* name, const char* method, uintptr_t addr, const char* verdict) {
+    s_fn.push_back({name, method, addr, verdict});
+    LOG("[FD] %-26s %-22s RVA=0x%08llX %s", name, method,
+        (unsigned long long)(addr ? addr - g_base : 0), verdict);
+}
+
+// ------------------------------------------------------------ [G39-w13] the judge
+// What a discovery method returns: the address (0 = failed) + whether the
+// method is SELF-PROVING on this device (see the banner above for what that
+// means) + the method name for the ledger.
+struct Found { uintptr_t abs; bool verified; const char* method; };
+
+// Decide the FINAL RVA for a function. `tableRva` is what the known-build
+// profile carried (0 on unknown builds). Returns the RVA to install and
+// records the verdict — every branch is one loud log line so the device
+// log is the complete audit trail of where every address came from.
+static uintptr_t Adjudicate(const char* name, const Found& f, uintptr_t tableRva) {
+    uintptr_t disc = f.abs ? (uintptr_t)(f.abs - g_base) : 0;
+    if (!disc && !tableRva) { RecF(name, f.method, 0, "MISSING(no path, no table)"); return 0; }
+    if (!disc) { RecF(name, f.method, tableRva, "fallback:known-build"); return tableRva; }
+    if (!tableRva) { RecF(name, f.method, disc, "discovered(runtime-only)"); return disc; }
+    if (disc == tableRva) { RecF(name, f.method, disc, "VERIFIED(runtime=table)"); return disc; }
+    if (f.verified) {
+        LOG("[FD] ⚠️ %s: runtime 0x%llX ≠ table 0x%llX — RUNTIME EVIDENCE WINS "
+            "(self-proving method '%s'; table entry retired for this run)",
+            name, (unsigned long long)disc, (unsigned long long)tableRva, f.method);
+        RecF(name, f.method, disc, "OVERRIDE(runtime>table)");
+        return disc;
+    }
+    LOG("[FD] ⚠️ %s: heuristic 0x%llX ≠ table 0x%llX — table kept "
+        "(device-verified measurement outranks a shape-only guess)",
+        name, (unsigned long long)disc, (unsigned long long)tableRva);
+    RecF(name, f.method, tableRva, "kept-table(heuristic disagreed)");
+    return tableRva;
+}
+
+// Same judge for VTABLE SLOT INDEXES (not addresses — no g_base math, the
+// value IS the byte offset inside the vtable). Used for the QuickBar slots.
+static unsigned AdjudicateSlot(const char* name, unsigned discovered, unsigned tableVal,
+                                bool verified, const char* method) {
+    if (!discovered && !tableVal) { RecF(name, method, 0, "MISSING(no path)"); return 0; }
+    if (!discovered) { RecF(name, method, tableVal, "fallback:known-build"); return tableVal; }
+    if (!tableVal) { RecF(name, method, discovered, "discovered(runtime-only)"); return discovered; }
+    if (discovered == tableVal) { RecF(name, method, discovered, "VERIFIED(runtime=table)"); return discovered; }
+    if (verified) {
+        LOG("[FD] ⚠️ %s: runtime slot 0x%X ≠ table 0x%X — RUNTIME WINS (read from the live vtable)",
+            name, discovered, tableVal);
+        RecF(name, method, discovered, "OVERRIDE(runtime>table)");
+        return discovered;
+    }
+    RecF(name, method, tableVal, "kept-table(heuristic disagreed)");
+    return tableVal;
+}
+
+// ---------- shared ARM64 helpers (built on the [G01] scanner) ----------
+
+// Is `p` inside an executable PT_LOAD range of libUnreal.so (and readable)?
+// Any address we accept as "a function" must pass this first — it rejects
+// data pointers, heap pointers, and unmapped values in one check.
+static bool InExec(uintptr_t p) {
+    if (p < 0x10000) return false;                     // null-page guard
+    for (const arm::Range& r : arm::s_ranges)
+        if (r.exec && p >= r.start && p < r.end) return true;
+    return false;
+}
+// Does `p` START a function? (valid exec address + valid prologue opener)
+static bool IsFunctionStart(uintptr_t p) {
+    if (!InExec(p) || !IsReadable((void*)p, 4)) return false;
+    return arm::IsPrologueOpener(*(uint32_t*)p) && arm::HasFrameConfirmation(p);
+}
+// How big is the code at `fn`? Walk forward until compiler padding (a run of
+// NOPs between functions) or the exec-range end. First-RET is NOT a function
+// end (conditional blocks RET early), so padding is the honest boundary.
+// Capped at 0x60000 (240KB) — nothing we measure is bigger.
+static size_t CodeExtent(uintptr_t fn) {
+    if (!InExec(fn)) return 0;
+    int nops = 0;
+    for (uintptr_t p = fn; p < fn + 0x60000; p += 4) {
+        if (!IsReadable((void*)p, 4)) return (size_t)(p - fn);
+        uint32_t w = *(uint32_t*)p;
+        if (w == 0xD503201F) { if (++nops >= 3) return (size_t)(p - fn - 12); }
+        else nops = 0;
+    }
+    return 0x60000;
+}
+// Collect the BL (branch-with-link) targets of a function body — the ARM64
+// "who does this call" list. BL encoding: 100101 imm26 — the target is
+// pc + (signed imm26 << 2), covering ±128MB (the whole .text).
+// This is the ladder step that turns "a thunk" into "its callees".
+static void CollectBlTargets(uintptr_t fn, size_t window, std::vector<uintptr_t>& out) {
+    for (uintptr_t p = fn; p < fn + window; p += 4) {
+        if (!IsReadable((void*)p, 4)) break;
+        uint32_t w = *(uint32_t*)p;
+        if ((w & 0xFC000000) != 0x94000000) continue;          // BL rel26
+        int64_t imm = (int64_t)(w & 0x3FFFFFF);
+        if (imm & (1 << 25)) imm -= (int64_t)1 << 26;
+        uintptr_t t = p + ((uintptr_t)imm << 2);
+        if (!IsFunctionStart(t)) continue;                      // skip PLT/data
+        bool dup = false;
+        for (uintptr_t o : out) if (o == t) { dup = true; break; }
+        if (!dup) out.push_back(t);
+    }
+}
+
+// ---------------------------------------------------------------- L2 support
+// UFunction::Func — THE member that turns reflection into code addresses.
+// It is NOT a UPROPERTY (never reflected), and it MOVES between engine
+// releases (Erbium's own Offsets.h shows 0xB0/0xC0/0xC8/0xF0/0xD8 across
+// Fortnite versions). So we PROBE it, with cross-validation:
+//   1. Sample several native Kismet UFunctions (their Func = exec thunks).
+//   2. For each candidate offset (8-aligned, 0x80..0x160 — the whole window
+//      every known UE4.22/UE5 build has ever used), require EVERY sampled
+//      function to hold an executable, prologue-valid pointer there.
+//   3. Func is the ONLY code-pointer member in that window (the neighbours
+//      are flags/u16s/FField-chain pointers into DATA), so the offset where
+//      all samples agree on "points into .text" is Func.
+//   4. Sanity: the thunks must be DISTINCT addresses (execLoadAsset ≠
+//      execLoadClass...) — if all samples held one identical address we
+//      would have found something else (e.g. a shared data member).
+static unsigned s_funcOff = 0;
+static unsigned ProbeFuncOffset() {
+    if (s_funcOff) return s_funcOff;
+    if (!arm::Init()) return 0;
+    static const char* const kSamples[] = {
+        "/Script/Engine.GameplayStatics.LoadAsset",
+        "/Script/Engine.GameplayStatics.LoadClass",
+        "/Script/Engine.GameplayStatics.SpawnObject",
+        "/Script/Engine.GameplayStatics.BeginDeferredActorSpawnFromClass",
+        "/Script/Engine.GameplayStatics.FinishSpawningActor",
+        "/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand",
+    };
+    std::vector<void*> ufs;
+    for (const char* path : kSamples) {
+        void* u = FindObj(path);                       // native path OR od scan
+        if (u && !IsBadPtr(u)) ufs.push_back(u);
+    }
+    if (ufs.size() < 3) { LOG("[FD] ⚠️ Func-offset probe: only %zu sample UFunctions", ufs.size()); return 0; }
+    for (unsigned o = 0x80; o <= 0x160; o += 8) {
+        bool all = true;
+        uintptr_t first = 0; bool distinct = false;
+        for (void* u : ufs) {
+            uintptr_t p = Read<uintptr_t>(u, o);
+            if (!IsFunctionStart(p)) { all = false; break; }
+            if (!first) first = p; else if (p != first) distinct = true;
+        }
+        if (all && distinct) {
+            s_funcOff = o;
+            od::Rec("UFunction.Func", "probed", o);
+            LOG("[FD] ✅ UFunction::Func probed at +0x%X (%zu samples, distinct thunks) — "
+                "thunks are now callable addresses on ANY build", o, ufs.size());
+            return o;
+        }
+    }
+    LOG("[FD] ⚠️ UFunction::Func probe found no unanimous offset — L2 ladder disabled");
+    return 0;
+}
+// Read a UFunction's native thunk (0 if unavailable/invalid).
+static uintptr_t ThunkOf(const char* ufnPath) {
+    unsigned fo = ProbeFuncOffset();
+    if (!fo) return 0;
+    void* u = FindObj(ufnPath);
+    if (!u || IsBadPtr(u)) return 0;
+    uintptr_t t = Read<uintptr_t>(u, fo);
+    return IsFunctionStart(t) ? t : 0;
+}
+
+// ---------------------------------------------------------------- discovery
+// UWorld::Tick — HOOK TARGET #1. Found by L3 slot-diff voting:
+//   siblings (AActor subclasses that keep the base Tick) AGREE on the slot
+//   value; UWorld OVERRIDES it with one of the engine's biggest functions.
+//   PE calibration first: the vtable must contain the (L1-discovered)
+//   ProcessEvent at the SAME index in every class — the proof that we are
+//   reading real, layout-aligned vtables (Erbium's InitializeProcessEventVft).
+static Found DiscoverWorldTick() {
+    void* worldCdo = FindObj("/Script/Engine.Default__World");
+    if (!worldCdo || IsBadPtr(worldCdo)) { LOG("[FD] ⚠️ WorldTick: Default__World not found"); return {0, false, "vtable-diff"}; }
+    void* actorClass = FindObj("/Script/Engine.Actor");
+    // Sibling CDOs — AActor subclasses with the BASE Tick (no override):
+    // StaticMeshActor / Info / WorldSettings are core engine classes whose
+    // CDOs are resident from boot, before any map streams in.
+    const char* const kSibs[] = { "/Script/Engine.Default__StaticMeshActor",
+                                  "/Script/Engine.Default__Info",
+                                  "/Script/Engine.Default__WorldSettings" };
+    std::vector<uintptr_t> sibVts;
+    for (const char* s : kSibs) {
+        void* cdo = FindObj(s);
+        if (!cdo || IsBadPtr(cdo)) continue;
+        if (actorClass && !IsA(Read<void*>(cdo, profile::ObjectClass), actorClass)) continue;
+        uintptr_t vt = Read<uintptr_t>(cdo, 0);
+        if (vt && !IsBadPtr((void*)vt)) sibVts.push_back(vt);
+    }
+    uintptr_t worldVt = Read<uintptr_t>(worldCdo, 0);
+    if (!worldVt || IsBadPtr((void*)worldVt) || sibVts.empty()) {
+        LOG("[FD] ⚠️ WorldTick: vtable unavailable (world=%p sibs=%zu)", (void*)worldVt, sibVts.size());
+        return {0, false, "vtable-diff"};
+    }
+    // --- PE calibration: every UObject-derived vtable has ProcessEvent at
+    // the same index. Find that index in the WORLD vtable and require the
+    // siblings to agree — the layout-alignment proof.
+    uintptr_t peAbs = profile::ProcessEvent ? g_base + profile::ProcessEvent : 0;
+    int peSlot = -1;
+    if (peAbs) {
+        for (int i = 0; i < 0x400; ++i) {
+            if (!IsReadable((void*)(worldVt + (size_t)i * 8), 8)) break;
+            if (Read<uintptr_t>((void*)(worldVt + (size_t)i * 8)) == peAbs) { peSlot = i; break; }
+        }
+        if (peSlot >= 0) {
+            int agree = 0;
+            for (uintptr_t svt : sibVts)
+                if (IsReadable((void*)(svt + (size_t)peSlot * 8), 8) &&
+                    Read<uintptr_t>((void*)(svt + (size_t)peSlot * 8)) == peAbs) ++agree;
+            if (agree == (int)sibVts.size())
+                LOG("[FD] WorldTick: PE calibration OK (slot %d in %zu/%zu vtables) — vtables trusted",
+                    peSlot, sibVts.size(), sibVts.size());
+            else { LOG("[FD] ⚠️ WorldTick: PE slot misaligned (%d/%zu) — vtable method aborted",
+                           agree, sibVts.size()); return {0, false, "vtable-diff"}; }
+        } else LOG("[FD] ⚠️ WorldTick: ProcessEvent not in the vtable — vtable method aborted");
+        if (peSlot < 0) return {0, false, "vtable-diff"};
+    }
+    // --- slot-diff voting with the size tiebreaker
+    struct Cand { int slot; uintptr_t fn; size_t extent; };
+    std::vector<Cand> cands;
+    for (int i = 0; i < 0x400; ++i) {
+        if (i == peSlot) continue;
+        uintptr_t a = worldVt + (size_t)i * 8;
+        if (!IsReadable((void*)a, 8)) break;
+        uintptr_t w = Read<uintptr_t>((void*)a);
+        if (!IsFunctionStart(w)) continue;
+        // base-agreement: ≥2 siblings must share ONE identical value at this
+        // slot (the base AActor implementation), and NO sibling may hold
+        // UWorld's value (else the slot is not a UWorld-only override).
+        int agree = 0;
+        uintptr_t base = 0;
+        bool blocked = false;
+        for (uintptr_t svt : sibVts) {
+            if (!IsReadable((void*)(svt + (size_t)i * 8), 8)) continue;
+            uintptr_t v = Read<uintptr_t>((void*)(svt + (size_t)i * 8));
+            if (!v) continue;
+            if (v == w) { blocked = true; break; }     // a sibling has the SAME impl
+            if (!base) base = v;
+            if (v == base) ++agree;
+        }
+        if (blocked || agree < 2) continue;
+        size_t ext = CodeExtent(w);
+        if (ext < 0x1800) continue;                      // Tick is HUGE — this kills every other override
+        cands.push_back({i, w, ext});
+        LOG("[FD] WorldTick candidate: slot=0x%X rva=0x%llX extent=0x%zX",
+            i, (unsigned long long)(w - g_base), ext);
+    }
+    if (cands.empty()) { LOG("[FD] ⚠️ WorldTick: no slot-diff candidate passed the filters"); return {0, false, "vtable-diff"}; }
+    std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) { return x.extent > y.extent; });
+    // [G39-w13] self-proving: PE calibration validated the vtable layout,
+    // ≥2 siblings agreed on the base value, and the extent filter isolated a
+    // giant override — Adjudicate() decides runtime-vs-table from here.
+    LOG("[FD] ✅ WorldTick: slot=0x%X extent=0x%zX (%zu candidates) — PE-calibrated vtable evidence",
+        cands[0].slot, cands[0].extent, cands.size());
+    return {cands[0].fn, true, "vtable-diff"};
+}
+
+// UEngine::Exec — HOOK TARGET #2 (the era.* console channel). L3 + L1 voting:
+// the shipping engine's CDO vtable (Default__GameEngine) is swept; the slot
+// whose function references the MOST distinct exec-command literals wins.
+// Each literal ("GAMENAME", "TOGGLEDEBUGCAMERA", ...) exists as a wide
+// .rodata literal referenced by an ADRP+ADD inside Exec's dispatch chain.
+static Found DiscoverEngineExec() {
+    if (!arm::Init()) return {0, false, "literal-vote"};
+    void* engineCdo = FindObj("/Script/Engine.Default__GameEngine");
+    if (!engineCdo || IsBadPtr(engineCdo)) engineCdo = FindObj("/Script/Engine.Default__Engine");
+    if (!engineCdo || IsBadPtr(engineCdo)) { LOG("[FD] ⚠️ EngineExec: engine CDO not found"); return {0, false, "literal-vote"}; }
+    uintptr_t vt = Read<uintptr_t>(engineCdo, 0);
+    if (!vt || IsBadPtr((void*)vt)) return {0, false, "literal-vote"};
+    static const char* const kVotes[] = {
+        "TOGGLEONSCREENDEBUGDISPLAY", "TOGGLEDEBUGCAMERA", "GAMENAME",
+        "TOGGLESCREENSHOTMODE", "STAT", "CRASH",
+    };
+    // function → distinct-literal count
+    std::map<uintptr_t, int> votes;
+    uintptr_t scanLo = arm::s_ranges.empty() ? 0 : arm::s_ranges[0].start;
+    for (const char* lit : kVotes) {
+        uintptr_t str = arm::FindString(lit);
+        if (!str) continue;
+        uintptr_t ref = 0;
+        for (int n = 0; n < 64 && scanLo; ++n) {         // every code ref to this literal
+            ref = arm::FindAdrpAddRef(str, ref ? ref + 4 : scanLo, UINTPTR_MAX);
+            if (!ref) break;
+            uintptr_t fn = arm::BackscanPrologue(ref);
+            if (fn && IsFunctionStart(fn)) votes[fn] += 1;   // +1 per DISTINCT literal
+        }
+    }
+    if (votes.empty()) { LOG("[FD] ⚠️ EngineExec: no exec-literal references found"); return {0, false, "literal-vote"}; }
+    // rank: most distinct literals first
+    std::vector<std::pair<uintptr_t, int>> ranked(votes.begin(), votes.end());
+    std::sort(ranked.begin(), ranked.end(),
+              [](auto& a, auto& b) { return a.second > b.second; });
+    uintptr_t winner = ranked[0].first;
+    int bestVotes = ranked[0].second;
+    if (bestVotes < 2) { LOG("[FD] ⚠️ EngineExec: best vote count %d < 2 — not trusted", bestVotes); return {0, false, "literal-vote"}; }
+    // is the winner a slot of the shipping engine's own vtable? (Exec is
+    // virtual — being in the vtable is corroboration, not a requirement,
+    // because the literal may vote for a base-class implementation)
+    int inVtSlot = -1;
+    for (int i = 0; i < 0x400; ++i) {
+        if (!IsReadable((void*)(vt + (size_t)i * 8), 8)) break;
+        if (Read<uintptr_t>((void*)(vt + (size_t)i * 8)) == winner) { inVtSlot = i; break; }
+    }
+    LOG("[FD] EngineExec voting: winner rva=0x%llX votes=%d vtable-slot=%s (runner-up votes=%d)",
+        (unsigned long long)(winner - g_base), bestVotes, inVtSlot >= 0 ? "yes" : "no",
+        ranked.size() > 1 ? ranked[1].second : 0);
+    // [G39-w13] ≥2 DISTINCT exec literals referenced from one function
+    // start is self-proving — Adjudicate() compares with the table.
+    return {winner, true, "literal-vote"};
+}
+
+// StaticLoadObject — L2 thunk ladder + L1 verifiers:
+//   execLoadAsset (thunk, found by reflection) BLs into the load machinery;
+//   among its call targets the BIG one that also references a load-failure
+//   literal is StaticLoadObject. On known builds the RVA must match.
+static Found DiscoverLoadObject() {
+    uintptr_t thunk = ThunkOf("/Script/Engine.GameplayStatics.LoadAsset");
+    if (!thunk) { LOG("[FD] ⚠️ StaticLoadObject: LoadAsset thunk unavailable"); return {0, false, "thunk-ladder"}; }
+    std::vector<uintptr_t> targets;
+    CollectBlTargets(thunk, 0x200, targets);
+    if (targets.empty()) { LOG("[FD] ⚠️ StaticLoadObject: thunk has no BL targets"); return {0, false, "thunk-ladder"}; }
+    static const char* const kVerifiers[] = { "Failed to load '%s'", "Failed to load" };
+    std::sort(targets.begin(), targets.end(), [](uintptr_t a, uintptr_t b) {
+        return CodeExtent(a) > CodeExtent(b);
+    });
+    uintptr_t winner = 0; const char* how = "biggest-callee"; bool litVerified = false;
+    for (size_t i = 0; i < targets.size() && i < 4; ++i) {
+        LOG("[FD] StaticLoadObject candidate %zu: rva=0x%llX extent=0x%zX",
+            i, (unsigned long long)(targets[i] - g_base), CodeExtent(targets[i]));
+        for (const char* v : kVerifiers) {
+            uintptr_t str = arm::FindString(v);
+            if (!str) continue;
+            uintptr_t ref = arm::FindAdrpAddRef(str, targets[i], targets[i] + 0x800);
+            if (ref && arm::BackscanPrologue(ref) == targets[i]) { winner = targets[i]; how = "thunk+literal"; litVerified = true; break; }
+        }
+        if (winner) break;
+        if (!winner && i == 0 && CodeExtent(targets[0]) >= 0x300) winner = targets[0];
+    }
+    if (!winner) { LOG("[FD] ⚠️ StaticLoadObject: no candidate passed (targets=%zu)", targets.size()); return {0, false, "thunk-ladder"}; }
+    // [G39-w13] a load-failure literal referenced from inside the winner is
+    // self-proving; "biggest callee" alone is a heuristic.
+    return {winner, litVerified, how};
+}
+
+// BeginSpawn/FinishSpawn/SpawnObject — L2 thunk ladder. The Kismet wrappers
+// are the (device-proven) natives' own entry points:
+//   UGameplayStatics::BeginDeferredActorSpawnFromClass / FinishSpawningActor /
+//   SpawnObject are BlueprintCallable — their exec thunks marshal the params
+//   and BL the natives. "SpawnActor failed because…" literals verify the
+//   begin-side native; on known builds RVA equality verifies all three.
+static Found DiscoverViaThunk(const char* ufnPath, const char* name,
+                              size_t minExtent, const char* const* verifiers, int nVerifiers) {
+    uintptr_t thunk = ThunkOf(ufnPath);
+    if (!thunk) { LOG("[FD] ⚠️ %s: thunk unavailable (%s)", name, ufnPath); return {0, false, "thunk-ladder"}; }
+    std::vector<uintptr_t> targets;
+    CollectBlTargets(thunk, 0x200, targets);
+    std::sort(targets.begin(), targets.end(), [](uintptr_t a, uintptr_t b) {
+        return CodeExtent(a) > CodeExtent(b);
+    });
+    uintptr_t winner = 0; const char* how = "thunk-BL"; bool litVerified = false;
+    for (size_t i = 0; i < targets.size() && i < 5; ++i) {
+        if (CodeExtent(targets[i]) < minExtent) break;
+        if (verifiers) {
+            for (int v = 0; v < nVerifiers; ++v) {
+                uintptr_t str = arm::FindString(verifiers[v]);
+                if (!str) continue;
+                uintptr_t ref = arm::FindAdrpAddRef(str, targets[i], targets[i] + 0xA00);
+                if (ref && arm::BackscanPrologue(ref) == targets[i]) {
+                    winner = targets[i]; how = "thunk+literal"; litVerified = true; break;
+                }
+            }
+            if (winner) break;
+            if (i == 0 && CodeExtent(targets[0]) >= minExtent) winner = targets[0];
+        } else if (i == 0) { winner = targets[0]; break; }
+    }
+    if (!winner) { LOG("[FD] ⚠️ %s: no thunk target passed (targets=%zu)", name, targets.size()); return {0, false, "thunk-ladder"}; }
+    // [G39-w13] literal-verified → self-proving; bare biggest-callee → heuristic.
+    return {winner, litVerified, how};
+}
+
+// ---------------------------------------------------------------------------
+// [G41] StaticLoadClass — CALL-GRAPH CROSS-LINK (رابط الاستدعاء بين الدالتين).
+// HOW (اشرحها في الكود):
+//   The engine's class loader is a thin wrapper: it validates the base class
+//   and then loads through the OBJECT loader. That dependency gives us a
+//   discovery rule that needs no literal and no table:
+//     1. "/Script/Engine.GameplayStatics.LoadClass" is a reflected UFunction;
+//        its exec thunk (UFunction::Func, offset probed by ProbeFuncOffset)
+//        marshals the Blueprint params and BLs the native StaticLoadClass.
+//     2. Collect the thunk's BL callees (the L2 ladder step).
+//     3. The class loader is the callee whose OWN call window contains the
+//        already-adjudicated StaticLoadObject address — a wrapper must call
+//        the loader it wraps. This is SELF-PROVING evidence: the call edge
+//        we require is the very definition of the wrapper relationship.
+static Found DiscoverLoadClass(uintptr_t loadObjectAbs) {
+    if (!loadObjectAbs) { LOG("[FD] ⚠️ StaticLoadClass: StaticLoadObject unresolved first"); return {0, false, "thunk+calls-LoadObject"}; }
+    uintptr_t thunk = ThunkOf("/Script/Engine.GameplayStatics.LoadClass");
+    if (!thunk) { LOG("[FD] ⚠️ StaticLoadClass: LoadClass thunk unavailable"); return {0, false, "thunk+calls-LoadObject"}; }
+    std::vector<uintptr_t> targets;
+    CollectBlTargets(thunk, 0x200, targets);
+    uintptr_t winner = 0; int nWinners = 0;
+    for (uintptr_t t : targets) {
+        std::vector<uintptr_t> inner;
+        CollectBlTargets(t, 0x800, inner);
+        for (uintptr_t c : inner)
+            if (c == loadObjectAbs) { if (!winner) winner = t; ++nWinners; break; }
+    }
+    if (!winner) { LOG("[FD] ⚠️ StaticLoadClass: no thunk callee calls StaticLoadObject (targets=%zu)", targets.size()); return {0, false, "thunk+calls-LoadObject"}; }
+    if (nWinners > 1) LOG("[FD] ⚠️ StaticLoadClass: %d callees call LoadObject — taking the first (cross-check on table)", nWinners);
+    return {winner, true, "thunk+calls-LoadObject"};
+}
+
+// ---------------------------------------------------------------------------
+// [G42] InitializeAthenaQuickBars + QuickBarResize + the init vtable slot —
+// "بصمة البارَّين" (the two-bar signature). ONE scanner, three answers.
+// HOW (اشرحها في الكود):
+//   The native quickbar init is the ONLY FortQuickBarsAthena vtable override
+//   that touches BOTH reflected bar members BY ADDRESS: it passes
+//   &PrimaryQuickBar[.Slots] and &SecondaryQuickBar[.Slots] (offsets the OD
+//   engine resolved from the live UStruct — 0x278/0x308 + 0x10 on 21.30)
+//   into the bar grow/init helper. On ARM64 that address materialization is
+//   exactly:
+//       ADD  Xd, Xn, #imm          ; imm = a reflected bar member offset
+//       ...  (≤6 words)
+//       BL   helper
+//   So the discovery ladder is:
+//     1. LIVE vtables: Default__FortQuickBarsAthena vs Default__FortQuickBars
+//        (its DIRECT base CDO) — slots where they differ are Athena's own
+//        overrides (the same slot-diff logic that finds UWorld::Tick).
+//     2. Every override is scanned for bar CALL-SITES: an ADD whose imm is a
+//        reflected bar offset (the bar struct, or bar+Slots for the array
+//        field) with a BL within 6 words.
+//     3. The override with ≥1 PRIMARY-site AND ≥1 SECONDARY-site is the
+//        init — nothing else in one body touches both bars by address.
+//     4. If the primary-site and the secondary-site BL the SAME helper,
+//        that helper is the bar grow/init function (QuickBarResize) —
+//        agreement at BOTH bars is its proof (self-verifying).
+//     5. The slot index where the init sits in the LIVE vtable retires the
+//        fixed 0x738: the slot becomes a value READ from the running game.
+//   Cross-check: when "InitializeAthenaQuickBars" is also a reflected
+//   UFunction, its exec thunk's BL ladder must agree (logged either way).
+struct QBDiscovery { uintptr_t initAbs; uintptr_t resizeAbs; unsigned slot; };
+static QBDiscovery DiscoverQBInit() {
+    QBDiscovery out{0, 0, 0};
+    void* cdoA = FindObj("/Script/FortniteGame.Default__FortQuickBarsAthena");
+    void* cdoB = FindObj("/Script/FortniteGame.Default__FortQuickBars");
+    if (!cdoA || !cdoB || IsBadPtr(cdoA) || IsBadPtr(cdoB)) {
+        LOG("[FD] ⚠️ QB init: FortQuickBars CDOs unavailable — native init left to the table/manual path");
+        return out;
+    }
+    uintptr_t vtA = Read<uintptr_t>(cdoA, 0), vtB = Read<uintptr_t>(cdoB, 0);
+    if (!vtA || !vtB || IsBadPtr((void*)vtA) || IsBadPtr((void*)vtB)) return out;
+    // Reflected bar offsets — OD truth (the compile-time values are the
+    // last resort only; on every build od::ResolveAll rewrote them).
+    unsigned pImms[2] = { profile::QuickBars_PrimaryOffset,
+                          profile::QuickBars_PrimaryOffset + profile::QuickBar_SlotsOffset };
+    unsigned sImms[2] = { profile::QuickBars_SecondaryOffset,
+                          profile::QuickBars_SecondaryOffset + profile::QuickBar_SlotsOffset };
+    // Scan one candidate body for the two-bar signature. Returns
+    // (hasPrimary, hasSecondary, blTargetAtPrimary, blTargetAtSecondary).
+    auto ScanTwoBar = [&](uintptr_t fn, bool& hasP, bool& hasS,
+                          uintptr_t& blP, uintptr_t& blS) {
+        for (uintptr_t pc = fn; pc < fn + 0x1800; pc += 4) {
+            if (!IsReadable((void*)pc, 4)) break;
+            uint32_t w = *(uint32_t*)pc;
+            if ((w & 0xFF800000) != 0x91000000) continue;        // ADD Xd,Xn,#imm12
+            uint64_t imm = (w >> 10) & 0xFFF;
+            if ((w >> 22) & 1) imm <<= 12;
+            bool isP = (imm == pImms[0] || imm == pImms[1]);
+            bool isS = (imm == sImms[0] || imm == sImms[1]);
+            if (!isP && !isS) continue;
+            for (int k = 1; k <= 6; ++k) {                        // BL within 6 words
+                if (!IsReadable((void*)(pc + 4 * (size_t)k), 4)) break;
+                uint32_t bl = *(uint32_t*)(pc + 4 * (size_t)k);
+                if ((bl & 0xFC000000) != 0x94000000) continue;
+                int64_t bimm = (int64_t)(bl & 0x3FFFFFF);
+                if (bimm & (1 << 25)) bimm -= (int64_t)1 << 26;
+                uintptr_t target = pc + 4 * (size_t)k + ((uintptr_t)bimm << 2);
+                if (!IsFunctionStart(target)) break;
+                if (isP) { hasP = true; blP = target; } else { hasS = true; blS = target; }
+                break;
+            }
+            if (hasP && hasS) break;
+        }
+    };
+    for (int i = 0; i < 0x400; ++i) {
+        if (!IsReadable((void*)(vtA + (size_t)i * 8), 8) || !IsReadable((void*)(vtB + (size_t)i * 8), 8)) break;
+        uintptr_t fnA = Read<uintptr_t>((void*)(vtA + (size_t)i * 8));
+        uintptr_t fnB = Read<uintptr_t>((void*)(vtB + (size_t)i * 8));
+        if (!fnA || fnA == fnB) continue;                         // not an Athena override
+        if (!IsFunctionStart(fnA)) continue;
+        bool hasP = false, hasS = false; uintptr_t blP = 0, blS = 0;
+        ScanTwoBar(fnA, hasP, hasS, blP, blS);
+        if (hasP && hasS) {
+            out.initAbs = fnA;
+            out.slot = (unsigned)((size_t)i * 8);
+            if (blP && blP == blS) out.resizeAbs = blP;
+            LOG("[FD] QB init: two-bar signature at vtable slot 0x%X (rva=0x%llX) "
+                "resize=0x%llX %s", out.slot, (unsigned long long)(fnA - g_base),
+                (unsigned long long)(out.resizeAbs ? out.resizeAbs - g_base : 0),
+                out.resizeAbs ? "(shared BL at both bars)" : "(distinct helpers — resize unresolved)");
+            break;
+        }
+    }
+    // Fallback channel: the reflected UFunction's own BL ladder — the native
+    // the thunk calls gets the SAME two-bar scan (covers builds where the
+    // init is not an Athena-only vtable override, e.g. defined on the base).
+    if (!out.initAbs) {
+        uintptr_t thunk = ThunkOf("/Script/FortniteGame.FortQuickBarsAthena.InitializeAthenaQuickBars");
+        if (!thunk) thunk = ThunkOf("/Script/FortniteGame.FortQuickBars.InitializeAthenaQuickBars");
+        if (thunk) {
+            std::vector<uintptr_t> targets;
+            CollectBlTargets(thunk, 0x200, targets);
+            for (uintptr_t t : targets) {
+                if (!IsFunctionStart(t)) continue;
+                bool hasP = false, hasS = false; uintptr_t blP = 0, blS = 0;
+                ScanTwoBar(t, hasP, hasS, blP, blS);
+                if (hasP && hasS) {
+                    out.initAbs = t;
+                    if (blP && blP == blS) out.resizeAbs = blP;
+                    // learn the slot from whichever live vtable contains it
+                    for (uintptr_t vt : { vtA, vtB })
+                        for (int i = 0; i < 0x400; ++i) {
+                            if (!IsReadable((void*)(vt + (size_t)i * 8), 8)) break;
+                            if (Read<uintptr_t>((void*)(vt + (size_t)i * 8)) == t) { out.slot = (unsigned)((size_t)i * 8); break; }
+                        }
+                    LOG("[FD] QB init: two-bar signature via UFunction thunk (rva=0x%llX slot=0x%X)",
+                        (unsigned long long)(t - g_base), out.slot);
+                    break;
+                }
+            }
+        }
+    }
+    if (out.initAbs) {
+        // bonus cross-check: the reflected UFunction thunk ladder must agree
+        uintptr_t thunk = ThunkOf("/Script/FortniteGame.FortQuickBarsAthena.InitializeAthenaQuickBars");
+        if (!thunk) thunk = ThunkOf("/Script/FortniteGame.FortQuickBars.InitializeAthenaQuickBars");
+        if (thunk) {
+            std::vector<uintptr_t> targets;
+            CollectBlTargets(thunk, 0x200, targets);
+            bool agrees = false;
+            for (uintptr_t t : targets) if (t == out.initAbs) agrees = true;
+            LOG("[FD] QB init: UFunction thunk %s the two-bar winner",
+                agrees ? "CONFIRMS" : "does not confirm (two-bar evidence kept)");
+        }
+    } else LOG("[FD] ⚠️ QB init: no two-bar signature found (Athena CDO vtable + thunk ladder)");
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// [G42] GetItemInSlot's vtable slot — retire 0x6f0 by DECODING the engine's
+// own virtual dispatch (فك الاستدعاء الافتراضي). HOW (اشرحها في الكود):
+//   GetItemInQuickbarSlot (a reflected controller UFunction) is implemented
+//   as: QuickBars = [this + ClientQuickBars] (offset OD-resolved from the
+//   live class); vtable = [QuickBars]; method = [vtable + SLOT]; tail-call
+//   method(QuickBars, type, slotIdx). In ARM64 that dispatch is:
+//       LDR  Xn, [Xthis, #qcOff]    ; the QuickBars member — OUR ANCHOR
+//       ...                          ; null gates
+//       LDR  Xm, [Xn]               ; the vtable fetch
+//       LDR  Xk, [Xm, #SLOT]        ; the method pointer ← what we want
+//       BLR  Xk                     ; the dispatch
+//   Scanning the UFunction's implementation chain for
+//   "member-load anchor → vtable fetch → method load → BLR" yields the slot
+//   offset the ENGINE itself uses — the constant becomes a decoded value.
+static unsigned DiscoverQBGetItemSlot() {
+    uintptr_t thunk = ThunkOf("/Script/FortniteGame.FortPlayerController.GetItemInQuickbarSlot");
+    if (!thunk) return 0;
+    std::vector<uintptr_t> fns{ thunk };
+    CollectBlTargets(thunk, 0x100, fns);         // + the impl it calls
+    unsigned qcOff = profile::Controller_ClientQuickBars;   // OD truth
+    for (uintptr_t fn : fns) {
+        if (!IsFunctionStart(fn)) continue;
+        // light register sketch (the impl is small, straight-line code):
+        //   thisReg ← X0 or a MOV Xd,X0 copy;  qcReg ← [thisReg,#qcOff];
+        //   vtReg  ← [qcReg];  methodReg ← [vtReg,#slot];  BLR methodReg.
+        // MOV Xd,X0 = ORR Xd,XZR,X0: sf/opc/01010/shift fixed by
+        // 0xFFC00000=0xAA000000, Rm(bits21-16)=0, imm6(bits15-10)=0,
+        // Rn(bits9-5)=31(XZR) → (w & 0xFFFFFFE0) == 0xAA0003E0, Rd = w&0x1F.
+        int thisReg = 0, qcReg = -1, vtReg = -1;
+        unsigned slot = 0;
+        for (uintptr_t pc = fn; pc < fn + 0x140; pc += 4) {
+            if (!IsReadable((void*)pc, 4)) break;
+            uint32_t w = *(uint32_t*)pc;
+            if ((w & 0xFFFFFFE0) == 0xAA0003E0) {
+                thisReg = (int)(w & 0x1F);                // MOV Xd, X0
+                qcReg = -1; vtReg = -1;
+                continue;
+            }
+            if ((w & 0xFFC00000) != 0xF9400000) continue;  // LDR Xt,[Xn,#imm12]
+            unsigned rt = w & 0x1F, rn = (w >> 5) & 0x1F;
+            uint64_t imm = (uint64_t)((w >> 10) & 0xFFF) << 3;
+            if ((int)rn == thisReg && imm == qcOff) { qcReg = (int)rt; vtReg = -1; }
+            else if (qcReg >= 0 && (int)rn == qcReg && imm == 0) vtReg = (int)rt;
+            else if (vtReg >= 0 && (int)rn == vtReg && imm > 0 && imm < 0x4000) {
+                for (int k = 1; k <= 4; ++k) {             // BLR the loaded reg?
+                    if (!IsReadable((void*)(pc + 4 * (size_t)k), 4)) break;
+                    uint32_t blr = *(uint32_t*)(pc + 4 * (size_t)k);
+                    if ((blr & 0xFFFFFC1F) == 0xD63F0000 && ((blr >> 5) & 0x1F) == rt)
+                        { slot = (unsigned)imm; break; }
+                }
+            }
+        }
+        if (slot) {
+            LOG("[FD] QB GetItemInSlot: virtual dispatch decoded — slot=0x%X (from rva=0x%llX)",
+                slot, (unsigned long long)(fn - g_base));
+            return slot;
+        }
+    }
+    LOG("[FD] ⚠️ QB GetItemInSlot: dispatch pattern not found (diagnostic-only path degrades)");
+    return 0;
+}
+
+// ---------------------------------------------------------------- L4 ledger
+// Functions whose native address is NO LONGER REQUIRED (each has a working
+// reflection channel — the [G40] entries now have REAL implementations, not
+// just claims). Recorded so era.functions shows the WHOLE truth.
+static void RecordReflectionReplacements() {
+    RecF("StaticFindObject", "reflection", 0, "primary:od-scan (table=cross-check)");
+    RecF("NameAppendString", "reflection", 0, "primary:name-pool");
+    RecF("FMemory::Free", "reflection", 0, "primary:name-pool");
+    RecF("GetPawn", "reflection", 0, "primary:Controller.Pawn");
+    RecF("AController::Possess", "reflection", 0, "primary:UFunction-Call");
+    RecF("IsGarbageCollecting", "unused", 0, "not-required");
+    RecF("IsSavingPackage", "unused", 0, "not-required");
+    RecF("IsStandalone", "reflection", 0, "primary:World.NetMode==NM_Standalone [G40]");
+    RecF("GetPlayerController", "reflection", 0, "primary:GameInstance.LocalPlayers [G40]");
+    RecF("QuickBars::Init", "fallback", 0, "replaced:manual-grow+bind");
+    // Engine-only helpers with NO reflection and NO anchor: guarded natives.
+    // Their absence on unknown builds degrades to a working fallback path —
+    // recorded here so the ledger hides nothing.
+    RecF("FMemory::Realloc", "guarded", profile::Realloc,
+         profile::Realloc ? "known-build only (QB manual-grow fallback)" : "OFF (fallback path)");
+    RecF("CopyScriptStruct", "guarded", profile::CopyScriptStruct,
+         profile::CopyScriptStruct ? "known-build only" : "OFF");
+    RecF("GetInterfaceAddress", "guarded", profile::GetInterfaceAddress,
+         profile::GetInterfaceAddress ? "known-build only (cosmetics)" : "OFF (cosmetics degrade)");
+}
+
+// ---------------------------------------------------------------- orchestration
+// [G39-w13] THE ENTRY POINT the user demanded. Wave-12 wrote this function
+// but the Worker never called it — the table was still the only address
+// source in practice. From wave 13 this runs on EVERY build (known or not),
+// between od::ResolveAll (data offsets) and InstallHooks:
+//     discovery ALWAYS runs → ALWAYS reports → VERIFIED runtime evidence
+//     OVERRIDES the table. الاكتشاف أولاً — الجدول مجرد تدقيق.
+static void ResolveAll() {
+    LOG("[FD] === FUNCTION DISCOVERY — الاكتشاف أولاً: كل عنوان من الجهاز الحي ===");
+    double t0 = Monotonic();
+    // ---- L1: ProcessEvent — dual string anchor (the strongest single
+    //      proof: two independent literals must backscan to the SAME start).
+    //      Must run FIRST: WorldTick's vtable calibration uses PE.
+    //      Extra corroboration: ProcessEvent is VIRTUAL — the discovered
+    //      address must also sit inside a live UObject vtable (the world
+    //      CDO's). A wrong backscan that is a valid function start AND is
+    //      referenced by BOTH literals AND sits in a vtable does not happen;
+    //      without this check a bad backscan could look "self-proving" and
+    //      override a device-verified address.
+    {
+        uintptr_t pe = od::DiscoverProcessEvent();
+        uintptr_t tableRva = profile::ProcessEvent;
+        bool verified = pe != 0;
+        if (pe) {
+            bool inVt = false;
+            void* worldCdo = FindObj("/Script/Engine.Default__World");
+            if (worldCdo && !IsBadPtr(worldCdo)) {
+                uintptr_t vt = Read<uintptr_t>(worldCdo, 0);
+                if (vt && !IsBadPtr((void*)vt))
+                    for (int i = 0; i < 0x400; ++i) {
+                        if (!IsReadable((void*)(vt + (size_t)i * 8), 8)) break;
+                        if (Read<uintptr_t>((void*)(vt + (size_t)i * 8)) == pe) { inVt = true; break; }
+                    }
+            }
+            if (inVt) LOG("[FD] ProcessEvent vtable corroboration OK (virtual slot in Default__World)");
+            else {
+                verified = false;
+                LOG("[FD] ⚠️ ProcessEvent dual-anchor 0x%llX NOT in the world vtable — "
+                    "demoted to heuristic (a wrong backscan must not beat a verified table)",
+                    (unsigned long long)(pe - g_base));
+            }
+        }
+        Found f{pe, verified, "dual-anchor"};
+        profile::ProcessEvent = Adjudicate("UObject::ProcessEvent", f, tableRva);
+        // [G39-w13] VERIFIED(runtime=table) → the word-table check stays in
+        // force (od flag cleared); only true overrides / table-less builds
+        // use shape validation.
+        uintptr_t peDisc = pe ? (uintptr_t)(pe - g_base) : 0;
+        od::SetPeDiscovered(peDisc != 0 && profile::ProcessEvent == peDisc && peDisc != tableRva);
+    }
+    // ---- L3: UWorld::Tick — vtable slot-diff, PE-calibrated.
+    {
+        Found f = DiscoverWorldTick();
+        uintptr_t disc = f.abs ? (uintptr_t)(f.abs - g_base) : 0;
+        uintptr_t tableRva = profile::WorldTick;
+        profile::WorldTick = Adjudicate("UWorld::Tick", f, tableRva);
+        // runtime-sourced = the installed address is the DISCOVERED one AND
+        // the table did not independently confirm it (override, or no table
+        // at all). VERIFIED(runtime=table) keeps the word-table check.
+        s_tickRuntime = (disc != 0 && profile::WorldTick == disc && disc != tableRva);
+    }
+    // ---- L3+L1: UEngine::Exec — exec-literal voting.
+    {
+        Found f = DiscoverEngineExec();
+        uintptr_t disc = f.abs ? (uintptr_t)(f.abs - g_base) : 0;
+        uintptr_t tableRva = profile::EngineExec;
+        profile::EngineExec = Adjudicate("UEngine::Exec", f, tableRva);
+        s_execRuntime = (disc != 0 && profile::EngineExec == disc && disc != tableRva);
+    }
+    // ---- L2: StaticLoadObject — thunk ladder + load-failure literal.
+    profile::StaticLoadObject = Adjudicate("StaticLoadObject",
+                                           DiscoverLoadObject(), profile::StaticLoadObject);
+    // ---- L2 [G41]: StaticLoadClass — the callee that CALLS LoadObject.
+    profile::StaticLoadClass = Adjudicate("StaticLoadClass",
+        DiscoverLoadClass(profile::StaticLoadObject ? g_base + profile::StaticLoadObject : 0),
+        profile::StaticLoadClass);
+    // ---- L2: the spawn natives — thunk ladders with "SpawnActor failed…"
+    //      literal verification on the begin side.
+    static const char* const kBeginV[] = {
+        "SpawnActor failed because the world is not initialized",
+        "SpawnActor failed because no class was specified",
+        "SpawnActor failed because class %s is abstract",
+    };
+    profile::BeginSpawn = Adjudicate("BeginDeferredSpawn",
+        DiscoverViaThunk("/Script/Engine.GameplayStatics.BeginDeferredActorSpawnFromClass",
+                         "BeginDeferredSpawn", 0x80, kBeginV, 3),
+        profile::BeginSpawn);
+    profile::FinishSpawn = Adjudicate("FinishSpawning",
+        DiscoverViaThunk("/Script/Engine.GameplayStatics.FinishSpawningActor",
+                         "FinishSpawning", 0x80, nullptr, 0),
+        profile::FinishSpawn);
+    profile::SpawnObject = Adjudicate("SpawnObject",
+        DiscoverViaThunk("/Script/Engine.GameplayStatics.SpawnObject",
+                         "SpawnObject", 0x20, nullptr, 0),
+        profile::SpawnObject);
+    // ---- L2: GetPlayerController native — reflection ([G40]) is the
+    //      primary; the native stays as the fallback channel and is
+    //      discovered like everything else (heuristic: biggest callee).
+    profile::GetPlayerController = Adjudicate("GetPlayerController(native)",
+        DiscoverViaThunk("/Script/Engine.GameplayStatics.GetPlayerController",
+                         "GetPlayerController", 0x20, nullptr, 0),
+        profile::GetPlayerController);
+    // ---- [G42] the QuickBar family — two-bar signature.
+    {
+        QBDiscovery qb = DiscoverQBInit();
+        if (qb.initAbs) {
+            Found fi{qb.initAbs, true, "two-bar-signature"};
+            profile::InitializeAthenaQuickBars =
+                Adjudicate("InitializeAthenaQuickBars", fi, profile::InitializeAthenaQuickBars);
+            profile::QuickBars_VtableSlot = AdjudicateSlot(
+                "QuickBars.VtableSlot(init)", qb.slot, profile::QuickBars_VtableSlot,
+                true, "vtable-read");
+        } else {
+            RecF("InitializeAthenaQuickBars", "two-bar-signature",
+                 profile::InitializeAthenaQuickBars,
+                 profile::InitializeAthenaQuickBars ? "fallback:known-build" : "MISSING(manual builder primary)");
+            RecF("QuickBars.VtableSlot(init)", "vtable-read", profile::QuickBars_VtableSlot,
+                 profile::QuickBars_VtableSlot ? "fallback:known-build" : "MISSING(manual builder primary)");
+        }
+        if (qb.resizeAbs) {
+            Found fr{qb.resizeAbs, true, "two-bar-site-agreement"};
+            profile::QuickBarResize = Adjudicate("QuickBarResize", fr, profile::QuickBarResize);
+        } else {
+            RecF("QuickBarResize", "two-bar-site", profile::QuickBarResize,
+                 profile::QuickBarResize ? "fallback:known-build" : "MISSING(manual grow fallback)");
+        }
+        // GetItemInSlot slot — virtual-dispatch decode (diagnostic path).
+        profile::QuickBars_VtableSlot_GetItemInSlot = AdjudicateSlot(
+            "QuickBars.VtableSlot(GetItemInSlot)", DiscoverQBGetItemSlot(),
+            profile::QuickBars_VtableSlot_GetItemInSlot, true, "dispatch-decode");
+    }
+    // ---- ledger for everything that needs no address at all.
+    RecordReflectionReplacements();
+    LOG("[FD] report: %zu function records (%.1fs) — 'era.functions' reprints, 'era.explain' the method",
+        s_fn.size(), Monotonic() - t0);
+}
+// [G39-w13] InstallHooks gates — a runtime-sourced (discovered/overridden)
+// hook target is shape-validated instead of word-table-validated.
+static bool WorldTickWasDiscovered() { return s_tickRuntime; }
+static bool EngineExecWasDiscovered() { return s_execRuntime; }
+
+static void Dump() {   // era.functions
+    LOG("=== era.functions — قرار كل عنوان دالة [G39] ===");
+    int verified = 0, discovered = 0, overrides = 0, fallback = 0, missing = 0;
+    for (const FnRecord& r : s_fn) {
+        LOG("  %-30s %-22s 0x%08llX %s", r.name, r.method,
+            (unsigned long long)r.rva, r.verdict);
+        if (strstr(r.verdict, "VERIFIED")) ++verified;
+        else if (strstr(r.verdict, "OVERRIDE")) ++overrides;
+        else if (strstr(r.verdict, "discovered(runtime-only)")) ++discovered;
+        else if (strstr(r.verdict, "fallback")) ++fallback;
+        else if (strstr(r.verdict, "MISSING")) ++missing;
+    }
+    LOG("=== total=%zu verified=%d override=%d discovered=%d fallback=%d missing=%d — 'era.explain' للمنهجية ===",
+        s_fn.size(), verified, overrides, discovered, fallback, missing);
+}
+static void Explain() {   // era.explain — the on-device methodology dump
+    LOG("=== era.explain — كيف يُوجد هذا المبنى عناوين الدوال أثناء التشغيل ===");
+    LOG("القاعدة [G39]: الاكتشاف يعمل على كل إصدار والجدول مجرد تدقيق —");
+    LOG("   الدليل القاطع من الجهاز يتغلب على الجدول عند الاختلاف (OVERRIDE).");
+    LOG("L1 مرساة النص: نص فريد داخل الدالة (UTF-16 في .rodata) ← زوج ADRP+ADD");
+    LOG("   يشير إليه ← رجوع للبداية (STP/SUB SP) ← إثبات مزدوج: مرساتان");
+    LOG("   مستقلتان (Access None + Bad expression index) تتفقان على نفس البداية.");
+    LOG("L2 سلّم الثانك: UFunction بالاسم (انعكاس) ← عضو Func (يُستكشف بالتحقق");
+    LOG("   المتقاطع) ← فك تعليمات BL داخل الثانك ← الهدف = الدالة الأصلية.");
+    LOG("L2-رابط: من يستدعي من؟ StaticLoadClass هو الخلية التي تستدعي");
+    LOG("   StaticLoadObject داخل نافذتها — علاقة الغلاف نفسها هي الدليل.");
+    LOG("L3 خانة الجدول: CDO (Default__Class موجود دائماً) ← vtable ← معايرة");
+    LOG("   ProcessEvent تثبت المحاذاة، ثم فروق الخانات + حجم الدالة يحدد Tick،");
+    LOG("   وأصوات نصوص الأوامر (GAMENAME/STAT/CRASH) تحدد Exec.");
+    LOG("L4 بصمة البارَّين [G42]: المُهيئ الوحيد الذي يلمس Primary و Secondary");
+    LOG("   بالعنوان (ADD Xd,Xn,#ازاحة-منعكسة ثم BL) — منه نستخرج الدالة");
+    LOG("   وخانة الجدول ودالة التكبير (هدف BL المشترك للبارَّين) معاً.");
+    LOG("L4 فك الاستدعاء [G42]: LDR [this+ClientQuickBars] ← LDR [vtable] ←");
+    LOG("   LDR [vtable+خانة] ← BLR = خانة GetItemInSlot كما يستخدمها المحرك.");
+    LOG("L5 الاستغناء بالتأمل [G40]: GetPC عبر OwningGameInstance→LocalPlayers،");
+    LOG("   وIsStandalone عبر NetMode — نفس منطق الدالة الأصلية بلا عنوان.");
+    LOG("التحقق: شكل المقدمة + تأكيد الإطار + IsFunctionStart لكل عنوان، ثم");
+    LOG("   المطابقة مع الجدول على الإصدارات المعروفة (VERIFIED) أو إعلان");
+    LOG("   التجاوز (OVERRIDE) — era.functions يطبع قرار كل دالة.");
+}
+
+} // namespace fd
+
+// ============================================================================
 // ASSET LOADING / SPAWN
 // ============================================================================
 static void* LoadAsset(const std::string& path,
@@ -2650,9 +4367,46 @@ static void* LoadClass(const char* path, const char* base_path = "/Script/Engine
     return Fn<void*(*)(void*, void*, const char16_t*, const char16_t*, uint32_t, void*)>(
         profile::StaticLoadClass)(parent, nullptr, s.c_str(), nullptr, 0, nullptr);
 }
+// [G40] L4 reflection — the controller through the engine's own object
+// graph. The native UGameplayStatics::GetPlayerController walks exactly this
+// chain internally, so we walk it ourselves and the native address is not
+// needed at all:
+//     World.OwningGameInstance (reflected)  →  GameInstance.LocalPlayers
+//     (reflected TArray)  →  LocalPlayers[index].PlayerController (reflected).
+// Wave-12's era.explain CLAIMED this channel while GetPC still jumped through
+// the table RVA — and on unknown builds RVA 0 meant a jump to g_base+0 (the
+// ELF header!). This is the real implementation; the discovered/table native
+// (adjudicated in fd::ResolveAll) stays as the fallback channel.
 static void* GetPC(void* world, int index = 0) {
     if (!world) return nullptr;
-    return Fn<void*(*)(void*, int)>(profile::GetPlayerController)(world, index);
+    static void* giProp = nullptr; static void* lpProp = nullptr; static void* pcProp = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        giProp = GetProp("/Script/Engine.World.OwningGameInstance");
+        lpProp = GetProp("/Script/Engine.GameInstance.LocalPlayers");
+        pcProp = GetProp("/Script/Engine.LocalPlayer.PlayerController");
+        if (!giProp || !lpProp || !pcProp)
+            LOG("[FD] ⚠️ GetPC reflection incomplete (gi=%d lp=%d pc=%d) — native channel only",
+                giProp ? 1 : 0, lpProp ? 1 : 0, pcProp ? 1 : 0);
+    }
+    if (giProp && lpProp && pcProp) {
+        void* gi = Read<void*>(GetField(world, giProp));
+        if (gi && !IsBadPtr(gi)) {
+            Array lps = Read<Array>(GetField(gi, lpProp));
+            if (lps.Data && !IsBadPtr(lps.Data) && lps.Count > 0 && lps.Count <= 16 &&
+                index >= 0 && index < lps.Count) {
+                void* lp = Read<void*>((char*)lps.Data + (size_t)index * sizeof(void*));
+                if (lp && !IsBadPtr(lp)) {
+                    void* pc = Read<void*>(GetField(lp, pcProp));
+                    if (pc && !IsBadPtr(pc)) return pc;
+                }
+            }
+        }
+    }
+    if (profile::GetPlayerController)
+        return Fn<void*(*)(void*, int)>(profile::GetPlayerController)(world, index);
+    return nullptr;
 }
 static void* GetPawn(void* controller) {
     if (!controller) return nullptr;
@@ -2817,17 +4571,53 @@ struct Session {
     int   glider_opens = 0;             // total auto/manual opens this session
     // [G30] emote cycle index for era.emote
     int   emote_cycle = 0;
+    // [G36] World Partition streaming source (the REAL fix for missing
+    // cities + dead graphics: the engine streams cells around the source
+    // instead of us forcing all 990 loaded levels visible at once).
+    bool  wp_source_set = false;
+    bool  wp_source_logged = false;
+    void* wp_source = nullptr;
+    int   wp_source_attempts = 0;
+    int   wp_forced_visible = 0;        // bounded fallback bookkeeping
 } session;
+
+// [G35] TEARDOWN STATE — declared early (used by Athena::Tick, pe_hook and
+// tick_hook): true from the lobby request until a NEW world appears. Every
+// deferred system checks this first and goes silent — during travel the
+// departing world's actors are destroyed underneath anything holding them.
+static volatile bool g_teardown = false;
 
 static double Monotonic() {
     timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
     return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
 }
 // [F15] Standalone gating — never touch an online session.
+// [G40] L4 reflection: UWorld::NetMode is a reflected TEnumAsByte and
+// ENetMode has been stable since UE3 — NM_Standalone == 0. The native
+// IsStandalone does exactly this read; the address is not needed. (The old
+// code jumped through the table RVA with NO zero guard — on an unknown build
+// that is a jump to g_base+0.) The native stays as the fallback channel.
 static bool WorldIsStandalone(void* world) {
     if (!g_base || !world) return false;
-    using IsStandalone_t = bool(*)(void*);
-    return Fn<IsStandalone_t>(profile::IsStandalone)(world);
+    static void* nmProp = nullptr; static size_t nmSize = 1; static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        nmProp = GetProp("/Script/Engine.World.NetMode");
+        if (nmProp) {
+            int es = Read<int>(nmProp, profile::PropElementSize);
+            nmSize = (es == 4) ? 4 : 1;               // TEnumAsByte=1, widened enum=4
+        } else LOG("[FD] ⚠️ World.NetMode not reflected — IsStandalone falls back to the %s",
+                  profile::IsStandalone ? "known-build native" : "unavailable (setup blocked)");
+    }
+    if (nmProp) {
+        void* f = GetField(world, nmProp);
+        if (f && !IsBadPtr(f)) {
+            unsigned nm = (nmSize == 4) ? Read<uint32_t>(f) : Read<uint8_t>(f);
+            return nm == 0;                            // NM_Standalone
+        }
+    }
+    if (profile::IsStandalone) return Fn<bool(*)(void*)>(profile::IsStandalone)(world);
+    return false;
 }
 static bool ActorLocation(void* actor, Vector& out) {
     Call c("/Script/Engine.Actor.K2_GetActorLocation");
@@ -2962,7 +4752,8 @@ namespace Athena {
     void* NearestVehicle(float radius);                    // [G19-b] HUD-button fallback target
     void DispatchHudInteract();                            // [G21] HUD interact button → nearest target dispatch
     void DiagnoseWorldPartition();                         // [G22] WP probes + activation attempts
-    void TickStreamingSources();                            // [G23-e] bIsStreamingSource forcing + FlushLevelStreaming
+    void TickStreamingSources();                            // [G36] streaming-source component retry
+    void SetupStreamingSource();                            // [G36] WorldPartitionStreamingSourceComponent on the pawn
     void TickVoidGuard();                                   // [G24] fall-through rescue (below-map teleport)
     // [G28] creatures / llama / vending / wildlife
     void TickCreatures();                                   // scan classes (pass 1) then auto-spawn (pass 2)
@@ -3033,6 +4824,10 @@ namespace Athena {
 
     // [G17-e] Erbium win parity — Victory Royale banner
     void HandleVictory(bool onDeath = false);
+
+    // [G34] CROWN WIN DISPLAY — resolve + wear the Victory Crown character
+    // part on the pawn (the crown you SEE on the winner's head).
+    void WearVictoryCrown(void* crownItemDef);
 
     void DebugDump();
 }
@@ -3871,17 +5666,23 @@ void Athena::RefreshHUD() {
 // ============================================================================
 void Athena::InitializeQuickBarsNative() {
     if (!session.quickbars || IsBadPtr(session.quickbars)) { LOG("[QB] No quickbar"); return; }
-    const uint32_t expected[] = {0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd};
-    if (profile::InitializeAthenaQuickBars == 0) return;   // [G16-f] not on this build
-    if (memcmp(reinterpret_cast<void*>(g_base + profile::InitializeAthenaQuickBars), expected, sizeof(expected)) != 0)
-        LOG("[QB] ⚠️ prologue mismatch at 0x%llX", (unsigned long long)(g_base + profile::InitializeAthenaQuickBars));
+    // [G42] the fixed prologue-word memcmp is RETIRED: the address now comes
+    // from the fd ledger — the two-bar signature (any build) adjudicated
+    // against the table (known builds) — and shape validation ran at
+    // discovery time (IsFunctionStart + frame confirmation).
+    if (profile::InitializeAthenaQuickBars == 0) {
+        LOG("[QB] init unavailable (fd found nothing, no table) — manual builder remains");
+        return;
+    }
+    uintptr_t initFn = g_base + profile::InitializeAthenaQuickBars;
+    uintptr_t init_slot = 0;
     void* vtable = Read<void*>(session.quickbars);
-    if (!vtable || IsBadPtr(vtable)) { LOG("[QB] vtable invalid"); return; }
-    uintptr_t init_slot = Read<uintptr_t>(vtable, profile::QuickBars_VtableSlot);
-    uintptr_t expected_fn = g_base + profile::InitializeAthenaQuickBars;
-    LOG("[QB] vtable=%p slot+0x%X=0x%llX expected=0x%llX", vtable, profile::QuickBars_VtableSlot, (unsigned long long)init_slot, (unsigned long long)expected_fn);
-    if (init_slot != expected_fn) { LOG("[QB] ❌ vtable mismatch — SKIPPING native call"); return; }
-    LOG("[QB] ✅ vtable match — calling native init");
+    if (vtable && !IsBadPtr(vtable) && profile::QuickBars_VtableSlot) {
+        init_slot = Read<uintptr_t>(vtable, profile::QuickBars_VtableSlot);
+        LOG("[QB] vtable=%p slot+0x%X=0x%llX fn=0x%llX (%s)", vtable, profile::QuickBars_VtableSlot,
+            (unsigned long long)init_slot, (unsigned long long)initFn,
+            init_slot == initFn ? "MATCH" : "slot mismatch — direct call");
+    } else LOG("[QB] init fn=0x%llX (no vtable slot — direct call)", (unsigned long long)initFn);
     // [F83-c] runtime cross-check of the F81-verified layout (0x278/0x308 —
     // binary-verified via disassembly) against live reflection. A drift here
     // means every read below is a false 0/0 and the builder would write the
@@ -3904,7 +5705,10 @@ void Athena::InitializeQuickBarsNative() {
     // [F43] Native init is called with (this, controller) — the 21.30 entry
     // reads the owning controller as its argument (harmless when the param
     // list is empty; without it the call early-outs and the bars stay empty).
-    { Guard g; reinterpret_cast<void(*)(void*, void*)>(init_slot)(session.quickbars, session.controller); }
+    // [G42] dispatch through the live vtable when the slot agrees (the
+    // engine's own dispatch — the [F92]-proven read path), else directly on
+    // the adjudicated address (same function, evidence-based route).
+    { Guard g; reinterpret_cast<void(*)(void*, void*)>(init_slot ? init_slot : initFn)(session.quickbars, session.controller); }
     Array p_after = Read<Array>(primary, profile::QuickBar_SlotsOffset);
     Array s_after = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
     LOG("[QB] After: Primary=%d Secondary=%d", p_after.Count, s_after.Count);
@@ -3920,7 +5724,7 @@ void Athena::InitializeQuickBarsNative() {
         void* psCtx = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
         if (psCtx && !IsBadPtr(psCtx)) {
             Write<void*>((char*)session.quickbars + profile::QuickBars_CtxOwner, 0, psCtx);
-            { Guard g; reinterpret_cast<void(*)(void*, void*)>(init_slot)(session.quickbars, session.controller); }
+            { Guard g; reinterpret_cast<void(*)(void*, void*)>(init_slot ? init_slot : initFn)(session.quickbars, session.controller); }
             Array p2 = Read<Array>(primary, profile::QuickBar_SlotsOffset);
             Array s2 = Read<Array>(secondary, profile::QuickBar_SlotsOffset);
             LOG("[QB] ctx=PlayerState retry: P=%d S=%d%s", p2.Count, s2.Count,
@@ -4138,9 +5942,15 @@ void Athena::VerifyHUDReadPath() {
         (qbLink == session.quickbars ? "MATCH" : "MISMATCH"), (unsigned)gate);
     void* vt = Read<void*>(session.quickbars);
     if (!vt || IsBadPtr(vt)) { LOG("[QB] HUD-verify: vtable invalid"); return; }
+    // [G42] the slot is the fd-decoded value (virtual-dispatch decode);
+    // 0 means the decode found nothing — the diagnostic degrades honestly.
+    if (!profile::QuickBars_VtableSlot_GetItemInSlot) {
+        LOG("[QB] HUD-verify: GetItemInSlot slot not resolved [G42] — diagnostic skipped");
+        return;
+    }
     using GIS_t = void* (*)(void*, int, int);
     GIS_t gis = reinterpret_cast<GIS_t>(Read<uintptr_t>(vt, profile::QuickBars_VtableSlot_GetItemInSlot));
-    if (!gis || IsBadPtr((void*)gis)) { LOG("[QB] HUD-verify: GetItemInSlot vtable[0x6f0] invalid"); return; }
+    if (!gis || IsBadPtr((void*)gis)) { LOG("[QB] HUD-verify: GetItemInSlot vtable[+0x%X] invalid", profile::QuickBars_VtableSlot_GetItemInSlot); return; }
     const struct { const char* name; unsigned off; } bars[2] = {
         {"Primary", profile::QuickBars_PrimaryOffset}, {"Secondary", profile::QuickBars_SecondaryOffset} };
     for (int b = 0; b < 2; ++b) {
@@ -4779,54 +6589,85 @@ static bool DoorCloseNative(void* wall) {
     return c.result<bool>();
 }
 // State probe: ABuildingWall::IsDoorOpen() (SDK-verified UFunction), with the
-// bit read as fallback.
+// OD-resolved bit ([G37] — no hardcoded mask) as fallback.
 static bool DoorIsOpen(void* wall) {
     if (!wall || IsBadPtr(wall)) return false;
     Call c("/Script/FortniteGame.BuildingWall.IsDoorOpen");
     if (c.ok() && c.run(wall)) return c.result<bool>();
     if (!profile::RawOffsetsVerified) return false;   // [G16-f] bit offsets 21.30-verified only
     uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
-    return (*pack & 0x20) != 0;
+    return (*pack & profile::BuildingWall_bDoorOpen_Mask) != 0;
 }
 
-static void DoorOpenApply(void* wall, bool fast) {
+static bool DoorOpenApply(void* wall, bool fast) {
     // [G06] native IOpenableInterface route first — authority, replication,
     // animation and collision all handled by ABuildingWall's own Open().
     if (DoorOpenNative(wall, fast)) {
+        // [G37] the SDK's own state verifier — collision must match the open
+        // state exactly like the server would enforce.
+        Call ver("/Script/FortniteGame.BuildingWall.VerifyDoorCollisionMatchesServer");
+        if (ver.ok()) ver.run(wall);
         Call netup("/Script/Engine.Actor.ForceNetUpdate");
         if (netup.ok()) netup.run(wall);
-        return;
+        return true;
     }
-    // [F-door r1] fallback: touch only the door bits.
-    if (!profile::RawOffsetsVerified) return;   // [G16-f] bit-pack offsets are 21.30-verified only
+    // [F-door r1] fallback: touch only the door bits — [G37] OD-resolved
+    // masks make this path version-independent (21.30 defaults only when
+    // reflection missed).
+    if (!profile::RawOffsetsVerified && !profile::BuildingWall_bDoorOpen_Mask) return false;
     uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
-    *pack |= 0x20 | 0x40;                        // bDoorOpen | bLocalDoorOpen
+    *pack |= profile::BuildingWall_bDoorOpen_Mask | profile::BuildingWall_bLocalDoorOpen_Mask;
     if (fast) {
-        uint8_t* fastPack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte + 1;
-        *fastPack |= 0x10;                       // bFastOpenRequested
+        uint8_t* fastPack = (uint8_t*)wall + profile::BuildingWall_bFastOpen_Byte;
+        *fastPack |= profile::BuildingWall_bFastOpen_Mask;
     }
     Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
     if (r.ok()) r.run(wall);
+    Call ver("/Script/FortniteGame.BuildingWall.VerifyDoorCollisionMatchesServer");
+    if (ver.ok()) ver.run(wall);
 
     Call netup("/Script/Engine.Actor.ForceNetUpdate");
     if (netup.ok()) netup.run(wall);
+    return true;
 }
 
-static void DoorCloseApply(void* wall) {
+static bool DoorCloseApply(void* wall) {
     // [G06] native Close route first.
     if (DoorCloseNative(wall)) {
+        Call ver("/Script/FortniteGame.BuildingWall.VerifyDoorCollisionMatchesServer");
+        if (ver.ok()) ver.run(wall);
         Call netup("/Script/Engine.Actor.ForceNetUpdate");
         if (netup.ok()) netup.run(wall);
-        return;
+        return true;
     }
-    if (!profile::RawOffsetsVerified) return;   // [G16-f] bit-pack offsets are 21.30-verified only
+    if (!profile::RawOffsetsVerified && !profile::BuildingWall_bDoorOpen_Mask) return false;
     uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
-    *pack &= uint8_t(~(0x20 | 0x40));            // clear bDoorOpen|bLocalDoorOpen
+    *pack &= uint8_t(~(profile::BuildingWall_bDoorOpen_Mask | profile::BuildingWall_bLocalDoorOpen_Mask));
     Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
     if (r.ok()) r.run(wall);
+    Call ver("/Script/FortniteGame.BuildingWall.VerifyDoorCollisionMatchesServer");
+    if (ver.ok()) ver.run(wall);
 
     Call netup("/Script/Engine.Actor.ForceNetUpdate");
     if (netup.ok()) netup.run(wall);
+    return true;
+}
+
+// [G37] SetDoorOpenState — THE complete "SetIsDoorOpen" API: 21.30 has no
+// UFunction by that name (the live server drives the private bit through its
+// own code); the reflected equivalent is this chain — Kismet OpenActor/Close
+// (IOpenableInterface → ABuildingWall::Open/Close: anim + collision +
+// bDoorOpen + replication) with the OD-mask bit-pack + OnRep +
+// VerifyDoorCollisionMatchesServer as the version-proof fallback. Returns
+// whether the state change went through. Used by the interact path, the
+// sprint bash-assist, and era.door.
+static bool SetDoorOpenState(void* wall, bool open, bool fast = true) {
+    if (!wall || IsBadPtr(wall)) return false;
+    bool ok = open ? DoorOpenApply(wall, fast) : DoorCloseApply(wall);
+    LOG("[Door] %s %s → %s (state now %s) [G37]",
+        ObjName(wall).c_str(), open ? "OPEN" : "CLOSE",
+        ok ? "applied" : "declined", DoorIsOpen(wall) ? "open" : "closed");
+    return ok;
 }
 
 // [G16-a] OWN-OPENED door bookkeeping — the toggle direction source.
@@ -4857,17 +6698,15 @@ void Athena::HandleOpenable(void* target) {
     // statics the native interact uses (UFortKismetLibrary::OpenActor /
     // CloseActor dispatch IOpenableInterface::Open/Close on ANY implementer).
     if (!target || IsBadPtr(target)) return;
+    // [G37] the toggle goes through SetDoorOpenState — the canonical
+    // "SetIsDoorOpen" chain (Kismet IOpenableInterface + verify + OnRep
+    // fallback), with the own-opened set as the direction source.
     if (DoorSetTake(target)) {
-        if (DoorCloseNative(target)) {
-            LOG("[Door] ✅ closed %s", ObjName(Read<void*>(target, profile::ObjectClass)).c_str());
-            return;
-        }
-        LOG("[Door] close declined for %s", ObjName(Read<void*>(target, profile::ObjectClass)).c_str());
+        SetDoorOpenState(target, /*open=*/false, /*fast=*/false);
         return;
     }
-    if (DoorOpenNative(target, /*fast=*/false)) {
+    if (SetDoorOpenState(target, /*open=*/true, /*fast=*/false)) {
         DoorSetAdd(target);
-        LOG("[Door] ✅ opened %s", ObjName(Read<void*>(target, profile::ObjectClass)).c_str());
         return;
     }
     // Not openable — BP interact event fallback (BuildingActor family).
@@ -4914,7 +6753,7 @@ void Athena::TickSprintDoorAssist() {
         if (!ActorLocation(w, loc) || !NearPlayer(loc, 150.0f)) continue;
         if (DoorOpenNative(w, /*fast=*/true)) { DoorSetAdd(w); ++opened; }
     }
-    if (opened) LOG("[Door] sprint fast-open %d", opened);
+    if (opened) LOG("[Door] sprint fast-open %d [G37]", opened);
 }
 
 // [G15-b] DELETED: TickDoorPins / TickSprintDoors. The pin re-assertion ran
@@ -5342,6 +7181,11 @@ void Athena::SetupWorld(void* world) {
     // POI stand-in mesh; deleting it (a server-side Erbium memory habit)
     // punched visible holes into cities whose real sublevels had not streamed
     // in. The HLODs stay; ForceSublevels now drives the real geometry.
+    // [G36] the REAL streaming source — attach it BEFORE any sublevel pass so
+    // ForceSublevels sees it live and forces nothing (engine-managed cells).
+    LOG("SetupWorld: SetupStreamingSource (G36 — WP source component)");
+    SetupStreamingSource();
+    TickStreamingSources();
     LOG("SetupWorld: ForceSublevels (DestroyLods disabled — G19-d)"); ForceSublevels();
     LOG("SetupWorld: InitializeInventory"); InitializeInventory();
     LOG("SetupWorld: ResetStaleContainers"); ResetStaleContainers();   // [F34]
@@ -5431,6 +7275,7 @@ void Athena::FinalizePlayer() {
 
 void Athena::Tick() {
     if (!session.world) return;
+    if (g_teardown) return;                 // [G35] frozen during lobby travel teardown
     double now = Monotonic();
     if (!session.attempted) {
         if (now - session.retry_at < 1.0) return;
@@ -5489,7 +7334,7 @@ void Athena::Tick() {
             (int)session.mesh_network_fixed,
             (int)session.playlist_levels_done,
             session.void_rescues,          // [G24] void-guard rescues
-            session.src_force_passes,      // [G23-e] streaming-source passes
+            session.wp_source_attempts,    // [G36] streaming-source setup attempts
             session.wp_diag_passes,        // [G22] WP diagnostic passes
             session.creatures_spawned,     // [G28] creatures spawned
             session.creature_passes,       // [G28] scan passes done
@@ -5545,7 +7390,7 @@ void Athena::Tick() {
         TickRealityProximity();    // [F44] reality tree proximity effect
         TickSprintDoorAssist();    // [G16-a] safe bash-through (open-only)
         TickBuildingLoads();       // [F-cities] drive LoadBuildings over a streaming window
-        TickStreamingSources();    // [G23-e] pawn/controller as WP streaming sources (own ticker)
+        TickStreamingSources();    // [G36] streaming-source component retry (own ticker)
         TickVoidGuard();           // [G24] fall-through rescue (below-map teleport)
         TickCreatures();           // [G28] llama/vending/wildlife scan + spawn rollout
         TickGliderAuto();          // [G29] auto-deploy the glider near ground
@@ -5631,14 +7476,38 @@ void Athena::ForceSublevels() {
         return;
     }
     if (levels.Count > 128) {
-        // [G23-d] WORLD PARTITION MAP — NEVER force bShouldBeLoaded on the
-        // whole cell set (the engine would load the entire map → OOM kill).
-        // Force VISIBILITY ONLY on streamers that already hold a loaded
-        // level: WP can leave cells loaded-but-invisible, which is exactly
-        // the "holes where buildings should be" symptom. The WP runtime
-        // keeps managing loading; newly loaded cells get their visibility
-        // forced on the next pass (30 s apart).
-        int visForced = 0, alreadyVis = 0, loaded = 0;
+        // [G36] THE GRAPHICS-DEATH FIX. The old pass forced bShouldBeVisible
+        // on EVERY loaded cell (990 at once, 6 passes) — a mobile GPU cannot
+        // draw the entire map simultaneously, the renderer chokes and "الخريطة
+        // رسوماتها ماتت" is exactly that. Now:
+        //   • streaming source live (G36 component)  → force NOTHING. The
+        //     engine activates cells around the player itself — cities appear
+        //     as you approach, graphics stay alive.
+        //   • source not live yet (fallback window)  → bounded visibility:
+        //     only the NEAREST loaded cells to the pawn (kMaxBounded), so the
+        //     immediate surroundings are never holes while the source comes up.
+        if (session.wp_source_set) {
+            if (!session.wp_source_logged) {
+                session.wp_source_logged = true;
+                LOG("[WP] partition map: %d streamers — source live, visibility FULLY engine-managed "
+                    "(no forcing — the graphics-death fix) [G36]", (int)levels.Count);
+            }
+            return;
+        }
+        Vector pawnLoc{};
+        bool haveLoc = session.pawn && PawnStillValid(session.pawn) && ActorLocation(session.pawn, pawnLoc);
+        void* ltProp = GetProp("/Script/Engine.LevelStreaming.LevelTransform");   // [G36] reflected
+        // LWC check (doubles vs floats in FTransform) — from the engine's own
+        // Vector.X element size, exactly like the od meta probe.
+        static int s_vecElem = -1;
+        if (s_vecElem < 0) {
+            s_vecElem = 8;
+            if (void* vp = GetProp("/Script/CoreUObject.Vector.X"))
+                s_vecElem = Read<int>(vp, profile::PropElementSize) == 4 ? 4 : 8;
+        }
+        struct Cand { double d2; void* ls; };
+        std::vector<Cand> cands;
+        int loaded = 0, alreadyVis = 0;
         for (int i = 0; i < levels.Count; ++i) {
             void* ls = Read<void*>(levels.Data, (size_t)i * 8);
             if (!ls || IsBadPtr(ls) || !IsReadable(ls, 0x10)) continue;
@@ -5646,11 +7515,42 @@ void Athena::ForceSublevels() {
             if (!lv || IsBadPtr(lv)) continue;                    // not loaded — leave alone
             ++loaded;
             if (GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible")) { ++alreadyVis; continue; }
-            SetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible", true);
+            if (!haveLoc || !ltProp) continue;
+            // LevelTransform — FTransform Translation (LWC: Quat@0, Translation@0x20
+            // as doubles; pre-LWC: Quat@0 floats, Translation@0x10 as floats).
+            int ltOff = Read<int>(ltProp, profile::PropOffset);
+            double lx, ly;
+            if (s_vecElem == 8) {
+                lx = Read<double>((char*)ls + ltOff + 0x20);
+                ly = Read<double>((char*)ls + ltOff + 0x28);
+            } else {
+                lx = (double)Read<float>((char*)ls + ltOff + 0x10);
+                ly = (double)Read<float>((char*)ls + ltOff + 0x14);
+            }
+            double dx = lx - pawnLoc.X, dy = ly - pawnLoc.Y;
+            cands.push_back({dx * dx + dy * dy, ls});
+        }
+        if (!haveLoc || !ltProp) {
+            LOG("[WP] partition map: %d streamers, %d loaded — no source%s%s; nothing forced [G36]",
+                (int)levels.Count, loaded,
+                haveLoc ? "" : " (no pawn loc)", ltProp ? "" : " (LevelTransform not reflected)");
+            return;
+        }
+        constexpr int kMaxBounded = 48;                           // bounded working set
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.d2 < b.d2; });
+        int visForced = 0;
+        for (size_t i = 0; i < cands.size() && i < (size_t)kMaxBounded; ++i) {
+            // Prefer the engine's own setter (fires the native update path).
+            Call sv("/Script/Engine.LevelStreaming.SetShouldBeVisible");
+            bool on = true;
+            if (sv.ok() && sv.set("bInShouldBeVisible", on) && sv.run(cands[i].ls)) { ++visForced; continue; }
+            SetBool(cands[i].ls, "/Script/Engine.LevelStreaming.bShouldBeVisible", true);
             ++visForced;
         }
-        LOG("[WP] partition map: %d streamers, %d hold loaded levels — visibility forced on %d (%d already visible, pass %d) [G23-d]",
-            (int)levels.Count, loaded, visForced, alreadyVis, session.sublevel_passes);
+        session.wp_forced_visible = visForced;
+        LOG("[WP] partition map: %d streamers, %d loaded, %d already visible — bounded visibility on the nearest %d "
+            "(fallback until the streaming source lands; was: ALL %d forced — the graphics killer) [G36]",
+            (int)levels.Count, loaded, alreadyVis, visForced, loaded);
         return;
     }
     int changed = 0, already = 0;
@@ -6754,6 +8654,16 @@ namespace local_loot {
     };
     static Cache g_cache;
 
+    // [G35] cross-session reset — the cache points into the departing world's
+    // DataTable row memory (GC'd on travel). A surviving "ready" flag would
+    // hand the next session dangling row pointers.
+    void ResetSession() {
+        g_cache.ready = false;
+        g_cache.tiers.clear(); g_cache.packages.clear();
+        g_cache.tierIndex.clear(); g_cache.pkgIndex.clear();
+        g_cache.failAt = -1000.0; g_cache.holdUntil = -1000.0;
+    }
+
     // [F92] heartbeat accessor — table count for the [HB] state line
     int TableCount() {
         return g_cache.ready ? (int)(g_cache.tiers.size() + g_cache.packages.size()) : 0;
@@ -7501,6 +9411,16 @@ namespace flo {
     static double lastRediscover = -1;
     static bool   capLogged = false, doneLogged = false;
     constexpr int MAX_PICKUPS = 6000;
+
+    // [G35] cross-session reset — pending/rolled hold ACTOR pointers from the
+    // departing world; the drain loop would keep calling natives on them
+    // after the travel tears the actors down (the end-of-session crash class).
+    void ResetSession() {
+        pending.clear(); rolled.clear();
+        spawned = failed = destroyed = rediscoveries = 0;
+        lastProgress = 0; lastRediscover = -1;
+        capLogged = doneLogged = false;
+    }
 
     // Discover floor-loot spawners not yet rolled. Cheap by design: two
     // GetAllActorsOfClass scans and NO per-actor work (the old pass read
@@ -8694,6 +10614,118 @@ void Athena::TickRealAlive() {
 }
 
 // ============================================================================
+// [G34] CROWN WIN DISPLAY — Athena::WearVictoryCrown.
+// ----------------------------------------------------------------------------
+// "نظام الفوز عمل لكن Crown Win لم يعمل": the Erbium-parity grant puts
+// AGID_VictoryCrown in the inventory, but the crown is only VISIBLE when the
+// pawn WEARS it as a character part (the "crowned victory" look — the crown
+// on the head during the victory screen). The live game resolves the part
+// from the item and ServerChoosePart's it onto the pawn.
+//
+// DATA-DRIVEN, ZERO HARDCODED ASSETS: the crown part is found by walking the
+// crown item definition's OWN reflected members (whatever array holds its
+// CustomCharacterParts — names differ per item class), with a GObjects scan
+// for a CustomCharacterPart named "*Crown*" as the fallback. The part's own
+// CharacterPartType drives ServerChoosePart, then the same
+// ApplyCharacterCosmetics + visualization refresh the body pipeline uses
+// makes it render. Every step logs so the next device run shows exactly
+// which stage produced the crown.
+// ============================================================================
+void Athena::WearVictoryCrown(void* crownItemDef) {
+    if (!session.pawn || !PawnStillValid(session.pawn)) { LOG("[Crown] ⚠️ pawn gone — crown wear skipped [G34]"); return; }
+    void* partCls = FindObj("/Script/FortniteGame.CustomCharacterPart");
+    if (!partCls) { LOG("[Crown] ⚠️ CustomCharacterPart class not resident [G34]"); return; }
+
+    // ---- 1. collect candidate crown parts ---------------------------------
+    std::vector<void*> candidates;
+    // (a) every reflected ARRAY member of the crown item whose elements are
+    //     CustomCharacterPart — works for any item-def class shape.
+    if (crownItemDef && !IsBadPtr(crownItemDef)) {
+        void* cls = Read<void*>(crownItemDef, profile::ObjectClass);
+        for (int depth = 0; cls && !IsBadPtr(cls) && depth < 6; ++depth) {
+            void* f = (profile::HasFField ? Read<void*>(cls, profile::StructChildProps) : nullptr);
+            for (int i = 0; f && !IsBadPtr(f) && i < 128; ++i, f = Read<void*>(f, profile::FFieldNext)) {
+                std::string n;
+                if (!SafeFieldName(f, profile::FFieldName, n)) continue;
+                int off = Read<int>(f, profile::PropOffset);
+                int es  = Read<int>(f, profile::PropElementSize);
+                if (off < 0 || off > 0x400 || es != 8) continue;          // pointer arrays only
+                Array arr = Read<Array>((char*)crownItemDef + off);
+                if (!arr.Data || IsBadPtr(arr.Data) || arr.Count <= 0 || arr.Count > 16) continue;
+                for (int k = 0; k < arr.Count; ++k) {
+                    void* el = Read<void*>(arr.Data, (size_t)k * 8);
+                    if (el && !IsBadPtr(el) && IsA(el, partCls))
+                        candidates.push_back(el);
+                }
+            }
+            cls = Read<void*>(cls, profile::StructSuper);
+        }
+    }
+    // (b) single part-typed members (some item defs reference one part)
+    // (c) GObjects scan: CustomCharacterPart with "Crown" in the name —
+    //     the VictoryCrown gameplay part is resident whenever the item is.
+    if (candidates.empty()) {
+        GObjects_t* go = GObjectArray();
+        if (go) {
+            for (int32 i = 0; i < go->NumElements && candidates.size() < 4; ++i) {
+                void* o = go->GetById((uint32)i);
+                if (!o || IsBadPtr(o) || Read<void*>(o, profile::ObjectClass) != partCls) continue;
+                std::string nm = ObjName(o);
+                if (nm.find("Crown") != std::string::npos || nm.find("crown") != std::string::npos)
+                    candidates.push_back(o);
+            }
+        }
+    }
+    if (candidates.empty()) { LOG("[Crown] ⚠️ no crown character part found (item members + GObjects scan) [G34]"); return; }
+
+    // ---- 2. wear each part through the engine's own chooser ----------------
+    int worn = 0;
+    for (void* part : candidates) {
+        uint8_t type = 255;
+        if (!GetFieldValue<uint8_t>(part, "/Script/FortniteGame.CustomCharacterPart.CharacterPartType", type) || type > 6) {
+            LOG("[Crown] ⚠️ part '%s' has no valid CharacterPartType — skipped",
+                ObjName(part).c_str());
+            continue;
+        }
+        Call choose("/Script/FortniteGame.FortPlayerPawn.ServerChoosePart");
+        if (choose.ok() && choose.set("Part", type) && choose.set("ChosenCharacterPart", part)) {
+            choose.run(session.pawn);
+            if (std::find(session.character_parts.begin(), session.character_parts.end(), part) == session.character_parts.end())
+                session.character_parts.push_back(part);
+            ++worn;
+            LOG("[Crown] 👑 wearing part '%s' (type=%u) [G34]", ObjName(part).c_str(), (unsigned)type);
+        }
+    }
+    if (!worn) { LOG("[Crown] ⚠️ ServerChoosePart failed for every candidate [G34]"); return; }
+
+    // ---- 3. make the cosmetics component rebuild (the render refresh) ------
+    void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
+    if (state && !IsBadPtr(state)) {
+        Array partsArr{session.character_parts.data(), (int32)session.character_parts.size(),
+                       (int32)session.character_parts.size()};
+        Call apply("/Script/FortniteGame.FortKismetLibrary.ApplyCharacterCosmetics");
+        if (apply.ok() && apply.set("WorldContextObject", session.world) &&
+            apply.set("CharacterParts", partsArr) && apply.set("PlayerState", state)) {
+            void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+            if (klib) apply.run(klib);
+        }
+        Call rcp("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts", state);
+        if (rcp.ok()) rcp.run(state);
+        void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+        if (klib) {
+            Call upd("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
+            if (upd.ok() && upd.set("PlayerState", state)) upd.run(klib);
+        }
+        Call r3("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData", state);
+        if (r3.ok()) r3.run(state);
+    }
+    // ---- 4. keep the body visible through the win sequence ------------------
+    Call body("/Script/FortniteGame.FortPlayerPawnAthena.SetCharacterBodyVisibilityForPossession");
+    if (body.ok()) { bool bShow = true; if (body.set("bVisible", bShow)) body.run(session.pawn); }
+    LOG("[Crown] ✅ crown-win display complete — %d part(s) worn, refresh dispatched [G34]", worn);
+}
+
+// ============================================================================
 // [G17-e/G18-a] HandleVictory — Erbium win parity (ClientOnPawnDied lines
 // 1262-1301): when the last opponent dies the server notifies the winner —
 //   PlayWinEffects (v16+) → ClientNotifyWon → ClientNotifyTeamWon,
@@ -8796,6 +10828,11 @@ void Athena::HandleVictory(bool onDeath) {
                 LOG("[Victory] 👑 Victory Crown granted (Erbium parity)");
             else
                 LOG("[Victory] ⚠️ crown grant failed");
+            // [G34] CROWN WIN DISPLAY — the item alone does not wear anything:
+            // the crown becomes VISIBLE through the character-part pipeline
+            // (the live game resolves the crown's part and chooses it on the
+            // pawn — "Crowned Victory Royale" is the crown on your head).
+            WearVictoryCrown(crown);
         } else LOG("[Victory] crown asset not resident — skipped");
     }
     // [G30] victory dance — the classic default emote, resident-first with one
@@ -9562,46 +11599,68 @@ void Athena::DiagnoseWorldPartition() {
 }
 
 // ============================================================================
-// [G23-e] STREAMING SOURCES — extracted from the WP diagnostic into its own
-// ticker. Round-10 proof it was needed: the diagnostic crashed in part B
-// BEFORE the old "attempts 1 & 2" block ever ran, so on that entire session
-// the pawn never became a World Partition streaming source — WP streamed
-// around nothing useful and the player fell through unloaded cells. The
-// reflected bIsStreamingSource flag is what the WP streaming-source iterator
-// keys on; forcing it on pawn + controller (4 passes × 30 s, idempotent) plus
-// a FlushLevelStreaming console pass gives the runtime a source at the player
-// for the whole match.
+// [G36] STREAMING SOURCE — THE REAL ONE. 21.30 (UE 5.0) streams World
+// Partition cells around UWorldPartitionStreamingSourceComponent instances
+// (the reflected Actor.bIsStreamingSource flag from UE4 is GONE — that is
+// why every "bIsStreamingSource not reflected" pass forced nothing and the
+// player was never a source). This attaches the component to the pawn and
+// EnableStreamingSource()s it: from that moment the ENGINE loads+shows the
+// cells around the player as they move — cities appear as you approach
+// them, exactly like the live game, and nothing needs blanket-forcing.
 // ============================================================================
+void Athena::SetupStreamingSource() {
+    if (session.wp_source_set || !session.pawn || !PawnStillValid(session.pawn)) return;
+    if (++session.wp_source_attempts > 24) return;              // ~2 min of 5s retries
+    void* cls = FindObj("/Script/Engine.WorldPartitionStreamingSourceComponent");
+    if (!cls) return;                                           // streams in later — retry
+    void* comp = nullptr;
+    Call get("/Script/Engine.Actor.GetComponentByClass");
+    if (get.ok() && get.set("ComponentClass", cls) && get.run(session.pawn)) comp = get.result<void*>();
+    if (!comp || IsBadPtr(comp)) {
+        Call add("/Script/Engine.Actor.AddComponentByClass");
+        if (add.ok()) {
+            bool bManual = false; Transform t{}; bool bDeferred = false;
+            add.set("Class_0", cls) || add.set("Class", cls);
+            add.set("bManualAttachment", bManual);
+            add.set("RelativeTransform", t); add.set("bDeferredFinish", bDeferred);
+            if (add.run(session.pawn)) comp = add.result<void*>();
+        }
+    }
+    if (!comp || IsBadPtr(comp)) return;
+    session.wp_source = comp;
+    // bStreamingSourceEnabled is private on this build — EnableStreamingSource
+    // is the public BlueprintCallable that flips it with the native side too.
+    Call en("/Script/Engine.WorldPartitionStreamingSourceComponent.EnableStreamingSource");
+    bool ok = en.ok() && en.run(comp);
+    Call chk("/Script/Engine.WorldPartitionStreamingSourceComponent.IsStreamingSourceEnabled");
+    bool live = false;
+    if (chk.ok() && chk.run(comp)) live = chk.result<bool>();
+    if (ok || live) {
+        session.wp_source_set = true;
+        LOG("[WP] ✅ WorldPartitionStreamingSourceComponent live on the pawn (%s) — "
+            "engine-managed cell streaming around the player [G36]",
+            live ? "verified" : "dispatched");
+        // one flush to make the runtime re-evaluate sources immediately
+        Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
+        if (f.ok()) {
+            auto cmd = ToWide("FlushLevelStreaming");
+            FStringNative command{(TCHAR*)cmd.data(), (int32)cmd.size() + 1, (int32)cmd.size() + 1};
+            if (f.set("WorldContextObject", session.world) && f.set("Command", command) && f.set("SpecificPlayer", session.controller))
+                f.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
+        }
+    } else {
+        LOG("[WP] ⚠️ EnableStreamingSource failed (attempt %d) [G36]", session.wp_source_attempts);
+        session.wp_source = nullptr;
+    }
+}
+
 void Athena::TickStreamingSources() {
-    if (session.src_force_passes >= 4) return;
+    if (session.wp_source_set) return;
     static double lastTry = 0;
     double now = Monotonic();
-    if (session.src_force_passes > 0 && now - lastTry < 30.0) return;
+    if (session.wp_source_attempts > 0 && now - lastTry < 5.0) return;
     lastTry = now;
-    ++session.src_force_passes;
-    int forced = 0;
-    void* srcProp = GetProp("/Script/Engine.Actor.bIsStreamingSource");
-    if (srcProp) {
-        if (session.pawn && PawnStillValid(session.pawn)) {
-            SetBool(session.pawn, "/Script/Engine.Actor.bIsStreamingSource", true);
-            ++forced;
-        }
-        if (session.controller) {
-            SetBool(session.controller, "/Script/Engine.Actor.bIsStreamingSource", true);
-            ++forced;
-        }
-    }
-    LOG("[WP] streaming-source pass %d/4: %d forced%s",
-        session.src_force_passes, forced,
-        srcProp ? " (pawn+controller)" : " — bIsStreamingSource not reflected");
-    Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
-    if (f.ok()) {
-        auto cmd = ToWide("FlushLevelStreaming");
-        FStringNative command{(TCHAR*)cmd.data(), (int32)cmd.size() + 1, (int32)cmd.size() + 1};
-        if (f.set("WorldContextObject", session.world) && f.set("Command", command) && f.set("SpecificPlayer", session.controller))
-            f.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
-        LOG("[WP] FlushLevelStreaming console pass dispatched");
-    }
+    SetupStreamingSource();
 }
 
 // ============================================================================
@@ -9649,9 +11708,10 @@ void Athena::TickVoidGuard() {
             target.X, target.Y, target.Z, session.void_rescues);
         if (session.void_rescues == 3) {
             // repeated falls — the cell under the player is not streaming in:
-            // re-arm the streaming-source pass budget and flush streaming.
-            session.src_force_passes = 0;
-            LOG("[VoidGuard] repeated falls — streaming-source passes re-armed + FlushLevelStreaming");
+            // re-arm the streaming-source setup budget and flush streaming.
+            session.wp_source_attempts = 0;
+            session.wp_source_set = false;
+            LOG("[VoidGuard] repeated falls — streaming-source setup re-armed + FlushLevelStreaming");
             Call f("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
             if (f.ok()) {
                 auto cmd = ToWide("FlushLevelStreaming");
@@ -10518,21 +12578,75 @@ void Athena::CheatScript(const char* script) {
 // LOBBY / CHEAT COMMANDS — [F24]
 // ============================================================================
 static void* g_depart_world = nullptr;
+// [G35] cross-session static reset — statics holding ACTOR pointers from the
+// departing world must not survive into the next one (use-after-free class).
+static void ResetCrossSessionStatics() {
+    local_loot::ResetSession();
+    flo::ResetSession();
+}
+
+// [G35] pre-travel cleanup: undo everything this module forced onto the
+// streaming system (the engine unloads levels during travel — streamers we
+// forced visible/loaded fight the unload and can fault inside the teardown).
+static void TeardownStreamingForcing(void* world) {
+    if (!world || IsBadPtr(world)) return;
+    void* levelsProp = GetProp("/Script/Engine.World.StreamingLevels");
+    if (!levelsProp) return;
+    Array levels = Read<Array>(GetField(world, levelsProp));
+    if (!levels.Data || IsBadPtr(levels.Data) || levels.Count <= 0 || levels.Count > 4096) return;
+    int reverted = 0;
+    for (int i = 0; i < levels.Count; ++i) {
+        void* ls = Read<void*>(levels.Data, (size_t)i * 8);
+        if (!ls || IsBadPtr(ls) || !IsReadable(ls, 0x10)) continue;
+        // Only the ones WE forced (engine-managed ones were already visible).
+        if (GetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible")) {
+            SetBool(ls, "/Script/Engine.LevelStreaming.bShouldBeVisible", false);
+            ++reverted;
+        }
+    }
+    LOG("[G35] pre-travel: streamer visibility reverted on %d/%d — engine owns the unload",
+        reverted, (int)levels.Count);
+}
 
 void Athena::ReturnToLobby(void* world) {
     // Travel after WorldTick, never from inside a controller return-menu RPC
     // (Era core return_to_lobby ported).
+    // [G35] ORDER MATTERS: (1) freeze every deferred system, (2) undo our
+    // forcing on the world, (3) travel through the engine's OWN client
+    // return path (proper HUD/state teardown), (4) only then raw console
+    // travel as the fallback, (5) all under the fault guard.
+    g_teardown = true;
     void* controller = session.controller;
     g_depart_world = world;
+    gas::RunGuarded("[G35] pre-travel cleanup", [&] { TeardownStreamingForcing(world); });
     session = Session{};
-    auto text = ToWide("open Frontend");
-    FStringNative command{(TCHAR*)text.data(), (int32)text.size() + 1, (int32)text.size() + 1};
-    Call travel("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
-    bool dispatched = travel.ok() && travel.set("WorldContextObject", world) &&
-                      travel.set("Command", command) && travel.set("SpecificPlayer", controller) &&
-                      travel.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
-    LOG("Lobby travel dispatched=%d; old session cleared", (int)dispatched);
-    if (!dispatched) { g_depart_world = nullptr; }
+    ResetCrossSessionStatics();
+    bool dispatched = false;
+    // (3) the engine's own return flow — does the full client cleanup the
+    // live game performs when a match ends (HUD teardown, state flush).
+    if (controller && !IsBadPtr(controller)) {
+        Call r("/Script/Engine.PlayerController.ClientReturnToMainMenuWithTextReason", controller);
+        if (r.ok()) {
+            auto reason = ToWide("VictoryRoyale");
+            FStringNative text{(TCHAR*)reason.data(), (int32)reason.size() + 1, (int32)reason.size() + 1};
+            bool bExit = false;
+            if (r.set_any(text, "Reason", "TextReason", "InReason") && r.set_any(bExit, "bShutdownServer", "bExit"))
+                dispatched = gas::RunGuarded("[G35] ClientReturnToMainMenu", [&] { r.run(controller); });
+        }
+    }
+    // (4) fallback: the raw travel that always worked.
+    if (!dispatched) {
+        auto text = ToWide("open Frontend");
+        FStringNative command{(TCHAR*)text.data(), (int32)text.size() + 1, (int32)text.size() + 1};
+        Call travel("/Script/Engine.KismetSystemLibrary.ExecuteConsoleCommand");
+        dispatched = travel.ok() && travel.set("WorldContextObject", world) &&
+                     travel.set("Command", command) && travel.set("SpecificPlayer", controller) &&
+                     gas::RunGuarded("[G35] open Frontend", [&] {
+                         return travel.run(FindObj("/Script/Engine.Default__KismetSystemLibrary"));
+                     });
+    }
+    LOG("Lobby travel dispatched=%d; old session cleared (teardown frozen, streaming reverted)", (int)dispatched);
+    if (!dispatched) { g_depart_world = nullptr; g_teardown = false; }
 }
 
 void Athena::TeleportToReticle() {
@@ -10601,7 +12715,18 @@ static bool PrologueMatchPE(const char* label, uintptr_t rva) {
     bool ok0 = false;
     for (size_t i = 0; i < sizeof(word0_variants) / sizeof(word0_variants[0]); ++i)
         if (actual0 == word0_variants[i]) { ok0 = true; break; }
+    // [G33] OD-discovered PE (unknown build): the exact word table belongs to
+    // the two known builds; a discovered address only needs a VALID function
+    // opener (the scanner's own prologue vocabulary) — anything else would
+    // re-break the "not limited to one version" requirement.
     if (!ok0) {
+        if (od::ProcessEventWasDiscovered() &&
+            (arm::IsCalleeSavedStpSp(actual0) || arm::IsStpX29X30Sp(actual0) ||
+             arm::IsSubSpImm(actual0) || arm::IsPacHint(actual0))) {
+            LOG("Prologue verified %s RVA=%llx word0=%08x (OD-discovered, shape-validated)",
+                label, (unsigned long long)rva, actual0);
+            return true;
+        }
         LOG("PROLOGUE MISMATCH %s RVA=%llx word=0 expected=a9ba6ffc|f81a0ffc actual=%08x",
             label, (unsigned long long)rva, actual0);
         return false;
@@ -10644,7 +12769,7 @@ static void DumpRpcParams(void* func, void* params, const char* tag) {
 static void pe_hook(void* obj, void* func, void* params) {
     if (!orig_PE) return;
     if (!g_internal && func && g_gameTid.load() == (int)gettid()) {
-        if (session.lobby_requested) { orig_PE(obj, func, params); return; }
+        if (session.lobby_requested || g_teardown) { orig_PE(obj, func, params); return; }   // [G35]
 
         std::string fn = ObjName(func);
         bool isPC   = (obj == session.controller);
@@ -11094,6 +13219,18 @@ static void tick_hook(void* world, int type, float delta) {
         if (world == g_depart_world) return;
         g_depart_world = nullptr;
     }
+    // [G35] TEARDOWN FREEZE: from the lobby request until a NEW terrain
+    // world appears, this hook does NOTHING beyond the OG tick — no name
+    // resolution, no session work, nothing that touches the dying world.
+    if (g_teardown) {
+        std::string wchk = ObjName(world);
+        if (wchk.find("Artemis_Terrain") != std::string::npos ||
+            wchk.find("Athena_Terrain") != std::string::npos) {
+            g_teardown = false;
+            LOG("[G35] teardown complete — new terrain world live, session machinery re-armed");
+            // fall through: fresh session for the new world below
+        } else return;
+    }
     if (session.lobby_requested && session.world == world) { Athena::ReturnToLobby(world); return; }
 
     std::string wn = ObjName(world);
@@ -11352,7 +13489,49 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
         } else if (normalized == "era.mark" && session.controller) {
             // [G31] map marker probe
             Athena::TryPlaceMarker();
-        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.alive | era.qb | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.players N | era.vehicles | era.loot | era.die | era.win | era.spawn /Game/Path | era.emote | era.glider | era.llama [N] | era.animals | era.vending [N] | era.klombo | era.class <name> | era.mark | fly | walk | ghost | god | teleport | era.lobby");
+        } else if (normalized == "era.dumper") {
+            // [G33] the offset-source report: every offset with WHERE it came
+            // from (reflected / discovered / scan / probed / known-build).
+            od::Dump();
+        } else if (normalized == "era.functions") {
+            // [G39] the function-address ledger: every function with the
+            // VERDICT of its address (VERIFIED / OVERRIDE / discovered /
+            // fallback / MISSING) — the audit trail of لا عناوين ثابتة.
+            fd::Dump();
+        } else if (normalized == "era.explain") {
+            // [G39] the on-device methodology dump — كيف تُوجد الدوال.
+            fd::Explain();
+        } else if (normalized == "era.door" && session.world && session.pawn) {
+            // [G37] SetIsDoorOpen live test: toggle the nearest door through
+            // the full chain (Kismet OpenActor → OnRep → verify collision).
+            {
+                void* wallCls = FindObj("/Script/FortniteGame.BuildingWall");
+                std::vector<void*> walls;
+                void* best = nullptr; double bestD2 = 600.0 * 600.0;
+                if (wallCls && GetAllActorsOfClassRaw(wallCls, walls)) {
+                    Vector pawnLoc{};
+                    if (ActorLocation(session.pawn, pawnLoc)) {
+                        for (void* w : walls) {
+                            if (!w || IsBadPtr(w)) continue;
+                            Vector l{};
+                            if (!ActorLocation(w, l)) continue;
+                            double dx = l.X - pawnLoc.X, dy = l.Y - pawnLoc.Y, dz = l.Z - pawnLoc.Z;
+                            double d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 < bestD2) { bestD2 = d2; best = w; }
+                        }
+                    }
+                }
+                if (best) {
+                    bool open = !DoorIsOpen(best);
+                    SetDoorOpenState(best, open, /*fast=*/false);
+                } else LOG("era.door: no door within 600uu");
+            }
+        } else if (normalized == "era.crown" && session.world && session.pawn) {
+            // [G34] crown-win display live test (no era.win needed)
+            void* crown = FindObj("/VictoryCrownsGameplay/Items/AGID_VictoryCrown.AGID_VictoryCrown");
+            if (crown && !IsBadPtr(crown)) Athena::WearVictoryCrown(crown);
+            else LOG("era.crown: crown item not resident");
+        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.alive | era.qb | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.players N | era.vehicles | era.loot | era.die | era.win | era.spawn /Game/Path | era.emote | era.glider | era.llama [N] | era.animals | era.vending [N] | era.klombo | era.class <name> | era.mark | era.dumper | era.functions | era.explain | era.door | era.crown | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
@@ -11394,10 +13573,34 @@ static void InstallHooks() {
     // dual-build (PrologueMatchPE accepts both families' word0 + tail).
     bool pe_valid   = PrologueMatchPE("ProcessEvent", profile::ProcessEvent);
     const BuildProfile& bp = *s_activeProfile;
-    bool tick_valid = PrologueMatch("WorldTick",  profile::WorldTick,  bp.tickWords, 4);
-    bool exec_valid = PrologueMatch("EngineExec", profile::EngineExec, bp.execWords, 4);
-    bool qb_valid   = profile::InitializeAthenaQuickBars != 0
-                      && PrologueMatch("AthenaQuickBars", profile::InitializeAthenaQuickBars, bp.qbWords, 4);
+    // [G39-w13] A runtime-sourced hook target (discovered or OVERRIDEed by
+    // fd) is validated by SHAPE — the scanner's own prologue vocabulary +
+    // frame confirmation — instead of the known-build word tables. The word
+    // tables belong to the two profiled builds; applying them to a
+    // correctly-discovered address on ANY other build would wrongly disable
+    // the Tick/Exec hooks (the wave-12 "honest limits" that wave-13 removes).
+    auto HookTargetValid = [](const char* label, uintptr_t rva, const uint32_t* words, bool runtime) {
+        if (!rva) return false;
+        if (runtime) {
+            if (fd::IsFunctionStart(g_base + rva)) {
+                LOG("Prologue verified %s RVA=%llx (runtime-discovered, shape-validated)",
+                    label, (unsigned long long)rva);
+                return true;
+            }
+            LOG("PROLOGUE MISMATCH %s RVA=%llx (runtime-discovered, NOT a function start)",
+                label, (unsigned long long)rva);
+            return false;
+        }
+        return PrologueMatch(label, rva, words, 4);
+    };
+    bool tick_valid = HookTargetValid("WorldTick", profile::WorldTick, bp.tickWords,
+                                      fd::WorldTickWasDiscovered());
+    bool exec_valid = HookTargetValid("EngineExec", profile::EngineExec, bp.execWords,
+                                      fd::EngineExecWasDiscovered());
+    // [G42] the QB initializer is no longer hooked here — its address is
+    // adjudicated in fd and CALLED under Guard when needed; a stale word
+    // table would only produce a false negative.
+    bool qb_valid   = profile::InitializeAthenaQuickBars != 0;
 
     int installed = 0, failed = 0;
     if (pe_valid) {
@@ -11412,7 +13615,7 @@ static void InstallHooks() {
         if (DobbyHook((void*)(g_base + profile::EngineExec), (void*)exec_hook, (void**)&orig_Exec) == 0 && orig_Exec) { LOG("EngineExec hooked"); ++installed; }
         else { LOG("EngineExec FAILED"); ++failed; }
     } else { LOG("EngineExec skipped (prologue)"); ++failed; }
-    if (!qb_valid) LOG("[QB] initializer prologue mismatch — native init disabled, manual path only");
+    if (!qb_valid) LOG("[QB] initializer not adjudicated — manual builder path only [G42]");
 
     // [G05/G12] MCP dispatch hook — through the shared installer (also used
     // by the late terrain re-scan path).
@@ -11432,8 +13635,10 @@ static int InspectCb(dl_phdr_info* info, size_t, void*) {
 }
 
 static void* Worker(void*) {
-    LOG("=== EraCH3 starting — multi-version build (auto-detected profiles) ===");
-    LOG("[Build] wave-11 [G27-G32]: native-init probe OFF, creatures/llama/Klombo, auto-glider, emotes, break-loot, era.class dumper");
+    LOG("=== EraCH3 starting — runtime function discovery build ===");
+    LOG("[Build] wave-13 [G39-G44]: discovery-first — الاكتشاف أولاً: fd wired on "
+        "EVERY build, runtime evidence overrides the table, QB family + LoadClass "
+        "discovered, GetPC/IsStandalone real reflection");
     LOG("sizeof(Vector)=%zu sizeof(Rotator)=%zu sizeof(Transform)=%zu", sizeof(Vector), sizeof(Rotator), sizeof(Transform));
     for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
         dl_iterate_phdr(InspectCb, nullptr);
@@ -11441,14 +13646,33 @@ static void* Worker(void*) {
     }
     if (g_status.load() != 1) { LOG("Timeout"); return nullptr; }
     usleep(300000);
-    // [G16-f] PROFILE SELECTION FIRST — the build ID decides every RVA and
-    // structural offset before anything else runs.
+    // [G16-f] PROFILE SELECTION FIRST — the build ID decides the fast path
+    // (known builds: table loaded as CROSS-CHECK) or triggers RVA zeroing
+    // (unknown builds, [G33]).
     DetectAndApplyProfile();
-    // [G02] Native discovery NEXT (Erbium Finders parity): the scanner walks
-    // the loaded image once on this worker thread — the found addresses feed
-    // InstallHooks ([G05] MCP) and the ability/animation/vehicle systems.
+    // [G33] OD BOOTSTRAP SECOND — name pool + GObjects scans + meta layout
+    // probe: from here the module can find objects and read names on ANY
+    // build, known or not. On unknown builds this is what makes reflection
+    // work at all; on known builds it cross-checks the profile.
+    od::Bootstrap();
+    // [G33] REFLECTION BULK RESOLVE — every gameplay member offset is
+    // re-derived from the live classes/structs (version truth, not tables).
+    od::ResolveAll();
+    // [G39-w13] THE FIX THE USER DEMANDED — the function-discovery engine
+    // runs on EVERY build and adjudicates EVERY function address against
+    // the running game. Wave-12 wrote fd::ResolveAll but never called it —
+    // the table was still the only address source in practice, which is
+    // exactly "لا تزال تستخدم ازاحات ثابتة". From this wave: discovery
+    // ALWAYS runs, ALWAYS reports, and VERIFIED runtime evidence OVERRIDES
+    // the table on disagreement. The table is a cross-check, never the
+    // authority.
+    fd::ResolveAll();
+    // [G02] GAS/MCP native discovery (Erbium Finders parity): the scanner
+    // walks the loaded image once on this worker thread — the found addresses
+    // feed InstallHooks ([G05] MCP) and the ability/animation/vehicle systems.
     // Version-independent: the log strings are stable across builds.
     gas::Discover();
+    od::Report();
     InstallHooks();
     LOG("=== Ready ===");
     return nullptr;
