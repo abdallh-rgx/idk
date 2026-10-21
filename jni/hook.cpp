@@ -1,16 +1,54 @@
 // ============================================================================
-// EraCH3 — Fortnite Android  (RUNTIME FUNCTION DISCOVERY BUILD — wave 13)
+// EraCH3 — Fortnite Android  (RUNTIME FUNCTION DISCOVERY BUILD — wave 14)
 // ============================================================================
 // Build ID of the reference libUnreal.so (21.30):
 //   5b371871c152651ff2b038c01c9504c1a82de1f8
 //
-// WAVE 13 — "الاكتشاف أولاً" ([G39]-[G44]). The user's verdict on wave 12:
-//   "لا تزال تستخدم ازاحات ثابتة و ليس أثناء التشغيل اكتشف كيف تجد الدوال
-//    و اشرحها في الكود" — and it was TRUE: wave-12 built the fd function-
-//   discovery engine but NEVER WIRED IT INTO THE WORKER (fd::ResolveAll was
-//   dead code; the profile table was still the only address source; even
-//   era.functions/era.explain were never dispatched). This wave makes
-//   runtime discovery THE source of function addresses:
+// WAVE 14 — "منهج MobileDumper-7" ([G45]-[G48]). The user pointed at
+//   github.com/MJx0/MobileDumper-7 after the wave-13 boot log died:
+//   "[OD] ⚠️ name pool not found" → كراش → "انت لا زلت تستخدم ازاحات ثابتة".
+//   Both were correct — here is what this wave changes:
+//  [G45] NAME POOL — POINTER-SLOT SCAN (the wave-13 scan was searching the
+//        wrong place): the pool's 64KB blocks are HEAP allocations, NOT in
+//        the module image — the only in-module hook is Blocks[0], a .bss
+//        slot pointing OUT to the heap. The scan now walks every writable
+//        PT_LOAD slot, kernel-probes the heap target, and FINGERPRINTS it
+//        by walking the engine-standard reserved-name sequence
+//        (None/ByteProperty/IntProperty/... — UnrealNames.inl, MobileDumper-
+//        7's own anchors). The walk also DISCOVERS the entry format
+//        (lenShift 1 vs 6, stride 2 vs 4) — nothing about the header is
+//        assumed, and the low-16 id is scaled by the discovered stride
+//        (FNameEntryHandle::FromUnstableInt — the old code forgot the
+//        multiply entirely).
+//  [G46] GOBJECTS — the wave-13 CRASH, root-caused and fixed three ways:
+//        (1) the old scan validated 8 bytes of the chunk table then read
+//        16KB past them (objs[numChunks-1] on garbage) — now the arithmetic
+//        INVARIANT ceil(Num/65536)==NumChunks rejects garbage before any
+//        external dereference, and every heap read is kernel-probed first;
+//        (2) the ObjObjects member offset is PROBED (7 candidates), the
+//        counters validated at member+0x10..+0x1C, and the result fills an
+//        ADAPTER instance so no call site depends on engine layout;
+//        (3) the whole od::Bootstrap runs under RunGuarded — a scan fault
+//        is logged and skipped, NEVER fatal.
+//  [G47] PROCESS EVENT — THIRD PATH: the MobileDumper-7 InitProcessEvent
+//        vtable signal scan, ported faithfully: any live CDO's vtable, ten
+//        signals scored per slot (GObjects reference ±0x10, InternalIndex
+//        load, FUObjectItem immediate, PropertiesSize, ParamSize ×2,
+//        ChildProperties ×2, TBZ/TBNZ, ≥3 STP pairs), neighbor boundary =
+//        prologue-after-return, kMinScore=4, score≥6 self-proving. PE now
+//        has THREE independent voters (dual string anchors, signal scan,
+//        known-build table) — agreement is super-verification; the scan
+//        alone rescues builds whose log strings are stripped.
+//  [G48] The explanation discipline continues: every scanner above carries
+//        its full methodology in-code (Arabic + English), era.explain
+//        prints it on device, and the discovery logs name the mechanism
+//        that produced every address.
+//
+// WAVE 13 recap ([G39]-[G44], all still in force): discovery-first
+// adjudication — fd::ResolveAll runs on EVERY build before hooks; runtime
+// evidence OVERRIDES the table; QB family + LoadClass by call-graph; the
+// profile table is a cross-check, never the authority.
+//
 //  [G39] DISCOVERY-FIRST ADJUDICATION — fd::ResolveAll() now runs on EVERY
 //        build (known or not) BEFORE the hooks install. Every function
 //        address is adjudicated between runtime evidence and the known-build
@@ -2825,22 +2863,71 @@ static void Rec(const char* name, const char* source, unsigned value) {
 }
 
 // ---------------------------------------------------------------- L1: names
+// [G45] HOW THE NAME POOL IS FOUND — منهج MobileDumper-7 (NameStrategy) بعد أن
+// أثبت الجهاز أن المسح القديم كان يبحث في المكان الخطأ:
+//
+// WHAT WAS WRONG (the wave-13 "name pool not found"): the old scan searched
+// for the literal bytes "08 00 None" INSIDE the module image. But the pool's
+// 64KB BLOCKS are HEAP allocations (FMemory::Malloc) — they are NOT in any
+// PT_LOAD of libUnreal.so, so the bytes were never there to be found.
+//
+// WHAT IS ACTUALLY IN THE MODULE: the FNamePool STRUCT itself — a global in
+// .bss — whose only hook into the heap is Blocks[0], the first slot of its
+// block-pointer array. So the correct scan is a POINTER-SLOT scan:
+//     for every 8-aligned slot `a` in every writable PT_LOAD:
+//         p = *(void**)a                — direct read (module image, mapped)
+//         p must look like a heap block (outside every module range,
+//           page-aligned in pass 1 — 128KB mallocs come from mmap)
+//         kernel-validate p (IsReadable) — heap memory, NEVER trust it
+//         WALK the block's first entries and match the reserved names
+//
+// THE FINGERPRINT (why this cannot false-positive): the engine's FNamePool
+// constructor registers the EName reserved names FIRST — before any game
+// name exists — starting at entry 0 of block 0, IN ORDER (UnrealNames.inl,
+// stable across UE4.0..UE5.x): "None", "ByteProperty", "IntProperty",
+// "BoolProperty", "FloatProperty", "ObjectProperty", ... A random heap
+// block that walks through 8+ of those names in exact positional order is
+// the pool's block 0; MobileDumper-7 uses the same names as its resolution
+// anchors ("ByteProperty"/"IntProperty"/... identify FNamePool::FNamePool).
+//
+// THE FORMAT IS DISCOVERED, NOT ASSUMED — no fixed header decoding survives:
+//     lenShift=1 : hdr = wide:1 | len:15                  (WITH_CASE_PRESERVING_NAME)
+//     lenShift=6 : hdr = wide:1 | probeHash:5 | len:10    (UE5.0 default)
+//     stride 2/4 : entry alignment (alignof(FNameEntry) per release)
+// The (lenShift, stride) pair whose walk scores highest IS this build's
+// format; EntryToString then uses the discovered pair for every name.
+// The stored 16-bit id offset is in STRIDE UNITS (FNameEntryHandle::
+// FromUnstableInt does (id & 0xFFFF) * Stride) — the old code forgot the
+// multiply, another reason it could never have worked.
 static uint8_t** s_blocks = nullptr;      // engine FNamePool Blocks[] (valid: block0..N)
 static int       s_blockCount = 0;        // usable entries (probed)
 static bool      s_namesReady = false;
+static unsigned  s_lenShift   = 1;        // [G45] discovered: hdr >> lenShift = len
+static unsigned  s_stride     = 2;        // [G45] discovered: entry alignment
+static unsigned  s_blockBytes = 0x20000;  // [G45] BlockSize(0x10000) * stride
+
+// The engine-standard reserved-name sequence (UnrealNames.inl).
+static const char* const kReservedNames[] = {
+    "None", "ByteProperty", "IntProperty", "BoolProperty", "FloatProperty",
+    "ObjectProperty", "NameProperty", "DelegateProperty", "DoubleProperty",
+    "ArrayProperty", "StructProperty", "StrProperty", "TextProperty",
+};
+constexpr int kReservedCount = (int)(sizeof(kReservedNames) / sizeof(kReservedNames[0]));
 
 // Decode one FNameEntryId → string. Number suffix ("_2") like the engine.
 // [perf] No IsReadable here: every block pointer was probed ONCE at
-// discovery, blocks are 64KB allocations (fully mapped), and the offset is
-// masked to 16 bits — this runs per-object during scans (up to 1M calls),
-// a write() syscall per name would cost seconds.
+// discovery, blocks are large allocations (fully mapped), and the offset is
+// bounded by s_blockBytes — this runs per-object during scans (up to 1M
+// calls), a write() syscall per name would cost seconds.
 static bool EntryToString(uint32 compIdx, std::string& out) {
     if (!s_blocks) return false;
-    uint32 block = compIdx >> 16, off = compIdx & 0xFFFF;
-    if (block >= (uint32)s_blockCount || off > 0x10000 - 512) return false;
+    // [G45] the low 16 bits are the offset in STRIDE units, not bytes —
+    // FNameEntryHandle::FromUnstableInt: byteOffset = (id & 0xFFFF) * Stride.
+    uint32 block = compIdx >> 16, off = (compIdx & 0xFFFF) * s_stride;
+    if (block >= (uint32)s_blockCount || off + 512 > s_blockBytes) return false;
     uint8_t* entry = (uint8_t*)s_blocks[block] + off;
     uint16 hdr = *(uint16*)entry;
-    uint32 len = (uint32)(hdr >> 1);
+    uint32 len = (uint32)(hdr >> s_lenShift);   // [G45] discovered shift, not fixed
     bool wide = (hdr & 1) != 0;
     if (len == 0 || len > 255) return false;
     out.clear();
@@ -2881,119 +2968,225 @@ static bool PoolNameAtImpl(const void* fnamePtr, std::string& out) {
     return true;
 }
 
-// Find "None" (entry 0 of block 0) → the pointer TO it in writable memory is
-// Blocks[0]. Header = (4<<1)|0 = 0x0008. Validate neighbors before trusting.
+// Walk block 0's first entries under a candidate format and count how many
+// reserved names match POSITION-EXACTLY. The walk advances by
+// align_up(2 + len*charSize, stride) — the allocator's own rule — so a
+// correct format keeps its footing through the whole sequence while a wrong
+// one trips on an impossible length within a few entries. `names` is filled
+// for the discovery log (what the walk actually read).
+struct NameFmt { unsigned lenShift; unsigned stride; };
+static const NameFmt kNameFmts[] = {{1, 2}, {6, 2}, {1, 4}, {6, 4}};
+static int WalkReservedNames(const uint8_t* block0, NameFmt fmt,
+                             char names[][48], int maxN) {
+    unsigned off = 0; int score = 0;
+    for (int i = 0; i < maxN && i < kReservedCount; ++i) {
+        if (off + 2 > 0x200) break;                       // probe window
+        uint16 hdr = *(const uint16*)(block0 + off);
+        unsigned len = hdr >> fmt.lenShift;
+        bool wide = (hdr & 1) != 0;
+        if (len == 0 || len > 1023) break;                // wrong format/garbage
+        unsigned bytes = 2 + len * (wide ? 2 : 1);
+        if (off + bytes > 0x200) break;
+        const uint8_t* p = block0 + off + 2;
+        unsigned kmax = len < 47 ? len : 47;
+        for (unsigned k = 0; k < kmax; ++k)
+            names[i][k] = wide ? (char)(p[k * 2] < 128 ? p[k * 2] : '?') : (char)p[k];
+        names[i][kmax] = 0;
+        if (strcmp(names[i], kReservedNames[i]) == 0) ++score;
+        off += (bytes + fmt.stride - 1) & ~(fmt.stride - 1);
+    }
+    return score;
+}
+
+// [G45] The pointer-slot scan (see the L1 banner above for the full method).
+// Pass 1: only page-aligned block candidates (the normal case — 128KB
+// mallocs land on mmap pages). Pass 2: relaxed to any plausible heap
+// pointer, probe-capped so a pathological image cannot stall the boot.
 static bool InitNamePool() {
     if (s_namesReady) return true;
     if (!arm::Init()) return false;
     double t0 = Monotonic();
-    static const uint8_t kNone[6] = {0x08, 0x00, 'N', 'o', 'n', 'e'};
-    // Candidate block-0 starts: every "08 00 None" in the image.
-    for (const arm::Range& r : arm::s_ranges) {
-        if (r.exec || r.end - r.start < 0x100) continue;      // pool is writable
-        const uint8_t* p = (const uint8_t*)r.start;
-        const uint8_t* e = (const uint8_t*)r.end - 6;
-        while (p <= e) {
-            const uint8_t* hit = (const uint8_t*)memchr(p, 0x08, (size_t)(e - p) + 1);
-            if (!hit) break;
-            if (hit + 6 <= (const uint8_t*)r.end && memcmp(hit, kNone, 6) == 0) {
-                uintptr_t block0 = (uintptr_t)hit;
-                // Blocks[] must live in writable memory and contain this pointer.
-                for (const arm::Range& w : arm::s_ranges) {
-                    if (w.exec || w.end - w.start < 0x40) continue;
-                    // NOTE: direct reads — every PT_LOAD range is mapped by the
-                    // loader (this is the same assumption arm::FindAdrpAddRef
-                    // makes on exec ranges). Per-slot IsReadable would be one
-                    // write() syscall per 8 bytes over ~90MB — minutes.
-                    for (uintptr_t a = w.start; a + 8 <= w.end; a += 8) {
-                        if (*(uintptr_t*)a != block0) continue;
-                        // Validate the following block pointers look like blocks.
-                        uint8_t** cand = (uint8_t**)a;
-                        bool ok = true;
-                        int usable = 1;
-                        for (int b = 1; b < 8; ++b) {
-                            if (!IsReadable((void*)(a + (size_t)b * 8), 8)) { ok = b >= 2; usable = b; break; }
-                            uint8_t* bp = ((uint8_t**)a)[b];
-                            if (!bp || !IsReadable(bp, 2)) { usable = b; break; }
-                            uint16 h2 = *(uint16*)bp;               // first entry header
-                            if ((h2 >> 1) == 0 || (h2 >> 1) > 255) { usable = b; break; }
-                            ++usable;
-                        }
-                        if (ok && usable >= 2) {
-                            // one-time per-block probe (cheap — at most 8)
-                            bool blocksReadable = true;
-                            for (int b = 0; b < usable; ++b)
-                                if (!IsReadable(cand[b], 2)) { blocksReadable = false; break; }
-                            if (blocksReadable) {
-                                s_blocks = cand;
-                                s_blockCount = usable;
-                                s_namesReady = true;
-                                // self-test: id 0 must decode "None"
-                                std::string probe;
-                                if (EntryToString(0, probe) && probe == "None") {
-                                    Rec("NamePool.Blocks", "scan", (unsigned)(a - g_base));
-                                    LOG("[OD] name pool online: blocks=%d (%.2fs) — names no longer need natives",
-                                        usable, Monotonic() - t0);
-                                    return true;
-                                }
-                                s_blocks = nullptr; s_blockCount = 0; s_namesReady = false;
-                            }
-                        }
+    long probes = 0;
+    const long kMaxProbes = 2'000'000;
+    for (int pass = 0; pass < 2 && !s_namesReady; ++pass) {
+        for (const arm::Range& w : arm::s_ranges) {
+            if (w.exec || w.end - w.start < 0x40) continue;
+            for (uintptr_t a = w.start; a + 8 <= w.end; a += 8) {
+                uintptr_t p = *(uintptr_t*)a;                 // direct read — module image
+                if (p < 0x10000 || p > 0x0000FFFFFFFFFFFFULL) continue;
+                if (p & 7) continue;                          // at least word-aligned
+                if (pass == 0 && (p & 0xFFF)) continue;       // pass 1: page-aligned blocks
+                bool inModule = false;                        // blocks live on the HEAP
+                for (const arm::Range& r : arm::s_ranges)
+                    if (p >= r.start && p < r.end) { inModule = true; break; }
+                if (inModule) continue;
+                if (++probes > kMaxProbes) break;             // pass-2 safety cap
+                if (!IsReadable((void*)p, 0x200)) continue;   // kernel-validate the heap block
+                char names[kReservedCount][48] = {}, tmp[kReservedCount][48];
+                int bestScore = 0; int bestFi = -1;
+                for (int fi = 0; fi < 4; ++fi) {
+                    int sc = WalkReservedNames((const uint8_t*)p, kNameFmts[fi],
+                                              tmp, kReservedCount);
+                    if (sc > bestScore) {                      // keep the BEST format's
+                        bestScore = sc; bestFi = fi;           // walk — not the last's
+                        memcpy(names, tmp, sizeof(names));
                     }
-                    if (s_namesReady) break;
                 }
+                // 8 of 13 position-exact reserved names + entry 0 == "None"
+                // (a heap block that spells these by accident does not exist)
+                if (bestScore < 8 || strcmp(names[0], "None") != 0) continue;
+                // Counters beside Blocks[0] — CurrentBlock/CurrentByteCursor
+                // at slot-8/slot-4 in stock UE (lock 0x38 on Linux). Plausibility
+                // ONLY (forks move them); when implausible we probe forward.
+                uint32 curBlock = (a - 8 >= w.start) ? *(uint32*)(a - 8) : 0;
+                uint32 curByte  = (a - 8 >= w.start) ? *(uint32*)(a - 4) : 0;
+                int usable = 0;
+                if (curBlock >= 1 && curBlock < 8192 && curByte <= 0x40000) {
+                    usable = (int)curBlock;
+                    for (int b = 0; b < usable; ++b)       // one-time per-block probe
+                        if (!IsReadable((void*)(a + (size_t)b * 8), 8) ||
+                            !IsReadable(*(void**)(a + (size_t)b * 8), 2)) { usable = b; break; }
+                }
+                if (usable < 1) {
+                    for (int b = 0; b < 8192; ++b) {       // probe forward instead
+                        if (!IsReadable((void*)(a + (size_t)b * 8), 8)) { usable = b; break; }
+                        void* bp = *(void**)(a + (size_t)b * 8);
+                        if (!bp || !IsReadable(bp, 2)) { usable = b; break; }
+                    }
+                    if (usable < 2) continue;
+                }
+                s_blocks = (uint8_t**)a;
+                s_blockCount = usable;
+                s_lenShift = kNameFmts[bestFi].lenShift;
+                s_stride   = kNameFmts[bestFi].stride;
+                s_blockBytes = 0x10000 * s_stride;
+                s_namesReady = true;
+                std::string probe;
+                if (EntryToString(0, probe) && probe == "None") {
+                    Rec("NamePool.Blocks", "scan", (unsigned)(a - g_base));
+                    LOG("[OD] ✅ name pool ONLINE by pointer-slot scan [G45]: blocks=%d "
+                        "fmt(lenShift=%u stride=%u, %s) reserved=%d/13 @RVA 0x%llX (%.2fs) "
+                        "— names no longer need natives",
+                        usable, s_lenShift, s_stride,
+                        s_lenShift == 6 ? "UE5 probe-hash Len:10" : "Len:15",
+                        bestScore, (unsigned long long)(a - g_base), Monotonic() - t0);
+                    return true;
+                }
+                s_blocks = nullptr; s_blockCount = 0; s_namesReady = false;
             }
-            p = hit + 1;
+            if (s_namesReady || probes > kMaxProbes) break;
         }
-        if (s_namesReady) break;
     }
-    LOG("[OD] ⚠️ name pool not found (\"None\" entry scan failed) — names stay on the native path");
+    LOG("[OD] ⚠️ name pool not found (pointer-slot scan: no heap block walked the "
+        "reserved-name sequence) — names stay on the native path");
     return false;
 }
 
 // ---------------------------------------------------------------- L2: GObjects
-static GObjects_t* s_go = nullptr;        // directly discovered instance
+// [G46] HOW GOBJECTS IS FOUND + WHY WAVE-13 CRASHED HERE.
+//
+// THE CRASH (the user's "كراش" right after the name-pool warning): the old
+// scan validated only `IsReadable(objs, 8)` — eight bytes of the chunk TABLE
+// — then read `((void**)objs)[numChunks/2]` and `[(numChunks-1)]`, i.e. up
+// to 16KB past the only bytes the kernel had vouched for. A garbage .bss
+// candidate whose counters looked plausible pointed `objs` at a barely-
+// mapped region → SIGSEGV on the Worker thread → process death, with NO
+// guard installed (od::Bootstrap ran bare).
+//
+// THE FIX, three layers:
+//   1. THE ARITHMETIC INVARIANT (reject before ANY dereference): a chunked
+//      FUObjectArray holds exactly ceil(Num/65536) chunks (UE4.21+/UE5;
+//      UE4.20 used 0x10400). Random counter-quads virtually never satisfy
+//      the equation, so garbage candidates die before a single external
+//      pointer is followed.
+//   2. FULL GUARDS on every external read (chunk table sized numChunks*8,
+//      each chunk, the first object, its class) — kernel-validated BEFORE
+//      the read, not after.
+//   3. THE WHOLE BOOTSTRAP RUNS UNDER RunGuarded ([G23] fault guard) — even
+//      an unforeseen fault is logged and skipped, never fatal.
+//
+// THE LAYOUT IS PROBED, NOT FIXED (MobileDumper-7 walks a header window for
+// the same reason): stock UE4.23+/UE5 embeds the ObjObjects member at +0x10
+// of FUObjectArray, forks move it. Each candidate base is probed at several
+// member offsets; the counters (Max/Num/MaxChunks/NumChunks) always sit at
+// member+0x10..+0x1C in the chunked-array layout. The discovered values are
+// written into an ADAPTER instance so no call site ever depends on where the
+// engine put the fields.
+static GObjects_t* s_go = nullptr;        // adapter (scan path) — never a raw engine pointer
+static GObjects_t  s_goAdapter;           // [G46] runtime-filled from the discovered layout
+static uintptr_t   s_goEngineAddr = 0;    // [G47] the FUObjectArray base in libUnreal's image
+static uintptr_t   s_goObjsMember = 0;    // [G47] its ObjObjects member (vtable-scan anchors)
 static bool InitGObjects() {
     if (s_go) return true;
     if (!arm::Init()) return false;
     double t0 = Monotonic();
-    auto valid = [](uintptr_t g) -> bool {
-        if (!IsReadable((void*)(g + 0x30), 0x10)) return false;
-        uintptr_t objs = *(uintptr_t*)(g + 0x10);
-        int32 num   = *(int32*)(g + 0x24);
-        int32 maxc  = *(int32*)(g + 0x28);
-        int32 nch   = *(int32*)(g + 0x2C);
-        if (num < 1000 || num > 8000000) return false;
-        if (maxc < 1 || maxc > 2048 || nch < 1 || nch > maxc) return false;
-        if (!objs || !IsReadable((void*)objs, 8)) return false;
-        for (int c : {0, nch / 2, nch - 1}) {
-            if (c < 0 || c >= nch) continue;
-            void* chunk = ((void**)objs)[c];
-            if (!chunk || !IsReadable(chunk, 0x20)) return false;
-        }
-        void* first = ((FUObjectItem*)((void**)objs)[0])[0].Object;
-        if (!first || !IsReadable(first, 0x28)) return false;
-        void* cls  = *(void**)((char*)first + 0x10);
-        if (!cls || !IsReadable(cls, 0x18)) return false;
-        void* cc   = *(void**)((char*)cls + 0x10);
-        if (cc != cls) return false;                        // Class->Class == Class
-        return true;
-    };
+    static const unsigned kObjsOffs[] = {0x10, 0x08, 0x18, 0x00, 0x20, 0x28, 0x30};
     // Writable ranges, last-first: the FUObjectArray global lives in .bss
     // (typically the last RW PT_LOAD). Direct reads inside module PT_LOADs
     // (mapped by the loader — per-slot IsReadable would be a syscall storm);
-    // valid() itself probes the EXTERNAL pointers (chunk heap memory) only.
+    // every EXTERNAL (heap) dereference below is kernel-probed first.
     for (auto it = arm::s_ranges.rbegin(); it != arm::s_ranges.rend(); ++it) {
         if (it->exec || it->end - it->start < 0x100) continue;
-        for (uintptr_t a = it->end - 0x30; a >= it->start; a -= 8) {
-            if (*(int32*)(a + 0x24) < 1000) continue;       // cheap reject first
-            if (!valid(a)) continue;
-            s_go = (GObjects_t*)a;
-            Rec("GObjects.instance", "scan", (unsigned)(a - g_base));
-            LOG("[OD] GObjects discovered by structure @+0x%llX (num=%d chunks=%d, %.2fs)",
-                (unsigned long long)(a - g_base), *(int32*)(a + 0x24), *(int32*)(a + 0x2C),
-                Monotonic() - t0);
-            return true;
+        // start 0x50 below the end: the deepest probe reads a+0x4C, and the
+        // byte AFTER a PT_LOAD's memsz end is not guaranteed mapped.
+        for (uintptr_t a = it->end - 0x50; a >= it->start; a -= 8) {
+            // cheap pre-reject: SOME probe offset must show a plausible Num
+            bool any = false;
+            for (unsigned oo : kObjsOffs)
+                if (*(int32*)(a + oo + 0x14) >= 1000) { any = true; break; }
+            if (!any) continue;
+            for (unsigned oo : kObjsOffs) {
+                uintptr_t objs = *(uintptr_t*)(a + oo);
+                int32 maxE = *(int32*)(a + oo + 0x10);
+                int32 num  = *(int32*)(a + oo + 0x14);
+                int32 maxC = *(int32*)(a + oo + 0x18);
+                int32 numC = *(int32*)(a + oo + 0x1C);
+                if (num < 1000 || num > 8000000 || num > maxE) continue;
+                if (maxC < 1 || maxC > 2048 || numC < 1 || numC > maxC) continue;
+                // [G46] THE INVARIANT: ceil(Num/65536) == NumChunks (allow the
+                // +1 growth race; UE4.20's 0x10400 accepted for old builds).
+                uint32 want = ((uint32)num + 0xFFFFu) >> 16;
+                if ((uint32)numC != want && (uint32)numC != want + 1 &&
+                    (uint32)numC != (uint32)((num + 0x103FF) / 0x10400) &&
+                    (uint32)numC != (uint32)((num + 0x103FF) / 0x10400) + 1) continue;
+                if (!objs || IsBadPtr((void*)objs)) continue;
+                // [G46] the chunk TABLE is sized numChunks*8 — validate the
+                // WHOLE table (one syscall), then the chunk pointers at both
+                // ends and the middle (heap memory, kernel-probed each).
+                if (!IsReadable((void*)objs, (size_t)numC * 8)) continue;
+                void* chunk0 = ((void**)objs)[0];
+                void* chunkM = ((void**)objs)[numC > 1 ? numC / 2 : 0];
+                void* chunkL = ((void**)objs)[numC - 1];
+                if (!chunk0 || !IsReadable(chunk0, 0x20)) continue;
+                if (chunkM && !IsReadable(chunkM, 0x20)) continue;
+                if (chunkL && !IsReadable(chunkL, 0x20)) continue;
+                // first object: its Class must self-loop (Class->Class == Class —
+                // the first allocated UObjects ARE the core UClass CDOs). The
+                // Class-member offset is probed, not assumed.
+                void* first = ((FUObjectItem*)chunk0)[0].Object;
+                if (!first || !IsReadable(first, 0x28)) continue;
+                bool selfLoop = false;
+                for (unsigned clsOff : {profile::ObjectClass, 0x8u, 0x18u}) {
+                    void* cls = Read<void*>((char*)first + clsOff, 0);
+                    if (!cls || !IsReadable(cls, clsOff + 8)) continue;
+                    if (Read<void*>((char*)cls + clsOff, 0) == cls) { selfLoop = true; break; }
+                }
+                if (!selfLoop) continue;
+                // ACCEPTED — fill the adapter: call sites keep ONE shape no
+                // matter where this build hides the member.
+                s_goAdapter.Objects = (void**)objs;
+                s_goAdapter.MaxElements = maxE; s_goAdapter.NumElements = num;
+                s_goAdapter.MaxChunks = maxC;   s_goAdapter.NumChunks = numC;
+                s_go = &s_goAdapter;
+                s_goEngineAddr = a;             // [G47] engine-side anchors
+                s_goObjsMember = a + oo;
+                Rec("GObjects.instance", "scan", (unsigned)(a - g_base));
+                Rec("GObjects.ObjObjects", "probed", oo);
+                LOG("[OD] ✅ GObjects discovered by structure [G46] @+0x%llX (ObjObjects@+0x%X "
+                    "num=%d chunks=%d invariant=%u, %.2fs)",
+                    (unsigned long long)(a - g_base), oo, num, numC, want, Monotonic() - t0);
+                return true;
+            }
         }
     }
     LOG("[OD] ⚠️ GObjects structural scan found nothing — profile RVA stays primary");
@@ -3059,6 +3252,22 @@ std::string PoolNameAt(const void* fname) {
 }
 void* FindObjByScan(const std::string& path) { return FindObjByScanImpl(path); }
 GObjects_t* DirectGObjects() { return s_go; }
+// [G47] ENGINE-SIDE GObjects anchors for the vtable signal scan: engine code
+// never references our adapter (it lives in this .so) — it references the
+// FUObjectArray base and its ObjObjects member inside libUnreal.so. On the
+// scan path both were recorded at discovery; on the profile path they are
+// resolved lazily from the RVA-held global pointer.
+uintptr_t GoEngineAddr() {
+    if (!s_goEngineAddr && g_base && profile::GObjects) {
+        uintptr_t g = Read<uintptr_t>((void*)(g_base + profile::GObjects));
+        if (g && !IsBadPtr((void*)g) && IsReadable((void*)(g + 0x30), 0x18)) {
+            s_goEngineAddr = g;
+            s_goObjsMember = g + 0x10;      // canonical member (slack absorbs forks)
+        }
+    }
+    return s_goEngineAddr;
+}
+uintptr_t GoObjsMember() { GoEngineAddr(); return s_goObjsMember; }
 bool ProcessEventWasDiscovered() { return s_peDiscovered; }   // [G33] shape-validate instead of word-table
 // [G39-w13] fd::ResolveAll adjudicates PE against the table; when the table
 // independently CONFIRMS the discovered address (VERIFIED) the word-table
@@ -3390,8 +3599,20 @@ static void Bootstrap() {
     if (s_bootstrapped) return;
     s_bootstrapped = true;
     LOG("[OD] === bootstrap: name pool → GObjects → layout probe ===");
-    InitNamePool();
-    InitGObjects();
+    // [G46] THE CRASH FIX — the wave-13 death (the user's "كراش" right after
+    // the name-pool warning) happened inside the GObjects scan: an unguarded
+    // chunk-table read on a garbage candidate, on a thread with NO recovery
+    // point. The scans themselves are now invariant-guarded, and the WHOLE
+    // bootstrap additionally runs under the [G23] fault guard: any residual
+    // fault is logged by name and the completed layers keep working — a
+    // discovery miss must never kill the game again.
+    if (!gas::RunGuarded("[OD] bootstrap", [] {
+            InitNamePool();
+            InitGObjects();
+        })) {
+        LOG("[OD] ⚠️ bootstrap faulted mid-scan — layers completed before the fault stay live");
+        return;                    // ProbeMetaLayout needs BOTH layers — skip it
+    }
     if (ScanReady()) {
         // If the profile's FindObj/NameAppendString natives are unusable
         // (unknown build), the scan paths replace them transparently.
@@ -3421,7 +3642,8 @@ static void Dump() {   // era.dumper
     LOG("  %-42s %-10s 0x%X", "QuickBars.VtableSlot", "fd(runtime)", profile::QuickBars_VtableSlot);
     LOG("  %-42s %-10s 0x%X", "QuickBars.VtableSlot.GetItemInSlot", "fd(runtime)",
         profile::QuickBars_VtableSlot_GetItemInSlot);
-    LOG("  %-42s %-10s %s", "NamePool", s_namesReady ? "scan" : "native-only", "");
+    LOG("  %-42s %-10s %s", "NamePool", s_namesReady ? "scan" : "native-only",
+        s_namesReady ? "(fmt discovered at runtime)" : "");
     LOG("  %-42s %-10s %s", "GObjects", s_go ? "scan" : "profile-rva", "");
     LOG("=== %zu records — run 'era.functions' for the FUNCTION-ADDRESS report [G39] ===",
         s_records.size());
@@ -4137,6 +4359,219 @@ static unsigned DiscoverQBGetItemSlot() {
     return 0;
 }
 
+// ------------------------------------------------- [G47] PE path 3: vtable scan
+// ProcessEvent by VTABLE SIGNAL SCAN — a faithful port of MobileDumper-7's
+// InitProcessEvent (the mechanism the user pointed at:
+// github.com/MJx0/MobileDumper-7, Dumper/Engine/OffsetFinder/Offsets.cpp).
+//
+// WHY IT WORKS (the method, explained):
+// ProcessEvent is VIRTUAL — every UObject-derived class inherits it at the
+// SAME vtable slot — and no other virtual looks like it, because its body is
+// the Kismet VM's dispatch loop. The scanner takes any live CDO's vtable and
+// scores each slot's function by ten independent signatures; the slot that
+// accumulates ≥4 (MobileDumper's kMinScore) is ProcessEvent:
+//   S1  resolves objects through the GObjects global — the IndexToObject
+//       lookup of the IsUnreachable guard materializes the array (or its
+//       ObjObjects member) via ADRP+ADD / folded ADRP+LDR, ±0x10 slack;
+//   S2  loads UObject::InternalIndex in the same lookup (the id member,
+//       at Class-4 — derived from the probed Class offset, not fixed);
+//   S3  materializes sizeof(FUObjectItem)=0x18 as an immediate — the item
+//       stride of the same lookup;
+//   S4  loads UStruct::PropertiesSize — sizes the parms buffer;
+//   S5  loads UFunction::ParamSize TWICE (memset sizing + copy loop — two
+//       distinct hits are the signature, MobileDumper scores them apart);
+//   S6  walks UStruct::ChildProperties TWICE (parms in, retval out);
+//   S7  emits TBZ/TBNZ bit tests (the FUNC_Native flag check);
+//   S8  saves ≥3 callee-saved STP pairs (the VM loop's big frame).
+// The decode window walks with a small register tracker (ADRP page base →
+// ADD/LDR completion, pointer-width loads followed one hop — the same
+// tracking MobileDumper's GlobalAccessHarvester does for the whole image,
+// here confined to one candidate function). The window ENDS at the first
+// prologue AFTER a return (neighbor-function boundary) or 0x400 bytes.
+//
+// VTABLE SOURCE: prefer reflection-resolved CDOs of native classes
+// (Default__World / Default__Engine — always resident, plain UObject
+// layout); fall back to walking the first GObjects chunk (any vtable has
+// PE at the same slot — MobileDumper's last-resort scan, minus the
+// Blueprint "_C" classes which can reorder the tail).
+struct PESignals {
+    bool s1Objects = false, s2Index = false, s3ItemSize = false, s4StructSize = false;
+    bool s5Param1 = false, s5Param2 = false, s6Child1 = false, s6Child2 = false;
+    bool s7TestBit = false, s8StorePairs = false;
+    int Count() const {
+        return (int)s1Objects + (int)s2Index + (int)s3ItemSize + (int)s4StructSize +
+               (int)s5Param1 + (int)s5Param2 + (int)s6Child1 + (int)s6Child2 +
+               (int)s7TestBit + (int)s8StorePairs;
+    }
+    void Describe(char* buf, size_t n) const {
+        snprintf(buf, n, "objs=%d idx=%d item=%d size=%d param=%d%d child=%d%d tbz=%d stp=%d",
+                 s1Objects, s2Index, s3ItemSize, s4StructSize, s5Param1, s5Param2,
+                 s6Child1, s6Child2, s7TestBit, s8StorePairs);
+    }
+};
+static PESignals ScorePEWindow(uintptr_t fn, uintptr_t goAnchor, uintptr_t objsAnchor,
+                                unsigned idxOff, unsigned structSizeOff, unsigned paramSizeOff,
+                                unsigned childrenOff, uint64_t itemSize) {
+    PESignals S;
+    // the window is clamped inside fn's exec PT_LOAD — every word read is a
+    // direct load from loader-mapped code (the same guarantee the [G01]
+    // scanner relies on; per-word IsReadable would be 256 syscalls a slot).
+    uintptr_t rangeEnd = 0;
+    for (const arm::Range& r : arm::s_ranges)
+        if (r.exec && fn >= r.start && fn < r.end) { rangeEnd = r.end; break; }
+    if (!rangeEnd) return S;
+    uintptr_t winEnd = fn + 0x400 < rangeEnd ? fn + 0x400 : rangeEnd;
+    // register tracker: value + known + page-granular (ADRP awaiting completion)
+    uint64_t rv[32]; bool rk[32] = {}, rg[32] = {};
+    bool seenRet = false; int stpPairs = 0;
+    auto nearAnchor = [&](uintptr_t v) {
+        auto within = [&](uintptr_t a) { return a && v + 0x10 >= a && v <= a + 0x10; };
+        return within(goAnchor) || within(objsAnchor);
+    };
+    auto inWritableModule = [&](uintptr_t v) {
+        for (const arm::Range& r : arm::s_ranges)
+            if (!r.exec && v >= r.start && v + 8 <= r.end) return true;   // direct read safe
+        return false;
+    };
+    for (uintptr_t pc = fn; pc < winEnd; pc += 4) {
+        uint32 w = *(uint32*)pc;
+        // -- raw-word signals (matched before decode, as in MobileDumper:
+        //    the signed-offset STP is not a form normal decoders return)
+        if ((w & 0x7F000000u) == 0x36000000u || (w & 0x7F000000u) == 0x37000000u)
+            S.s7TestBit = true;                                 // TBZ / TBNZ
+        if ((w & 0xFFC003E0u) == 0xA90003E0u) ++stpPairs;       // STP Xt1,Xt2,[SP,#imm]
+        // -- boundary: a fresh prologue AFTER a return = the next function
+        if (seenRet && arm::IsPrologueOpener(w)) break;
+        // RET {Xn}: 0xD65F0000 | (Rn<<5) — the mask strips Rn (bits 9:5) so
+        // BOTH plain `RET` (X30) and register-tail `RET Xn` are recognized.
+        if ((w & 0xFFFFFC1Fu) == 0xD65F0000u) {
+            seenRet = true;
+            for (int r = 0; r < 32; ++r) rk[r] = false;
+            continue;
+        }
+        // -- ADRP Xd, page (SetBase)
+        if ((w & 0x9F000000) == 0x90000000) {
+            unsigned rd = w & 0x1F; uintptr_t page = 0;
+            arm::DecodeAdrp(w, pc, page);
+            rv[rd] = page; rk[rd] = true; rg[rd] = true;
+            continue;
+        }
+        // -- ADD Xd, Xn, #imm (64-bit immediate form)
+        if ((w & 0xFF000000) == 0x91000000) {
+            unsigned rd = w & 0x1F, rn = (w >> 5) & 0x1F;
+            uint64 imm = (w >> 10) & 0xFFF;
+            if ((w >> 22) & 1) imm <<= 12;
+            if (rk[rn]) {
+                rv[rd] = rv[rn] + imm; rk[rd] = true; rg[rd] = false;
+                if (nearAnchor((uintptr_t)rv[rd])) S.s1Objects = true;
+            } else rk[rd] = false;
+            continue;
+        }
+        // -- MOVZ/MOVK Xd/Wd (immediate composition — the item-size constant).
+        //    Encoding: sf opc(01=Z,11=K) 100101 hw imm16 Rd → bits[30:23] =
+        //    0xA5 for MOVZ, 0xE5 for MOVK; the 0x7F800000 mask strips sf and
+        //    keeps the opc+fixed field (X- and W-forms share the match).
+        if ((w & 0x7F800000) == 0x52800000 || (w & 0x7F800000) == 0x72800000) {
+            unsigned rd = w & 0x1F;
+            uint64 imm16 = (w >> 5) & 0xFFFF, hw = (w >> 21) & 3;
+            bool isK = (w & 0x7F800000) == 0x72800000;          // opc=11 → MOVK
+            bool is64 = (w >> 31) & 1;
+            uint64 v = imm16 << (hw * 16);
+            rv[rd] = isK ? ((rv[rd] & ~(0xFFFFULL << (hw * 16))) | v) : v;
+            if (!is64) rv[rd] &= 0xFFFFFFFFULL;                  // W-form zeroes the top
+            rk[rd] = true; rg[rd] = false;
+            if (rv[rd] == itemSize) S.s3ItemSize = true;
+            continue;
+        }
+        // -- LDR/STR (unsigned offset, integer) — the member-access family
+        if ((w & 0x3B000000) == 0x39000000 && !((w >> 26) & 1)) {
+            unsigned size = (w >> 30) & 3, rn = (w >> 5) & 0x1F, rt = w & 0x1F;
+            uint64 realOff = (uint64)((w >> 10) & 0xFFF) << size;
+            if (rk[rn] && !rg[rn]) {                             // field within a known base
+                if (realOff == idxOff)         S.s2Index = true;
+                if (realOff == structSizeOff)  S.s4StructSize = true;
+                if (realOff == paramSizeOff)   { if (S.s5Param1) S.s5Param2 = true; else S.s5Param1 = true; }
+                if (realOff == childrenOff)    { if (S.s6Child1) S.s6Child2 = true; else S.s6Child1 = true; }
+            }
+            if (rk[rn]) {
+                uintptr_t accessed = (uintptr_t)(rv[rn] + realOff);
+                if (nearAnchor(accessed)) S.s1Objects = true;
+                // follow pointer-width loads one hop — the dominant real form
+                // is base → load through a global → access (only module
+                // writes are followed: heap targets are NOT vouched for)
+                bool isLoad = ((w >> 22) & 3) == 1 && size == 3;
+                if (isLoad && inWritableModule(accessed)) {
+                    rv[rt] = *(uint64*)accessed; rk[rt] = rv[rt] != 0; rg[rt] = false;
+                    if (nearAnchor((uintptr_t)rv[rt])) S.s1Objects = true;
+                } else if (isLoad) rk[rt] = false;
+            } else if (((w >> 22) & 3) == 1) rk[rt] = false;     // unknown-base load
+            continue;
+        }
+        // -- BL rel26 (call): clobbers the caller-saved registers
+        if ((w & 0xFC000000) == 0x94000000) {
+            for (int r = 0; r <= 18; ++r) rk[r] = false;
+            continue;
+        }
+    }
+    S.s8StorePairs = stpPairs >= 3;
+    return S;
+}
+static Found DiscoverPEVtableScan() {
+    // (1) vtable source — native-class CDOs first, GObjects walk last
+    uintptr_t vt = 0; const char* vtSrc = "";
+    static const char* const kVtSrcs[] = {
+        "/Script/Engine.Default__World", "/Script/Engine.Default__Engine",
+        "/Script/Engine.Default__GameViewportClient",
+    };
+    for (const char* s : kVtSrcs) {
+        void* cdo = FindObj(s);
+        if (!cdo || IsBadPtr(cdo)) continue;
+        uintptr_t v = Read<uintptr_t>(cdo, 0);
+        if (v && !IsBadPtr((void*)v) && IsReadable((void*)v, 0x400)) { vt = v; vtSrc = s; break; }
+    }
+    if (!vt) {
+        GObjects_t* go = od::DirectGObjects();
+        if (!go) go = (g_base && profile::GObjects) ? Read<GObjects_t*>((void*)(g_base + profile::GObjects)) : nullptr;
+        if (go && go->Objects) {
+            for (uint32 i = 0; i < 64 && !vt; ++i) {
+                void* o = go->GetById(i);
+                if (!o || IsBadPtr(o)) continue;
+                uintptr_t v = Read<uintptr_t>(o, 0);
+                if (v && !IsBadPtr((void*)v) && IsReadable((void*)v, 0x400)) { vt = v; vtSrc = "GObjects-walk"; }
+            }
+        }
+    }
+    if (!vt) { LOG("[FD] ⚠️ PE vtable-scan: no usable vtable source"); return {0, false, "vtable-scan"}; }
+    // (2) the anchors engine code references (NEVER our adapter's address)
+    uintptr_t goAnchor = od::GoEngineAddr(), objsAnchor = od::GoObjsMember();
+    if (!goAnchor) { LOG("[FD] ⚠️ PE vtable-scan: no GObjects anchor (pool/scan + profile both missed)"); return {0, false, "vtable-scan"}; }
+    // (3) expected member offsets — every one probed/reflected earlier in boot
+    unsigned idxOff = profile::ObjectClass >= 4 ? profile::ObjectClass - 4 : 0x0C;
+    unsigned structSizeOff = profile::StructPropertiesSize;
+    unsigned paramSizeOff = profile::FunctionParamSize;
+    unsigned childrenOff = profile::StructChildProps ? profile::StructChildProps : profile::StructChildren;
+    const uint64 kItemSize = sizeof(FUObjectItem);               // 0x18 on 64-bit
+    // (4) score every slot; the best ≥4 wins (ties → first, logged)
+    uintptr_t best = 0; int bestScore = 0, bestIdx = -1; PESignals bestS{};
+    for (int i = 0; i < 100; ++i) {
+        if (!IsReadable((void*)(vt + (size_t)i * 8), 8)) break;
+        uintptr_t target = Read<uintptr_t>((void*)(vt + (size_t)i * 8));
+        if (!IsFunctionStart(target)) continue;                  // not code → not a virtual
+        PESignals s = ScorePEWindow(target, goAnchor, objsAnchor, idxOff,
+                                    structSizeOff, paramSizeOff, childrenOff, kItemSize);
+        if (s.Count() > bestScore) { bestScore = s.Count(); best = target; bestIdx = i; bestS = s; }
+    }
+    if (bestScore >= 4) {
+        char d[128]; bestS.Describe(d, sizeof(d));
+        LOG("[FD] ✅ PE vtable-signal-scan [G47]: %s slot=%d RVA=0x%08llX score=%d/10 (%s) "
+            "— MobileDumper-7 InitProcessEvent port",
+            vtSrc, bestIdx, (unsigned long long)(best - g_base), bestScore, d);
+        return {best, bestScore >= 6, "vtable-signal-scan"};
+    }
+    LOG("[FD] ⚠️ PE vtable-scan: best slot scored %d/10 (<4) — no candidate", bestScore);
+    return {0, false, "vtable-scan"};
+}
+
 // ---------------------------------------------------------------- L4 ledger
 // Functions whose native address is NO LONGER REQUIRED (each has a working
 // reflection channel — the [G40] entries now have REAL implementations, not
@@ -4182,10 +4617,42 @@ static void ResolveAll() {
     //      referenced by BOTH literals AND sits in a vtable does not happen;
     //      without this check a bad backscan could look "self-proving" and
     //      override a device-verified address.
+    //      [G47] THIRD PATH — the MobileDumper-7 vtable signal scan: score
+    //      every vtable slot by the ten ProcessEvent-only signatures. Three
+    //      independent methods (anchor pair, signal scan, known-build table)
+    //      now vote on the ONE address:
+    //        anchor == scan            → super-verified (different evidence
+    //                                    families agreeing — strings vs code
+    //                                    shape vs the table)
+    //        scan only (anchor missed) → the scan result, self-proving at
+    //                                    score ≥ 6 (works on builds whose
+    //                                    log strings are stripped/changed)
+    //        both but disagreeing      → the anchor+vtable-corroboration path
+    //                                    wins (two independent proofs beat
+    //                                    one shape count), logged loudly.
     {
         uintptr_t pe = od::DiscoverProcessEvent();
         uintptr_t tableRva = profile::ProcessEvent;
         bool verified = pe != 0;
+        // [G47] path 3 — the signal scan (runs on EVERY build)
+        Found fv = DiscoverPEVtableScan();
+        if (pe && fv.abs) {
+            if (pe == fv.abs) {
+                verified = true;
+                LOG("[FD] ✅ ProcessEvent THREE-WAY agreement: dual-anchor == vtable-signal-scan "
+                    "== 0x%llX (independent evidence families agree)",
+                    (unsigned long long)(pe - g_base));
+            } else {
+                LOG("[FD] ⚠️ ProcessEvent anchor 0x%llX ≠ vtable-scan 0x%llX — anchor path wins "
+                    "(dual literals + vtable corroboration outrank a shape-only score)",
+                    (unsigned long long)(pe - g_base), (unsigned long long)(fv.abs - g_base));
+            }
+        } else if (!pe && fv.abs) {
+            pe = fv.abs;
+            verified = fv.verified;
+            LOG("[FD] ProcessEvent: dual anchors missed — vtable-signal-scan is the source %s",
+                fv.verified ? "(self-proving, score≥6)" : "(heuristic, score 4-5)");
+        }
         if (pe) {
             bool inVt = false;
             void* worldCdo = FindObj("/Script/Engine.Default__World");
@@ -4205,7 +4672,7 @@ static void ResolveAll() {
                     (unsigned long long)(pe - g_base));
             }
         }
-        Found f{pe, verified, "dual-anchor"};
+        Found f{pe, verified, "dual-anchor+vtable-scan"};
         profile::ProcessEvent = Adjudicate("UObject::ProcessEvent", f, tableRva);
         // [G39-w13] VERIFIED(runtime=table) → the word-table check stays in
         // force (od flag cleared); only true overrides / table-less builds
@@ -4323,9 +4790,27 @@ static void Explain() {   // era.explain — the on-device methodology dump
     LOG("=== era.explain — كيف يُوجد هذا المبنى عناوين الدوال أثناء التشغيل ===");
     LOG("القاعدة [G39]: الاكتشاف يعمل على كل إصدار والجدول مجرد تدقيق —");
     LOG("   الدليل القاطع من الجهاز يتغلب على الجدول عند الاختلاف (OVERRIDE).");
+    LOG("L0 مسح خانات المؤشر [G45] (منهج MobileDumper-7 NameStrategy): كتل");
+    LOG("   الأسماء على الكومة وليست في المكتبة — الخانة الوحيدة داخل الصورة هي");
+    LOG("   Blocks[0] في .bss تشير للخارج. نمسح كل خانة قابلة للكتابة، نتحقق");
+    LOG("   من الهدف عبر النواة، ثم نمشي الأسماء المحجوزة القياسية (None ←");
+    LOG("   ByteProperty ← IntProperty...) بالترتيب — 8/13 تطابق موقعي = هي");
+    LOG("   الكتلة صفر. المشي نفسه يكشف صيغة الترويسة (lenShift/stride) فلا");
+    LOG("   افتراض لشيء، وإزاحة الهوية داخل الكتلة تُضرب بالـstride المكتشف.");
+    LOG("L0 بنية GObjects [G46]: ثابت حسابي ceil(Num/65536)==NumChunks يرفض");
+    LOG("   الزيف قبل أي إلغاء إشارة، كل قراءة خارجية محمية بالنواة، إزاحة");
+    LOG("   العضو تُستكشف (7 مرشحين) والنتيجة تُنسخ لمحوّل — والتشغيل كله");
+    LOG("   تحت RunGuarded: أي خطأ يُسجّل ويُتجاوز ولا يقتل اللعبة أبداً.");
     LOG("L1 مرساة النص: نص فريد داخل الدالة (UTF-16 في .rodata) ← زوج ADRP+ADD");
     LOG("   يشير إليه ← رجوع للبداية (STP/SUB SP) ← إثبات مزدوج: مرساتان");
     LOG("   مستقلتان (Access None + Bad expression index) تتفقان على نفس البداية.");
+    LOG("L1+ مسح إشارات الجدول الافتراضي [G47] (منقولة من MobileDumper-7");
+    LOG("   InitProcessEvent): ProcessEvent افتراضية في نفس الخانة عند كل");
+    LOG("   صنف — نمسح خانات أي vtable حيّة ونمنح كل دالة عشر إشارات: مرجع");
+    LOG("   GObjects (بسماحية ±0x10)، قراءة InternalIndex، ثابت حجم العنصر");
+    LOG("   0x18، PropertiesSize، ParamSize مرتين، ChildProperties مرتين،");
+    LOG("   TBZ/TBNZ، و≥3 أزواج STP. 4/10 تقبل، 6/10 إثبات ذاتي — المسارُ");
+    LOG("   الثالث يُنقذ الإصدارات المحرومة من نصوص السجل.");
     LOG("L2 سلّم الثانك: UFunction بالاسم (انعكاس) ← عضو Func (يُستكشف بالتحقق");
     LOG("   المتقاطع) ← فك تعليمات BL داخل الثانك ← الهدف = الدالة الأصلية.");
     LOG("L2-رابط: من يستدعي من؟ StaticLoadClass هو الخلية التي تستدعي");
@@ -13636,9 +14121,12 @@ static int InspectCb(dl_phdr_info* info, size_t, void*) {
 
 static void* Worker(void*) {
     LOG("=== EraCH3 starting — runtime function discovery build ===");
-    LOG("[Build] wave-13 [G39-G44]: discovery-first — الاكتشاف أولاً: fd wired on "
-        "EVERY build, runtime evidence overrides the table, QB family + LoadClass "
-        "discovered, GetPC/IsStandalone real reflection");
+    LOG("[Build] wave-14 [G45-G48]: MobileDumper-7 mechanism — منهج MobileDumper-7: "
+        "name pool by POINTER-SLOT scan + reserved-name walk (format discovered, not "
+        "assumed), GObjects by invariant-guarded layout probe (the wave-13 crash fixed "
+        "at the root), ProcessEvent by vtable SIGNAL SCAN (10 signatures, 3-way "
+        "adjudication), bootstrap under RunGuarded — a discovery miss can never kill "
+        "the game again");
     LOG("sizeof(Vector)=%zu sizeof(Rotator)=%zu sizeof(Transform)=%zu", sizeof(Vector), sizeof(Rotator), sizeof(Transform));
     for (int i = 0; i < 600 && g_status.load() == 0; ++i) {
         dl_iterate_phdr(InspectCb, nullptr);
