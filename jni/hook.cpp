@@ -201,6 +201,39 @@
 //        previous weapon or pickaxe).
 //  [G10] era.abilities / era.specs console command + heartbeat flags for
 //        the new native paths (gas_init/gaa/ita/acc/mcp).
+//  [G11] NATIVE FAULT GUARD (device-crash fix): the run died INSIDE the
+//        native InitializePlayerGameplayAbilities — device log ends at
+//        "[Stamina] Initialized FortPlayerAttributeSet" and logging is
+//        unbuffered (logcat + fflush), so nothing was lost: the interface
+//        resolved, the call was made, the process faulted inside the
+//        engine. Prime suspect: the client-side PlayerState ASC was never
+//        server-initialized (Erbium calls this AFTER a real possession
+//        flow on a listen server; EraCH3 has no server). The call now runs
+//        under a scoped SIGSEGV/SIGBUS/SIGILL guard (sigsetjmp/siglongjmp
+//        + old-handler chaining): a fault LOGS signal+PC+faulting address,
+//        permanently disables the native path for the session, and the
+//        proven EquipFortAbilitySet reflection path delivers the sets
+//        instead of killing the process. The interface pointer is fully
+//        validated (readable, readable vtable) and the raw-PlayerState
+//        fallback is GONE — the IFortAbilitySystemInterface* is
+//        this-adjusted; the UObject pointer means a wrong vtable on the
+//        first virtual call. Spec-count success is now measured on BOTH
+//        ASCs (pawn + PlayerState) since the native targets the PS's.
+//  [G12] SCANNER RELAXATION + LAZY RE-DISCOVERY + PICKAXE: ADRP+ADD string
+//        references may materialize the pointer into a different register
+//        (ADRP X8,page; ADD X0,X8,#off — clang's argument shape) and up to
+//        4 instructions apart. The strict same-register back-to-back form
+//        missed GiveAbilityAndActivateOnce, InternalTryActivateAbility,
+//        ApplyCharacterCustomization and SendRequestNow on device ("no
+//        code ref" lines while the strings WERE resident). Strict stays
+//        primary so every already-verified address resolves identically;
+//        the relaxed pass only runs on misses. A late re-scan when the
+//        terrain world appears + lazy SendRequestNow hook install (Erbium
+//        finders are lazy for the same reason) covers paged-in-late
+//        .rodata — that hook is the MCP profile enabler. Pickaxe fix
+//        (Erbium 1:1): the locker pickaxe resolves its WeaponDefinition
+//        (CosmeticLoadoutPC.Pickaxe->WeaponDefinition) before GiveItem,
+//        and the locker re-syncs once at finalize (MCP lands async).
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -226,6 +259,9 @@
 #include <set>
 #include <algorithm>
 #include <android/log.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/ucontext.h>
 
 static FILE* g_logFile = nullptr;
 static void InitLog() {
@@ -530,8 +566,12 @@ static bool DecodeAdrp(uint32_t w, uintptr_t pc, uintptr_t& page) {
     page = (pc & ~0xFFFULL) + ((uintptr_t)imm << 12);
     return true;
 }
-// First ADRP+ADD pair referencing `target` within [scanStart, scanEnd).
-static uintptr_t FindAdrpAddRef(uintptr_t target, uintptr_t scanStart, uintptr_t scanEnd) {
+// [G12] Strict form (original): ADD Xd,Xd,#imm back-to-back with the ADRP,
+// same destination register. Kept as the PRIMARY matcher so every address
+// the first device run already resolved (init=1) keeps resolving to the
+// exact same function — a relaxed-first order could shift a hit to an
+// earlier ADRP+ADD belonging to a different (inlined) caller.
+static uintptr_t FindAdrpAddRefStrict(uintptr_t target, uintptr_t scanStart, uintptr_t scanEnd) {
     uintptr_t page = target & ~0xFFFULL;
     for (const Range& r : s_ranges) {
         if (!r.exec) continue;
@@ -552,6 +592,41 @@ static uintptr_t FindAdrpAddRef(uintptr_t target, uintptr_t scanStart, uintptr_t
         }
     }
     return 0;
+}
+// [G12] Relaxed form: ADRP Xn,page followed within 4 instructions by
+// ADD Xd,Xn,#imm where Rd may differ from the ADRP destination (the
+// standard argument-materialization shape). The imm12 still pins the exact
+// byte address, so false positives stay vanishingly rare. Device proof it
+// is required: gaa/ita/acc/mcp strings were RESIDENT yet "no code ref".
+static uintptr_t FindAdrpAddRefRelaxed(uintptr_t target, uintptr_t scanStart, uintptr_t scanEnd) {
+    uintptr_t page = target & ~0xFFFULL;
+    for (const Range& r : s_ranges) {
+        if (!r.exec) continue;
+        uintptr_t begin = scanStart > r.start ? scanStart : r.start;
+        begin &= ~3ULL;
+        uintptr_t end = r.end < scanEnd ? r.end : scanEnd;
+        for (uintptr_t pc = begin; pc + 8 <= end; pc += 4) {
+            uint32_t adrp = *(uint32_t*)pc;
+            uintptr_t pg = 0;
+            if (!DecodeAdrp(adrp, pc, pg) || pg != page) continue;
+            uint32_t rn = adrp & 0x1F;                            // ADRP destination
+            for (int k = 1; k <= 4; ++k) {
+                uintptr_t apc = pc + 4 * (size_t)k;
+                if (apc + 4 > end) break;
+                uint32_t add = *(uint32_t*)apc;
+                if ((add & 0xFF000000) != 0x91000000) continue;   // ADD Xd,Xn,#imm
+                if (((add >> 5) & 0x1F) != rn) continue;           // source = ADRP dest
+                uint64_t imm = (add >> 10) & 0xFFF;
+                if ((add >> 22) & 1) imm <<= 12;
+                if (pg + imm == target) return pc;
+            }
+        }
+    }
+    return 0;
+}
+static uintptr_t FindAdrpAddRef(uintptr_t target, uintptr_t scanStart, uintptr_t scanEnd) {
+    if (uintptr_t strict = FindAdrpAddRefStrict(target, scanStart, scanEnd)) return strict;
+    return FindAdrpAddRefRelaxed(target, scanStart, scanEnd);
 }
 
 // Frame-setup + boundary detection.
@@ -901,6 +976,9 @@ static void* hook_SendRequestNow(void* Arg1, void* MCPData, int /*ContextCredent
     if (orig_SendRequestNow) return orig_SendRequestNow(Arg1, MCPData, 3);   // CXC_Public
     return nullptr;
 }
+// [G12] Defined near InstallHooks; forward-declared here for the late
+// terrain re-scan path in tick_hook.
+static bool TryInstallMcpHook();
 
 // ============================================================================
 // CALL SYSTEM  — [F16] upgraded:
@@ -1540,6 +1618,7 @@ struct Session {
     std::array<double,6> held_build_pose{};
     std::array<double,6> last_build_pose{};
     void*  locker_pickaxe = nullptr;      // [F22] resolved by SyncLockerLoadout
+    bool   locker_resynced = false;       // [G12] one finalize-time MCP re-sync
     double observed_at = 0;
     double retry_at = 0;
     double finalize_at = 0;
@@ -1752,6 +1831,7 @@ static uintptr_t ApplyCharacterCustomization = 0;
 // [G05] void SendRequestNow(void* Arg1, void* MCPData, int ContextCredentials)
 static uintptr_t SendRequestNow = 0;
 static bool discovered = false;
+static bool gas_native_failed = false;   // [G11] one fault → native grant path off for the session
 
 // [G04] Reflection-driven FGameplayAbilitySpec layout — offsets are resolved
 // from the live UScriptStruct, so "print Spec.InputID before/after grant"
@@ -1865,34 +1945,173 @@ static void Discover() {
         SendRequestNow ? 1 : 0);
 }
 
+// [G12] Late re-discovery (Erbium finders are lazy for the same reason):
+// paged .rodata only becomes resident after its subsystem first touches it,
+// so anything the startup pass missed gets another chance once the game
+// world is live. Newly-found SendRequestNow is hooked on the spot by the
+// caller (TryInstallMcpHook) — that hook is the MCP profile enabler.
+static void RediscoverMissing() {
+    if (!InitializePlayerGameplayAbilities)
+        InitializePlayerGameplayAbilities = arm::FindFunctionByString(
+            "InitializePlayerGameplayAbilities with invalid PlayerStateOrProxy!");
+    if (!GiveAbilityAndActivateOnce)
+        GiveAbilityAndActivateOnce = arm::FindFunctionByString(
+            "GiveAbilityAndActivateOnce called on ability %s on the client, not allowed!");
+    if (!InternalTryActivateAbility)
+        InternalTryActivateAbility = arm::FindFunctionByString(
+            "InternalTryActivateAbility called with invalid Handle! ASC: %s. AvatarActor: %s");
+    if (!ApplyCharacterCustomization)
+        ApplyCharacterCustomization = arm::FindFunctionByString(
+            "AFortPlayerState::ApplyCharacterCustomization - Failed initialization, using default parts. "
+            "Player Controller: %s PlayerState: %s, HeroId: %s");
+    if (!SendRequestNow) {
+        SendRequestNow = arm::FindFunctionByString("MCP-Profile: Dispatching request to %s");
+        if (!SendRequestNow)
+            SendRequestNow = arm::FindFunctionByString(
+                "MCP-Profile: Dispatching request to %s - ContextCredentials: %s");
+    }
+    LOG("[GAS] rediscovery pass — init=%d gaa=%d ita=%d acc=%d mcp=%d",
+        InitializePlayerGameplayAbilities ? 1 : 0, GiveAbilityAndActivateOnce ? 1 : 0,
+        InternalTryActivateAbility ? 1 : 0, ApplyCharacterCustomization ? 1 : 0,
+        SendRequestNow ? 1 : 0);
+}
+
 // Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
 static int CountActivatableSpecs(void* asc = nullptr);
 
-// [G02] The Erbium primary grant: hand the PlayerState's
+// [G11] NATIVE FAULT GUARD — device-crash analysis: the run died INSIDE the
+// native InitializePlayerGameplayAbilities (last device log line: "[Stamina]
+// Initialized FortPlayerAttributeSet"; LogImpl is unbuffered logcat + fflush,
+// so nothing was lost — the interface resolved, the call was made, the
+// process faulted inside the engine). A direct call into a scanner-resolved
+// native can fault for reasons impossible to fully validate from outside
+// (client-side PlayerState ASC never server-initialized is the prime
+// suspect — Erbium only ever calls this from ServerAcknowledgePossession on
+// a real listen server where the full possession flow completed first).
+// Erbium's answer to the unknown is layered fallbacks; this adds the hard
+// safety net: the call runs under a scoped SIGSEGV/SIGBUS/SIGILL guard
+// (sigsetjmp/siglongjmp with old-handler chaining). A fault logs
+// signal+PC+faulting address, disables the native path for the session, and
+// the proven EquipFortAbilitySet reflection path continues instead of
+// killing the process.
+static sigjmp_buf g_gasJmp;
+static volatile sig_atomic_t g_inNativeCall = 0;
+static struct sigaction g_oldSegv, g_oldBus, g_oldIll;
+static bool g_gasGuardsUp = false;
+static volatile sig_atomic_t g_faultSig = 0;
+static volatile uintptr_t g_faultPc = 0, g_faultAddr = 0;
+
+static void NativeFaultForward(int sig, siginfo_t* info, void* uctx) {
+    struct sigaction* old = sig == SIGSEGV ? &g_oldSegv : (sig == SIGBUS ? &g_oldBus : &g_oldIll);
+    if (old->sa_flags & SA_SIGINFO) { old->sa_sigaction(sig, info, uctx); return; }
+    if (old->sa_handler && old->sa_handler != SIG_IGN && old->sa_handler != SIG_DFL) { old->sa_handler(sig); return; }
+    struct sigaction dflt;
+    memset(&dflt, 0, sizeof(dflt));
+    dflt.sa_handler = SIG_DFL;
+    sigaction(sig, &dflt, nullptr);
+    raise(sig);
+}
+static void NativeFaultHandler(int sig, siginfo_t* info, void* uctx) {
+    if (g_inNativeCall) {
+        g_faultSig  = sig;
+        g_faultPc   = uctx ? (uintptr_t)((ucontext_t*)uctx)->uc_mcontext.pc : 0;
+        g_faultAddr = info ? (uintptr_t)info->si_addr : 0;
+        g_inNativeCall = 0;
+        siglongjmp(g_gasJmp, 1);
+    }
+    NativeFaultForward(sig, info, uctx);   // not ours — chain to the previous owner
+}
+static bool InstallFaultGuards() {
+    if (g_gasGuardsUp) return true;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = NativeFaultHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    g_gasGuardsUp = sigaction(SIGSEGV, &sa, &g_oldSegv) == 0 &&
+                    sigaction(SIGBUS, &sa, &g_oldBus) == 0 &&
+                    sigaction(SIGILL, &sa, &g_oldIll) == 0;
+    return g_gasGuardsUp;
+}
+// Runs fn(arg) under the guard. Returns false when the call faulted — the
+// caller must treat the native as unusable and take its reflection fallback.
+// NOT reentrant (single sigjmp buffer) — exactly one call site exists today
+// (the GAS native grant, game thread only).
+static volatile bool g_gasPrevInternal = false;
+static bool RunGuarded(const char* tag, void (*fn)(void*), void* arg) {
+    if (!InstallFaultGuards()) return false;
+    if (sigsetjmp(g_gasJmp, 1) != 0) {
+        // Restore the exact pre-call g_internal (captured in a volatile
+        // before the call so it survives the longjmp). Blowing it to false
+        // here would punch a reentrancy hole through the outer tick Guard.
+        g_internal = g_gasPrevInternal;
+        LOG("[%s] ⚠️ native call FAULTED — sig=%d pc=0x%llx addr=0x%llx (native path disabled, reflection fallback continues)",
+            tag, (int)g_faultSig, (unsigned long long)g_faultPc, (unsigned long long)g_faultAddr);
+        return false;
+    }
+    g_gasPrevInternal = g_internal;
+    g_internal = true;        // engine callbacks fired during the native stay internal
+    g_inNativeCall = 1;
+    fn(arg);
+    g_inNativeCall = 0;
+    g_internal = g_gasPrevInternal;
+    return true;
+}
+static void NativeInitGasCall(void* ifaceAddr) {
+    ((void (*)(void*))InitializePlayerGameplayAbilities)(ifaceAddr);
+}
+
+// [G02/G11] The Erbium primary grant: hand the PlayerState's
 // IFortAbilitySystemInterface to the native InitializePlayerGameplayAbilities.
 // It resolves the pawn/PlayerState DefaultAbilitySets from the CDOs, builds
 // specs WITH their declared InputIDs (GAS-driven anims), and delivers them
-// through the native GiveAbility chain. Returns false when the native was
-// not found or the interface could not be resolved.
+// through the native GiveAbility chain. Now fault-guarded, fully staged/logged
+// and interface-validated; on ANY failure it returns false so the
+// EquipFortAbilitySet path (which never crashed on device) delivers the sets.
 static bool NativeInitializePlayerGameplayAbilities() {
     if (!InitializePlayerGameplayAbilities) return false;
+    if (gas_native_failed) { LOG("[GAS] native path disabled (previous fault)"); return false; }
     void* ifaceType = FindObj("/Script/FortniteGame.FortAbilitySystemInterface");
     if (!ifaceType) ifaceType = FindObj("/Script/FortniteGame.FortPlayerState.FortAbilitySystemInterface");
     void* target = session.player_state ? session.player_state : session.pawn;
     if (!target) return false;
+    LOG("[GAS] native init: fn@+0x%llX target=%p (%s) ifaceClass=%s",
+        (unsigned long long)(InitializePlayerGameplayAbilities - g_base), target,
+        target == session.player_state ? "PlayerState" : "pawn",
+        ifaceType ? "found" : "MISSING");
     void* ifaceAddr = ifaceType ? ResolveInterface(target, ifaceType) : nullptr;
-    if (!ifaceAddr) {
-        LOG("[GAS] IFortAbilitySystemInterface not resolvable — passing PlayerState");
-        ifaceAddr = target;   // single-inheritance interface: the object IS the interface
+    LOG("[GAS] interface pointer: %p", ifaceAddr);
+    // [G11] HARD RULE from the crash analysis: NEVER substitute the raw
+    // object pointer. The IFortAbilitySystemInterface* is this-adjusted —
+    // handing the native the UObject pointer means a wrong vtable on the
+    // very first virtual call (GetFortAbilitySystemComponent). No
+    // interface → no native call, reflection path takes over.
+    if (!ifaceAddr || !IsReadable(ifaceAddr, 8)) {
+        LOG("[GAS] interface not resolvable/readable — native path skipped");
+        return false;
     }
+    void* ifaceVtable = Read<void*>(ifaceAddr, 0);
+    if (!ifaceVtable || !IsReadable(ifaceVtable, 8)) {
+        LOG("[GAS] interface vtable not readable (%p) — native path skipped", ifaceVtable);
+        return false;
+    }
+    // [G11] The native targets the PlayerState's ASC while the fallback
+    // targets the pawn's — measure BOTH so a successful native grant is
+    // not reported as a failure (and vice versa).
+    void* psAsc = GetObjField(target, "/Script/FortniteGame.FortPlayerState.AbilitySystemComponent");
     int before = CountActivatableSpecs();
-    {
-        Guard g;   // the native calls back into UE — mark internal
-        ((void (*)(void*))InitializePlayerGameplayAbilities)(ifaceAddr);
+    int beforePs = psAsc ? CountActivatableSpecs(psAsc) : -1;
+    LOG("[GAS] calling native InitializePlayerGameplayAbilities(iface=%p) — pawn specs=%d ps specs=%d",
+        ifaceAddr, before, beforePs);
+    if (!RunGuarded("GAS", NativeInitGasCall, ifaceAddr)) {
+        gas_native_failed = true;
+        return false;
     }
     int after = CountActivatableSpecs();
-    LOG("[GAS] InitializePlayerGameplayAbilities: specs %d -> %d", before, after);
-    return after > before;
+    int afterPs = psAsc ? CountActivatableSpecs(psAsc) : -1;
+    LOG("[GAS] InitializePlayerGameplayAbilities: pawn specs %d -> %d, ps specs %d -> %d",
+        before, after, beforePs, afterPs);
+    return after > before || (afterPs > beforePs && beforePs >= 0);
 }
 
 // Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
@@ -2047,10 +2266,11 @@ void Athena::GrantAllAbilitySets() {
     if (!asc) { LOG("[Abilities] no ASC"); return; }
     if (!session.stamina_initialized) InitStaminaAttributes();
 
-    // [G02] PRIMARY — the native Erbium path: InitializePlayerGameplayAbilities
-    // reads the pawn/PlayerState DefaultAbilitySets from the CDOs and grants
-    // every ability through the real GiveAbility chain WITH its InputID (the
-    // GAS-driven locomotion/interaction animation enabler).
+    // [G02/G11] PRIMARY — the native Erbium path, now FAULT-GUARDED: the
+    // device run crashed inside this native call (the last log line was the
+    // stamina init). A fault no longer kills the process — it logs
+    // signal+PC+address, disables the native path for the session, and the
+    // proven EquipFortAbilitySet reflection path below takes over.
     bool nativeGranted = gas::NativeInitializePlayerGameplayAbilities();
 
     void* coreSet = LoadAsset(
@@ -3544,6 +3764,14 @@ void Athena::FinalizePlayer() {
     // printed BEFORE 'SetupWorld: EnsurePlayerState'). Re-run the full flow
     // now that the state is guaranteed.
     if (!session.cosmetics_with_state) { LOG("Finalize: cosmetics with state"); LoadDefaultCosmetics(); }
+    // [G12] The MCP profile lands asynchronously — the locker is often still
+    // empty at SetupWorld time (device log: "character= pickaxe="). One
+    // re-sync here catches the loaded profile so the pickaxe resolves.
+    if (!session.locker_pickaxe && !session.locker_resynced) {
+        session.locker_resynced = true;
+        LOG("Finalize: locker re-sync (MCP profile may have landed)");
+        SyncLockerLoadout();
+    }
     // Readiness can change possession — refresh cached pawn-dependent state.
     Call ps("/Script/Engine.Pawn.OnRep_PlayerState", pawn); if (ps.ok()) ps.run(pawn);
     if (!session.abilities_granted) GrantAllAbilitySets();
@@ -3971,8 +4199,17 @@ void Athena::InitializeInventory() {
 
     LOG("Inventory ready: inv=%p qb=%p", session.inventory, session.quickbars);
 
-    // Pickaxe: locker first, hardcoded fallback second.
-    void* pickaxeDef = session.locker_pickaxe;
+    // Pickaxe: locker first — Erbium parity: CosmeticLoadoutPC.Pickaxe is the
+    // COSMETIC AthenaPickaxeItemDefinition; the carried weapon is its
+    // WeaponDefinition. The old code handed the cosmetic def straight to
+    // GiveItem, so a locker pickaxe never materialized as a real weapon.
+    // Hardcoded default second.
+    void* pickaxeDef = nullptr;
+    if (session.locker_pickaxe) {
+        pickaxeDef = ResolveWeaponDefForEquip(session.locker_pickaxe);
+        if (pickaxeDef) LOG("[Pickaxe] ✅ locker pickaxe -> %s", ObjName(pickaxeDef).c_str());
+        else LOG("[Pickaxe] locker item exposes no WeaponDefinition — default pickaxe");
+    }
     if (!pickaxeDef) pickaxeDef = LoadAsset("/Game/Athena/Items/Weapons/WID_Harvest_Pickaxe_Athena_C_T01.WID_Harvest_Pickaxe_Athena_C_T01");
     if (!pickaxeDef) pickaxeDef = ByShortName("WID_Harvest_Pickaxe_Athena_C_T01");
     if (pickaxeDef) GiveItem(pickaxeDef, 1, 0, 0, false);
@@ -6980,6 +7217,17 @@ static void tick_hook(void* world, int type, float delta) {
         session.world = world; session.world_index = index;
         session.observed_at = Monotonic();
         LOG(">>> Terrain detected: %s", wn.c_str());
+        // [G12] Late native re-scan (Erbium lazy finders): anything the
+        // startup scan missed — paged-out .rodata, relaxed-form refs — gets
+        // one more pass now that the game world is resident, and a
+        // newly-found SendRequestNow is hooked immediately. This is the MCP
+        // profile/pickaxe enabler.
+        static bool g_lateScanDone = false;
+        if (!g_lateScanDone) {
+            g_lateScanDone = true;
+            gas::RediscoverMissing();
+            TryInstallMcpHook();
+        }
     }
     double now = Monotonic();
     // [F24] GamePhase tracking for diagnostics (reflection cached).
@@ -7116,6 +7364,29 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
     return orig_Exec(engine, world, command, output);
 }
 
+// [G05/G12] MCP dispatch hook installer — shared by InstallHooks (startup)
+// and the late terrain re-scan path so a lazily-discovered SendRequestNow
+// still gets hooked without a restart. Erbium installs its finders lazily
+// for exactly the same reason.
+static bool TryInstallMcpHook() {
+    if (orig_SendRequestNow) return true;   // already installed
+    if (!gas::SendRequestNow || !IsReadable((void*)gas::SendRequestNow, 16)) {
+        LOG("[MCP] SendRequestNow not found — profile dispatch unpatched");
+        return false;
+    }
+    uint32_t w0 = Read<uint32_t>((void*)gas::SendRequestNow);
+    if (!(arm::IsStpX29X30Sp(w0) || arm::IsSubSpImm(w0))) {
+        LOG("[MCP] SendRequestNow prologue unexpected (0x%08X) — skipped", w0);
+        return false;
+    }
+    if (DobbyHook((void*)gas::SendRequestNow, (void*)hook_SendRequestNow, (void**)&orig_SendRequestNow) == 0 && orig_SendRequestNow) {
+        LOG("[MCP] ✅ SendRequestNow hooked (CXC_Public forced)");
+        return true;
+    }
+    LOG("[MCP] SendRequestNow hook FAILED");
+    return false;
+}
+
 static void InstallHooks() {
     LOG("=== InstallHooks ===");
     // [F25/F26] Verify every hooked RVA belongs to this build before patching.
@@ -7145,16 +7416,9 @@ static void InstallHooks() {
     } else { LOG("EngineExec skipped (prologue)"); ++failed; }
     if (!qb_valid) LOG("[QB] initializer prologue mismatch — native init disabled, manual path only");
 
-    // [G05] MCP dispatch hook — installed only when the [G01] scanner located
-    // SendRequestNow AND its prologue reads like a valid frame entry.
-    if (gas::SendRequestNow && IsReadable((void*)gas::SendRequestNow, 16)) {
-        uint32_t w0 = Read<uint32_t>((void*)gas::SendRequestNow);
-        if (arm::IsStpX29X30Sp(w0) || arm::IsSubSpImm(w0)) {
-            if (DobbyHook((void*)gas::SendRequestNow, (void*)hook_SendRequestNow, (void**)&orig_SendRequestNow) == 0 && orig_SendRequestNow) {
-                LOG("[MCP] ✅ SendRequestNow hooked (CXC_Public forced)"); ++installed;
-            } else { LOG("[MCP] SendRequestNow hook FAILED"); ++failed; }
-        } else LOG("[MCP] SendRequestNow prologue unexpected (0x%08X) — skipped", w0);
-    } else LOG("[MCP] SendRequestNow not found — profile dispatch unpatched");
+    // [G05/G12] MCP dispatch hook — through the shared installer (also used
+    // by the late terrain re-scan path).
+    if (TryInstallMcpHook()) ++installed;
 
     LOG("InstallHooks done: installed=%d failed=%d", installed, failed);
 }
