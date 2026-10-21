@@ -271,6 +271,48 @@
 //            Emotes use the PlayerState ASC (Erbium ServerPlayEmoteItem
 //            parity). The MCP hook prologue check accepts the full STP opener
 //            set this build emits.
+//  [G14] THIRD-RUN ROOT-CAUSE FIXES (5/5 discovery, 43 specs granted, then
+//        the dump crashed at spec #3/#4):
+//        (a) THE STRIDE — PropertiesSize (111) is the UNPADDED end of the
+//            reflected properties (the last one is the InputPressed bitfield
+//            byte, so the value is odd); a TArray<FGameplayAbilitySpec>
+//            advances by sizeof(), which UHT pads to the struct alignment (8:
+//            the spec holds pointers) = 112. Device proof: with 111, spec #1
+//            read handle=0x200 — the byte pattern of spec#0's last padding
+//            byte (0) followed by spec#1's real Handle (2) — and #2's
+//            inputID=0x6F8B62 was the middle of the Ability pointer. The
+//            stride is now align8(PropertiesSize) AND auto-validated against
+//            3 consecutive slots (small handle/InputID/Level + Ability
+//            pointer that is aligned, readable and vtabled inside the
+//            module); on validation failure a raw hexdump of slots 0/1 gives
+//            ground truth for the next run.
+//        (b) THE FATAL CRASH — the misaligned Ability pointer passed ObjName's
+//            FName bounds checks and the native NameAppendString walked into
+//            unmapped memory (unguarded). Now every Ability pointer is hard
+//            pre-validated (alignment + readability + vtable inside
+//            libUnreal.so's PT_LOAD ranges) and the name fetch itself runs
+//            under the fault guard: diagnostics can never kill the server.
+//            CountActivatableSpecs/BuildSpec use the same align8 sizing.
+//        (c) THE NATIVE INIT CALL — BOTH attempts (interface x0 AND raw
+//            PlayerState x0) faulted at the SAME address (0x2886b5a5ee198c,
+//            +8 vs the previous run) — the load at target+0xC reads a STALE
+//            ARGUMENT REGISTER, not our this-pointer. The native's own
+//            validation string ("...with invalid P[layerStateOrProxy]")
+//            names its second parameter, which this variant dereferences
+//            first. All calls now go through an 8-arg zeroed prototype
+//            (x2..x7 = 0) with a proxy in x1, across a 5-convention matrix
+//            (ps-iface+PS / raw PS+PS / pawn-iface+PS / ps-iface+pawn /
+//            ps-iface+null — the null trips the function's own guard branch
+//            and returns cleanly); the first non-faulting convention is
+//            remembered, and the path is only disabled when ALL fault.
+//        (d) ANTI-DOUBLE-GRANT — if the native really delivers the CDO
+//            DefaultAbilitySets (spec delta >= 20), GAS_AthenaPlayer is NOT
+//            re-equipped through EquipFortAbilitySet (would duplicate its 37
+//            abilities); the Erbium movement family still equips (not in the
+//            CDO).
+//        (e) LATE-STREAMING SETS — AS_HillScramble/AS_SlideImpulse were not
+//            resident at grant time; they queue and retry from Tick (~8s
+//            cadence, ~3 min window) once the main grant has committed.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -1975,9 +2017,12 @@ static void* BuildSpec(void* abilityCdo, void* sourceObject) {
     static SpecLayout layout; static bool resolved = false;
     if (!resolved) { resolved = true; if (!ResolveSpecLayout(layout)) LOG("[GAS] ⚠️ GameplayAbilitySpec reflection missing"); }
     if (!layout.ok() || !abilityCdo) return nullptr;
-    void* spec = malloc((size_t)std::max(layout.Size, 0x40));
+    // [G14] sizeof = align8(PropertiesSize): the engine reads the full padded
+    // struct out of this buffer (111 would under-allocate by one byte).
+    size_t specBytes = (size_t)std::max((layout.Size + 7) & ~7, 0x40);
+    void* spec = malloc(specBytes);
     if (!spec) return nullptr;
-    memset(spec, 0, (size_t)std::max(layout.Size, 0x40));
+    memset(spec, 0, specBytes);
     Write<int32>(spec, 0x0, -1);                              // ReplicationID
     Write<int32>(spec, 0x4, -1);                              // ReplicationKey
     Write<int32>(spec, 0x8, -1);                              // MostRecentArrayReplicationKey
@@ -2166,8 +2211,16 @@ static bool RunGuarded(const char* tag, FnT fn, ArgsT... args) {
     g_internal = g_gasPrevInternal;
     return true;
 }
-static void NativeInitGasCall(void* thisPtr) {
-    ((void (*)(void*))InitializePlayerGameplayAbilities)(thisPtr);
+static void NativeInitGasCall(void* thisPtr, void* proxyArg) {
+    // [G14] 8-arg prototype: the compiler materializes x2..x7 = 0 explicitly.
+    // The twin device faults (identical addr, two DIFFERENT x0 values) prove
+    // the faulting load at target+0xC reads a stale argument register — the
+    // 1-arg cast left x1..x7 holding whatever the previous call left behind.
+    // Arg2 carries the PlayerStateOrProxy the native validates ("with invalid
+    // P..."); nullptr trips its own null-guard branch (logs, returns clean).
+    ((void (*)(void*, void*, void*, void*, void*, void*, void*, void*))
+        InitializePlayerGameplayAbilities)(thisPtr, proxyArg,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 }
 // [G13] Wrapped native entries for the other scanner-resolved calls.
 static void NativeAccCall(void* playerState, void* pawn) {
@@ -2181,16 +2234,24 @@ static void NativeGaaCall(void* asc, void* outHandle, void* spec) {
 // Abilities resolves the pawn/PlayerState DefaultAbilitySets from the CDOs,
 // builds specs WITH their declared InputIDs (GAS-driven anims), and delivers
 // them through the native GiveAbility chain — never a hand-rebuilt spec.
-// [G13] Calling conventions, in order, both fault-guarded:
-//   1. IFortAbilitySystemInterface slot pointer — 1:1 Erbium (it passes
-//      PlayerState->GetInterface(...) into the same scanner-found native).
-//   2. The raw AFortPlayerState UObject — the plain member-function
-//      convention. Only tried when (1) FAULTED: a fault is itself evidence
-//      the interface convention was wrong for this native; when (1) merely
-//      grants nothing (e.g. a client-side early-out) retrying the same body
-//      with a different `this` is pointless and the reflection path wins.
-// A fault on BOTH attempts disables the native path for the session.
-static bool gas_use_raw_target = false;   // [G13] remembered working convention
+// [G14] Calling conventions — the third device run settled it: BOTH attempts
+// (interface pointer AND raw PlayerState as x0) faulted at the SAME address
+// (0x2886b5a5ee198c, +8 vs the previous run) with different x0 values, so the
+// faulting load at target+0xC reads a STALE ARGUMENT REGISTER, not our
+// this-pointer. The native's own validation string ("InitializePlayerGameplay-
+// Abilities with invalid P[layerStateOrProxy]") names its second parameter,
+// which this 21.30 Android variant dereferences before anything else.
+// Every attempt now goes through the 8-arg zeroed prototype (x2..x7 = 0) with
+// a real proxy in x1; nullptr trips the function's own null-guard branch (it
+// logs and returns). Matrix, all fault-guarded, first non-faulting convention
+// wins and is remembered for the session:
+//   1. ps-interface + PlayerStateOrProxy (Erbium's receiver, proxy filled in)
+//   2. raw PlayerState + PlayerStateOrProxy (plain member convention)
+//   3. pawn-interface + PlayerStateOrProxy
+//   4. ps-interface + pawn (in case "P" means the pawn)
+//   5. ps-interface + nullptr (guard branch — runs clean, grants nothing)
+// gas_native_failed is only set when EVERY self-valid attempt faulted.
+static int gas_working_conv = -1;      // [G14] remembered non-faulting convention
 static bool NativeInitializePlayerGameplayAbilities() {
     if (!InitializePlayerGameplayAbilities) return false;
     if (gas_native_failed) { LOG("[GAS] native path disabled (previous fault)"); return false; }
@@ -2198,59 +2259,70 @@ static bool NativeInitializePlayerGameplayAbilities() {
     if (!ifaceType) ifaceType = FindObj("/Script/FortniteGame.FortPlayerState.FortAbilitySystemInterface");
     void* target = session.player_state ? session.player_state : session.pawn;
     if (!target) return false;
+    void* ps = session.player_state;
+    void* pawn = session.pawn;
     LOG("[GAS] native init: fn@+0x%llX target=%p (%s) ifaceClass=%s",
         (unsigned long long)(InitializePlayerGameplayAbilities - g_base), target,
         target == session.player_state ? "PlayerState" : "pawn",
         ifaceType ? "found" : "MISSING");
-    void* ifaceAddr = ifaceType ? ResolveInterface(target, ifaceType) : nullptr;
-    LOG("[GAS] interface pointer: %p (raw convention %s)",
-        ifaceAddr, gas_use_raw_target ? "ACTIVE" : "inactive");
-    if (ifaceAddr && !IsReadable(ifaceAddr, 8)) {
-        LOG("[GAS] interface pointer unreadable — treating as absent");
-        ifaceAddr = nullptr;
-    } else if (ifaceAddr) {
-        void* ifaceVtable = Read<void*>(ifaceAddr, 0);
-        if (!ifaceVtable || !IsReadable(ifaceVtable, 8)) {
-            LOG("[GAS] interface vtable not readable (%p) — treating as absent", ifaceVtable);
-            ifaceAddr = nullptr;
-        }
-    }
+    auto usable = [](void* p) -> void* {
+        if (!p || !IsReadable(p, 8)) return nullptr;
+        void* vt = Read<void*>(p, 0);
+        if (!vt || !IsReadable(vt, 8)) return nullptr;
+        return p;
+    };
+    void* psIface = ifaceType ? usable(ResolveInterface(target, ifaceType)) : nullptr;
+    void* pawnIface = (ifaceType && pawn && pawn != target) ? usable(ResolveInterface(pawn, ifaceType)) : nullptr;
+    LOG("[GAS] interface pointers: ps=%p pawn=%p (working convention #%d)",
+        psIface, pawnIface, gas_working_conv);
     // [G11] The native targets the PlayerState's ASC while the fallback
     // targets the pawn's — measure BOTH so a successful native grant is
     // not reported as a failure (and vice versa).
     void* psAsc = GetObjField(target, "/Script/FortniteGame.FortPlayerState.AbilitySystemComponent");
     int before = CountActivatableSpecs();
     int beforePs = psAsc ? CountActivatableSpecs(psAsc) : -1;
-    if (gas_use_raw_target) {
-        LOG("[GAS] calling native InitializePlayerGameplayAbilities(raw=%p) — pawn specs=%d ps specs=%d",
-            target, before, beforePs);
-        if (!RunGuarded("GAS", NativeInitGasCall, target)) {
-            gas_native_failed = true;
-            return false;
-        }
-    } else if (ifaceAddr) {
-        LOG("[GAS] calling native InitializePlayerGameplayAbilities(iface=%p) — pawn specs=%d ps specs=%d",
-            ifaceAddr, before, beforePs);
-        if (!RunGuarded("GAS", NativeInitGasCall, ifaceAddr)) {
-            // [G13] Interface convention faulted — the wrong-`this` theory.
-            // Retry exactly once with the raw object before giving up.
-            LOG("[GAS] interface convention faulted — retrying with the raw %s pointer",
-                target == session.player_state ? "PlayerState" : "pawn");
-            if (!RunGuarded("GAS", NativeInitGasCall, target)) {
-                gas_native_failed = true;
-                return false;
-            }
-            gas_use_raw_target = true;   // remember the working convention
-        }
-    } else {
-        LOG("[GAS] interface not resolvable — native path skipped");
-        return false;
+    struct Conv { void* self; void* proxy; const char* name; };
+    Conv convs[5] = {
+        { psIface,   ps,      "ps-iface + PlayerStateOrProxy" },
+        { target,    ps,      "playerstate + PlayerStateOrProxy" },
+        { pawnIface, ps,      "pawn-iface + PlayerStateOrProxy" },
+        { psIface,   pawn,    "ps-iface + pawn" },
+        { psIface,   nullptr, "ps-iface + nullptr" },
+    };
+    int order[5] = { 0, 1, 2, 3, 4 };
+    if (gas_working_conv > 0 && gas_working_conv < 5) {
+        order[0] = gas_working_conv;
+        order[gas_working_conv] = 0;
     }
-    int after = CountActivatableSpecs();
-    int afterPs = psAsc ? CountActivatableSpecs(psAsc) : -1;
-    LOG("[GAS] InitializePlayerGameplayAbilities: pawn specs %d -> %d, ps specs %d -> %d",
-        before, after, beforePs, afterPs);
-    return after > before || (afterPs > beforePs && beforePs >= 0);
+    int faults = 0, ranClean = -1;
+    for (int oi = 0; oi < 5; ++oi) {
+        Conv& cv = convs[order[oi]];
+        if (!cv.self) continue;
+        LOG("[GAS] calling native InitializePlayerGameplayAbilities(%s, this=%p, proxy=%p) — pawn specs=%d ps specs=%d",
+            cv.name, cv.self, cv.proxy, before, beforePs);
+        if (!RunGuarded("GAS", NativeInitGasCall, cv.self, cv.proxy)) {
+            ++faults;
+            LOG("[GAS] convention '%s' faulted — trying next", cv.name);
+            continue;
+        }
+        gas_working_conv = order[oi];
+        ranClean = order[oi];
+        int after = CountActivatableSpecs();
+        int afterPs = psAsc ? CountActivatableSpecs(psAsc) : -1;
+        LOG("[GAS] InitializePlayerGameplayAbilities: pawn specs %d -> %d, ps specs %d -> %d",
+            before, after, beforePs, afterPs);
+        if (after > before || (afterPs > beforePs && beforePs >= 0)) return true;
+        // Ran clean but granted nothing (null-guard branch or a client-side
+        // early-out) — another convention may still deliver.
+    }
+    if (ranClean < 0 && faults > 0) {
+        gas_native_failed = true;
+        LOG("[GAS] every native convention faulted — path disabled for the session");
+    } else if (ranClean >= 0) {
+        LOG("[GAS] native ran clean (convention #%d) but granted nothing — reflection path wins",
+            ranClean);
+    }
+    return false;
 }
 
 // Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
@@ -2276,6 +2348,9 @@ static int CountActivatableSpecs(void* asc) {
                 void* stru = FindObj("/Script/GameplayAbilities.GameplayAbilitySpec");
                 if (stru && !IsBadPtr(stru)) stride = Read<int32>(stru, profile::StructPropertiesSize);
             }
+            // [G14] PropertiesSize is the unpadded property end (111 on this
+            // build) — the TArray element stride is sizeof() = align8(props).
+            if (stride > 0) stride = (stride + 7) & ~7;
             if (stride <= 0) stride = 0x70;                        // 21.30 typical spec size fallback
         }
     }
@@ -2285,15 +2360,57 @@ static int CountActivatableSpecs(void* asc) {
     return items.Count;
 }
 
-// [G04/G13] Dump every spec with ability name + InputID (the user-visible
+// [G04/G13/G14] Dump every spec with ability name + InputID (the user-visible
 // "granted but bound?" verification). Rate-free — call on demand.
 // [G13] The second device crash was HERE: the array stride came from
 // hardcoded FField::Inner/Struct offsets (0x70), specs #1+ read misaligned
 // garbage ("inputID=7310658 level=510656512"), and spec #4 memcpy'd off the
-// end of the array page — a hard, unguarded SIGSEGV. The stride is now the
-// engine's own FGameplayAbilitySpec::PropertiesSize (ResolveSpecLayout /
-// live UScriptStruct), every element is readability-probed before reading,
-// and the dump is capped.
+// end of the array page — a hard, unguarded SIGSEGV.
+// [G14-a] The THIRD run proved PropertiesSize (111) is still wrong AS A
+// STRIDE: UScriptStruct::PropertiesSize is the UNPADDED end of the reflected
+// properties (the last one is the InputPressed bitfield byte, so the value is
+// odd) — a TArray<FGameplayAbilitySpec> advances by sizeof(), which UHT pads
+// to the struct alignment (8: the spec holds pointers). stride =
+// align8(111) = 112. The misaligned Ability pointers (#1-#3 blank names,
+// pointer fragments read as ints) were the direct fallout.
+// [G14-b] And the FATAL crash: a garbage Ability pointer passed ObjName's
+// FName bounds checks and NameAppendString walked into unmapped memory.
+// Now: stride auto-validation across 3 consecutive slots, hard pre-validation
+// of every Ability pointer (alignment + readability + vtable inside
+// libUnreal.so's PT_LOAD ranges), and a fault guard around the name fetch —
+// a diagnostic can never kill the server.
+static bool PtrInUnrealModule(const void* p) {
+    if (!p) return false;
+    uintptr_t v = (uintptr_t)p;
+    for (const auto& r : arm::s_ranges)
+        if (v >= r.start && v < r.end) return true;
+    return false;
+}
+// A slot that looks like a real spec: small engine-assigned handle (1,2,3…),
+// sane InputID/Level, and an Ability pointer that is 8-aligned, readable and
+// carrying a vtable inside the module (a real UObject). Under the broken 111
+// stride this fails by the 2nd/3rd slot — the InputID reads the middle of the
+// Ability pointer — which is exactly what makes the auto-validation decisive.
+static bool SpecSlotSane(const Array& items, int stride, int idx, const SpecLayout& L) {
+    if (idx < 0 || (size_t)idx >= (size_t)items.Count) return false;
+    uint8_t* p = (uint8_t*)items.Data + (size_t)idx * (size_t)stride;
+    if (!IsReadable(p, (size_t)stride)) return false;
+    int32 h = Read<int32>(p, L.OffHandle);
+    int32 in = Read<int32>(p, L.OffInputID);
+    int32 lv = L.OffLevel >= 0 ? Read<int32>(p, L.OffLevel) : 1;
+    void* ab = Read<void*>(p, L.OffAbility);
+    if (h < 0 || h > 0xFFFF || in < -1 || in > 0xFFFF || lv < 0 || lv > 0xFFFF) return false;
+    if (!ab || ((uintptr_t)ab & 7) != 0 || !IsReadable(ab, 0x28)) return false;
+    void* vt = Read<void*>(ab, 0);
+    return vt && PtrInUnrealModule(vt);
+}
+// [G14-b] The guarded name fetch (ObjName → native NameAppendString). Writes
+// into out[] only; a fault longjmps past it and leaves out[0] = 0.
+static void SpecNameFetch(void* ability, char* out) {
+    out[0] = 0;
+    std::string n = ObjName(ability);
+    if (!n.empty()) { strncpy(out, n.c_str(), 63); out[63] = 0; }
+}
 static void DumpSpecs(const char* tag) {
     void* asc = GetASC(session.pawn);
     if (!asc) return;
@@ -2310,38 +2427,60 @@ static void DumpSpecs(const char* tag) {
     }
     LOG("[Specs] %s: %d specs", tag, items.Count);
     if (!layout.ok()) return;
-    // [G13] Stride priority: layout.Size (engine truth via the live
-    // UScriptStruct) → UScriptStruct re-read → bounded FField guess → 0x70.
-    int stride = (layout.Size >= 0x30 && layout.Size <= 0x200) ? layout.Size : 0;
-    if (stride <= 0) {
-        void* stru = FindObj("/Script/GameplayAbilities.GameplayAbilitySpec");
-        if (stru && !IsBadPtr(stru)) {
-            int s = Read<int32>(stru, profile::StructPropertiesSize);
-            if (s >= 0x30 && s <= 0x200) stride = s;
+    // [G14-a] Stride resolution: align8(PropertiesSize) first, then the
+    // plausible neighbors — a candidate must make THREE consecutive slots
+    // look like real specs. With fewer than 3 specs validation is impossible;
+    // align8(props) is the best-grounded value then.
+    int propsRaw = (layout.Size >= 0x20 && layout.Size <= 0x400) ? layout.Size : 0x70;
+    int aligned = (propsRaw + 7) & ~7;
+    int stride = 0;
+    if (items.Count >= 3) {
+        int cand[6] = { aligned, 0x70, 0x78, 0x68, 0x60, 0x80 };
+        for (int ci = 0; ci < 6 && !stride; ++ci) {
+            if (cand[ci] < 0x20 || cand[ci] > 0x400) continue;
+            if (SpecSlotSane(items, cand[ci], 0, layout) &&
+                SpecSlotSane(items, cand[ci], 1, layout) &&
+                SpecSlotSane(items, cand[ci], 2, layout))
+                stride = cand[ci];
         }
     }
-    if (stride <= 0) {
-        void* inner = Read<void*>(itemsProp, 0x70);
-        if (inner && !IsBadPtr(inner)) {
-            void* sStruct = Read<void*>(inner, 0x70);
-            if (sStruct && !IsBadPtr(sStruct)) {
-                int s = Read<int32>(sStruct, profile::StructPropertiesSize);
-                if (s >= 0x30 && s <= 0x200) stride = s;
-            }
+    if (!stride) {
+        stride = aligned;
+        LOG("[Specs] ⚠️ stride auto-validation failed — using align8(props=%d)=%d, raw slot bytes follow:",
+            propsRaw, stride);
+        for (int s = 0; s < 2 && s < items.Count; ++s) {   // ground truth for the next run
+            uint8_t* p = (uint8_t*)items.Data + (size_t)s * (size_t)stride;
+            if (!IsReadable(p, 0x40)) continue;
+            char hex[3 * 0x40 + 1]; int o = 0;
+            for (int b = 0; b < 0x40; ++b) o += snprintf(hex + o, sizeof(hex) - o, "%02X ", p[b]);
+            LOG("[Specs]  slot%d @%p: %s", s, p, hex);
         }
     }
-    if (stride <= 0) stride = 0x70;
-    LOG("[Specs] stride=%d (spec size)", stride);
+    LOG("[Specs] stride=%d (spec size, props=%d) data=%p", stride, propsRaw, items.Data);
     int cap = items.Count > 128 ? 128 : items.Count;
     for (int i = 0; i < cap; ++i) {
-        void* spec = (char*)items.Data + (size_t)i * stride;
+        uint8_t* spec = (uint8_t*)items.Data + (size_t)i * (size_t)stride;
         if (!IsReadable(spec, (size_t)stride)) { LOG("[Specs]  #%d <unreadable spec — stop>", i); break; }
-        void* ability = Read<void*>(spec, layout.OffAbility);
         int32 inputID = Read<int32>(spec, layout.OffInputID);
         int32 level = layout.OffLevel >= 0 ? Read<int32>(spec, layout.OffLevel) : 1;
         int32 handle = layout.OffHandle >= 0 ? Read<int32>(spec, layout.OffHandle) : 0;
+        void* ability = Read<void*>(spec, layout.OffAbility);
+        char name[64];
+        name[0] = 0;
+        // [G14-b] Hard pre-validation: alignment + readability + vtable inside
+        // the module. Only then is the (still guarded) name fetch allowed.
+        if (ability && ((uintptr_t)ability & 7) == 0 && IsReadable(ability, 0x28)
+            && PtrInUnrealModule(Read<void*>(ability, 0))) {
+            if (!RunGuarded("Specs", SpecNameFetch, ability, name)) {
+                LOG("[Specs]  #%d <name fetch faulted — stop>", i);
+                break;
+            }
+        } else {
+            strncpy(name, "<bad-ability>", sizeof(name) - 1);
+            name[sizeof(name) - 1] = 0;
+        }
         LOG("[Specs]  #%d %s inputID=%d level=%d handle=0x%X", i,
-            ObjName(ability).c_str(), inputID, level, (unsigned)handle);
+            name[0] ? name : "<no-name>", inputID, level, (unsigned)handle);
     }
     if (items.Count > cap) LOG("[Specs]  ... %d more (capped)", items.Count - cap);
 }
@@ -2415,6 +2554,45 @@ static bool ApplyAbilitySet(void* pawn, void* abilitySet) {
     return true;
 }
 
+// ============================================================================
+// [G14-e] LATE-STREAMING ABILITY SETS — AS_HillScramble/AS_SlideImpulse were
+// not resident at grant time on the device (they load with the terrain's
+// streaming levels). Once GrantAllAbilitySets has committed, the queue below
+// retries them from Tick until the asset lands (or ~3 minutes pass).
+// ============================================================================
+struct PendingAbilitySet { const char* path; const char* shortName; int tries; };
+static std::vector<PendingAbilitySet> s_pendingSets;
+static void QueuePendingAbilitySet(const char* path, const char* shortName) {
+    for (const auto& p : s_pendingSets)
+        if (strcmp(p.shortName, shortName) == 0) return;   // already queued
+    s_pendingSets.push_back({ path, shortName, 0 });
+}
+static void PumpPendingAbilitySets() {
+    if (s_pendingSets.empty() || !session.pawn) return;
+    for (size_t i = 0; i < s_pendingSets.size(); ) {
+        PendingAbilitySet& p = s_pendingSets[i];
+        void* set = LoadAsset(p.path, "/Script/FortniteGame.FortAbilitySet");
+        if (!set) set = FindLoadedObjectOfType("/Script/FortniteGame.FortAbilitySet", p.shortName);
+        if (set && !IsBadPtr(set)) {
+            bool already = std::find(session.granted_ability_sets.begin(),
+                                     session.granted_ability_sets.end(), set)
+                           != session.granted_ability_sets.end();
+            if (!already && ApplyAbilitySet(session.pawn, set)) {
+                session.granted_ability_sets.push_back(set);
+                LOG("[Abilities] ✅ Applied late set: %s", p.shortName);
+            }
+            s_pendingSets.erase(s_pendingSets.begin() + i);
+            continue;
+        }
+        if (++p.tries > 22) {   // ~3 min at the 8s Tick cadence
+            LOG("[Abilities] giving up on %s (never became resident)", p.shortName);
+            s_pendingSets.erase(s_pendingSets.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+}
+
 void Athena::InitStaminaAttributes() {
     if (!session.pawn) return;
     void* asc = GetASC(session.pawn);
@@ -2444,7 +2622,16 @@ void Athena::GrantAllAbilitySets() {
     // stamina init). A fault no longer kills the process — it logs
     // signal+PC+address, disables the native path for the session, and the
     // proven EquipFortAbilitySet reflection path below takes over.
+    // [G14-d] Anti-double-grant: if the native actually delivered the CDO
+    // DefaultAbilitySets (GAS_AthenaPlayer & co.), re-equipping the core set
+    // through EquipFortAbilitySet would duplicate its 37 abilities.
+    int specsPreNative = gas::CountActivatableSpecs(asc);
     bool nativeGranted = gas::NativeInitializePlayerGameplayAbilities();
+    int specsPostNative = gas::CountActivatableSpecs(asc);
+    bool skipCoreSet = nativeGranted && (specsPostNative - specsPreNative) >= 20;
+    if (skipCoreSet)
+        LOG("[Abilities] native granted %d specs — skipping GAS_AthenaPlayer re-grant (anti-duplicate)",
+            specsPostNative - specsPreNative);
 
     void* coreSet = LoadAsset(
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_AthenaPlayer.GAS_AthenaPlayer",
@@ -2503,7 +2690,7 @@ void Athena::GrantAllAbilitySets() {
     }
 
     bool coreApplied = false;
-    if (coreSet && ApplyAbilitySet(session.pawn, coreSet)) {
+    if (coreSet && !skipCoreSet && ApplyAbilitySet(session.pawn, coreSet)) {
         session.granted_ability_sets.push_back(coreSet);
         coreApplied = true;
     }
@@ -2515,7 +2702,13 @@ void Athena::GrantAllAbilitySets() {
     for (int i = 0; erbiumSets[i].path; ++i) {
         void* set = LoadAsset(erbiumSets[i].path, "/Script/FortniteGame.FortAbilitySet");
         if (!set) set = FindLoadedObjectOfType("/Script/FortniteGame.FortAbilitySet", erbiumSets[i].shortName);
-        if (!set || IsBadPtr(set)) { LOG("[Abilities] set not resident yet: %s", erbiumSets[i].shortName); continue; }
+        if (!set || IsBadPtr(set)) {
+            // [G14-e] These stream in late (HillScramble/SlideImpulse on the
+            // device run) — queue for the Tick pump instead of dropping.
+            LOG("[Abilities] set not resident yet: %s (queued for late retry)", erbiumSets[i].shortName);
+            QueuePendingAbilitySet(erbiumSets[i].path, erbiumSets[i].shortName);
+            continue;
+        }
         if (std::find(session.granted_ability_sets.begin(), session.granted_ability_sets.end(), set) != session.granted_ability_sets.end())
             continue;   // already equipped (retry path)
         if (ApplyAbilitySet(session.pawn, set)) {
@@ -4074,6 +4267,7 @@ void Athena::Tick() {
         lastAnimCheck = now;
         FixBodyAndAnimations();       // [F83-b] retries until the AnimBP streams in
         GrantWorldAbilities();        // [F52] retries until the core ability pair streams in
+        PumpPendingAbilitySets();     // [G14-e] AS_HillScramble/AS_SlideImpulse late-stream retry
     }
     if (session.finalized && now - lastCosmeticsCheck > 8.0) {   // [F90-c/AUD-1]
         lastCosmeticsCheck = now;
