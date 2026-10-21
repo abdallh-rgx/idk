@@ -98,6 +98,34 @@
 //            does not exist in this build — loot used to vanish).
 //          • Container loot now TossPickups out of the chest (was hovering
 //            mid-air), PawnWhoDroppedPickup set on every spawn.
+//  [F94] LOOT TABLES ACTIVATED — GetDataTableRow is unresolved on this
+//        build ([F93]) which silently failed ALL 2401 row reads ("cache
+//        ready=0 tiers=0 packages=0" → curated fallback → random loot).
+//        Rows are now read DIRECTLY from UDataTable::RowMap @+0x30
+//        (Erbium DataTable.h layout: RowStruct @0x28 — runtime-verified here
+//        by every PropOffsetOn hit; TSet element stride 24 with allocation
+//        bit-array free-slot skip). The real 21.30 loot distribution
+//        (252 tier rows × 2149 package rows) finally rolls.
+//  [F94-b] Row size via FField walk (primary) — the raw PropertiesSize@0x54
+//        slot reads 0x6F=111 on BOTH loot structs (non-4-aligned, identical
+//        across two different row types = not PropertiesSize). Applies to
+//        BuildCache + ClipSizeOf + ItemLevelOf. Also: the pkg-row
+//        LootPackageCall FString is ENGINE-OWNED row memory — the old
+//        Free() on it would have corrupted the table heap the moment row
+//        reads started working (latent landmine, removed).
+//  [F-loot-batch r2] CRASH FIX — the old SpawnFloorLoot rolled EVERY spawner
+//        synchronously inside one WorldTick (1052 + 2958 passes, ~6300
+//        pickups × 4-6 native calls each) → multi-second frame stall → phone
+//        choke → crash; SearchContainer logged one line per spawner (the
+//        ~4000-line log). New model: enqueue-only at SetupWorld, drain ~12
+//        spawners per tick, rediscovery every 15s (10 passes) for streamed-in
+//        POI sublevel spawners, aggregated logging, 6000-pickup hard cap.
+//  [F-loot-place] AUTHENTIC FLOOR-LOOT PLACEMENT — no TossPickup (toss
+//        physics was scattering pickups into random spots AND kept all
+//        ~6300 of them active physics bodies), no +40 Z, no spread grid,
+//        no per-spawner axis UFunction calls: pickups sit EXACTLY on the
+//        spawner point (extras on a tight 35cm ring) like the real game.
+//        Chests/ammo boxes keep the toss (authentic).
 //  [F36] QUICKBARS/INVENTORY (Erbium 1:1) — fixes "QuickBars disabled":
 //          • FortQuickBars.ServerAddItemInternal / ServerActivateSlotInternal
 //            / ServerRemoveItemInternal / EmptySlot native binding with the
@@ -1491,6 +1519,18 @@ static int StructSizeByFFieldWalk(void* s, const char* const* mustHave, int must
     if (best <= 0 || best > 512) return 0;
     return (best + 7) & ~7;   // align to 8 (row copies are struct-aligned)
 }
+// [F94-b] Row size resolution: the FField walk is AUTHORITATIVE — the raw
+// PropertiesSize@0x54 slot reads 0x6F (111) on BOTH loot structs on this
+// build (a non-4-aligned impossible size for structs with FName/TArray
+// members, and identical across two different row types = that slot is
+// not PropertiesSize here). Walk first; raw only as a last resort.
+static int TableRowSizeOf(void* rs, const char* const* mustHave, int mustCount) {
+    if (!rs || IsBadPtr(rs)) return 0;
+    int walk = StructSizeByFFieldWalk(rs, mustHave, mustCount);
+    if (walk > 0) return walk;
+    int raw = Read<int>(rs, profile::StructPropertiesSize);
+    return (raw > 0 && raw <= 512) ? raw : 0;
+}
 static std::string FNameToString(const void* fnameBytes) {
     if (!fnameBytes) return {};
     FStringNative ns{};
@@ -1528,6 +1568,46 @@ static bool DataTableRowNames(void* table, std::vector<FName>& out) {
     if (res.Data) Fn<void(*)(void*)>(profile::Free)(res.Data);
     return !out.empty();
 }
+// [F94] DIRECT RowMap row read — the fix for the silent 2401-row failure.
+// GetDataTableRow is unresolved on this build ([F93]) while GetDataTableRow-
+// Names resolves fine, so every historical row read returned false and the
+// cache stayed empty ("cache ready=0 tiers=0 packages=0" → curated fallback
+// → random loot). Erbium's DataTable.h pins the layout for this build
+// family: RowStruct @0x28 (runtime-verified here — every PropOffsetOn on it
+// resolves), RowMap @0x30. TMap<FName,uint8*> = FScriptSet:
+//   +0x00 TSparseArray.Elements { Data*, ArrayNum, ArrayMax }
+//   +0x10 FirstFreeIndex, +0x14 NumFreeIndices
+//   +0x18 AllocationFlags { Data*, NumBits, MaxBits }
+// Element stride 24: TSetElement{ FName key(8), uint8* value(8),
+// HashNextId(4), HashIndex(4) }. Free slots are skipped via NumFreeIndices
+// and the allocation bit-array; a key match is only trusted when the value
+// pointer is sane.
+static uint8_t* RowMapFind(void* table, const FName& row, int rowSize) {
+    if (!table || IsBadPtr(table) || !row.CompIdx) return nullptr;
+    uint8_t* m = (uint8_t*)table + 0x30;
+    void* elems = Read<void*>(m, 0x00);
+    int32_t num = Read<int32>(m, 0x08);
+    if (!elems || IsBadPtr(elems) || num <= 0 || num > 200000) return nullptr;
+    int32_t numFree = Read<int32>(m, 0x14);
+    void* flags = Read<void*>(m, 0x18);
+    int32_t numBits = Read<int32>(m, 0x20);
+    bool flagsOk = flags && !IsBadPtr(flags) && numBits >= num && numBits <= num + 64;
+    for (int32_t i = 0; i < num; ++i) {
+        if (numFree != 0) {   // sparse array has holes — skip free slots
+            if (flagsOk) {
+                uint32_t word = Read<uint32>(flags, (size_t)(i >> 5) * 4);
+                if (!((word >> (i & 31)) & 1)) continue;
+            }
+        }
+        uint8_t* el = (uint8_t*)elems + (size_t)i * 24;
+        if (Read<uint32>(el, 0) != row.CompIdx || Read<uint32>(el, 4) != row.DispIdx) continue;
+        uint8_t* val = Read<uint8_t*>(el, 8);
+        // [F94] kernel-validated probe — a layout mismatch can only degrade
+        // to "row not found" (curated fallback), never a wild memcpy.
+        if (val && IsReadable(val, rowSize > 0 ? (size_t)rowSize : 8)) return val;
+    }
+    return nullptr;
+}
 // [F32] Copy a row into a caller buffer. The native writes Table->RowStruct->
 // PropertiesSize bytes at the OutRow slot, so the slot is read back raw.
 // [F93] one-shot diagnosis: every historical failure of this function was
@@ -1536,6 +1616,13 @@ static bool DataTableRowNames(void* table, std::vector<FName>& out) {
 // 2401 calls fail without telling us WHY. This names the path, once.
 static bool DataTableRow(void* table, const FName& row, void* dst, int rowSize) {
     if (!table || IsBadPtr(table) || rowSize <= 0 || rowSize > 512 || !dst) return false;
+    // [F94] PRIMARY: read the row bytes straight out of RowMap — no
+    // UFunction involved (see RowMapFind above for why the old path was
+    // dead on this build).
+    if (uint8_t* src = RowMapFind(table, row, rowSize)) {
+        memcpy(dst, src, (size_t)rowSize);
+        return true;
+    }
     Call c("/Script/Engine.DataTableFunctionLibrary.GetDataTableRow");
     static bool dumped = false;   // one diagnosis per process — 2401 failures, 1 log
     auto diagnose = [&](const char* why) {
@@ -1588,9 +1675,7 @@ static int ClipSizeOf(void* weaponDef) {
     if (!table || IsBadPtr(table) || !row.CompIdx) return 30;
     void* rs = Read<void*>(table, 0x28);   // UDataTable::RowStruct
     if (!rs || IsBadPtr(rs)) return 30;
-    int rowSize = Read<int>(rs, profile::StructPropertiesSize);
-    if (rowSize <= 0 || rowSize > 512)   // [F86-a/LOOT-1] 0xA8 reads 0 on this build
-        rowSize = StructSizeByFFieldWalk(rs, nullptr, 0);   // ClipSize presence is validated right below
+    int rowSize = TableRowSizeOf(rs, nullptr, 0);   // [F94-b] walk-first — ClipSize presence is validated right below
     if (rowSize <= 0 || rowSize > 512) return 30;
     int off = PropOffsetOn(rs, "ClipSize");
     if (off < 0) return 30;
@@ -1812,8 +1897,6 @@ struct Session {
     double last_door_scan = 0;
     // [F-cities] building-instruction handler load attempts (streaming window)
     int   building_load_attempts = 0;
-    // [F-loot-auto] floor loot retries while spawners still stream in
-    int   floor_loot_attempts = 0;
 } session;
 
 static double Monotonic() {
@@ -1927,7 +2010,7 @@ namespace Athena {
     // Loot [F20/F32]
     void SpawnFloorLoot();
     void ResetStaleContainers();       // [F34] standalone cache fix
-    bool SearchContainer(void* actor, const Vector& location, bool force = false);
+    bool SearchContainer(void* actor, const Vector& location, bool force = false, bool floorLoot = false);   // [F-loot-place] floorLoot: authentic static placement
 
     // [F18] pickups / [movement]
     void ServerHandlePickup(void* pickup);
@@ -3328,7 +3411,12 @@ void Athena::GrantWorldAbilities() {
     std::vector<void*> classes;
     for (int i = 0; names[i]; ++i) {
         if (void* k = FindAbilityClassNamed(names[i])) classes.push_back(k);
-        else if (i < 2) LOG("[World] ability class not resident yet: %s", names[i]);
+        else if (i < 2) {
+            // [G-log] log each missing core class ONCE — this retried every
+            // 8 s while the POI sublevels streamed in (log spam).
+            static bool said[2] = { false, false };
+            if (!said[i]) { said[i] = true; LOG("[World] ability class not resident yet: %s (silent retries until it streams in)", names[i]); }
+        }
     }
     if (classes.size() < 2) return;   // wait for the core pair to stream in
 
@@ -5409,12 +5497,13 @@ namespace local_loot {
         static const char* const pkgMust[]  = { "LootPackageID", "Weight", "ItemDefinition", "Count" };
         int tierRaw = Read<int>(tierStruct, profile::StructPropertiesSize);
         int pkgRaw  = Read<int>(pkgStruct, profile::StructPropertiesSize);
-        int tierRowSize = (tierRaw > 0 && tierRaw <= 512) ? tierRaw : StructSizeByFFieldWalk(tierStruct, tierMust, 5);
-        int pkgRowSize  = (pkgRaw  > 0 && pkgRaw  <= 512) ? pkgRaw  : StructSizeByFFieldWalk(pkgStruct,  pkgMust,  4);
-        LOG("[Loot] row sizes: tier=0x%X (raw@0x54=%d) pkg=0x%X (raw@0x54=%d)",
+        // [F94-b] FField walk PRIMARY (0x54 read is wrong on this build — see
+        // TableRowSizeOf). Walk validates the must-have members too.
+        int tierRowSize = TableRowSizeOf(tierStruct, tierMust, 5);
+        int pkgRowSize  = TableRowSizeOf(pkgStruct,  pkgMust,  4);
+        LOG("[Loot] row sizes: tier=%d (walk, raw@0x54=%d) pkg=%d (walk, raw@0x54=%d) [F94-b]",
             tierRowSize, tierRaw, pkgRowSize, pkgRaw);
         if (tierRowSize <= 0 || tierRowSize > 512 || pkgRowSize <= 0 || pkgRowSize > 512) { LOG("[Loot] ⚠️ bad row sizes %d/%d", tierRowSize, pkgRowSize); g_cache.failAt = Monotonic(); return; }
-        LOG("[Loot] [F86] row sizes OK: tier=%d pkg=%d (UStruct::PropertiesSize @0x54)", tierRowSize, pkgRowSize);
 
         int toNum  = PropOffsetOn(tierStruct, "NumLootPackageDrops");
         int toGrp  = PropOffsetOn(tierStruct, "TierGroup");
@@ -5466,6 +5555,7 @@ namespace local_loot {
             r.wArr  = readArr(buf, toWA);
             r.minArr = readArr(buf, toMin);
             r.maxArr = readArr(buf, toMax);
+            if (r.group.empty()) continue;   // [F94] junk-row guard — self-filtering
             uint32_t gIdx = Read<uint32>(buf, toGrp);
             uint32_t pIdx = Read<uint32>(buf, toPkg);
             tierDedupe[(uint64_t(gIdx) << 32) | pIdx] = r;
@@ -5476,10 +5566,15 @@ namespace local_loot {
             LPkgRow r;
             r.weight = Read<float>(buf, poWgt);
             r.id     = FNameToString(buf + poId);
+            if (r.id.empty()) continue;   // [F94] junk-row guard — self-filtering
             if (poCal >= 0) {
+                // [F94] The FString bytes are ENGINE-OWNED row memory (the
+                // buffer is a shallow copy) — freeing Data here would corrupt
+                // the table heap the moment direct row reads went live.
+                // Narrow only, never Free.
                 FStringNative fs = Read<FStringNative>(buf, poCal);
-                r.call = Narrow(fs.Data, fs.Count > 0 ? std::min(fs.Count, 256) : 0);
-                if (fs.Data) Fn<void(*)(void*)>(profile::Free)(fs.Data);
+                if (fs.Data && !IsBadPtr(fs.Data) && fs.Count > 0)
+                    r.call = Narrow(fs.Data, std::min(fs.Count, 256));
             }
             if (poDef >= 0) {
                 r.softStride = defStride;
@@ -5573,9 +5668,7 @@ namespace local_loot {
         if (!table || IsBadPtr(table) || !rowContents) return 0;
         void* rs = Read<void*>(table, 0x28);
         if (!rs || IsBadPtr(rs)) return 0;
-        int rowSize = Read<int>(rs, profile::StructPropertiesSize);
-        if (rowSize <= 0 || rowSize > 512)   // [F86-a/LOOT-1] 0xA8 reads 0 on this build
-            rowSize = StructSizeByFFieldWalk(rs, nullptr, 0);   // Category/LootLevel validated below
+        int rowSize = TableRowSizeOf(rs, nullptr, 0);   // [F94-b] walk-first — Category/LootLevel validated below
         if (rowSize <= 0 || rowSize > 512) return 0;
         int catOff = PropOffsetOn(rs, "Category");
         if (catOff < 0) catOff = PropOffsetOn(rs, "category");
@@ -5775,7 +5868,7 @@ void Athena::ResetStaleContainers() {
 
 // [F06/F20/F32/F33] Container search: Erbium DataTable roll first, curated
 // table fallback, container-axis placement + guarded toss.
-bool Athena::SearchContainer(void* actor, const Vector& location, bool force) {
+bool Athena::SearchContainer(void* actor, const Vector& location, bool force, bool floorLoot) {
     void* searchedProp = GetProp("/Script/FortniteGame.BuildingContainer.bAlreadySearched");
     if (!actor || !searchedProp) return false;
     if (!force && GetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched")) return true;
@@ -5817,36 +5910,53 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force) {
 
     // [F33] Container-relative placement (Erbium SpawnPickup(Container) 1:1):
     // container origin offset by LootSpawnLocation_Athena along F/R/U axes.
+    // [F-loot-place] floor loot skips ALL of this — the spawner point IS the
+    // loot point. The old path also burned 3 axis UFunction calls × 3173
+    // spawners (≈9500 native calls of pure waste in the batch stall).
     Vector fwd{1.0, 0.0, 0.0}, right{0.0, 1.0, 0.0}, up{0.0, 0.0, 1.0};
-    {
-        Call c("/Script/Engine.Actor.GetActorForwardVector");
-        if (c.ok() && c.run(actor)) fwd = c.result<Vector>();
-        c = Call("/Script/Engine.Actor.GetActorRightVector");
-        if (c.ok() && c.run(actor)) right = c.result<Vector>();
-        c = Call("/Script/Engine.Actor.GetActorUpVector");
-        if (c.ok() && c.run(actor)) up = c.result<Vector>();
-    }
     Vector off{60.0, 0.0, 40.0};
-    {
-        void* p = GetProp("/Script/FortniteGame.BuildingContainer.LootSpawnLocation_Athena");
-        if (p && Read<int>(p, profile::PropElementSize) == 24) off = Read<Vector>(GetField(actor, p));
-        else {
-            p = GetProp("/Script/FortniteGame.BuildingContainer.LootSpawnLocation");
+    if (!floorLoot) {
+        {
+            Call c("/Script/Engine.Actor.GetActorForwardVector");
+            if (c.ok() && c.run(actor)) fwd = c.result<Vector>();
+            c = Call("/Script/Engine.Actor.GetActorRightVector");
+            if (c.ok() && c.run(actor)) right = c.result<Vector>();
+            c = Call("/Script/Engine.Actor.GetActorUpVector");
+            if (c.ok() && c.run(actor)) up = c.result<Vector>();
+        }
+        {
+            void* p = GetProp("/Script/FortniteGame.BuildingContainer.LootSpawnLocation_Athena");
             if (p && Read<int>(p, profile::PropElementSize) == 24) off = Read<Vector>(GetField(actor, p));
+            else {
+                p = GetProp("/Script/FortniteGame.BuildingContainer.LootSpawnLocation");
+                if (p && Read<int>(p, profile::PropElementSize) == 24) off = Read<Vector>(GetField(actor, p));
+            }
         }
     }
 
     // Resolve/spawn every pickup first; roll back partial spawns so a retry
     // cannot duplicate loot (Era core guarantee).
     std::vector<void*> spawned;
-    for (size_t i = 0; i < drops.size(); ++i) {
-        double spreadX = (double)(i % 3) * 30.0;
-        double spreadY = (double)(i / 3) * 30.0;
-        Vector loc{
-            location.X + fwd.X * off.X + right.X * off.Y + up.X * off.Z + spreadX,
-            location.Y + fwd.Y * off.X + right.Y * off.Y + up.Y * off.Z + spreadY,
-            location.Z + fwd.Z * off.X + right.Z * off.Y + up.Z * off.Z + 40.0
-        };
+    size_t dropCount = floorLoot ? std::min<size_t>(drops.size(), 3) : drops.size();   // [F-loot-place] hard safety cap
+    for (size_t i = 0; i < dropCount; ++i) {
+        Vector loc;
+        if (floorLoot) {
+            // [F-loot-place] EXACT spawner location — extras (companion ammo
+            // etc.) on a tight 35 cm ring, exactly like real floor loot sits.
+            double ang = double(i) * 2.09439510239;   // 120° steps
+            double rad = i ? 35.0 : 0.0;
+            loc = Vector{ location.X + std::cos(ang) * rad,
+                          location.Y + std::sin(ang) * rad,
+                          location.Z };
+        } else {
+            double spreadX = (double)(i % 3) * 30.0;
+            double spreadY = (double)(i / 3) * 30.0;
+            loc = Vector{
+                location.X + fwd.X * off.X + right.X * off.Y + up.X * off.Z + spreadX,
+                location.Y + fwd.Y * off.X + right.Y * off.Y + up.Y * off.Z + spreadY,
+                location.Z + fwd.Z * off.X + right.Z * off.Y + up.Z * off.Z + 40.0
+            };
+        }
         uint8_t spawnSource = 9; // LootDrop
         if (group == "Loot_AthenaTreasure") spawnSource = 2; // Chest
         if (group.find("Ammo") != std::string::npos) spawnSource = 4; // AmmoBox
@@ -5875,7 +5985,13 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force) {
                 // pickup overlap never sees it properly — toss it out like the
                 // native chest does (fallback branch of the Erbium container
                 // spawner) and mark the container-toss FX.
-                {
+                // [F-loot-place] FLOOR LOOT NEVER TOSSES: real floor loot sits
+                // ON the spawner point (the pickup's own idle bob handles the
+                // look). The toss was scattering ~6300 pickups into random
+                // spots AND kept every one an active physics body — both the
+                // "weird random placement" and a large part of the phone
+                // choke. Chests/ammo boxes keep the toss (authentic).
+                if (!floorLoot) {
                     Call tp("/Script/FortniteGame.FortPickup.TossPickup");
                     if (tp.ok()) {
                         bool bound = tp.set("FinalLocation", loc) || tp.set("InTargetLoc", loc) || tp.set("TargetLoc", loc);
@@ -5903,8 +6019,12 @@ bool Athena::SearchContainer(void* actor, const Vector& location, bool force) {
     }
     SetBool(actor, "/Script/FortniteGame.BuildingContainer.bAlreadySearched", true);
     Call r1("/Script/FortniteGame.BuildingContainer.OnRep_bAlreadySearched"); if (r1.ok()) r1.run(actor);
-    Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer"); if (r2.ok()) r2.run(actor);
-    LOG("[Loot] ✅ Container search %s spawned=%zu tables=%d", group.c_str(), spawned.size(), (int)usedTables);
+    if (!floorLoot) {
+        Call r2("/Script/FortniteGame.BuildingContainer.BounceContainer"); if (r2.ok()) r2.run(actor);
+        LOG("[Loot] ✅ Container search %s spawned=%zu tables=%d", group.c_str(), spawned.size(), (int)usedTables);
+    }
+    // [F-loot-batch] floor-loot rolls log NOTHING per spawner — 3173 lines
+    // was the log spam; the queue (flo::Drain) logs aggregates only.
     return true;
 }
 
@@ -5932,41 +6052,102 @@ void Athena::Loot(void* actor) {
     LOG("[Loot] ❌ container search failed (local+native)");
 }
 
-// [F20/F32/F34] Floor loot: force-roll every floor-loot spawner through the
-// DataTable pipeline, then destroy the spawner itself (Erbium ≥11 behaviour —
-// stock builds remove the spawners once the loot is on the ground).
-void Athena::SpawnFloorLoot() {
-    LOG("[Loot] Spawning floor loot...");
-    const char* containers[] = {
-        "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C",
-        "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_Warmup.Tiered_Athena_FloorLoot_Warmup_C",
-        nullptr
-    };
-    int total = 0, destroyed = 0;
-    for (int i = 0; containers[i]; ++i) {
-        void* cls = FindObj(containers[i]);
-        if (!cls) cls = LoadClass(containers[i], "/Script/Engine.Actor");
-        if (!cls) continue;
-        std::vector<void*> actors;
-        if (!GetAllActorsOfClassRaw(cls, actors)) continue;
-        LOG("[Loot] Type %d: %zu actors", i, actors.size());
-        for (void* c : actors) {
-            if (!c || IsBadPtr(c)) continue;
+// ============================================================================
+// FLOOR LOOT — [F-loot-batch r2] queued streaming rollout (THE CRASH FIX)
+// ============================================================================
+// Device evidence (the ~4000-line log + crash): the old path rolled EVERY
+// spawner synchronously inside a single WorldTick — 1052 in the SetupWorld
+// pass, then 2958 more in the streaming pass — each spawning 2-3 pickups
+// with 4-6 native UFunction calls plus an active physics toss. That is a
+// ~6300-actor storm in one frame → multi-second stall → phone choke →
+// crash, and SearchContainer logged one line per spawner.
+// Erbium parity kept (SpawnFloorLootForContainer ≥11: roll + destroy each
+// spawner exactly once), but spread over frames:
+//   • SpawnFloorLoot() only ENQUEUES spawners (deduped, never rolled twice).
+//   • TickFloorLootStreaming() drains a few per tick — zero frame stalls.
+//   • Rediscovery every 15 s (10 passes ≈ 2.5 min) picks up streamed-in POI
+//     sublevel spawners, exactly like the old streaming window.
+//   • Aggregated logging: one queue line, progress every 300, one summary.
+//   • Hard cap 6000 pickups (authentic map ≈ 3200 spawners) memory guard.
+namespace flo {
+    static std::vector<void*> pending;   // spawners waiting for a roll
+    static std::set<void*>    rolled;    // dedupe across rediscovery passes
+    static int    spawned = 0, failed = 0, destroyed = 0, rediscoveries = 0;
+    static int    lastProgress = 0;
+    static double lastRediscover = -1;
+    static bool   capLogged = false, doneLogged = false;
+    constexpr int MAX_PICKUPS = 6000;
+
+    // Discover floor-loot spawners not yet rolled. Cheap by design: two
+    // GetAllActorsOfClass scans and NO per-actor work (the old pass read
+    // 3173 actor locations up front — another mini-stall).
+    static int Enqueue() {
+        if (spawned >= MAX_PICKUPS) return 0;
+        static const char* const kClasses[] = {
+            "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C",
+            "/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_Warmup.Tiered_Athena_FloorLoot_Warmup_C",
+            nullptr
+        };
+        int added = 0;
+        for (int i = 0; kClasses[i]; ++i) {
+            void* cls = FindObj(kClasses[i]);
+            if (!cls) cls = LoadClass(kClasses[i], "/Script/Engine.Actor");
+            if (!cls) continue;
+            std::vector<void*> actors;
+            if (!GetAllActorsOfClassRaw(cls, actors)) continue;
+            for (void* c : actors) {
+                if (!c || IsBadPtr(c) || rolled.count(c)) continue;
+                pending.push_back(c);
+                ++added;
+            }
+        }
+        return added;
+    }
+
+    // Roll up to `budget` spawners this tick. Each roll = the full DataTable
+    // pipeline (now live via [F94]) with authentic static placement
+    // ([F-loot-place]), then the spawner is destroyed (Erbium ≥11).
+    static void Drain(int budget) {
+        while (budget > 0 && !pending.empty()) {
+            void* spawner = pending.back();
+            pending.pop_back();
+            if (rolled.count(spawner)) continue;
+            rolled.insert(spawner);
+            if (spawned >= MAX_PICKUPS) {
+                if (!capLogged) {
+                    capLogged = true;
+                    LOG("[Loot] ⚠️ pickup cap %d reached — rollout stopped, %zu spawners dropped", MAX_PICKUPS, pending.size());
+                }
+                pending.clear();
+                return;
+            }
             bool ok = false;
             Vector loc{};
-            if (ActorLocation(c, loc)) ok = SearchContainer(c, loc, /*force=*/true);   // [F34] force: BeginPlay may have dead-rolled
+            if (ActorLocation(spawner, loc))
+                ok = Athena::SearchContainer(spawner, loc, /*force=*/true, /*floorLoot=*/true);
             if (!ok) {
                 // Native BP path second (it rolls the real cooked tables).
                 Call bp("/Script/FortniteGame.BuildingContainer.BP_SpawnLoot");
-                if (bp.ok() && bp.set("PlayerPawn", session.pawn)) ok = bp.run(c);
+                if (bp.ok() && bp.set("PlayerPawn", session.pawn)) ok = bp.run(spawner);
             }
-            if (ok) ++total;
-            // [F20 1:1] the spawner container is removed after rolling
-            Call d("/Script/Engine.Actor.K2_DestroyActor");
-            if (d.ok() && d.run(c)) ++destroyed;
+            if (ok) ++spawned; else ++failed;
+            Call d("/Script/Engine.Actor.K2_DestroyActor");   // [F20 1:1] spawner removed after rolling
+            if (d.ok() && d.run(spawner)) ++destroyed;
+            --budget;
+        }
+        if (spawned + failed - lastProgress >= 300) {
+            lastProgress = spawned + failed;
+            LOG("[Loot] floor-loot progress: %d rolled (%d spawners removed)", spawned + failed, destroyed);
         }
     }
-    LOG("[Loot] ✅ floor loot rolled on %d spawners (%d destroyed)", total, destroyed);
+}
+
+// [F20/F32/F34/F-loot-batch] Floor loot: enqueue every un-rolled spawner.
+// The actual rolling happens in TickFloorLootStreaming — a few per tick.
+void Athena::SpawnFloorLoot() {
+    int added = flo::Enqueue();
+    LOG("[Loot] floor-loot queued: +%d spawners (%zu pending) — rolled in batches of 12/tick [F-loot-batch]",
+        added, flo::pending.size());
 }
 
 // ============================================================================
@@ -7025,29 +7206,29 @@ void Athena::TickBuildingLoads() {
 }
 
 // ============================================================================
-// FLOOR LOOT WHILE STREAMING — [F-loot-auto r1]
+// FLOOR LOOT WHILE STREAMING — [F-loot-batch r2]
 // ============================================================================
-// "Loot seems manual" — Atlas: the one-shot SpawnFloorLoot ran during
-// SetupWorld, but Tiered_Athena_FloorLoot/Warmup spawners stream in with the
-// POI sublevels minutes later; the early pass found nothing, so the only loot
-// the player ever saw came from chest interaction. Fix: keep re-rolling the
-// floor-loot spawners over a 20 s × 6 window like the vehicles path
-// (SpawnFloorLoot destroys each spawner after rolling it, so retries only
-// process newly streamed ones).
+// Drains the spawner queue a few entries per tick (no frame stalls), keeps
+// rediscovering streamed-in POI sublevel spawners for ~2.5 minutes, then
+// logs one final summary. The old version re-ran the FULL synchronous
+// rollout here — the second 2958-actor storm that finished the phone off.
 void Athena::TickFloorLootStreaming() {
-    if (session.floor_loot_attempts >= 6) return;
-    static double last = 0;
+    if (!session.finalized) return;
+    flo::Drain(12);   // [F-loot-batch] a few spawners per tick
     double now = Monotonic();
-    if (now - last < 20.0) return;
-    last = now;
-    void* cls = FindObj("/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C");
-    if (!cls) cls = LoadClass("/Game/Athena/Environments/Blueprints/Tiered_Athena_FloorLoot_01.Tiered_Athena_FloorLoot_01_C", "/Script/Engine.Actor");
-    if (!cls) return;
-    std::vector<void*> spawners;
-    if (!GetAllActorsOfClassRaw(cls, spawners) || spawners.empty()) return;
-    session.floor_loot_attempts = 6;   // spawners present — final full rollout below covers warmup type too
-    LOG("[Loot] streaming rollout: %zu floor-loot spawners", spawners.size());
-    SpawnFloorLoot();
+    if (flo::lastRediscover < 0) flo::lastRediscover = now;   // arm on first tick
+    if (flo::rediscoveries < 10 && now - flo::lastRediscover >= 15.0) {
+        flo::lastRediscover = now;
+        ++flo::rediscoveries;
+        int added = flo::Enqueue();
+        if (added) LOG("[Loot] streaming check %d/10: +%d spawners queued (%d rolled so far)",
+                       flo::rediscoveries, added, flo::spawned + flo::failed);
+    }
+    if (flo::rediscoveries >= 10 && flo::pending.empty() && !flo::doneLogged) {
+        flo::doneLogged = true;
+        LOG("[Loot] ✅ floor loot complete: %d spawners rolled (%d failed, %d removed) over %d streaming passes",
+            flo::spawned + flo::failed, flo::failed, flo::destroyed, flo::rediscoveries);
+    }
 }
 
 void Athena::TeleportToSpawnIsland() {
