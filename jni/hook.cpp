@@ -234,6 +234,43 @@
 //        (Erbium 1:1): the locker pickaxe resolves its WeaponDefinition
 //        (CosmeticLoadoutPC.Pickaxe->WeaponDefinition) before GiveItem,
 //        and the locker re-syncs once at finalize (MCP lands async).
+//  [G13] CRASH ROOT-CAUSE FIXES (second device run: guard caught the fault,
+//        reflection delivered 42 abilities, then the spec dump crashed):
+//        (a) BackscanPrologue v2 — the old rule accepted only STP X29,X30
+//            prologues, but this build opens big natives with other callee-
+//            saved pairs FIRST (ProcessEvent itself = STP X28,X27,[SP,#-N]!,
+//            word0=0xA9BA6FFC). The old backscan skipped the real starts and
+//            returned EARLIER unrelated functions — that is what faulted at
+//            fn+0x24 with a garbage address. v2 accepts any callee-saved-pair
+//            pre/post-index writeback STP, PACIASP/PACIBSP, SUB SP,SP,#imm or
+//            the classic x29/x30 forms; strong boundaries (RET/B/BR/BLR/NOP)
+//            are separated from weak ones (B.cond), candidates with frame
+//            confirmation win, and the two prologue words are logged with
+//            every find for logcat-side verification.
+//        (b) DumpSpecs stride — the dump derived the FGameplayAbilitySpec
+//            array stride from hardcoded FField::Inner/Struct guesses (0x70),
+//            read misaligned garbage (#1 blank, #2 "inputID=7310658
+//            level=510656512") and memcpy'd off the array page at spec #4 —
+//            the hard crash. Stride is now the engine's own PropertiesSize
+//            (live UScriptStruct), every element readability-probed, dump
+//            capped at 128. CountActivatableSpecs got the same engine-truth
+//            fallback.
+//        (c) UTF-16LE everywhere — FString is { char16_t* Data; int32 Length;
+//            int32 Max }, so every TEXT() literal in libUnreal.so is UTF-16LE
+//            (device-proven). FindString now falls back to SUBSTRING matching
+//            (UTF-16 first) when the exact NUL-terminated literal is absent:
+//            "MCP-Profile: Dispatching request to %s" only exists as the
+//            prefix of "... - ContextCredentials: %s".
+//        (d) Native calls — InitializePlayerGameplayAbilities now tries the
+//            Erbium convention (interface slot pointer) first and, only when
+//            that FAULTS, retries with the raw PlayerState pointer (member
+//            convention); the working convention is remembered for the
+//            session. The fault guard is generalized (variadic) and wraps
+//            ApplyCharacterCustomization and GiveAbilityAndActivateOnce too —
+//            each disables its native path on first fault and falls back.
+//            Emotes use the PlayerState ASC (Erbium ServerPlayEmoteItem
+//            parity). The MCP hook prologue check accepts the full STP opener
+//            set this build emits.
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -555,7 +592,17 @@ static uintptr_t FindString(const char* needle) {
     // never false-positive.
     uintptr_t a = FindStringAscii(needle, len + 1);
     if (a) return a;
-    return FindStringUtf16(needle, len + 1);
+    a = FindStringUtf16(needle, len + 1);
+    if (a) return a;
+    // [G13] Substring fallback, UTF-16 first. Device-proven with the FString
+    // layout { char16_t* Data; int32 Length; int32 Max }: every TEXT()
+    // literal in libUnreal.so is UTF-16LE, and "MCP-Profile: Dispatching
+    // request to %s" only exists as the PREFIX of the longer
+    // "... - ContextCredentials: %s" — the terminator-terminated match
+    // refused to see it and reported "string not resident".
+    a = FindStringUtf16(needle, len);
+    if (a) return a;
+    return FindStringAscii(needle, len);
 }
 
 // ADRP decode: page-relative immediate. page = (pc & ~0xFFF) + (imm << 12).
@@ -630,6 +677,17 @@ static uintptr_t FindAdrpAddRef(uintptr_t target, uintptr_t scanStart, uintptr_t
 }
 
 // Frame-setup + boundary detection.
+// [G13] v2 — the device run proved the old rule (STP X29,X30 only) wrong for
+// this build: ProcessEvent itself opens with STP X28,X27,[SP,#-N]!
+// (word0=0xA9BA6FFC), and so do most large Fortnite natives — the frame
+// pointer pair is pushed only after the outer register pairs. The old
+// backscan skipped those prologues, walked back to an EARLIER unrelated
+// function, and that wrong address is what "native call FAULTED at fn+0x24"
+// was: a random earlier function executed with a bogus `this`. v2 accepts
+// any prologue that opens with a callee-saved-pair pre/post-index writeback
+// STP (x19-x30), PACIASP/PACIBSP, SUB SP,SP,#imm, or the classic STP x29,x30
+// forms, and separates STRONG boundaries (RET/B/BR/BLR/NOP) from weak ones
+// (B.cond — fall-through code follows it, so it is not a function end).
 static bool IsStpX29X30Sp(uint32_t w) {
     if ((w & 0x1F) != 29 || ((w >> 5) & 0x1F) != 31 || ((w >> 10) & 0x1F) != 30) return false;
     uint32_t op = (w >> 22) & 0x3FF;
@@ -637,6 +695,23 @@ static bool IsStpX29X30Sp(uint32_t w) {
 }
 static bool IsSubSpImm(uint32_t w) {
     return (w & 0xFF8003E0) == 0xD10003E0 && (w & 0x1F) == 31;   // SUB SP,SP,#imm
+}
+static bool IsPacHint(uint32_t w) {                    // PACIASP / PACIBSP
+    return w == 0xD503231F || w == 0xD503233F;
+}
+// STP Xt1,Xt2,[SP,#-imm]! / [SP],#imm — 64-bit pair, SP base, BOTH registers
+// callee-saved (x19-x30). Prologue pushes are callee-saved by definition;
+// mid-function spills usually hit caller-saved registers, which is what
+// keeps this matcher off inner code.
+static bool IsCalleeSavedStpSp(uint32_t w) {
+    uint32_t top = w & 0xFFC00000;
+    if (top != 0xA9800000 && top != 0xA8800000) return false;  // pre/post-index WB
+    if (((w >> 5) & 0x1F) != 31) return false;                 // [SP] base
+    uint32_t rt1 = w & 0x1F, rt2 = (w >> 10) & 0x1F;
+    return rt1 >= 19 && rt1 <= 30 && rt2 >= 19 && rt2 <= 30;
+}
+static bool IsPrologueOpener(uint32_t w) {
+    return IsCalleeSavedStpSp(w) || IsPacHint(w) || IsSubSpImm(w) || IsStpX29X30Sp(w);
 }
 static bool IsTerminator(uint32_t w) {
     if (w == 0xD65F03C0 || (w & 0xFFFFFC1F) == 0xD65F0000) return true;  // RET
@@ -647,21 +722,48 @@ static bool IsTerminator(uint32_t w) {
     if (w == 0xD503201F) return true;                                    // NOP padding
     return false;
 }
-// Walk back to the containing function's start (boundary-validated).
+static bool IsStrongTerminator(uint32_t w) {
+    if ((w & 0xFF000010) == 0x54000000) return false;    // B.cond: weak only
+    return IsTerminator(w);
+}
+// [G13] Non-leaf confirmation: within the 16 words after a candidate start,
+// a frame pair (STP x29,x30) or another SP writeback push must appear — the
+// string-referencing functions we hunt always set up a frame. Candidates
+// with confirmation win over plain openers; leaf-shaped helpers lose.
+static bool HasFrameConfirmation(uintptr_t start) {
+    for (int i = 0; i < 16; ++i) {
+        if (!IsReadable((void*)(start + (size_t)i * 4), 4)) return false;
+        uint32_t w = *(uint32_t*)(start + (size_t)i * 4);
+        if (IsStpX29X30Sp(w) || IsCalleeSavedStpSp(w)) return true;
+    }
+    return false;
+}
+// Walk back to the containing function's start (boundary-validated, v2).
+// Scan order (nearest-first from the string ref, one 0x40000 window):
+//   1. strong boundary + opener WITH frame confirmation
+//   2. strong boundary + opener (unconfirmed)
+//   3. weak boundary (B.cond) + opener
 static uintptr_t BackscanPrologue(uintptr_t ref) {
     uintptr_t limit = ref > 0x40000 ? ref - 0x40000 : g_base;
     if (limit < g_base + 8) limit = g_base + 8;
+    uintptr_t unconfirmed = 0, weak = 0;
     for (uintptr_t pc = (ref & ~3ULL) - 4; pc >= limit; pc -= 4) {
         if (!IsReadable((void*)pc, 8)) break;
         uint32_t w = *(uint32_t*)pc;
-        bool prologue = IsStpX29X30Sp(w);
-        if (!prologue && IsSubSpImm(w) && IsReadable((void*)(pc + 4), 4))
-            prologue = IsStpX29X30Sp(*(uint32_t*)(pc + 4));       // SUB SP; STP X29
-        if (!prologue) continue;
-        if (!IsReadable((void*)(pc - 4), 4)) break;
-        if (IsTerminator(*(uint32_t*)(pc - 4))) return pc;         // validated start
+        bool strong = IsStrongTerminator(w);
+        if (!strong && !weak && IsTerminator(w)) {          // B.cond — weak
+            if (IsReadable((void*)(pc + 4), 4) && IsPrologueOpener(*(uint32_t*)(pc + 4)))
+                weak = pc + 4;
+            continue;
+        }
+        if (!strong) continue;
+        if (!IsReadable((void*)(pc + 4), 4)) continue;
+        if (!IsPrologueOpener(*(uint32_t*)(pc + 4))) continue;
+        uintptr_t cand = pc + 4;
+        if (HasFrameConfirmation(cand)) return cand;        // confirmed — done
+        if (!unconfirmed) unconfirmed = cand;
     }
-    return 0;
+    return unconfirmed ? unconfirmed : weak;
 }
 // Nth BL target at/after `from` within `window` bytes.
 static uintptr_t NextBlTarget(uintptr_t from, size_t window, int nth) {
@@ -689,7 +791,14 @@ static uintptr_t FindFunctionByString(const char* needle, int useRefNum = 0) {
     }
     if (!ref) { LOG("[ARM] no code ref to: %.60s", needle); return 0; }
     uintptr_t fn = BackscanPrologue(ref);
-    if (fn) LOG("[ARM] ✅ %.48s -> fn+0x%llX", needle, (unsigned long long)(fn - g_base));
+    if (fn) {
+        // [G13] Log the first two words so the next device run can be
+        // verified from logcat alone (opener shape + following instruction).
+        uint32_t w0 = Read<uint32_t>((void*)fn);
+        uint32_t w1 = IsReadable((void*)(fn + 4), 4) ? Read<uint32_t>((void*)(fn + 4)) : 0;
+        LOG("[ARM] ✅ %.48s -> fn+0x%llX [w0=%08x w1=%08x]",
+            needle, (unsigned long long)(fn - g_base), w0, w1);
+    }
     else LOG("[ARM] ⚠️ ref found but no prologue for: %.48s", needle);
     return fn;
 }
@@ -1979,21 +2088,16 @@ static void RediscoverMissing() {
 // Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
 static int CountActivatableSpecs(void* asc = nullptr);
 
-// [G11] NATIVE FAULT GUARD — device-crash analysis: the run died INSIDE the
-// native InitializePlayerGameplayAbilities (last device log line: "[Stamina]
-// Initialized FortPlayerAttributeSet"; LogImpl is unbuffered logcat + fflush,
-// so nothing was lost — the interface resolved, the call was made, the
-// process faulted inside the engine). A direct call into a scanner-resolved
-// native can fault for reasons impossible to fully validate from outside
-// (client-side PlayerState ASC never server-initialized is the prime
-// suspect — Erbium only ever calls this from ServerAcknowledgePossession on
-// a real listen server where the full possession flow completed first).
-// Erbium's answer to the unknown is layered fallbacks; this adds the hard
-// safety net: the call runs under a scoped SIGSEGV/SIGBUS/SIGILL guard
+// [G11/G13] NATIVE FAULT GUARD — the first guarded device run caught the
+// fault and PROVED the guard works ("native call FAULTED — sig=11 pc=fn+0x24
+// addr=0x2886b5a5ee1984"), and the reflection fallback then delivered all
+// 42 abilities through EquipFortAbilitySet. Root cause of THAT fault is now
+// known: the old backscan resolved a wrong function start (see arm::
+// BackscanPrologue v2). The guard stays as the permanent safety net for every
+// scanner-resolved native call: scoped SIGSEGV/SIGBUS/SIGILL handler
 // (sigsetjmp/siglongjmp with old-handler chaining). A fault logs
-// signal+PC+faulting address, disables the native path for the session, and
-// the proven EquipFortAbilitySet reflection path continues instead of
-// killing the process.
+// signal+PC+faulting address and the caller takes its reflection fallback
+// instead of dying.
 static sigjmp_buf g_gasJmp;
 static volatile sig_atomic_t g_inNativeCall = 0;
 static struct sigaction g_oldSegv, g_oldBus, g_oldIll;
@@ -2033,41 +2137,60 @@ static bool InstallFaultGuards() {
                     sigaction(SIGILL, &sa, &g_oldIll) == 0;
     return g_gasGuardsUp;
 }
-// Runs fn(arg) under the guard. Returns false when the call faulted — the
-// caller must treat the native as unusable and take its reflection fallback.
-// NOT reentrant (single sigjmp buffer) — exactly one call site exists today
-// (the GAS native grant, game thread only).
+// Runs fn(args...) under the guard. Returns false when the call faulted —
+// the caller must treat the native as unusable for that call and take its
+// reflection fallback. NOT reentrant (single sigjmp buffer) — call sites are
+// game-thread and sequential, never nested.
 static volatile bool g_gasPrevInternal = false;
-static bool RunGuarded(const char* tag, void (*fn)(void*), void* arg) {
+// [G13] Variadic form — the guard now wraps every scanner-resolved native
+// call (GAS init, ApplyCharacterCustomization, GiveAbilityAndActivateOnce).
+// Call sites are game-thread and SEQUENTIAL (never inside each other); the
+// single sigjmp buffer forbids nesting, which no call site does.
+template <typename FnT, typename... ArgsT>
+static bool RunGuarded(const char* tag, FnT fn, ArgsT... args) {
     if (!InstallFaultGuards()) return false;
     if (sigsetjmp(g_gasJmp, 1) != 0) {
         // Restore the exact pre-call g_internal (captured in a volatile
         // before the call so it survives the longjmp). Blowing it to false
         // here would punch a reentrancy hole through the outer tick Guard.
         g_internal = g_gasPrevInternal;
-        LOG("[%s] ⚠️ native call FAULTED — sig=%d pc=0x%llx addr=0x%llx (native path disabled, reflection fallback continues)",
+        LOG("[%s] ⚠️ native call FAULTED — sig=%d pc=0x%llx addr=0x%llx (call abandoned, fallback continues)",
             tag, (int)g_faultSig, (unsigned long long)g_faultPc, (unsigned long long)g_faultAddr);
         return false;
     }
     g_gasPrevInternal = g_internal;
     g_internal = true;        // engine callbacks fired during the native stay internal
     g_inNativeCall = 1;
-    fn(arg);
+    fn(args...);
     g_inNativeCall = 0;
     g_internal = g_gasPrevInternal;
     return true;
 }
-static void NativeInitGasCall(void* ifaceAddr) {
-    ((void (*)(void*))InitializePlayerGameplayAbilities)(ifaceAddr);
+static void NativeInitGasCall(void* thisPtr) {
+    ((void (*)(void*))InitializePlayerGameplayAbilities)(thisPtr);
+}
+// [G13] Wrapped native entries for the other scanner-resolved calls.
+static void NativeAccCall(void* playerState, void* pawn) {
+    ((void (*)(void*, void*))ApplyCharacterCustomization)(playerState, pawn);
+}
+static void NativeGaaCall(void* asc, void* outHandle, void* spec) {
+    ((void (*)(void*, void*, void*, void*))GiveAbilityAndActivateOnce)(asc, outHandle, spec, nullptr);
 }
 
-// [G02/G11] The Erbium primary grant: hand the PlayerState's
-// IFortAbilitySystemInterface to the native InitializePlayerGameplayAbilities.
-// It resolves the pawn/PlayerState DefaultAbilitySets from the CDOs, builds
-// specs WITH their declared InputIDs (GAS-driven anims), and delivers them
-// through the native GiveAbility chain. Now fault-guarded, fully staged/logged
-// and interface-validated; on ANY failure it returns false so the
-// EquipFortAbilitySet path (which never crashed on device) delivers the sets.
+// [G02/G11/G13] The Erbium primary grant: the native InitializePlayerGameplay-
+// Abilities resolves the pawn/PlayerState DefaultAbilitySets from the CDOs,
+// builds specs WITH their declared InputIDs (GAS-driven anims), and delivers
+// them through the native GiveAbility chain — never a hand-rebuilt spec.
+// [G13] Calling conventions, in order, both fault-guarded:
+//   1. IFortAbilitySystemInterface slot pointer — 1:1 Erbium (it passes
+//      PlayerState->GetInterface(...) into the same scanner-found native).
+//   2. The raw AFortPlayerState UObject — the plain member-function
+//      convention. Only tried when (1) FAULTED: a fault is itself evidence
+//      the interface convention was wrong for this native; when (1) merely
+//      grants nothing (e.g. a client-side early-out) retrying the same body
+//      with a different `this` is pointless and the reflection path wins.
+// A fault on BOTH attempts disables the native path for the session.
+static bool gas_use_raw_target = false;   // [G13] remembered working convention
 static bool NativeInitializePlayerGameplayAbilities() {
     if (!InitializePlayerGameplayAbilities) return false;
     if (gas_native_failed) { LOG("[GAS] native path disabled (previous fault)"); return false; }
@@ -2080,20 +2203,17 @@ static bool NativeInitializePlayerGameplayAbilities() {
         target == session.player_state ? "PlayerState" : "pawn",
         ifaceType ? "found" : "MISSING");
     void* ifaceAddr = ifaceType ? ResolveInterface(target, ifaceType) : nullptr;
-    LOG("[GAS] interface pointer: %p", ifaceAddr);
-    // [G11] HARD RULE from the crash analysis: NEVER substitute the raw
-    // object pointer. The IFortAbilitySystemInterface* is this-adjusted —
-    // handing the native the UObject pointer means a wrong vtable on the
-    // very first virtual call (GetFortAbilitySystemComponent). No
-    // interface → no native call, reflection path takes over.
-    if (!ifaceAddr || !IsReadable(ifaceAddr, 8)) {
-        LOG("[GAS] interface not resolvable/readable — native path skipped");
-        return false;
-    }
-    void* ifaceVtable = Read<void*>(ifaceAddr, 0);
-    if (!ifaceVtable || !IsReadable(ifaceVtable, 8)) {
-        LOG("[GAS] interface vtable not readable (%p) — native path skipped", ifaceVtable);
-        return false;
+    LOG("[GAS] interface pointer: %p (raw convention %s)",
+        ifaceAddr, gas_use_raw_target ? "ACTIVE" : "inactive");
+    if (ifaceAddr && !IsReadable(ifaceAddr, 8)) {
+        LOG("[GAS] interface pointer unreadable — treating as absent");
+        ifaceAddr = nullptr;
+    } else if (ifaceAddr) {
+        void* ifaceVtable = Read<void*>(ifaceAddr, 0);
+        if (!ifaceVtable || !IsReadable(ifaceVtable, 8)) {
+            LOG("[GAS] interface vtable not readable (%p) — treating as absent", ifaceVtable);
+            ifaceAddr = nullptr;
+        }
     }
     // [G11] The native targets the PlayerState's ASC while the fallback
     // targets the pawn's — measure BOTH so a successful native grant is
@@ -2101,10 +2221,29 @@ static bool NativeInitializePlayerGameplayAbilities() {
     void* psAsc = GetObjField(target, "/Script/FortniteGame.FortPlayerState.AbilitySystemComponent");
     int before = CountActivatableSpecs();
     int beforePs = psAsc ? CountActivatableSpecs(psAsc) : -1;
-    LOG("[GAS] calling native InitializePlayerGameplayAbilities(iface=%p) — pawn specs=%d ps specs=%d",
-        ifaceAddr, before, beforePs);
-    if (!RunGuarded("GAS", NativeInitGasCall, ifaceAddr)) {
-        gas_native_failed = true;
+    if (gas_use_raw_target) {
+        LOG("[GAS] calling native InitializePlayerGameplayAbilities(raw=%p) — pawn specs=%d ps specs=%d",
+            target, before, beforePs);
+        if (!RunGuarded("GAS", NativeInitGasCall, target)) {
+            gas_native_failed = true;
+            return false;
+        }
+    } else if (ifaceAddr) {
+        LOG("[GAS] calling native InitializePlayerGameplayAbilities(iface=%p) — pawn specs=%d ps specs=%d",
+            ifaceAddr, before, beforePs);
+        if (!RunGuarded("GAS", NativeInitGasCall, ifaceAddr)) {
+            // [G13] Interface convention faulted — the wrong-`this` theory.
+            // Retry exactly once with the raw object before giving up.
+            LOG("[GAS] interface convention faulted — retrying with the raw %s pointer",
+                target == session.player_state ? "PlayerState" : "pawn");
+            if (!RunGuarded("GAS", NativeInitGasCall, target)) {
+                gas_native_failed = true;
+                return false;
+            }
+            gas_use_raw_target = true;   // remember the working convention
+        }
+    } else {
+        LOG("[GAS] interface not resolvable — native path skipped");
         return false;
     }
     int after = CountActivatableSpecs();
@@ -2126,10 +2265,16 @@ static int CountActivatableSpecs(void* asc) {
         if (contProp && itemsProp) {
             contOff = Read<int>(contProp, profile::PropOffset);
             itemsOff = Read<int>(itemsProp, profile::PropOffset);
-            void* inner = Read<void*>(itemsProp, 0x70);           // FArrayProperty::Inner
-            if (inner) {
-                void* sStruct = Read<void*>(inner, 0x70);         // FStructProperty::Struct
-                if (sStruct) stride = Read<int32>(sStruct, profile::StructPropertiesSize);
+            void* inner = Read<void*>(itemsProp, 0x70);           // FArrayProperty::Inner (guess)
+            if (inner && !IsBadPtr(inner)) {
+                void* sStruct = Read<void*>(inner, 0x70);         // FStructProperty::Struct (guess)
+                if (sStruct && !IsBadPtr(sStruct)) stride = Read<int32>(sStruct, profile::StructPropertiesSize);
+            }
+            if (stride <= 0) {
+                // [G13] Engine truth, not an FField-offset guess: the spec
+                // size straight from the live UScriptStruct.
+                void* stru = FindObj("/Script/GameplayAbilities.GameplayAbilitySpec");
+                if (stru && !IsBadPtr(stru)) stride = Read<int32>(stru, profile::StructPropertiesSize);
             }
             if (stride <= 0) stride = 0x70;                        // 21.30 typical spec size fallback
         }
@@ -2140,8 +2285,15 @@ static int CountActivatableSpecs(void* asc) {
     return items.Count;
 }
 
-// [G04] Dump every spec with ability name + InputID (the user-visible
+// [G04/G13] Dump every spec with ability name + InputID (the user-visible
 // "granted but bound?" verification). Rate-free — call on demand.
+// [G13] The second device crash was HERE: the array stride came from
+// hardcoded FField::Inner/Struct offsets (0x70), specs #1+ read misaligned
+// garbage ("inputID=7310658 level=510656512"), and spec #4 memcpy'd off the
+// end of the array page — a hard, unguarded SIGSEGV. The stride is now the
+// engine's own FGameplayAbilitySpec::PropertiesSize (ResolveSpecLayout /
+// live UScriptStruct), every element is readability-probed before reading,
+// and the dump is capped.
 static void DumpSpecs(const char* tag) {
     void* asc = GetASC(session.pawn);
     if (!asc) return;
@@ -2152,18 +2304,38 @@ static void DumpSpecs(const char* tag) {
     if (!contProp || !itemsProp) { LOG("[Specs] reflection missing"); return; }
     int contOff = Read<int>(contProp, profile::PropOffset);
     int itemsOff = Read<int>(itemsProp, profile::PropOffset);
-    void* inner = Read<void*>(itemsProp, 0x70);
-    void* sStruct = inner ? Read<void*>(inner, 0x70) : nullptr;
-    int stride = sStruct ? Read<int32>(sStruct, profile::StructPropertiesSize) : 0;
-    if (stride <= 0) stride = 0x70;
     Array items = Read<Array>((char*)asc + contOff + itemsOff);
     if (!items.Data || IsBadPtr(items.Data) || items.Count < 0 || items.Count > 4096) {
         LOG("[Specs] %s: none", tag); return;
     }
     LOG("[Specs] %s: %d specs", tag, items.Count);
     if (!layout.ok()) return;
-    for (int i = 0; i < items.Count; ++i) {
+    // [G13] Stride priority: layout.Size (engine truth via the live
+    // UScriptStruct) → UScriptStruct re-read → bounded FField guess → 0x70.
+    int stride = (layout.Size >= 0x30 && layout.Size <= 0x200) ? layout.Size : 0;
+    if (stride <= 0) {
+        void* stru = FindObj("/Script/GameplayAbilities.GameplayAbilitySpec");
+        if (stru && !IsBadPtr(stru)) {
+            int s = Read<int32>(stru, profile::StructPropertiesSize);
+            if (s >= 0x30 && s <= 0x200) stride = s;
+        }
+    }
+    if (stride <= 0) {
+        void* inner = Read<void*>(itemsProp, 0x70);
+        if (inner && !IsBadPtr(inner)) {
+            void* sStruct = Read<void*>(inner, 0x70);
+            if (sStruct && !IsBadPtr(sStruct)) {
+                int s = Read<int32>(sStruct, profile::StructPropertiesSize);
+                if (s >= 0x30 && s <= 0x200) stride = s;
+            }
+        }
+    }
+    if (stride <= 0) stride = 0x70;
+    LOG("[Specs] stride=%d (spec size)", stride);
+    int cap = items.Count > 128 ? 128 : items.Count;
+    for (int i = 0; i < cap; ++i) {
         void* spec = (char*)items.Data + (size_t)i * stride;
+        if (!IsReadable(spec, (size_t)stride)) { LOG("[Specs]  #%d <unreadable spec — stop>", i); break; }
         void* ability = Read<void*>(spec, layout.OffAbility);
         int32 inputID = Read<int32>(spec, layout.OffInputID);
         int32 level = layout.OffLevel >= 0 ? Read<int32>(spec, layout.OffLevel) : 1;
@@ -2171,6 +2343,7 @@ static void DumpSpecs(const char* tag) {
         LOG("[Specs]  #%d %s inputID=%d level=%d handle=0x%X", i,
             ObjName(ability).c_str(), inputID, level, (unsigned)handle);
     }
+    if (items.Count > cap) LOG("[Specs]  ... %d more (capped)", items.Count - cap);
 }
 } // namespace gas
 
@@ -2929,9 +3102,15 @@ void Athena::FixBodyAndAnimations() {
     // part pipeline just installed (this is the function the live game calls
     // at possession; it also fixes the "sick body" mesh state F68 described).
     if (gas::ApplyCharacterCustomization && session.player_state && session.pawn) {
-        Guard g;
-        ((void (*)(void*, void*))gas::ApplyCharacterCustomization)(session.player_state, session.pawn);
-        LOG("[Body] native ApplyCharacterCustomization dispatched");
+        // [G13] Fault-guarded — a scanner-resolved native must never be able
+        // to kill the process; on fault the native is zeroed for the session
+        // and the reflection-installed character parts stand.
+        if (gas::RunGuarded("ACC", gas::NativeAccCall, session.player_state, session.pawn))
+            LOG("[Body] native ApplyCharacterCustomization dispatched");
+        else {
+            LOG("[Body] native ApplyCharacterCustomization faulted — disabled for the session");
+            gas::ApplyCharacterCustomization = 0;
+        }
     }
 
     session.body_fixed = true;
@@ -4568,6 +4747,7 @@ void Athena::ProcessPendingPickups() {
 
 // [F35] Erbium AFortPlayerControllerAthena::InternalPickup 1:1.
 bool Athena::InternalPickup(void* entry, void* pickupActor) {
+    (void)pickupActor;   // [G13] reserved (Erbium passes it; the entry carries all state here)
     if (!entry || !session.inventory) return false;
     void* def = EntryDefinition(entry);
     int count = EntryCount(entry);
@@ -6726,7 +6906,12 @@ void Athena::PlayEmoteItem(void* item) {
     // this plays through GAS (montage + replication + moving-emote support)
     // instead of a bare local Montage_Play.
     if (gas::GiveAbilityAndActivateOnce) {
-        void* asc = GetASC(session.pawn);
+        // [G13] Erbium ServerPlayEmoteItem parity: the PlayerState's ASC owns
+        // emotes (fallback to the pawn's ASC when the prop read fails).
+        void* asc = session.player_state
+            ? GetObjField(session.player_state, "/Script/FortniteGame.FortPlayerState.AbilitySystemComponent")
+            : nullptr;
+        if (!asc || IsBadPtr(asc)) asc = GetASC(session.pawn);
         // Vehicle override (Erbium): while driving a FortCharacterVehicle the
         // vehicle's OverrideAbilitySystemComponent owns emotes.
         void* vehicle = nullptr;
@@ -6753,26 +6938,29 @@ void Athena::PlayEmoteItem(void* item) {
             void* spec = cdo ? gas::BuildSpec(cdo, item) : nullptr;
             if (spec) {
                 int32 outHandle = 0;
-                {
-                    Guard g;
-                    ((void (*)(void*, void*, void*, void*))gas::GiveAbilityAndActivateOnce)(
-                        asc, &outHandle, spec, nullptr);
-                }
+                // [G13] Fault-guarded: a scanner-resolved native must never
+                // kill the process — on fault the native emote path is
+                // disabled for the session and the montage fallback runs.
+                bool gaaOk = gas::RunGuarded("Emote", gas::NativeGaaCall, asc, &outHandle, spec);
                 free(spec);
-                // Replicate the emote for every client (Erbium):
-                // LastReplicatedEmoteExecuted + OnRep_LastReplicatedEmoteExecuted.
-                void* prop = GetProp("/Script/FortniteGame.FortPlayerPawn.LastReplicatedEmoteExecuted");
-                if (prop && Read<int>(prop, profile::PropElementSize) == 8) {
-                    void* old = Read<void*>(GetField(session.pawn, prop));
-                    Write<void*>(GetField(session.pawn, prop), 0, item);
-                    Call r("/Script/FortniteGame.FortPlayerPawn.OnRep_LastReplicatedEmoteExecuted");
-                    if (r.ok()) {
-                        if (r.set("LastEmotePlayed", old)) r.run(session.pawn);
-                        else r.run(session.pawn);
+                if (gaaOk) {
+                    // Replicate the emote for every client (Erbium):
+                    // LastReplicatedEmoteExecuted + OnRep_LastReplicatedEmoteExecuted.
+                    void* prop = GetProp("/Script/FortniteGame.FortPlayerPawn.LastReplicatedEmoteExecuted");
+                    if (prop && Read<int>(prop, profile::PropElementSize) == 8) {
+                        void* old = Read<void*>(GetField(session.pawn, prop));
+                        Write<void*>(GetField(session.pawn, prop), 0, item);
+                        Call r("/Script/FortniteGame.FortPlayerPawn.OnRep_LastReplicatedEmoteExecuted");
+                        if (r.ok()) {
+                            if (r.set("LastEmotePlayed", old)) r.run(session.pawn);
+                            else r.run(session.pawn);
+                        }
                     }
+                    LOG("[Emote] ✅ native GiveAbilityAndActivateOnce (handle=0x%X)", (unsigned)outHandle);
+                    return;
                 }
-                LOG("[Emote] ✅ native GiveAbilityAndActivateOnce (handle=0x%X)", (unsigned)outHandle);
-                return;
+                LOG("[Emote] native GiveAbilityAndActivateOnce faulted — disabled for the session, montage fallback");
+                gas::GiveAbilityAndActivateOnce = 0;
             }
             LOG("[Emote] native path incomplete — montage fallback");
         }
@@ -7375,7 +7563,11 @@ static bool TryInstallMcpHook() {
         return false;
     }
     uint32_t w0 = Read<uint32_t>((void*)gas::SendRequestNow);
-    if (!(arm::IsStpX29X30Sp(w0) || arm::IsSubSpImm(w0))) {
+    // [G13] Accept every STP prologue shape this build actually emits
+    // (x29/x30 pairs AND callee-saved pairs like ProcessEvent's
+    // STP X28,X27,[SP,#-N]!) plus SUB SP openers. PAC hints excluded —
+    // Dobby relocation of hint instructions is version-dependent.
+    if (!(arm::IsStpX29X30Sp(w0) || arm::IsSubSpImm(w0) || arm::IsCalleeSavedStpSp(w0))) {
         LOG("[MCP] SendRequestNow prologue unexpected (0x%08X) — skipped", w0);
         return false;
     }
