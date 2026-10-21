@@ -128,6 +128,79 @@
 //        before the map's spawners stream in (12 attempts × 15 s).
 //  [F42] era.fix (re-run every pass) + era.debug (dump slots/inventory/state)
 //        console commands.
+//
+// ----------------------------------------------------------------------------
+// G-SERIES — "Erbium parity wave 2" (this revision). Everything below was
+// ported from the Erbium gameserver source (Finders.cpp / AbilitySystem-
+// Component.cpp / FortKismetLibrary.cpp / FortVehicleSeatWeaponComponent.cpp /
+// BuildingSMActor.cpp) to Android ARM64, driven by a NEW runtime scanner so
+// no new hardcoded RVAs are required:
+//  [G01] ARM64 RUNTIME SCANNER (Memcury port): ELF PT_LOAD discovery via
+//        dl_iterate_phdr, literal string search in the loaded image,
+//        ADRP+ADD xref resolution, validated prologue backscan (STP X29,X30
+//        framed by RET/B boundaries) and BL call-target resolution. This is
+//        the Android equivalent of Erbium's FindStringRef()/ScanFor() — the
+//        engine's own log strings locate the stripped native functions.
+//  [G02] NATIVE GAS ENTRY POINTS, discovered at runtime through [G01]:
+//          • InitializePlayerGameplayAbilities  ("...with invalid
+//            PlayerStateOrProxy!") — THE real Fortnite grant path: resolves
+//            the DefaultAbilitySets of the pawn/PlayerState CDOs, builds
+//            FGameplayAbilitySpecs WITH their declared InputIDs (the reason
+//            GAS-driven locomotion/interaction anims live) and delivers them
+//            through the native GiveAbility chain.
+//          • GiveAbilityAndActivateOnce ("...called on ability %s on the
+//            client, not allowed!") — emotes/sprays as real one-shot specs.
+//          • InternalTryActivateAbility ("...called with invalid Handle!
+//            ASC: %s. AvatarActor: %s") — authority activation.
+//          • ApplyCharacterCustomization ("AFortPlayerState::ApplyCharacter-
+//            Customization - Failed initialization, using default parts...")
+//            — the native body-assembler, stronger than the visualization-
+//            only refresh.
+//        Every discovery is validated (exec-range + boundary framing +
+//        readable prologue) and every use is layered over the existing
+//        reflection fallbacks — a missing native degrades, never crashes.
+//  [G03] ABILITY SETS (Erbium 1:1 for season 21): the grant list is now the
+//        full Erbium set family — GAS_AthenaPlayer + AS_TacticalSprint +
+//        AS_Ascender + AS_DoorBash + AS_HillScramble + AS_SlideImpulse +
+//        GAS_Athena_RealitySapling — each loaded, appended with the mobile
+//        extras, and delivered through the native InitializePlayerGameplay-
+//        Abilities first, then EquipFortAbilitySet per set (granted-flag
+//        commits only when specs actually appear in ActivatableAbilities).
+//  [G04] InputID VERIFICATION: FGameplayAbilitySpec is read through
+//        reflection (Handle/Ability/Level/InputID/SourceObject offsets are
+//        resolved from the live UScriptStruct), and every grant pass logs
+//        the resulting spec list with ability name + InputID (era.abilities
+//        dumps them on demand). "Granted but not bound" is now observable.
+//  [G05] MCP PROFILE DISPATCH FIX (Erbium Misc::SendRequestNow): the
+//        "MCP-Profile: Dispatching request to %s" function is hooked and
+//        re-invoked with context credentials forced to 3 (CXC_Public) —
+//        the exact Erbium patch that lets profile/loadout queries leave the
+//        box, which is why the "MCP Profile phase" never loaded.
+//  [G06] DOORS THROUGH THE REAL API (IOpenableInterface parity): interaction
+//        now routes through UFortKismetLibrary::OpenActor /
+//        CloseActor (BlueprintAuthorityOnly statics that dispatch the
+//        IOpenableInterface::Open/Close implementation on ABuildingWall,
+//        with bRequestFastOpen for the slam path), with IsDoorOpen() as the
+//        state probe. The manual bit-pack write stays ONLY as fallback —
+//        the native path sets bDoorOpen + OnRep + collision + animation
+//        with server authority, so doors STAY OPEN exactly like the live
+//        game (TickDoorPins remains the re-assert safety net).
+//  [G07] ANIMATIONS: FixBodyAndAnimations now finishes with the native
+//        ApplyCharacterCustomization (PlayerState, Pawn) after the part
+//        pipeline; PlayEmoteItem first tries GiveAbilityAndActivateOnce
+//        with a reflection-built FGameplayAbilitySpec (Erbium ServerPlay-
+//        EmoteItem parity, replicating LastReplicatedEmoteExecuted) and
+//        falls back to the montage path.
+//  [G08] BUILDING EDIT AUTHORITY (Erbium SetEditingPlayer): begin/end edit
+//        now set EditingPlayer on the piece + OnRep_EditingPlayer with the
+//        SetNetDormancy(Initial)/ForceNetUpdate pair, and the edit spawn
+//        chain clears the editor before replacing the piece.
+//  [G09] VEHICLES: instant seat-weapon response through the OnPawnEnter/
+//        ExitVehicle events (in addition to the 0.5s poll), keeping the
+//        Erbium exit parity (remove seat weapon → OG exit → re-equip
+//        previous weapon or pickaxe).
+//  [G10] era.abilities / era.specs console command + heartbeat flags for
+//        the new native paths (gas_init/gaa/ita/acc/mcp).
 // ============================================================================
 #include <jni.h>
 #include <pthread.h>
@@ -359,6 +432,193 @@ static thread_local bool g_internal = false;
 
 struct Guard { bool s = g_internal; Guard() { g_internal = true; } ~Guard() { g_internal = s; } };
 template<class F> static F Fn(uintptr_t rva) { return reinterpret_cast<F>(g_base + rva); }
+
+// ============================================================================
+// [G01] ARM64 RUNTIME SCANNER — Erbium's Memcury (FindStringRef/ScanFor/
+// RelativeOffset) ported to the Android loader model. No new hardcoded RVAs:
+// the engine's own log literals locate the stripped native functions.
+//   • PT_LOAD discovery through the SAME dl_iterate_phdr walk that finds
+//     g_base (exec + data ranges of libUnreal.so).
+//   • FindString: literal search in the loaded image, in BOTH encodings UE
+//     uses on Android (TCHAR literals are UTF-16; some paths are ASCII).
+//   • FindAdrpAddRef: ADRP Xd,page + ADD Xd,Xd,#lo12 xref resolution — the
+//     ARM64 equivalent of Erbium's "48 8D 05/0D rel32" LEA scan.
+//   • BackscanPrologue: walk back from the reference to the containing
+//     function's frame setup (STP X29,X30,[SP..] / SUB SP,SP), validated by
+//     a terminator boundary (RET/B/BR/NOP) — Erbium's prologue backscan.
+//   • NextBlTarget: BL rel26 resolution for intra-function call discovery.
+// Everything is read-only, one-time, and runs on the Worker thread.
+// ============================================================================
+namespace arm {
+struct Range { uintptr_t start; uintptr_t end; bool exec; };
+static std::vector<Range> s_ranges;
+static bool s_ready = false;
+
+static int PhdrCb(dl_phdr_info* info, size_t, void*) {
+    const char* name = strrchr(info->dlpi_name, '/');
+    name = name ? name + 1 : info->dlpi_name;
+    if (strcmp(name, "libUnreal.so") || !info->dlpi_addr) return 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const Elf64_Phdr& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD) continue;
+        uintptr_t start = info->dlpi_addr + ph.p_vaddr;
+        uintptr_t end = start + ph.p_memsz;
+        if (end <= start || end - start > 0x80000000ULL) continue;
+        if (!IsReadable((void*)start, 0x40)) continue;
+        s_ranges.push_back({start, end, (ph.p_flags & PF_X) != 0});
+    }
+    return 1;
+}
+static bool Init() {
+    if (s_ready) return !s_ranges.empty();
+    s_ranges.clear();
+    dl_iterate_phdr(PhdrCb, nullptr);
+    s_ready = true;
+    size_t total = 0, execSz = 0;
+    for (auto& r : s_ranges) { total += r.end - r.start; if (r.exec) execSz += r.end - r.start; }
+    LOG("[ARM] ranges=%zu total=%.1fMB exec=%.1fMB", s_ranges.size(), total / 1048576.0, execSz / 1048576.0);
+    return !s_ranges.empty();
+}
+
+// Literal search. ASCII first (cheap), then UTF-16 (UE TCHAR literals).
+static uintptr_t FindStringAscii(const char* needle, size_t len) {
+    for (const Range& r : s_ranges) {
+        if (r.end - r.start < len) continue;
+        const char* p = (const char*)r.start;
+        const char* e = (const char*)r.end - len;
+        while (p <= e) {
+            const char* hit = (const char*)memchr(p, needle[0], (size_t)(e - p) + 1);
+            if (!hit) break;
+            if (memcmp(hit, needle, len) == 0) return (uintptr_t)hit;
+            p = hit + 1;
+        }
+    }
+    return 0;
+}
+static uintptr_t FindStringUtf16(const char* needle, size_t len) {
+    std::vector<char16_t> wide;
+    wide.reserve(len);
+    for (size_t i = 0; i < len; ++i) wide.push_back((char16_t)(unsigned char)needle[i]);
+    for (const Range& r : s_ranges) {
+        if (r.end - r.start < len * 2) continue;
+        const char16_t* p = (const char16_t*)r.start;
+        const char16_t* e = (const char16_t*)r.end - len;
+        while (p <= e) {
+            const char16_t* hit = std::find(p, e + 1, wide[0]);
+            if (hit == e + 1) break;
+            if (memcmp(hit, wide.data(), len * 2) == 0) return (uintptr_t)hit;
+            p = hit + 1;
+        }
+    }
+    return 0;
+}
+static uintptr_t FindString(const char* needle) {
+    if (!needle || !*needle) return 0;
+    size_t len = strlen(needle);
+    // NUL-terminated match (both encodings) so prefixes of longer literals
+    // never false-positive.
+    uintptr_t a = FindStringAscii(needle, len + 1);
+    if (a) return a;
+    return FindStringUtf16(needle, len + 1);
+}
+
+// ADRP decode: page-relative immediate. page = (pc & ~0xFFF) + (imm << 12).
+static bool DecodeAdrp(uint32_t w, uintptr_t pc, uintptr_t& page) {
+    if ((w & 0x9F000000) != 0x90000000) return false;            // ADRP
+    int64_t imm = (int64_t)((w >> 29) & 0x3) | ((int64_t)((w >> 5) & 0x7FFFF) << 2);
+    if (imm & (1 << 20)) imm -= (int64_t)1 << 21;
+    page = (pc & ~0xFFFULL) + ((uintptr_t)imm << 12);
+    return true;
+}
+// First ADRP+ADD pair referencing `target` within [scanStart, scanEnd).
+static uintptr_t FindAdrpAddRef(uintptr_t target, uintptr_t scanStart, uintptr_t scanEnd) {
+    uintptr_t page = target & ~0xFFFULL;
+    for (const Range& r : s_ranges) {
+        if (!r.exec) continue;
+        uintptr_t begin = scanStart > r.start ? scanStart : r.start;
+        begin &= ~3ULL;
+        uintptr_t end = r.end < scanEnd ? r.end : scanEnd;
+        for (uintptr_t pc = begin; pc + 8 <= end; pc += 4) {
+            uint32_t adrp = *(uint32_t*)pc;                        // exec range: mapped
+            uintptr_t pg = 0;
+            if (!DecodeAdrp(adrp, pc, pg) || pg != page) continue;
+            uint32_t add = *(uint32_t*)(pc + 4);
+            if ((add & 0xFF000000) != 0x91000000) continue;        // ADD Xd,Xn,#imm (64-bit)
+            uint32_t rd = adrp & 0x1F;
+            if ((add & 0x1F) != rd || ((add >> 5) & 0x1F) != rd) continue;
+            uint64_t imm = (add >> 10) & 0xFFF;
+            if ((add >> 22) & 1) imm <<= 12;
+            if (pg + imm == target) return pc;
+        }
+    }
+    return 0;
+}
+
+// Frame-setup + boundary detection.
+static bool IsStpX29X30Sp(uint32_t w) {
+    if ((w & 0x1F) != 29 || ((w >> 5) & 0x1F) != 31 || ((w >> 10) & 0x1F) != 30) return false;
+    uint32_t op = (w >> 22) & 0x3FF;
+    return op == 0x2A2 || op == 0x2A6 || op == 0x2AA;   // post/pre/signed STP
+}
+static bool IsSubSpImm(uint32_t w) {
+    return (w & 0xFF8003E0) == 0xD10003E0 && (w & 0x1F) == 31;   // SUB SP,SP,#imm
+}
+static bool IsTerminator(uint32_t w) {
+    if (w == 0xD65F03C0 || (w & 0xFFFFFC1F) == 0xD65F0000) return true;  // RET
+    if ((w & 0xFC000000) == 0x14000000) return true;                     // B imm
+    if ((w & 0xFF000010) == 0x54000000) return true;                     // B.cond
+    if ((w & 0xFFFFFC1F) == 0xD61F0000) return true;                     // BR
+    if ((w & 0xFFFFFC1F) == 0xD63F0000) return true;                     // BLR
+    if (w == 0xD503201F) return true;                                    // NOP padding
+    return false;
+}
+// Walk back to the containing function's start (boundary-validated).
+static uintptr_t BackscanPrologue(uintptr_t ref) {
+    uintptr_t limit = ref > 0x40000 ? ref - 0x40000 : g_base;
+    if (limit < g_base + 8) limit = g_base + 8;
+    for (uintptr_t pc = (ref & ~3ULL) - 4; pc >= limit; pc -= 4) {
+        if (!IsReadable((void*)pc, 8)) break;
+        uint32_t w = *(uint32_t*)pc;
+        bool prologue = IsStpX29X30Sp(w);
+        if (!prologue && IsSubSpImm(w) && IsReadable((void*)(pc + 4), 4))
+            prologue = IsStpX29X30Sp(*(uint32_t*)(pc + 4));       // SUB SP; STP X29
+        if (!prologue) continue;
+        if (!IsReadable((void*)(pc - 4), 4)) break;
+        if (IsTerminator(*(uint32_t*)(pc - 4))) return pc;         // validated start
+    }
+    return 0;
+}
+// Nth BL target at/after `from` within `window` bytes.
+static uintptr_t NextBlTarget(uintptr_t from, size_t window, int nth) {
+    for (uintptr_t pc = from; pc < from + window; pc += 4) {
+        if (!IsReadable((void*)pc, 4)) break;
+        uint32_t w = *(uint32_t*)pc;
+        if ((w & 0xFC000000) != 0x94000000) continue;              // BL rel26
+        int64_t imm = (int64_t)(w & 0x3FFFFFF);
+        if (imm & (1 << 25)) imm -= (int64_t)1 << 26;
+        if (--nth <= 0) return pc + ((uintptr_t)imm << 2);
+    }
+    return 0;
+}
+// Composite: string → ADRP+ADD ref → containing function start.
+static uintptr_t FindFunctionByString(const char* needle, int useRefNum = 0) {
+    if (!Init()) return 0;
+    uintptr_t str = FindString(needle);
+    if (!str) { LOG("[ARM] string not resident: %.60s", needle); return 0; }
+    uintptr_t scanStart = 0, scanEnd = UINTPTR_MAX;
+    for (const Range& r : s_ranges) if (r.exec) { scanStart = r.start; scanEnd = r.end; break; }
+    uintptr_t ref = 0;
+    for (int i = 0; i <= useRefNum && scanStart; ++i) {
+        ref = FindAdrpAddRef(str, ref ? ref + 4 : scanStart, scanEnd);
+        if (!ref) break;
+    }
+    if (!ref) { LOG("[ARM] no code ref to: %.60s", needle); return 0; }
+    uintptr_t fn = BackscanPrologue(ref);
+    if (fn) LOG("[ARM] ✅ %.48s -> fn+0x%llX", needle, (unsigned long long)(fn - g_base));
+    else LOG("[ARM] ⚠️ ref found but no prologue for: %.48s", needle);
+    return fn;
+}
+} // namespace arm
 
 // ============================================================================
 // UE5 STRUCTS (LWC — 21.30 uses double-precision FVector/FRotator)
@@ -627,6 +887,20 @@ using Exec_t = bool(*)(void*, void*, const char16_t*, void*);
 static PE_t   orig_PE = nullptr;
 static Tick_t orig_Tick = nullptr;
 static Exec_t orig_Exec = nullptr;
+
+// [G05] MCP PROFILE DISPATCH — Erbium Misc::SendRequestNow 1:1.
+// The standalone client prepares profile/loadout queries but never dispatches
+// them with public credentials, so the "MCP Profile phase" never loads. The
+// hook forces the context credentials argument to 3 (CXC_Public) on every
+// dispatch — exactly Erbium's UE5-era patch (the struct write was only needed
+// pre-4.23; 21.30 passes credentials as the third argument). The hook itself
+// is installed in InstallHooks only when the [G01] scanner located the native.
+using SendRequestNow_t = void* (*)(void*, void*, int);
+static SendRequestNow_t orig_SendRequestNow = nullptr;
+static void* hook_SendRequestNow(void* Arg1, void* MCPData, int /*ContextCredentials*/) {
+    if (orig_SendRequestNow) return orig_SendRequestNow(Arg1, MCPData, 3);   // CXC_Public
+    return nullptr;
+}
 
 // ============================================================================
 // CALL SYSTEM  — [F16] upgraded:
@@ -1363,6 +1637,7 @@ namespace Athena {
     void AddToInventory(void* def, int count, int slot);
     void InventoryUpdate();
     void GrantDefaultAbilities();
+    void ActivateAbilityByClass(void* klass);   // [G03] activation helper — granting flows through the sets
     void GrantAbility(void* klass);
     void GrantAllAbilitySets();
     void GrantWorldAbilities();        // [F52/F83-b] slide + vehicle abilities as real specs
@@ -1396,7 +1671,7 @@ namespace Athena {
 
     // [F28] Vehicles (Erbium AFortAthenaVehicleSpawner path, 1:1)
     void SpawnVehicles();
-    void TickVehicleSeats();
+    void TickVehicleSeats(bool force = false);   // [G09] force bypasses the 0.5s poll throttle
     void GiveVehicleWeapon(void* weaponDef, int seatIdx);
     void RemoveVehicleWeapon(bool reequip);
     void TickMantleAssist();           // [F45] 21.30 wall climb / mantle assist
@@ -1460,12 +1735,234 @@ static void* GetASC(void* actor) {
     return asc;
 }
 
-void Athena::GrantAbility(void* klass) {
+// ============================================================================
+// [G02] NATIVE GAS ENTRY POINTS — Erbium Finders.cpp ported through the
+// [G01] scanner. The engine's own log literals are the anchors; every entry
+// degrades gracefully to the reflection path when not found.
+// ============================================================================
+namespace gas {
+// void AFortPlayerState::InitializePlayerGameplayAbilities(const IFortAbilitySystemInterface*)
+static uintptr_t InitializePlayerGameplayAbilities = 0;
+// void UAbilitySystemComponent::GiveAbilityAndActivateOnce(this, FGameplayAbilitySpecHandle* out, FGameplayAbilitySpec* spec, void* predictionKey)
+static uintptr_t GiveAbilityAndActivateOnce = 0;
+// bool UAbilitySystemComponent::InternalTryActivateAbility(this, handle, predictionKey, UFortGameplayAbility** outInstanced, void*, void* triggerEventData)
+static uintptr_t InternalTryActivateAbility = 0;
+// void AFortPlayerState::ApplyCharacterCustomization(AFortPlayerState*, APawn*)
+static uintptr_t ApplyCharacterCustomization = 0;
+// [G05] void SendRequestNow(void* Arg1, void* MCPData, int ContextCredentials)
+static uintptr_t SendRequestNow = 0;
+static bool discovered = false;
+
+// [G04] Reflection-driven FGameplayAbilitySpec layout — offsets are resolved
+// from the live UScriptStruct, so "print Spec.InputID before/after grant"
+// works without a single hardcoded struct offset.
+struct SpecLayout {
+    int OffHandle = -1, OffAbility = -1, OffLevel = -1, OffInputID = -1, OffSourceObject = -1;
+    int Size = 0;
+    bool ok() const { return OffAbility >= 0 && OffInputID >= 0 && Size >= 0x20; }
+};
+static bool ResolveSpecLayout(SpecLayout& out) {
+    void* propAbility = GetProp("/Script/GameplayAbilities.GameplayAbilitySpec.Ability");
+    void* propInput   = GetProp("/Script/GameplayAbilities.GameplayAbilitySpec.InputID");
+    if (!propAbility || !propInput) return false;
+    void* propHandle = GetProp("/Script/GameplayAbilities.GameplayAbilitySpec.Handle");
+    void* propLevel  = GetProp("/Script/GameplayAbilities.GameplayAbilitySpec.Level");
+    void* propSrc    = GetProp("/Script/GameplayAbilities.GameplayAbilitySpec.SourceObject");
+    void* stru = FindObj("/Script/GameplayAbilities.GameplayAbilitySpec");
+    if (!stru || IsBadPtr(stru)) return false;
+    out.OffAbility   = Read<int>(propAbility, profile::PropOffset);
+    out.OffInputID   = Read<int>(propInput,   profile::PropOffset);
+    out.OffHandle    = propHandle ? Read<int>(propHandle, profile::PropOffset) : 0x10;
+    out.OffLevel     = propLevel  ? Read<int>(propLevel,  profile::PropOffset) : out.OffInputID + 4;
+    out.OffSourceObject = propSrc ? Read<int>(propSrc, profile::PropOffset) : -1;
+    out.Size         = Read<int32>(stru, profile::StructPropertiesSize);
+    return out.ok();
+}
+
+// Erbium's manual spec fill (GiveAbility fallback shape): zeroed buffer,
+// FastArraySerializer keys = -1, Handle = rand, Ability = CDO, Level = 1,
+// InputID = -1 (input binding comes from the native set paths). Caller frees.
+static void* BuildSpec(void* abilityCdo, void* sourceObject) {
+    static SpecLayout layout; static bool resolved = false;
+    if (!resolved) { resolved = true; if (!ResolveSpecLayout(layout)) LOG("[GAS] ⚠️ GameplayAbilitySpec reflection missing"); }
+    if (!layout.ok() || !abilityCdo) return nullptr;
+    void* spec = malloc((size_t)std::max(layout.Size, 0x40));
+    if (!spec) return nullptr;
+    memset(spec, 0, (size_t)std::max(layout.Size, 0x40));
+    Write<int32>(spec, 0x0, -1);                              // ReplicationID
+    Write<int32>(spec, 0x4, -1);                              // ReplicationKey
+    Write<int32>(spec, 0x8, -1);                              // MostRecentArrayReplicationKey
+    Write<int32>(spec, layout.OffHandle, (int32)rand());      // Handle
+    Write<void*>(spec, layout.OffAbility, abilityCdo);
+    Write<int32>(spec, layout.OffLevel, 1);
+    Write<int32>(spec, layout.OffInputID, -1);
+    if (layout.OffSourceObject >= 0) Write<void*>(spec, layout.OffSourceObject, sourceObject);
+    return spec;
+}
+
+// CDO resolution by the engine's own "Default__" naming (StaticFindObject
+// path first, GObjects name-scan second — UClass::ClassDefaultObject is not
+// reflected in this dump).
+static void* ClassDefaultOf(void* klass) {
+    if (!klass || IsBadPtr(klass)) return nullptr;
+    static std::map<void*, void*> cache;
+    auto it = cache.find(klass);
+    if (it != cache.end()) return it->second;
+    void* cdo = nullptr;
+    {
+        // Build "<outer path>.Default__<name>" from the class's outer chain.
+        std::vector<std::string> parts;
+        void* cur = klass;
+        for (int d = 0; d < 8 && cur && !IsBadPtr(cur); ++d) {
+            parts.push_back(ObjName(cur));
+            cur = Read<void*>(cur, profile::ObjectOuter);
+        }
+        if (!parts.empty()) {
+            std::string path;
+            for (int d = (int)parts.size() - 1; d >= 0; --d) { path += parts[(size_t)d]; if (d) path += "."; }
+            size_t dot = path.rfind('.');
+            if (dot != std::string::npos)
+                cdo = FindObj(path.substr(0, dot) + ".Default__" + parts[0]);
+        }
+    }
+    if (!cdo) {
+        GObjects_t* go = GObjectArray();
+        if (go) {
+            std::string want = "Default__" + ObjName(klass);
+            for (int32 i = 0; i < go->NumElements && !cdo; ++i) {
+                void* o = go->GetById((uint32)i);
+                if (!o || IsBadPtr(o) || Read<void*>(o, profile::ObjectClass) != klass) continue;
+                if (ObjName(o) == want) cdo = o;
+            }
+        }
+    }
+    if (cdo) cache[klass] = cdo;
+    return cdo;
+}
+
+// One-time discovery — Worker thread, before InstallHooks.
+static void Discover() {
+    if (discovered) return;
+    discovered = true;
+    double t0 = Monotonic();
+    InitializePlayerGameplayAbilities = arm::FindFunctionByString(
+        "InitializePlayerGameplayAbilities with invalid PlayerStateOrProxy!");
+    GiveAbilityAndActivateOnce = arm::FindFunctionByString(
+        "GiveAbilityAndActivateOnce called on ability %s on the client, not allowed!");
+    InternalTryActivateAbility = arm::FindFunctionByString(
+        "InternalTryActivateAbility called with invalid Handle! ASC: %s. AvatarActor: %s");
+    ApplyCharacterCustomization = arm::FindFunctionByString(
+        "AFortPlayerState::ApplyCharacterCustomization - Failed initialization, using default parts. "
+        "Player Controller: %s PlayerState: %s, HeroId: %s");
+    SendRequestNow = arm::FindFunctionByString("MCP-Profile: Dispatching request to %s");
+    if (!SendRequestNow)
+        SendRequestNow = arm::FindFunctionByString(
+            "MCP-Profile: Dispatching request to %s - ContextCredentials: %s");
+    LOG("[GAS] discovery done in %.1fs — init=%d gaa=%d ita=%d acc=%d mcp=%d",
+        Monotonic() - t0,
+        InitializePlayerGameplayAbilities ? 1 : 0, GiveAbilityAndActivateOnce ? 1 : 0,
+        InternalTryActivateAbility ? 1 : 0, ApplyCharacterCustomization ? 1 : 0,
+        SendRequestNow ? 1 : 0);
+}
+
+// Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
+static int CountActivatableSpecs(void* asc = nullptr);
+
+// [G02] The Erbium primary grant: hand the PlayerState's
+// IFortAbilitySystemInterface to the native InitializePlayerGameplayAbilities.
+// It resolves the pawn/PlayerState DefaultAbilitySets from the CDOs, builds
+// specs WITH their declared InputIDs (GAS-driven anims), and delivers them
+// through the native GiveAbility chain. Returns false when the native was
+// not found or the interface could not be resolved.
+static bool NativeInitializePlayerGameplayAbilities() {
+    if (!InitializePlayerGameplayAbilities) return false;
+    void* ifaceType = FindObj("/Script/FortniteGame.FortAbilitySystemInterface");
+    if (!ifaceType) ifaceType = FindObj("/Script/FortniteGame.FortPlayerState.FortAbilitySystemInterface");
+    void* target = session.player_state ? session.player_state : session.pawn;
+    if (!target) return false;
+    void* ifaceAddr = ifaceType ? ResolveInterface(target, ifaceType) : nullptr;
+    if (!ifaceAddr) {
+        LOG("[GAS] IFortAbilitySystemInterface not resolvable — passing PlayerState");
+        ifaceAddr = target;   // single-inheritance interface: the object IS the interface
+    }
+    int before = CountActivatableSpecs();
+    {
+        Guard g;   // the native calls back into UE — mark internal
+        ((void (*)(void*))InitializePlayerGameplayAbilities)(ifaceAddr);
+    }
+    int after = CountActivatableSpecs();
+    LOG("[GAS] InitializePlayerGameplayAbilities: specs %d -> %d", before, after);
+    return after > before;
+}
+
+// Spec count through ActivatableAbilities (FGameplayAbilitySpecContainer).
+static int CountActivatableSpecs(void* asc) {
+    if (!asc) asc = GetASC(session.pawn);
+    if (!asc) return -1;
+    static int contOff = -2, itemsOff = -2, stride = -2;
+    if (contOff == -2) {
+        contOff = -1; itemsOff = -1; stride = -1;
+        void* contProp = GetProp("/Script/GameplayAbilities.AbilitySystemComponent.ActivatableAbilities");
+        void* itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.Items");
+        if (contProp && itemsProp) {
+            contOff = Read<int>(contProp, profile::PropOffset);
+            itemsOff = Read<int>(itemsProp, profile::PropOffset);
+            void* inner = Read<void*>(itemsProp, 0x70);           // FArrayProperty::Inner
+            if (inner) {
+                void* sStruct = Read<void*>(inner, 0x70);         // FStructProperty::Struct
+                if (sStruct) stride = Read<int32>(sStruct, profile::StructPropertiesSize);
+            }
+            if (stride <= 0) stride = 0x70;                        // 21.30 typical spec size fallback
+        }
+    }
+    if (contOff < 0 || itemsOff < 0 || stride <= 0) return -1;
+    Array items = Read<Array>((char*)asc + contOff + itemsOff);
+    if (!items.Data || IsBadPtr(items.Data) || items.Count < 0 || items.Count > 4096) return 0;
+    return items.Count;
+}
+
+// [G04] Dump every spec with ability name + InputID (the user-visible
+// "granted but bound?" verification). Rate-free — call on demand.
+static void DumpSpecs(const char* tag) {
+    void* asc = GetASC(session.pawn);
+    if (!asc) return;
+    static SpecLayout layout; static bool resolved = false;
+    if (!resolved) { resolved = true; ResolveSpecLayout(layout); }
+    void* contProp = GetProp("/Script/GameplayAbilities.AbilitySystemComponent.ActivatableAbilities");
+    void* itemsProp = GetProp("/Script/GameplayAbilities.GameplayAbilitySpecContainer.Items");
+    if (!contProp || !itemsProp) { LOG("[Specs] reflection missing"); return; }
+    int contOff = Read<int>(contProp, profile::PropOffset);
+    int itemsOff = Read<int>(itemsProp, profile::PropOffset);
+    void* inner = Read<void*>(itemsProp, 0x70);
+    void* sStruct = inner ? Read<void*>(inner, 0x70) : nullptr;
+    int stride = sStruct ? Read<int32>(sStruct, profile::StructPropertiesSize) : 0;
+    if (stride <= 0) stride = 0x70;
+    Array items = Read<Array>((char*)asc + contOff + itemsOff);
+    if (!items.Data || IsBadPtr(items.Data) || items.Count < 0 || items.Count > 4096) {
+        LOG("[Specs] %s: none", tag); return;
+    }
+    LOG("[Specs] %s: %d specs", tag, items.Count);
+    if (!layout.ok()) return;
+    for (int i = 0; i < items.Count; ++i) {
+        void* spec = (char*)items.Data + (size_t)i * stride;
+        void* ability = Read<void*>(spec, layout.OffAbility);
+        int32 inputID = Read<int32>(spec, layout.OffInputID);
+        int32 level = layout.OffLevel >= 0 ? Read<int32>(spec, layout.OffLevel) : 1;
+        int32 handle = layout.OffHandle >= 0 ? Read<int32>(spec, layout.OffHandle) : 0;
+        LOG("[Specs]  #%d %s inputID=%d level=%d handle=0x%X", i,
+            ObjName(ability).c_str(), inputID, level, (unsigned)handle);
+    }
+}
+} // namespace gas
+
+// [G03] ACTIVATION helper (the old "GrantAbility"): TryActivateAbilityByClass
+// is the only reflected activation entry point in 21.30 — granting itself
+// now flows exclusively through the ability sets above. Never call this at
+// grant time (the removed F13 fallback used to fire abilities on spawn).
+void Athena::ActivateAbilityByClass(void* klass) {
     if (!klass || !session.pawn) return;
     void* asc = GetASC(session.pawn);
     if (!asc) { LOG("[Ability] no ASC"); return; }
-    // [F13] TryActivateAbilityByClass is the only reflected activation entry
-    // point in 21.30 (GiveAbility/K2_GiveAbility do not exist).
     Call c("/Script/GameplayAbilities.AbilitySystemComponent.TryActivateAbilityByClass");
     if (!c.ok()) return;
     bool bAllow = true;
@@ -1474,6 +1971,8 @@ void Athena::GrantAbility(void* klass) {
         LOG("[Ability] Activated: %s", ObjName(klass).c_str());
     }
 }
+
+void Athena::GrantAbility(void* klass) { ActivateAbilityByClass(klass); }
 
 // FFortAbilitySetHandle (0x38): TWeakObjectPtr + GrantedAbilityHandles array
 // + AppliedEffectHandles array + ItemGuidsForAdditionalItems array. The
@@ -1548,17 +2047,41 @@ void Athena::GrantAllAbilitySets() {
     if (!asc) { LOG("[Abilities] no ASC"); return; }
     if (!session.stamina_initialized) InitStaminaAttributes();
 
+    // [G02] PRIMARY — the native Erbium path: InitializePlayerGameplayAbilities
+    // reads the pawn/PlayerState DefaultAbilitySets from the CDOs and grants
+    // every ability through the real GiveAbility chain WITH its InputID (the
+    // GAS-driven locomotion/interaction animation enabler).
+    bool nativeGranted = gas::NativeInitializePlayerGameplayAbilities();
+
     void* coreSet = LoadAsset(
         "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GAS_AthenaPlayer.GAS_AthenaPlayer",
         "/Script/FortniteGame.FortAbilitySet");
-    if (!coreSet) { LOG("[Abilities] GAS_AthenaPlayer missing — will retry (asset may stream late)"); return; }   // [F90-a/AUD-1] no premature commit: the 10s Tick retry re-invokes until the set lands
+    if (!coreSet && !nativeGranted) {
+        LOG("[Abilities] GAS_AthenaPlayer missing — will retry (asset may stream late)");
+        return;   // [F90-a/AUD-1] no premature commit: the 10s Tick retry re-invokes until the set lands
+    }
 
-    // Add the mobile interaction/harvest/sprint abilities into the set before
-    // EquipFortAbilitySet so the native delivery path initializes their
+    // [G03] The FULL Erbium season-21 set family (AFortGameMode::AbilitySets
+    // in Erbium for Fortnite >= 20): movement/door/slide/ascender/reality sets
+    // were missing — exactly why slide/door-bash/climb anims stayed dead with
+    // only GAS_AthenaPlayer granted.
+    struct SetEntry { const char* path; const char* shortName; };
+    static const SetEntry erbiumSets[] = {
+        {"/TacticalSprintGame/Gameplay/AS_TacticalSprint.AS_TacticalSprint",                    "AS_TacticalSprint"},
+        {"/Ascender/Gameplay/Ascender/AS_Ascender.AS_Ascender",                                  "AS_Ascender"},
+        {"/DoorBashContent/Gameplay/AS_DoorBash.AS_DoorBash",                                    "AS_DoorBash"},
+        {"/HillScramble/Gameplay/AS_HillScramble.AS_HillScramble",                               "AS_HillScramble"},
+        {"/SlideImpulse/Gameplay/AS_SlideImpulse.AS_SlideImpulse",                               "AS_SlideImpulse"},
+        {"/RealitySeedGameplay/Environment/Foliage/GAS_Athena_RealitySapling.GAS_Athena_RealitySapling", "GAS_Athena_RealitySapling"},
+        {nullptr, nullptr}
+    };
+
+    // Add the mobile interaction/harvest/sprint abilities into the core set
+    // before EquipFortAbilitySet so the native delivery path initializes their
     // replicated specs (Era core behaviour; offsets verified: GameplayAbilities
     // @0x38 on UFortAbilitySet).
     void* abilities_prop = GetProp("/Script/FortniteGame.FortAbilitySet.GameplayAbilities");
-    if (abilities_prop) {
+    if (abilities_prop && coreSet) {
         int off = Read<int>(abilities_prop, profile::PropOffset);
         LOG("[Abilities] GameplayAbilities offset = 0x%X (expect 0x38)", off);
         Array* abilities = reinterpret_cast<Array*>(GetField(coreSet, abilities_prop));
@@ -1586,26 +2109,50 @@ void Athena::GrantAllAbilitySets() {
         }
     }
 
-    if (ApplyAbilitySet(session.pawn, coreSet)) session.granted_ability_sets.push_back(coreSet);
-
-    // Fallback direct activations (only works for already-granted abilities).
-    const char* abilities[] = {
-        "/Script/GameplayAbilities.GameplayAbility_CharacterJump",
-        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractUse.GA_DefaultPlayer_InteractUse_C",
-        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_InteractSearch.GA_DefaultPlayer_InteractSearch_C",
-        "/Game/Abilities/Player/Generic/Traits/DefaultPlayer/GA_DefaultPlayer_Death.GA_DefaultPlayer_Death_C",
-        "/Game/Athena/Items/ForagedItems/Rift/GA_Rift_Athena_Skydive.GA_Rift_Athena_Skydive_C",
-        nullptr
-    };
-    for (int i = 0; abilities[i]; ++i) {
-        void* cls = FindObj(abilities[i]);
-        if (!cls) cls = LoadClass(abilities[i], "/Script/GameplayAbilities.GameplayAbility");
-        if (!cls) continue;
-        GrantAbility(cls);
+    bool coreApplied = false;
+    if (coreSet && ApplyAbilitySet(session.pawn, coreSet)) {
+        session.granted_ability_sets.push_back(coreSet);
+        coreApplied = true;
     }
-    session.abilities_granted = true;
-    session.melee_granted = true; // [F13] melee flows with the pickaxe weapon intrinsics; no separate grant API exists
-    LOG("[Abilities] Done — sets=%zu", session.granted_ability_sets.size());
+
+    // [G03] Erbium movement/interaction set family — each one equipped through
+    // the same native delivery (LoadAsset first, loaded-object fallback second:
+    // these stream in late like every other BP asset).
+    int extraSets = 0;
+    for (int i = 0; erbiumSets[i].path; ++i) {
+        void* set = LoadAsset(erbiumSets[i].path, "/Script/FortniteGame.FortAbilitySet");
+        if (!set) set = FindLoadedObjectOfType("/Script/FortniteGame.FortAbilitySet", erbiumSets[i].shortName);
+        if (!set || IsBadPtr(set)) { LOG("[Abilities] set not resident yet: %s", erbiumSets[i].shortName); continue; }
+        if (std::find(session.granted_ability_sets.begin(), session.granted_ability_sets.end(), set) != session.granted_ability_sets.end())
+            continue;   // already equipped (retry path)
+        if (ApplyAbilitySet(session.pawn, set)) {
+            session.granted_ability_sets.push_back(set);
+            ++extraSets;
+        }
+    }
+
+    // [G03/G04] Commit semantics: "granted" is defined by the ASC's own
+    // ActivatableAbilities when the reflection read works (specs must exist
+    // AND something must have been delivered this pass — the anti-duplicate
+    // guard for the 10s Tick retry); when the spec read is unavailable the
+    // delivery results alone decide. The spec list (with InputIDs) is logged
+    // for verification either way.
+    int specsAfter = gas::CountActivatableSpecs(asc);
+    bool delivered = nativeGranted || coreApplied || extraSets > 0;
+    if (specsAfter >= 0) {
+        if (delivered && specsAfter > 0) {
+            session.abilities_granted = true;
+            session.melee_granted = true; // [F13] melee flows with the pickaxe weapon intrinsics
+            gas::DumpSpecs("[Abilities] post-grant");   // [G04] ability + InputID visibility
+        }
+        // specs == 0 with a delivery attempt → nothing landed: keep retrying
+        // (a failed EquipFortAbilitySet does not duplicate anything).
+    } else if (delivered) {
+        session.abilities_granted = true;
+        session.melee_granted = true;
+        LOG("[Abilities] spec reflection unavailable — committed on delivery results");
+    }
+    LOG("[Abilities] Done — sets=%zu native=%d specs=%d", session.granted_ability_sets.size(), (int)nativeGranted, specsAfter);
 }
 
 void Athena::GrantDefaultAbilities() { GrantAllAbilitySets(); }
@@ -2156,6 +2703,17 @@ void Athena::FixBodyAndAnimations() {
     Call hid("/Script/Engine.Actor.SetActorHiddenInGame");
     if (hid.ok()) { bool h = false; if (hid.set("bNewHidden", h)) hid.run(session.pawn); }
 
+    // [G07] Finish with the NATIVE body assembler — Erbium's fallback when the
+    // visualization refresh is not enough: ApplyCharacterCustomization(Player-
+    // State, Pawn) builds the cosmetics component from the CharacterParts the
+    // part pipeline just installed (this is the function the live game calls
+    // at possession; it also fixes the "sick body" mesh state F68 described).
+    if (gas::ApplyCharacterCustomization && session.player_state && session.pawn) {
+        Guard g;
+        ((void (*)(void*, void*))gas::ApplyCharacterCustomization)(session.player_state, session.pawn);
+        LOG("[Body] native ApplyCharacterCustomization dispatched");
+    }
+
     session.body_fixed = true;
     LOG("[Body] ✅ locomotion online — body via %zu character parts (Erbium)",
         session.character_parts.size());
@@ -2364,18 +2922,63 @@ void Athena::SetupCheats() {
 }
 
 // ============================================================================
-// DOORS — [F-door r1] 21.30 bDoorOpen is bit 5 of the 0x0FDE bit-pack
+// DOORS — [G06] IOpenableInterface parity + [F-door r1] bit-pack fallback
 // ============================================================================
+// [G06] The 21.30 door API is reflected: UFortKismetLibrary::OpenActor /
+// CloseActor (Final, BlueprintAuthorityOnly, Native, Static — SDK-verified)
+// dispatch IOpenableInterface::Open(ControllerInstigator, bRequestFastOpen) /
+// Close on the actor, i.e. ABuildingWall's own door implementation. In
+// standalone the world IS the authority, so the native path runs, sets the
+// replicated bDoorOpen through the real SetIsDoorOpen chain (swing anim +
+// collision disable + OnRep), and the door STAYS OPEN exactly like the live
+// game. The [F-door r1] manual bit-pack write is kept ONLY as the fallback.
+//
 // 21.30 layout (MobileDumper7 dump, ABuildingWall 0x0FF8):
 //   0x0FDE = bSwingingDoor(0)|bSlidingDoor(1)|bAutomaticSlidingDoor(2)|
 //            bDoubleDoor(3)|bCreateDoorLink(4)|bDoorOpen(5,RepNotify)|
 //            bLocalDoorOpen(6)|bDoorCollisionDisabled(7)
 //   0x0FDF = bFastOpenRequested(4, Net|Transient)
-// The previous "plain bool byte" write flipped the wall-type bits along with
-// bDoorOpen — with bAutomaticSlidingDoor forced on, the native trigger path
-// slammed the door shut a moment later: the door-closes-by-itself symptom.
-// Every door write now touches only the door bits.
+static bool DoorOpenNative(void* wall, bool fast) {
+    Call c("/Script/FortniteGame.FortKismetLibrary.OpenActor");
+    if (!c.ok()) return false;
+    void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    if (!klib) return false;
+    bool bFast = fast;
+    if (!c.set("OpenableInterfaceActor", wall) ||
+        !c.set("OptionalControllerInstigator", session.controller) ||
+        !c.set("bRequestFastOpen", bFast)) return false;
+    if (!c.run(klib)) return false;
+    return c.result<bool>();
+}
+static bool DoorCloseNative(void* wall) {
+    Call c("/Script/FortniteGame.FortKismetLibrary.CloseActor");
+    if (!c.ok()) return false;
+    void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
+    if (!klib) return false;
+    if (!c.set("OpenableInterfaceActor", wall) ||
+        !c.set("OptionalControllerInstigator", session.controller)) return false;
+    if (!c.run(klib)) return false;
+    return c.result<bool>();
+}
+// State probe: ABuildingWall::IsDoorOpen() (SDK-verified UFunction), with the
+// bit read as fallback.
+static bool DoorIsOpen(void* wall) {
+    if (!wall || IsBadPtr(wall)) return false;
+    Call c("/Script/FortniteGame.BuildingWall.IsDoorOpen");
+    if (c.ok() && c.run(wall)) return c.result<bool>();
+    uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
+    return (*pack & 0x20) != 0;
+}
+
 static void DoorOpenApply(void* wall, bool fast) {
+    // [G06] native IOpenableInterface route first — authority, replication,
+    // animation and collision all handled by ABuildingWall's own Open().
+    if (DoorOpenNative(wall, fast)) {
+        Call netup("/Script/Engine.Actor.ForceNetUpdate");
+        if (netup.ok()) netup.run(wall);
+        return;
+    }
+    // [F-door r1] fallback: touch only the door bits.
     uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
     *pack |= 0x20 | 0x40;                        // bDoorOpen | bLocalDoorOpen
     if (fast) {
@@ -2390,6 +2993,12 @@ static void DoorOpenApply(void* wall, bool fast) {
 }
 
 static void DoorCloseApply(void* wall) {
+    // [G06] native Close route first.
+    if (DoorCloseNative(wall)) {
+        Call netup("/Script/Engine.Actor.ForceNetUpdate");
+        if (netup.ok()) netup.run(wall);
+        return;
+    }
     uint8_t* pack = (uint8_t*)wall + profile::BuildingWall_bDoorOpen_Byte;
     *pack &= uint8_t(~(0x20 | 0x40));            // clear bDoorOpen|bLocalDoorOpen
     Call r("/Script/FortniteGame.BuildingWall.OnRep_bDoorOpen");
@@ -2405,8 +3014,7 @@ void Athena::HandleDoor(void* door) {
     if (!wallCls) wallCls = FindObj("/Script/FortniteGame.BuildingWall");
     if (!wallCls || !IsA(door, wallCls)) return;
 
-    uint8_t* pack = (uint8_t*)door + profile::BuildingWall_bDoorOpen_Byte;
-    const bool open = (*pack & 0x20) != 0;
+    const bool open = DoorIsOpen(door);   // [G06] IsDoorOpen() probe
 
     // Interact toggle: closing removes the stay-open pin first; opening
     // registers it so TickDoorPins can re-assert if anything slams it shut.
@@ -2543,55 +3151,40 @@ void Athena::SyncLockerLoadout() {
     void* backpack  = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Backpack");
 
     // MCP route: GetContext(FortMcpContext).GetLoadoutForPlayer(PlayerID)
-    void* info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
+    // [G05] With SendRequestNow patched to CXC_Public the profile queries
+    // actually dispatch now, so this route resolves the real locker instead
+    // of silently no-oping. [G-d] GetRegisteredPlayerInfo() is the cleaner
+    // entry (SDK-verified UFunction); MyPlayerInfo stays as fallback.
+    void* info = nullptr;
+    {
+        Call gpi("/Script/FortniteGame.FortPlayerController.GetRegisteredPlayerInfo");
+        if (gpi.ok() && gpi.run(session.controller)) info = gpi.result<void*>();
+    }
+    if (!info) info = GetObjField(session.controller, "/Script/FortniteGame.FortPlayerController.MyPlayerInfo");
     void* idProp = GetProp("/Script/FortniteGame.FortRegisteredPlayerInfo.PlayerID");
-
-    // Always query MCP when the player identity is available. Do not gate this
-    // on !character: an earlier default-skin pass may already have populated
-    // CosmeticLoadoutPC and would otherwise permanently mask the real profile.
-    if (info && !IsBadPtr(info) && idProp) {
+    if (info && idProp && !character) {
         void* ctxType = FindObj("/Script/FortniteGame.FortMcpContext");
-        void* ctxLib = FindObj("/Script/BlueprintContext.Default__BlueprintContextLibrary");
         Call context("/Script/BlueprintContext.BlueprintContextLibrary.GetContext");
-        bool contextReady = ctxType && ctxLib && context.ok() &&
+        if (ctxType && context.ok() &&
             context.set("ContextObject", session.controller) &&
             (context.set("Class", ctxType) || context.set("Class_0", ctxType)) &&
-            context.run(ctxLib);
-        void* mcp = contextReady ? context.result<void*>() : nullptr;
-        int idSize = Read<int>(idProp, profile::PropElementSize);
-        int loadoutSize = Read<int>(loadoutProp, profile::PropElementSize);
-        if (mcp && !IsBadPtr(mcp) && idSize > 0 && idSize <= 256 &&
-            loadoutSize > 0 && loadoutSize <= (int)sizeof(FFortAthenaLoadoutShadow)) {
+            context.run(FindObj("/Script/BlueprintContext.Default__BlueprintContextLibrary"))) {
+            void* mcp = context.result<void*>();
+            int idSize = Read<int>(idProp, profile::PropElementSize);
             Call get("/Script/FortniteGame.FortMcpContext.GetLoadoutForPlayer");
-            if (get.ok() &&
-                get.set_bytes("MemberUniqueId", GetField(info, idProp), idSize) &&
-                get.run(mcp)) {
-                void* value = get.result_data(loadoutSize);
-                if (value && !IsBadPtr(value)) {
-                    void* profileCharacter = GetObjField(value, "/Script/FortniteGame.FortAthenaLoadout.Character");
-                    // Only replace the active loadout when MCP returned a real
-                    // character. An empty/default MCP result must not erase a
-                    // usable loadout already present on the controller.
-                    if (profileCharacter && !IsBadPtr(profileCharacter)) {
-                        memcpy(loadout, value, (size_t)loadoutSize);
-                        character = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Character");
-                        pickaxe   = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Pickaxe");
-                        LOG("[Locker] MCP profile loadout accepted (size=%d)", loadoutSize);
-                    } else {
-                        LOG("[Locker] MCP returned an empty character; preserving current loadout");
-                    }
-                } else {
-                    LOG("[Locker] MCP call returned no loadout buffer");
+            if (mcp && get.ok() && get.set_bytes("MemberUniqueId", GetField(info, idProp), idSize) && get.run(mcp)) {
+                void* value = get.result_data(Read<int>(loadoutProp, profile::PropElementSize));
+                if (value) {
+                    int size = Read<int>(loadoutProp, profile::PropElementSize);
+                    memcpy(loadout, value, (size_t)std::min(size, (int)sizeof(FFortAthenaLoadoutShadow)));
+                    character = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Character");
+                    pickaxe   = GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Pickaxe");
+                    LOG("[Locker] loadout resolved through MCP (mcp=%p info=%p)", mcp, info);
                 }
-            } else {
-                LOG("[Locker] MCP GetLoadoutForPlayer unavailable or parameter binding failed");
+            } else if (mcp) {
+                LOG("[Locker] MCP context live but loadout query failed (profile may still be loading)");
             }
-        } else {
-            LOG("[Locker] MCP context/identity/loadout size not ready (ctx=%p idSize=%d loadoutSize=%d)",
-                mcp, idSize, loadoutSize);
         }
-    } else {
-        LOG("[Locker] MCP identity unavailable (info=%p idProp=%p)", info, idProp);
     }
     LOG("[Locker] character=%s pickaxe=%s", ObjName(character).c_str(), ObjName(pickaxe).c_str());
     session.locker_pickaxe = pickaxe;
@@ -2618,9 +3211,7 @@ void Athena::SyncLockerLoadout() {
     if (pawnLoadoutProp && Read<int>(pawnLoadoutProp, profile::PropElementSize) == Read<int>(loadoutProp, profile::PropElementSize)) {
         int size = Read<int>(pawnLoadoutProp, profile::PropElementSize);
         memcpy(GetField(session.pawn, pawnLoadoutProp), loadout, (size_t)size);
-        Call onrep("/Script/FortniteGame.FortPlayerPawn.OnRep_CosmeticLoadout", session.pawn);
-        if (onrep.ok()) onrep.run(session.pawn);
-        LOG("[Locker] pawn CosmeticLoadout mirrored (%d bytes), OnRep=%d", size, (int)onrep.ok());
+        LOG("[Locker] pawn CosmeticLoadout mirrored (%d bytes)", size);
     }
 
     // Character parts: menu hero first, then hero specializations, then backpack.
@@ -2677,31 +3268,7 @@ void Athena::LoadProfileCosmetics() {
     if (!session.pawn || !session.controller) return;
     LOG("[Profile] Loading cosmetics...");
     SyncLockerLoadout();
-    if (!session.character_parts.empty()) {
-        // MCP/profile parts are authoritative when present. Refresh the native
-        // visualization without entering the hard-coded default-skin path.
-        void* state = GetObjField(session.controller, "/Script/Engine.Controller.PlayerState");
-        if (state && !IsBadPtr(state)) {
-            Call rep("/Script/FortniteGame.FortPlayerState.OnRep_CharacterParts", state);
-            if (rep.ok()) rep.run(state);
-            Call data("/Script/FortniteGame.FortPlayerState.OnRep_CharacterData", state);
-            if (data.ok()) data.run(state);
-            void* klib = FindObj("/Script/FortniteGame.Default__FortKismetLibrary");
-            Call refresh("/Script/FortniteGame.FortKismetLibrary.UpdatePlayerCustomCharacterPartsVisualization");
-            if (klib && refresh.ok() && refresh.set("PlayerState", state)) refresh.run(klib);
-        }
-        LOG("[Profile] Preserving %zu profile character parts", session.character_parts.size());
-        return;
-    }
-    void* loadoutProp = GetProp("/Script/FortniteGame.FortPlayerController.CosmeticLoadoutPC");
-    void* loadout = loadoutProp ? GetField(session.controller, loadoutProp) : nullptr;
-    void* profileCharacter = loadout ? GetObjField(loadout, "/Script/FortniteGame.FortAthenaLoadout.Character") : nullptr;
-    if (profileCharacter && !IsBadPtr(profileCharacter)) {
-        LOG("[Profile] character=%s exists but parts are not resident; defer fallback and retry",
-            ObjName(profileCharacter).c_str());
-        return;
-    }
-    LOG("[Profile] No profile character/parts resolved; using fallback defaults");
+    if (!session.character_parts.empty()) { ShowSkin(); return; }
     LoadDefaultCosmetics();
 }
 
@@ -2797,14 +3364,7 @@ void Athena::LoadDefaultCosmetics() {
     session.cosmetics_with_state = true;
     LOG("[Cosmetics] ✅ full flow with state done");
 }
-void Athena::ShowSkin() {
-    if (!session.pawn || !session.controller) return;
-    if (!session.character_parts.empty()) {
-        LoadProfileCosmetics();
-        return;
-    }
-    LoadDefaultCosmetics();
-}
+void Athena::ShowSkin() { LoadDefaultCosmetics(); }
 
 void Athena::ForcePlayerVisible() {
     if (!session.pawn || IsBadPtr(session.pawn)) return;
@@ -2943,16 +3503,12 @@ void Athena::SetupWorld(void* world) {
     LOG("SetupWorld: GrantAllAbilitySets"); GrantAllAbilitySets();
     LOG("SetupWorld: SetupTacticalSprint"); SetupTacticalSprint();
     LOG("SetupWorld: EnableMovementFeatures"); EnableMovementFeatures();
-    // Defer cosmetic evaluation until FinalizePlayer: the MCP identity/loadout
-    // and PlayerState must exist before we choose profile assets vs defaults.
-    LOG("SetupWorld: cosmetics deferred until FinalizePlayer");
+    LOG("SetupWorld: ShowSkin"); ShowSkin();
     LOG("SetupWorld: DestroyLods"); DestroyLods();
     LOG("SetupWorld: InitializeInventory"); InitializeInventory();
     LOG("SetupWorld: ResetStaleContainers"); ResetStaleContainers();   // [F34]
     LOG("SetupWorld: SpawnFloorLoot"); SpawnFloorLoot();
-    // Vehicles are deferred until FinalizePlayer: spawning actors while the
-    // loading transition is still changing possession/world state is unsafe.
-    LOG("SetupWorld: vehicle spawning deferred until FinalizePlayer");
+    LOG("SetupWorld: SpawnVehicles"); SpawnVehicles();                 // [F28]
     LOG("SetupWorld: ApplySprintSpeed"); ApplySprintSpeed();
     LOG("SetupWorld: SpawnSafeZoneIndicator"); SpawnSafeZoneIndicator();
     // [F38] SpawnBuildPreviews removed — the hidden hand-rolled preview actors
@@ -2987,7 +3543,7 @@ void Athena::FinalizePlayer() {
     // yet, so LoadDefaultCosmetics early-returned (log proof: cosmetics line
     // printed BEFORE 'SetupWorld: EnsurePlayerState'). Re-run the full flow
     // now that the state is guaranteed.
-    if (!session.cosmetics_with_state) { LOG("Finalize: cosmetics with state"); LoadProfileCosmetics(); }
+    if (!session.cosmetics_with_state) { LOG("Finalize: cosmetics with state"); LoadDefaultCosmetics(); }
     // Readiness can change possession — refresh cached pawn-dependent state.
     Call ps("/Script/Engine.Pawn.OnRep_PlayerState", pawn); if (ps.ok()) ps.run(pawn);
     if (!session.abilities_granted) GrantAllAbilitySets();
@@ -3058,7 +3614,8 @@ void Athena::Tick() {
             Array s = Read<Array>((char*)session.quickbars + profile::QuickBars_SecondaryOffset, profile::QuickBar_SlotsOffset);
             hbP = p.Count; hbS = s.Count;
         }
-        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d",
+        int hbSpecs = gas::CountActivatableSpecs();
+        LOG("[HB] qb_init=%d qb_link=%s gate=%u bars=%d/%d loot_tables=%d veh=%d match=%d cosmetics=%d body=%d wabilities=%d specs=%d gas(init=%d gaa=%d ita=%d acc=%d mcp=%d)",
             (int)session.quickbars_initialized,
             (qbLink == session.quickbars ? (session.quickbars ? "ok" : "n/a") : "BAD"),
             (unsigned)hbGate, hbP, hbS,
@@ -3067,7 +3624,13 @@ void Athena::Tick() {
             (int)session.match_state_ready,
             (int)session.cosmetics_with_state,
             (int)session.body_fixed,
-            (int)session.world_abilities_granted);
+            (int)session.world_abilities_granted,
+            hbSpecs,
+            gas::InitializePlayerGameplayAbilities ? 1 : 0,
+            gas::GiveAbilityAndActivateOnce ? 1 : 0,
+            gas::InternalTryActivateAbility ? 1 : 0,
+            gas::ApplyCharacterCustomization ? 1 : 0,
+            (gas::SendRequestNow && orig_SendRequestNow) ? 1 : 0);   // [G10]
     }
     // [F94-a] reviewer note (1): state can change after FinalizePlayer — the
     // internal 60s rate-limit makes this call free next to the heartbeat.
@@ -3107,7 +3670,7 @@ void Athena::Tick() {
     }
     if (session.finalized && now - lastCosmeticsCheck > 8.0) {   // [F90-c/AUD-1]
         lastCosmeticsCheck = now;
-        if (!session.cosmetics_with_state) LoadProfileCosmetics();  // retry MCP/profile before default fallback
+        if (!session.cosmetics_with_state) LoadDefaultCosmetics();   // re-runs the full with-state flow once PlayerState replicates
     }
     if (session.finalized) {
         PollTouchBuild();
@@ -4991,9 +5554,32 @@ void Athena::OnServerCreateBuildingActor(void* params) {
     }
 }
 
+// [G08] Erbium SetEditingPlayer (AFortPlayerControllerAthena.cpp): authority
+// bookkeeping while a piece is being edited — EditingPlayer + OnRep + the
+// SetNetDormancy(Initial while editing / DormantAll when released) +
+// ForceNetUpdate pair. Standalone IS the authority, so the guard passes.
+static void SetEditingPlayer(void* building, void* newEditor) {
+    if (!building || IsBadPtr(building)) return;
+    void* ep = GetProp("/Script/FortniteGame.BuildingSMActor.EditingPlayer");
+    if (ep && Read<int>(ep, profile::PropElementSize) == 8) {
+        Write<void*>(GetField(building, ep), 0, newEditor);
+        Call r("/Script/FortniteGame.BuildingSMActor.OnRep_EditingPlayer");
+        if (r.ok()) r.run(building);
+    }
+    Call d("/Script/Engine.Actor.SetNetDormancy");
+    if (d.ok()) {
+        uint8_t dorm = newEditor ? 1 : 2;   // DORM_Initial while edited, DORM_DormantAll when released
+        if (d.set("Dormancy", dorm)) d.run(building);
+    }
+    Call n("/Script/Engine.Actor.ForceNetUpdate");
+    if (n.ok()) n.run(building);
+}
+
 // [F10] Edit tool — EditActor and OnRep_EditActor live on FortWeap_EditingTool.
 void Athena::OnBeginEditActor(void* piece) {
     if (!session.edit_tool || !session.pawn || !piece) return;
+    // [G08] claim the piece as the editing player first (Erbium order).
+    SetEditingPlayer(piece, session.player_state);
     void* inst = nullptr;
     {
         Call c("/Script/FortniteGame.FortItemDefinition.CreateTemporaryItemInstanceBP");
@@ -5041,6 +5627,9 @@ void Athena::OnFinishEditActor(void* actor, void* newClass, int rotIter, bool mi
     rot.Yaw += double(rotIter) * 90.0;
     SetBool(actor, "/Script/FortniteGame.BuildingActor.bPlayDestructionEffects", false);
     if (!newClass || IsBadPtr(newClass)) return;
+    // [G08] release the editor claim before the swap (Erbium SetEditingPlayer
+    // → ReplaceBuildingActor order).
+    SetEditingPlayer(actor, nullptr);
     if (!SpawnBuildingActor(newClass, loc, rot, mirrored != 0, oldLevel)) return;
     // Erbium parity: the replaced piece is removed via SilentDie (no FX).
     Call sd("/Script/FortniteGame.BuildingSMActor.SilentDie");
@@ -5381,10 +5970,6 @@ static bool SpawnVehicleAt(void* cls, const Vector& loc, const Rotator& rot) {
 
 void Athena::SpawnVehicles() {
     if (!session.world || session.vehicles_spawned) return;
-    // Never create vehicle actors during SetupWorld/loading. The world may be
-    // valid enough for enumeration while possession, streaming and match phase
-    // are still transitioning; defer until FinalizePlayer has completed.
-    if (!session.finalized || !session.pawn || IsBadPtr(session.pawn)) return;
     if (!WorldIsStandalone(session.world)) return;
     // [F41] The flag is only committed when spawners are actually found —
     // the map streams its spawners in over time, and the old code marked the
@@ -5673,11 +6258,11 @@ void Athena::RemoveVehicleWeapon(bool reequip) {
     }
 }
 
-void Athena::TickVehicleSeats() {
+void Athena::TickVehicleSeats(bool force) {
     if (!session.pawn) return;
     static double nextPoll = 0;
     double now = Monotonic();
-    if (now < nextPoll) return;
+    if (!force && now < nextPoll) return;   // [G09] event-driven calls are instant
     nextPoll = now + 0.5;
     void* vehicle = nullptr;
     for (const char* name : {"GetVehicleActor", "GetVehicle"}) {
@@ -5894,10 +6479,69 @@ void Athena::RemoveNetDebugUI() {
 }
 
 // ============================================================================
-// EMOTES — [F09] 21.30 signature: BodyType/Gender/PawnContext
+// EMOTES — [G07] Erbium ServerPlayEmoteItem parity + [F09] montage fallback
 // ============================================================================
 void Athena::PlayEmoteItem(void* item) {
     if (!item || !session.pawn) return;
+
+    // [G07] NATIVE PATH (Erbium ServerPlayEmoteItem 1:1): build the ability
+    // spec, hand it to GiveAbilityAndActivateOnce, and replicate the emote —
+    // this plays through GAS (montage + replication + moving-emote support)
+    // instead of a bare local Montage_Play.
+    if (gas::GiveAbilityAndActivateOnce) {
+        void* asc = GetASC(session.pawn);
+        // Vehicle override (Erbium): while driving a FortCharacterVehicle the
+        // vehicle's OverrideAbilitySystemComponent owns emotes.
+        void* vehicle = nullptr;
+        for (const char* name : {"GetVehicleActor", "GetVehicle"}) {
+            Call c((std::string("/Script/FortniteGame.FortPlayerPawnAthena.") + name).c_str());
+            if (!c.ok()) c = Call((std::string("/Script/FortniteGame.FortPawn.") + name).c_str());
+            if (c.ok() && c.run(session.pawn)) vehicle = c.result<void*>();
+            if (vehicle && !IsBadPtr(vehicle)) break;
+            vehicle = nullptr;
+        }
+        if (vehicle && !IsBadPtr(vehicle)) {
+            void* oasc = GetObjField(vehicle, "/Script/FortniteGame.FortCharacterVehicle.OverrideAbilitySystemComponent");
+            if (oasc && !IsBadPtr(oasc)) asc = oasc;
+        }
+        if (asc) {
+            // Resolve the ability class: CustomDanceAbility when the item
+            // carries one, otherwise the generic emote ability.
+            void* abilityClass = GetObjField(item, "/Script/FortniteGame.AthenaDanceItemDefinition.CustomDanceAbility");
+            if (!abilityClass || IsBadPtr(abilityClass))
+                abilityClass = LoadClass("/Game/Abilities/Emotes/GAB_Emote_Generic.GAB_Emote_Generic_C",
+                                         "/Script/GameplayAbilities.GameplayAbility");
+            if (!abilityClass) abilityClass = FindAbilityClassNamed("GAB_Emote_Generic_C");
+            void* cdo = abilityClass ? gas::ClassDefaultOf(abilityClass) : nullptr;
+            void* spec = cdo ? gas::BuildSpec(cdo, item) : nullptr;
+            if (spec) {
+                int32 outHandle = 0;
+                {
+                    Guard g;
+                    ((void (*)(void*, void*, void*, void*))gas::GiveAbilityAndActivateOnce)(
+                        asc, &outHandle, spec, nullptr);
+                }
+                free(spec);
+                // Replicate the emote for every client (Erbium):
+                // LastReplicatedEmoteExecuted + OnRep_LastReplicatedEmoteExecuted.
+                void* prop = GetProp("/Script/FortniteGame.FortPlayerPawn.LastReplicatedEmoteExecuted");
+                if (prop && Read<int>(prop, profile::PropElementSize) == 8) {
+                    void* old = Read<void*>(GetField(session.pawn, prop));
+                    Write<void*>(GetField(session.pawn, prop), 0, item);
+                    Call r("/Script/FortniteGame.FortPlayerPawn.OnRep_LastReplicatedEmoteExecuted");
+                    if (r.ok()) {
+                        if (r.set("LastEmotePlayed", old)) r.run(session.pawn);
+                        else r.run(session.pawn);
+                    }
+                }
+                LOG("[Emote] ✅ native GiveAbilityAndActivateOnce (handle=0x%X)", (unsigned)outHandle);
+                return;
+            }
+            LOG("[Emote] native path incomplete — montage fallback");
+        }
+    }
+
+    // [F09] Montage fallback: 21.30 signature BodyType/Gender/PawnContext.
     void* mesh = GetObjField(session.pawn, "/Script/Engine.Character.Mesh");
     if (!mesh) return;
     Call anim("/Script/Engine.SkeletalMeshComponent.GetAnimInstance");
@@ -6072,6 +6716,23 @@ static void pe_hook(void* obj, void* func, void* params) {
         }
         // Direct receiver match (original behaviour retained for safety).
         if (isPC && fn == "JumpFromHudStart") { Athena::HandleJumpFromHudStart(); return orig_PE(obj, func, params); }
+
+        // [G09] Vehicle seat events are dispatched ON the vehicle actor —
+        // outside the PC/pawn receiver gate below. Enter: instant seat-weapon
+        // grant (no 0.5s poll wait). Exit: instant removal + re-equip.
+        if ((fn == "OnPawnEnterVehicle" || fn == "OnPawnExitVehicle") && params && session.pawn) {
+            void* who = Read<void*>(params, 0);   // AFortPlayerPawn* Pawn
+            if (who == session.pawn) {
+                if (fn == "OnPawnEnterVehicle") {
+                    LOG("[Vehicle] enter-seat event seat=%d", Read<int32>(params, 8));
+                    Athena::TickVehicleSeats(/*force=*/true);   // [G09] instant grant
+                } else {
+                    LOG("[Vehicle] exit-seat event");
+                    Athena::RemoveVehicleWeapon(true);
+                }
+            }
+            return orig_PE(obj, func, params);
+        }
 
         // [F24] Lobby return interception (standalone: travel locally).
         if (isPC && (fn == "ReturnToMainMenu" || fn == "ServerReturnToMainMenu" ||
@@ -6391,13 +7052,16 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                 if (!def) LOG("Give: asset not found: %s", asset);
                 else LOG("Give result=%d", (int)Athena::GiveItem(def, count, slot, slot >= 0 && slot < 6 ? 0 : (uint8_t)-1, false));
             }
-        } else if (normalized == "era.vehicles" && session.world && session.finalized) {
-            // [F28] manual re-run only after FinalizePlayer
+        } else if (normalized == "era.vehicles" && session.world) {
+            // [F28] manual re-run of the vehicle spawner pass
             session.vehicles_spawned = false;
             session.vehicle_attempts = 0;
             Athena::SpawnVehicles();
         } else if (normalized == "era.debug") {
             Athena::DebugDump();   // [F42] quickbars/inventory/match-state dump
+        } else if (normalized == "era.abilities" || normalized == "era.specs") {
+            // [G10/G04] dump every granted spec with its InputID
+            gas::DumpSpecs("era.abilities");
         } else if (normalized == "era.fix" && session.world && session.finalized) {
             // [F42/F43] re-run every world-side fix pass (state, QBs, loot, cars, HUD)
             Athena::EnsurePlayerState();
@@ -6446,7 +7110,7 @@ static bool exec_hook(void* engine, void* world, const char16_t* command, void* 
                     } else LOG("era.spawn: nothing found at %s", path);
                 }
             }
-        } else LOG("Commands: era.status | era.inventory | era.debug | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles | era.loot | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
+        } else LOG("Commands: era.status | era.inventory | era.debug | era.abilities | era.fix | era.equip 0..5 | era.give Name [count] [slot] | era.vehicles | era.loot | era.spawn /Game/Path | fly | walk | ghost | god | teleport | era.lobby");
         return true;
     }
     return orig_Exec(engine, world, command, output);
@@ -6480,6 +7144,18 @@ static void InstallHooks() {
         else { LOG("EngineExec FAILED"); ++failed; }
     } else { LOG("EngineExec skipped (prologue)"); ++failed; }
     if (!qb_valid) LOG("[QB] initializer prologue mismatch — native init disabled, manual path only");
+
+    // [G05] MCP dispatch hook — installed only when the [G01] scanner located
+    // SendRequestNow AND its prologue reads like a valid frame entry.
+    if (gas::SendRequestNow && IsReadable((void*)gas::SendRequestNow, 16)) {
+        uint32_t w0 = Read<uint32_t>((void*)gas::SendRequestNow);
+        if (arm::IsStpX29X30Sp(w0) || arm::IsSubSpImm(w0)) {
+            if (DobbyHook((void*)gas::SendRequestNow, (void*)hook_SendRequestNow, (void**)&orig_SendRequestNow) == 0 && orig_SendRequestNow) {
+                LOG("[MCP] ✅ SendRequestNow hooked (CXC_Public forced)"); ++installed;
+            } else { LOG("[MCP] SendRequestNow hook FAILED"); ++failed; }
+        } else LOG("[MCP] SendRequestNow prologue unexpected (0x%08X) — skipped", w0);
+    } else LOG("[MCP] SendRequestNow not found — profile dispatch unpatched");
+
     LOG("InstallHooks done: installed=%d failed=%d", installed, failed);
 }
 
@@ -6502,6 +7178,10 @@ static void* Worker(void*) {
     }
     if (g_status.load() != 1) { LOG("Timeout"); return nullptr; }
     usleep(300000);
+    // [G02] Native discovery FIRST (Erbium Finders parity): the scanner walks
+    // the loaded image once on this worker thread — the found addresses feed
+    // InstallHooks ([G05] MCP) and the ability/animation/vehicle systems.
+    gas::Discover();
     InstallHooks();
     LOG("=== Ready ===");
     return nullptr;
